@@ -1,109 +1,71 @@
-# Agent 驾驶舱：国内 AI Agent 多开管理器（单文件、零依赖，Python 3.10+）
-# 原理：Electron 系用 --user-data-dir 隔离实例；CLI 系用 CODEX_HOME / CLAUDE_CONFIG_DIR 隔离账号
+# Agent 驾驶舱：国内 AI Agent 多开 / 额度过期提醒 / 本地反代 一体机
+# 单文件、零依赖（Python 3.10+ stdlib）。启动后自动打开浏览器仪表盘 http://127.0.0.1:8787
+# 多开原理：Electron 系 --user-data-dir 隔离实例；CLI 系 CODEX_HOME / CLAUDE_CONFIG_DIR 隔离账号
 import json
 import os
 import shutil
 import subprocess
-import sys
+import threading
 import time
-import tkinter as tk
+import urllib.error
+import urllib.request
+import webbrowser
 import zipfile
+from datetime import date, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "Agent 驾驶舱"
+PORT = 8787
 BASE_DIR = Path.home() / ".agent-cockpit"
 INSTANCES_DIR = BASE_DIR / "instances"
 BACKUP_DIR = BASE_DIR / "backups"
+CONFIG_FILE = BASE_DIR / "config.json"
 
-HOME = Path.home()
 LOCAL = Path(os.environ.get("LOCALAPPDATA", ""))
 NPM_GLOBAL = Path("D:/npm-global")
 
-# ---------- 学术风配色（黑白灰底 + 深藏青/炭灰/学术红，无渐变） ----------
-NAVY = "#0F172A"        # 深藏青：标题、侧栏
-NAVY_SOFT = "#1E293B"   # 侧栏选中底色
-CHARCOAL = "#334155"    # 炭灰：正文
-RED = "#B91C1C"         # 学术红：强调/危险
-BG = "#F1F5F9"          # 窗口底
-CARD = "#FFFFFF"        # 卡片底
-BORDER = "#E2E8F0"      # 描边
-MUTED = "#64748B"       # 次要文字
-GREEN = "#15803D"       # 运行中
-HOVER = "#F8FAFC"
-
-FONT = "Microsoft YaHei UI"
-
 APPS = {
-    "qoder": {
-        "name": "Qoder",
-        "kind": "electron",
-        "exe": LOCAL / "Programs/Qoder/Qoder.exe",
-        "exe_alt": [Path("D:/Artificial_Intelligence/Qoder/Qoder.exe")],
-    },
-    "qoder-cn": {
-        "name": "Qoder CN",
-        "kind": "electron",
-        "exe": Path("D:/Artificial_Intelligence/Qoder CN/Qoder CN.exe"),
-    },
-    "qoder-cn-ide": {
-        "name": "Qoder CN IDE",
-        "kind": "electron",
-        "exe": Path("D:/Artificial_Intelligence/Qoder CN IDE/Qoder CN IDE.exe"),
-    },
-    "workbuddy": {
-        "name": "WorkBuddy",
-        "kind": "electron",
-        "exe": Path("D:/LenovoSoftstore/Install/WorkBuddy/WorkBuddy.exe"),
-    },
-    "traework-cn": {
-        "name": "TraeWork CN (TRAE SOLO)",
-        "kind": "electron",
-        "exe": Path("D:/Artificial_Intelligence/TRAE SOLO CN/TRAE SOLO CN.exe"),
-    },
-    "zcode": {
-        "name": "ZCode",
-        "kind": "electron",
-        "exe": Path("D:/Artificial_Intelligence/ZCode/ZCode.exe"),
-    },
-    "codex": {
-        "name": "Codex CLI",
-        "kind": "cli",
-        "exe": NPM_GLOBAL / "codex.cmd",
-        "env": "CODEX_HOME",
-    },
-    "claude": {
-        "name": "Claude Code CLI",
-        "kind": "cli",
-        "exe": NPM_GLOBAL / "claude.cmd",
-        "env": "CLAUDE_CONFIG_DIR",
-    },
+    "qoder": {"name": "Qoder", "kind": "electron",
+              "exe": [LOCAL / "Programs/Qoder/Qoder.exe",
+                      Path("D:/Artificial_Intelligence/Qoder/Qoder.exe")]},
+    "qoder-cn": {"name": "Qoder CN", "kind": "electron",
+                 "exe": [Path("D:/Artificial_Intelligence/Qoder CN/Qoder CN.exe")]},
+    "qoder-cn-ide": {"name": "Qoder CN IDE", "kind": "electron",
+                     "exe": [Path("D:/Artificial_Intelligence/Qoder CN IDE/Qoder CN IDE.exe")]},
+    "workbuddy": {"name": "WorkBuddy", "kind": "electron",
+                  "exe": [Path("D:/LenovoSoftstore/Install/WorkBuddy/WorkBuddy.exe")]},
+    "traework-cn": {"name": "TraeWork CN", "kind": "electron",
+                    "exe": [Path("D:/Artificial_Intelligence/TRAE SOLO CN/TRAE SOLO CN.exe")]},
+    "zcode": {"name": "ZCode", "kind": "electron",
+              "exe": [Path("D:/Artificial_Intelligence/ZCode/ZCode.exe")]},
+    "codex": {"name": "Codex CLI", "kind": "cli", "exe": [NPM_GLOBAL / "codex.cmd"],
+              "env": "CODEX_HOME"},
+    "claude": {"name": "Claude Code CLI", "kind": "cli", "exe": [NPM_GLOBAL / "claude.cmd"],
+               "env": "CLAUDE_CONFIG_DIR"},
 }
 
 DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW：pythonw 下调控制台程序不弹黑窗
+ALERT_WARN_DAYS = 30
+ALERT_DANGER_DAYS = 7
 
 
-def resolve_exe(app: dict):
-    exe = Path(app["exe"])
-    if exe.exists():
-        return exe
-    for alt in app.get("exe_alt", []):
-        if Path(alt).exists():
-            return Path(alt)
+def resolve_exe(app):
+    for p in app["exe"]:
+        if Path(p).exists():
+            return Path(p)
     return None
 
 
 def tasklist_snapshot():
-    """返回 {pid: 映像名} 快照"""
     out = {}
     try:
-        r = subprocess.run(
-            ["tasklist", "/fo", "csv", "/nh"],
-            capture_output=True, timeout=10,
-        )
-        text = r.stdout.decode("gbk", errors="replace")
-        for line in text.splitlines():
-            parts = [p.strip('"') for p in line.split('","')]
+        r = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True,
+                           timeout=10, creationflags=NO_WINDOW)
+        for line in r.stdout.decode("gbk", errors="replace").splitlines():
+            parts = [x.strip('"') for x in line.split('","')]
             if len(parts) >= 2:
                 try:
                     out[int(parts[1])] = parts[0]
@@ -114,555 +76,809 @@ def tasklist_snapshot():
     return out
 
 
-def pid_alive(pid: int) -> bool:
-    if not pid:
-        return False
-    return pid in tasklist_snapshot()
+def pid_alive(pid):
+    return bool(pid) and pid in tasklist_snapshot()
 
 
-def card(parent, title=None, subtitle=None):
-    """白底描边卡片，返回 (卡片frame, 内容frame)"""
-    outer = tk.Frame(parent, bg=CARD, highlightbackground=BORDER,
-                     highlightthickness=1, bd=0)
-    inner = tk.Frame(outer, bg=CARD)
-    inner.pack(fill="both", expand=True, padx=14, pady=10)
-    if title:
-        row = tk.Frame(inner, bg=CARD)
-        row.pack(fill="x", pady=(0, 8))
-        tk.Label(row, text=title, bg=CARD, fg=NAVY,
-                 font=(FONT, 11, "bold")).pack(side="left")
-        if subtitle:
-            tk.Label(row, text=subtitle, bg=CARD, fg=MUTED,
-                     font=(FONT, 9)).pack(side="left", padx=8, pady=(2, 0))
-    return outer, inner
+def days_left(expires_on):
+    if not expires_on:
+        return None
+    try:
+        return (date.fromisoformat(expires_on) - date.today()).days
+    except ValueError:
+        return None
 
 
-class App:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        root.title(APP_NAME)
-        root.geometry("1080x800")
-        root.minsize(940, 640)
-        root.configure(bg=BG)
+# ---------------- 存储 ----------------
+def load_instances(app_id):
+    out = []
+    d = INSTANCES_DIR / app_id
+    if d.exists():
+        for f in sorted(d.glob("*.json")):
+            try:
+                meta = json.loads(f.read_text(encoding="utf-8"))
+                meta["_file"] = str(f)
+                out.append(meta)
+            except Exception:
+                pass
+    return out
 
-        BASE_DIR.mkdir(parents=True, exist_ok=True)
-        INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-        self._setup_styles()
+def save_instance(app_id, meta):
+    d = INSTANCES_DIR / app_id
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / (meta["name"] + ".json")
+    f.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    meta["_file"] = str(f)
+    return meta
 
-        self.workdir = tk.StringVar(value=str(Path.home()))
-        self.status_var = tk.StringVar(value="就绪")
-        self.stats_var = tk.StringVar(value="")
-        self._app_ids = list(APPS.keys())
 
-        self._build_ui()
-        self.refresh_apps()
-        self.refresh_all()
-        root.after(4000, self._auto_refresh)
-
-    # ---------- 样式 ----------
-    def _setup_styles(self):
-        style = ttk.Style(self.root)
+def load_config():
+    if CONFIG_FILE.exists():
         try:
-            style.theme_use("clam")
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
-        style.configure(".", background=BG, foreground=CHARCOAL,
-                        font=(FONT, 10), bordercolor=BORDER,
-                        focuscolor=NAVY, lightcolor=CARD, darkcolor=CARD)
+    return {"proxy": {"upstream": "https://api.openai.com", "strategy": "round-robin"}}
 
-        # 按钮基类：扁平、无边框
-        style.configure("TButton", padding=(14, 7), borderwidth=0,
-                        relief="flat", font=(FONT, 10))
-        # 主操作：深藏青
-        style.configure("Primary.TButton", background=NAVY, foreground="#FFFFFF",
-                        font=(FONT, 10, "bold"))
-        style.map("Primary.TButton", background=[("active", NAVY_SOFT), ("disabled", BORDER)],
-                  foreground=[("disabled", MUTED)])
-        # 危险：学术红
-        style.configure("Danger.TButton", background=RED, foreground="#FFFFFF")
-        style.map("Danger.TButton", background=[("active", "#991B1B")])
-        # 启动：绿
-        style.configure("Go.TButton", background=GREEN, foreground="#FFFFFF",
-                        font=(FONT, 10, "bold"))
-        style.map("Go.TButton", background=[("active", "#166534")])
-        # 普通工具：浅灰
-        style.configure("Tool.TButton", background="#E2E8F0", foreground=CHARCOAL)
-        style.map("Tool.TButton", background=[("active", BORDER), ("pressed", "#CBD5E1")])
-        # 侧栏深底上的工具按钮
-        style.configure("Side.TButton", background=NAVY_SOFT, foreground="#E2E8F0",
-                        padding=(10, 5))
-        style.map("Side.TButton", background=[("active", "#334155")])
 
-        # 表格
-        style.configure("Treeview", background=CARD, fieldbackground=CARD,
-                        foreground=CHARCOAL, rowheight=32, borderwidth=0,
-                        font=(FONT, 10))
-        style.configure("Treeview.Heading", background=HOVER, foreground=MUTED,
-                        font=(FONT, 9, "bold"), borderwidth=0, relief="flat",
-                        padding=(6, 6))
-        style.map("Treeview.Heading", background=[("active", BORDER)])
-        style.map("Treeview", background=[("selected", NAVY)],
-                  foreground=[("selected", "#FFFFFF")])
+def save_config(cfg):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # 输入框
-        style.configure("TEntry", fieldbackground=CARD, bordercolor=BORDER,
-                        lightcolor=CARD, darkcolor=CARD, padding=6,
-                        insertcolor=CHARCOAL)
 
-        # 滚动条：扁平浅灰
-        style.configure("Vertical.TScrollbar", background="#CBD5E1",
-                        troughcolor=CARD, borderwidth=0, relief="flat", arrowsize=10)
-        style.map("Vertical.TScrollbar", background=[("active", MUTED)])
+# ---------------- 反代 ----------------
+class ProxyState:
+    def __init__(self):
+        self.server = None
+        self.thread = None
+        self.logs = []
+        self.idx = 0
+        self.cfg = load_config().get("proxy", {})
 
-    # ---------- UI ----------
-    def _build_ui(self):
-        # 顶部：深藏青标题栏
-        header = tk.Frame(self.root, bg=NAVY, height=58)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(header, text="▣ " + APP_NAME, bg=NAVY, fg="#FFFFFF",
-                 font=(FONT, 13, "bold")).pack(side="left", padx=16)
-        tk.Label(header, text="多开 = 独立数据目录，互不干扰 · 实例首次启动需各自登录账号",
-                 bg=NAVY, fg="#94A3B8", font=(FONT, 9)).pack(side="left", pady=(6, 0))
-        tk.Label(header, textvariable=self.stats_var, bg=NAVY, fg="#CBD5E1",
-                 font=(FONT, 9)).pack(side="right", padx=16)
+    @property
+    def running(self):
+        return self.server is not None
 
-        # 底部状态栏（先 pack，保证空间不足时不被裁掉）
-        tk.Frame(self.root, bg=BORDER, height=1).pack(side="bottom", fill="x")
-        bottom = tk.Frame(self.root, bg=CARD, height=32)
-        bottom.pack(side="bottom", fill="x")
-        bottom.pack_propagate(False)
-        tk.Label(bottom, textvariable=self.status_var, bg=CARD, fg=CHARCOAL,
-                 font=(FONT, 9)).pack(side="left", padx=14)
-
-        body = tk.Frame(self.root, bg=BG)
-        body.pack(fill="both", expand=True)
-
-        # 左：深藏青侧栏
-        side = tk.Frame(body, bg=NAVY, width=236)
-        side.pack(side="left", fill="y")
-        side.pack_propagate(False)
-        tk.Label(side, text="AGENTS", bg=NAVY, fg="#64748B",
-                 font=(FONT, 9, "bold")).pack(anchor="w", padx=16, pady=(14, 6))
-
-        list_wrap = tk.Frame(side, bg=NAVY)
-        list_wrap.pack(fill="both", expand=True, padx=8)
-        self.app_list = tk.Listbox(
-            list_wrap, exportselection=False, font=(FONT, 10),
-            bg=NAVY, fg="#E2E8F0", selectbackground=RED, selectforeground="#FFFFFF",
-            activestyle="none", highlightthickness=0, bd=0,
-            relief="flat", selectborderwidth=0)
-        self.app_list.pack(fill="both", expand=True)
-        self.app_list.bind("<<ListboxSelect>>", lambda e: self.refresh_instances())
-
-        side_info = tk.Frame(side, bg=NAVY)
-        side_info.pack(fill="x", padx=16, pady=(6, 14))
-        tk.Label(side_info, text="红底 = 当前选中\n灰字 = 未检测到安装",
-                 bg=NAVY, fg="#64748B", font=(FONT, 8), justify="left").pack(anchor="w")
-
-        # 右：内容区
-        content = tk.Frame(body, bg=BG)
-        content.pack(side="left", fill="both", expand=True, padx=12, pady=10)
-
-        # 卡片 1：实例
-        inst_card, inst_in = card(content, "实例（账号档案）", "双击行 = 直接启动")
-        inst_card.pack(fill="both", expand=True)
-
-        cols = ("status", "name", "workdir", "created")
-        inst_row = tk.Frame(inst_in, bg=CARD)
-        inst_row.pack(fill="both", expand=True)
-        self.inst_tree = ttk.Treeview(inst_row, columns=cols, show="headings", height=8)
-        for c, t, w, a in (("status", "状态", 150, "w"), ("name", "实例名", 120, "w"),
-                           ("workdir", "工作目录", 320, "w"), ("created", "创建时间", 130, "w")):
-            self.inst_tree.heading(c, text=t)
-            self.inst_tree.column(c, width=w, anchor=a, stretch=(c == "workdir"))
-        vsb = ttk.Scrollbar(inst_row, orient="vertical", command=self.inst_tree.yview)
-        self.inst_tree.configure(yscrollcommand=vsb.set)
-        self.inst_tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="left", fill="y")
-        self.inst_tree.bind("<Double-1>", lambda e: self.launch_instance())
-        self.inst_tree.tag_configure("running", foreground=GREEN)
-        self.inst_tree.tag_configure("stopped", foreground=MUTED)
-
-        btns = tk.Frame(inst_in, bg=CARD)
-        btns.pack(fill="x", pady=(10, 0))
-        row1 = tk.Frame(btns, bg=CARD)
-        row1.pack(fill="x")
-        ttk.Button(row1, text="＋ 新建实例", style="Primary.TButton",
-                   command=self.new_instance).pack(side="left")
-        ttk.Button(row1, text="▶ 启动", style="Go.TButton",
-                   command=self.launch_instance).pack(side="left", padx=6)
-        ttk.Button(row1, text="■ 结束", style="Danger.TButton",
-                   command=self.kill_instance).pack(side="left")
-        ttk.Button(row1, text="删除实例", style="Tool.TButton",
-                   command=self.delete_instance).pack(side="right")
-
-        row2 = tk.Frame(btns, bg=CARD)
-        row2.pack(fill="x", pady=(6, 0))
-        for text, cmd in (("备份账号", self.backup_instance),
-                          ("恢复账号", self.restore_instance),
-                          ("打开数据目录", self.open_instance_dir)):
-            ttk.Button(row2, text=text, style="Tool.TButton",
-                       command=cmd).pack(side="left", padx=(0, 6))
-
-        wd = tk.Frame(inst_in, bg=CARD)
-        wd.pack(fill="x", pady=(10, 0))
-        tk.Label(wd, text="工作目录", bg=CARD, fg=MUTED,
-                 font=(FONT, 9, "bold")).pack(side="left")
-        ent = ttk.Entry(wd, textvariable=self.workdir)
-        ent.pack(side="left", fill="x", expand=True, padx=8)
-        ttk.Button(wd, text="浏览…", style="Tool.TButton",
-                   command=self.pick_workdir).pack(side="left")
-        ttk.Button(wd, text="用当前测试区", style="Tool.TButton",
-                   command=lambda: self.workdir.set(r"D:\Claude\人工智能产品测试")).pack(side="left", padx=6)
-
-        # 卡片 2：进程
-        proc_card, proc_in = card(content, "运行中的进程", "每 4 秒自动刷新")
-        proc_card.pack(fill="both", expand=True, pady=(10, 0))
-
-        pcols = ("app", "detail", "pid")
-        proc_row = tk.Frame(proc_in, bg=CARD)
-        proc_row.pack(fill="both", expand=True)
-        self.proc_tree = ttk.Treeview(proc_row, columns=pcols, show="headings", height=6)
-        for c, t, w in (("app", "Agent", 200), ("detail", "详情", 420), ("pid", "PID", 120)):
-            self.proc_tree.heading(c, text=t)
-            self.proc_tree.column(c, width=w, anchor="w", stretch=(c == "detail"))
-        pvsb = ttk.Scrollbar(proc_row, orient="vertical", command=self.proc_tree.yview)
-        self.proc_tree.configure(yscrollcommand=pvsb.set)
-        self.proc_tree.pack(side="left", fill="both", expand=True)
-        pvsb.pack(side="left", fill="y")
-
-        pbtns = tk.Frame(proc_in, bg=CARD)
-        pbtns.pack(fill="x", pady=(10, 0))
-        ttk.Button(pbtns, text="刷新", style="Tool.TButton",
-                   command=self.refresh_all).pack(side="left")
-        ttk.Button(pbtns, text="结束选中进程", style="Danger.TButton",
-                   command=self.kill_process).pack(side="left", padx=6)
-
-    def _auto_refresh(self):
-        self.refresh_all()
-        self.root.after(4000, self._auto_refresh)
-
-    def status(self, msg):
-        self.status_var.set(msg)
-
-    # ---------- 数据 ----------
-    def instances_of(self, app_id: str):
-        result = []
-        d = INSTANCES_DIR / app_id
-        if d.exists():
-            for f in sorted(d.glob("*.json")):
-                try:
-                    meta = json.loads(f.read_text(encoding="utf-8"))
-                    meta["_file"] = str(f)
-                    result.append(meta)
-                except Exception:
-                    pass
-        return result
-
-    def save_instance(self, app_id, meta):
-        d = INSTANCES_DIR / app_id
-        d.mkdir(parents=True, exist_ok=True)
-        f = d / (meta["name"] + ".json")
-        f.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        meta["_file"] = str(f)
-        return meta
-
-    def current_app(self):
-        sel = self.app_list.curselection()
-        if not sel:
-            return None
-        idx = sel[0]
-        return self._app_ids[idx] if idx < len(self._app_ids) else None
-
-    # ---------- 刷新 ----------
-    def refresh_apps(self):
-        prev = self.current_app()
-        self.app_list.delete(0, "end")
-        for i, app_id in enumerate(self._app_ids):
-            app = APPS[app_id]
-            exe = resolve_exe(app)
-            n = len(self.instances_of(app_id))
-            mark = "●" if exe else "○"
-            suffix = f"  ·  {n} 实例" if n else ""
-            self.app_list.insert("end", f" {mark}  {app['name']}{suffix}")
-            self.app_list.itemconfig(i, foreground="#E2E8F0" if exe else "#64748B")
-        # 保持之前的选中
-        idx = self._app_ids.index(prev) if prev in self._app_ids else 0
-        self.app_list.selection_clear(0, "end")
-        self.app_list.selection_set(idx)
-
-    def refresh_instances(self):
-        app_id = self.current_app()
-        self.inst_tree.delete(*self.inst_tree.get_children())
-        if not app_id:
-            return
-        snap = tasklist_snapshot()
-        app = APPS[app_id]
-        exe_name = Path(app["exe"]).name.lower()
-        for meta in self.instances_of(app_id):
-            if app["kind"] == "cli":
-                running = pid_alive(meta.get("pid", 0))
-                st = f"● 运行中  PID {meta['pid']}" if running else "○ 未运行"
-            else:
-                n = sum(1 for p, name in snap.items() if name.lower() == exe_name)
-                st = f"● 程序运行中 ×{n}" if n else "○ 未运行"
-            created = time.strftime("%Y-%m-%d %H:%M", time.localtime(meta.get("created", 0)))
-            self.inst_tree.insert(
-                "", "end",
-                values=(st, meta["name"], meta.get("workdir", ""), created),
-                tags=("running" if st.startswith("●") else "stopped",))
-
-    def refresh_procs(self):
-        self.proc_tree.delete(*self.proc_tree.get_children())
-        snap = tasklist_snapshot()
-        n_proc_rows = 0
+    def pool(self):
+        pool = []
         for app_id, app in APPS.items():
-            exe = resolve_exe(app)
-            if not exe:
-                continue
-            if app["kind"] == "electron":
-                pids = [p for p, name in snap.items() if name.lower() == exe.name.lower()]
-                if pids:
-                    self.proc_tree.insert("", "end", values=(
-                        app["name"], f"{len(pids)} 个进程（含渲染/GPU 子进程）",
-                        ",".join(map(str, sorted(pids)[:6]))))
-                    n_proc_rows += 1
-            else:
-                for meta in self.instances_of(app_id):
-                    pid = meta.get("pid", 0)
-                    if pid_alive(pid):
-                        self.proc_tree.insert("", "end", values=(
-                            f"{app['name']} / {meta['name']}",
-                            meta.get("workdir", ""), pid))
-                        n_proc_rows += 1
-        total_inst = sum(len(self.instances_of(a)) for a in APPS)
-        self.stats_var.set(f"实例 {total_inst}  ·  运行中 {n_proc_rows}  ·  "
-                           f"{time.strftime('%H:%M:%S')}")
+            for meta in load_instances(app_id):
+                tok = (meta.get("token") or "").strip()
+                if tok:
+                    pool.append((f"{app['name']}/{meta['name']}", tok))
+        return pool
 
-    def refresh_all(self):
-        self.refresh_instances()
-        self.refresh_procs()
+    def start(self, port):
+        if self.running:
+            return False, "反代已在运行"
+        state = self
 
-    # ---------- 实例操作 ----------
-    def new_instance(self):
-        app_id = self.current_app()
-        if not app_id:
-            return
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _forward(self, method):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n) if n else None
+                pool = state.pool()
+                if not pool:
+                    self._reply(502, b'{"error":"no tokens in pool"}', "application/json")
+                    state._log(method, self.path, None, 502, "无可用 token")
+                    return
+                label, token = pool[state.idx % len(pool)]
+                state.idx += 1
+                model = None
+                if body:
+                    try:
+                        model = json.loads(body).get("model")
+                    except Exception:
+                        pass
+                hdrs = {k: v for k, v in self.headers.items()
+                        if k.lower() not in ("host", "content-length", "authorization",
+                                             "connection", "accept-encoding")}
+                hdrs["Authorization"] = f"Bearer {token}"
+                url = state.cfg.get("upstream", "").rstrip("/") + self.path
+                req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=300) as resp:
+                        rbody, status = resp.read(), resp.status
+                        ctype = resp.headers.get("Content-Type", "application/json")
+                except urllib.error.HTTPError as e:
+                    rbody, status = e.read(), e.code
+                    ctype = e.headers.get("Content-Type", "application/json")
+                except Exception as e:
+                    rbody, status = json.dumps({"error": str(e)}).encode(), 502
+                    ctype = "application/json"
+                state._log(method, self.path, model, status, label)
+                self._reply(status, rbody, ctype)
+
+            def _reply(self, status, body, ctype):
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = lambda self: self._forward(
+                self.command)
+
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        except OSError as e:
+            return False, f"端口 {port} 占用：{e}"
+        srv.daemon_threads = True
+        self.server = srv
+        self.thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        self.thread.start()
+        return True, f"反代已启动 127.0.0.1:{port}"
+
+    def stop(self):
+        if not self.running:
+            return False, "反代未运行"
+        self.server.shutdown()
+        self.server.server_close()
+        self.server = None
+        return True, "反代已停止"
+
+    def _log(self, method, path, model, status, label):
+        self.logs.append({"ts": datetime.now().strftime("%H:%M:%S"), "method": method,
+                          "path": path[:60], "model": model or "-", "status": status,
+                          "account": label})
+        self.logs = self.logs[-100:]
+
+
+PROXY = ProxyState()
+
+
+# ---------------- 额度自动抓取 ----------------
+def fetch_quota(meta):
+    url = (meta.get("quota_url") or "").strip()
+    if not url:
+        return None, "未配置 quota_url"
+    hdrs = {"User-Agent": "agent-cockpit/1.0"}
+    tok = (meta.get("token") or "").strip()
+    if tok:
+        hdrs["Authorization"] = f"Bearer {tok}"
+    try:
+        try:
+            extra = json.loads(meta.get("quota_headers") or "{}")
+            hdrs.update({k: str(v) for k, v in extra.items()})
+        except Exception:
+            pass
+        with urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+    except Exception as e:
+        return None, f"抓取失败：{e}"
+    node = data
+    for key in (meta.get("quota_path") or "").split("."):
+        if key and isinstance(node, dict):
+            node = node.get(key)
+    if not isinstance(node, (int, float)):
+        for key in ("remaining", "remaining_credits", "credits_left", "total_available",
+                    "grant_remaining"):
+            if isinstance(data, dict) and isinstance(data.get(key), (int, float)):
+                node = data[key]
+                break
+    if not isinstance(node, (int, float)):
+        return None, "响应中未找到数值字段，请设置 quota_path"
+    return float(node), None
+
+
+# ---------------- 业务动作 ----------------
+def build_state():
+    snap = tasklist_snapshot()
+    apps, instances, alerts = [], [], []
+    n_running = 0
+    for app_id, app in APPS.items():
+        exe = resolve_exe(app)
+        apps.append({"id": app_id, "name": app["name"], "kind": app["kind"],
+                     "installed": bool(exe)})
+        exe_name = Path(app["exe"][0]).name.lower()
+        procs = sum(1 for _, nm in snap.items() if nm.lower() == exe_name) if exe else 0
+        for meta in load_instances(app_id):
+            dl = days_left(meta.get("expires_on"))
+            running = (procs > 0) if app["kind"] == "electron" else (meta.get("pid", 0) in snap and meta.get("pid", 0) != 0)
+            if running:
+                n_running += 1
+            left = meta.get("credits_left")
+            if dl is not None and dl <= ALERT_WARN_DAYS and (left is None or left > 0):
+                alerts.append({"app": app["name"], "name": meta["name"], "days": dl,
+                               "left": left,
+                               "level": "danger" if dl <= ALERT_DANGER_DAYS else "warn"})
+            instances.append({
+                "app": app_id, "app_name": app["name"], "kind": app["kind"],
+                "name": meta["name"], "workdir": meta.get("workdir", ""),
+                "created": time.strftime("%Y-%m-%d", time.localtime(meta.get("created", 0))),
+                "running": running, "procs": procs,
+                "quota": {"total": meta.get("credits_total"), "left": left,
+                          "expires_on": meta.get("expires_on"), "days_left": dl,
+                          "has_token": bool((meta.get("token") or "").strip()),
+                          "quota_url": bool((meta.get("quota_url") or "").strip())},
+            })
+    alerts.sort(key=lambda a: a["days"])
+    procs_rows = []
+    for app_id, app in APPS.items():
+        exe = resolve_exe(app)
+        if not exe:
+            continue
+        if app["kind"] == "electron":
+            pids = sorted(p for p, nm in snap.items() if nm.lower() == exe.name.lower())
+            if pids:
+                procs_rows.append({"app": app["name"],
+                                   "detail": f"{len(pids)} 个进程（含渲染/GPU 子进程）",
+                                   "pids": pids[:6]})
+        else:
+            for meta in load_instances(app_id):
+                if meta.get("pid", 0) and meta.get("pid", 0) in snap:
+                    procs_rows.append({"app": f"{app['name']} / {meta['name']}",
+                                       "detail": meta.get("workdir", ""),
+                                       "pids": [meta["pid"]]})
+    return {"apps": apps, "instances": instances, "procs": procs_rows, "alerts": alerts,
+            "stats": {"instances": len(instances), "running": n_running},
+            "proxy": {"running": PROXY.running, "port": PORT + 1,
+                      "upstream": PROXY.cfg.get("upstream", ""),
+                      "strategy": PROXY.cfg.get("strategy", "round-robin"),
+                      "pool": [p[0] for p in PROXY.pool()],
+                      "logs": PROXY.logs[-30:][::-1]},
+            "now": datetime.now().strftime("%H:%M:%S")}
+
+
+def do_action(payload):
+    act = payload.get("action")
+    app_id = payload.get("app")
+    name = payload.get("name")
+
+    def meta_of():
+        for m in load_instances(app_id):
+            if m["name"] == name:
+                return m
+        return None
+
+    if act == "new_instance":
         app = APPS[app_id]
         if not resolve_exe(app):
-            messagebox.showwarning(APP_NAME, f"未找到 {app['name']} 的可执行文件，无法新建实例。")
-            return
-        existing = {m["name"] for m in self.instances_of(app_id)}
+            return {"ok": False, "msg": f"未找到 {app['name']} 可执行文件"}
+        existing = {m["name"] for m in load_instances(app_id)}
         i = 1
         while f"账号{i}" in existing:
             i += 1
-        name = f"账号{i}"
-        data_dir = INSTANCES_DIR / app_id / name
+        nm = f"账号{i}"
+        data_dir = INSTANCES_DIR / app_id / nm
         data_dir.mkdir(parents=True, exist_ok=True)
-        self.save_instance(app_id, {
-            "name": name,
-            "app": app_id,
-            "workdir": self.workdir.get(),
-            "data_dir": str(data_dir),
-            "created": time.time(),
-            "pid": 0,
-        })
-        self.refresh_apps()
-        self.refresh_instances()
-        self.status(f"已新建 {app['name']} 实例「{name}」，首次启动请在窗口内登录对应账号")
+        save_instance(app_id, {"name": nm, "app": app_id,
+                               "workdir": payload.get("workdir") or str(Path.home()),
+                               "data_dir": str(data_dir), "created": time.time(), "pid": 0})
+        return {"ok": True, "msg": f"已新建 {app['name']}「{nm}」，首次启动请登录对应账号"}
 
-    def _selected_instance(self):
-        app_id = self.current_app()
-        sel = self.inst_tree.selection()
-        if not app_id or not sel:
-            messagebox.showinfo(APP_NAME, "请先在左侧选 Agent、中间选实例。")
-            return None, None, None
-        name = self.inst_tree.item(sel[0], "values")[1]
-        for meta in self.instances_of(app_id):
-            if meta["name"] == name:
-                return app_id, name, meta
-        return app_id, name, None
-
-    def launch_instance(self):
-        app_id, name, meta = self._selected_instance()
+    if act == "launch":
+        meta = meta_of()
         if not meta:
-            return
+            return {"ok": False, "msg": "实例不存在"}
         app = APPS[app_id]
         exe = resolve_exe(app)
         if not exe:
-            messagebox.showerror(APP_NAME, f"未找到 {app['name']} 可执行文件")
-            return
-        workdir = meta.get("workdir") or self.workdir.get()
+            return {"ok": False, "msg": f"未找到 {app['name']} 可执行文件"}
+        workdir = meta.get("workdir") or str(Path.home())
         if not Path(workdir).exists():
             workdir = str(Path.home())
         data_dir = Path(meta["data_dir"])
         data_dir.mkdir(parents=True, exist_ok=True)
-
         if app["kind"] == "electron":
-            cmd = [str(exe), f"--user-data-dir={data_dir}", workdir]
-            try:
-                subprocess.Popen(cmd, cwd=str(exe.parent), close_fds=True,
-                                 creationflags=DETACHED)
-                self.status(f"已启动 {app['name']}「{name}」 → {workdir}")
-            except Exception as e:
-                messagebox.showerror(APP_NAME, f"启动失败：{e}")
-                return
-        else:
-            env = dict(os.environ)
-            env[app["env"]] = str(data_dir)
-            env["PYTHONIOENCODING"] = "utf-8"
-            inner = f'cd /d "{workdir}" && set "{app["env"]}={data_dir}" && "{exe}"'
-            try:
-                p = subprocess.Popen(["cmd", "/c", "start", "cmd", "/k", inner],
-                                     cwd=workdir, env=env, close_fds=True,
-                                     creationflags=DETACHED)
-                # start 命令本身立即退出，记录不了真实 PID；用窗口标题兜底
-                meta["pid"] = 0
-                self.save_instance(app_id, meta)
-                self.status(f"已在新终端启动 {app['name']}「{name}」（{app['env']}={data_dir}）")
-            except Exception as e:
-                messagebox.showerror(APP_NAME, f"启动失败：{e}")
-                return
-        self.root.after(1500, self.refresh_all)
+            subprocess.Popen([str(exe), f"--user-data-dir={data_dir}", workdir],
+                             cwd=str(exe.parent), close_fds=True, creationflags=DETACHED)
+            return {"ok": True, "msg": f"已启动 {app['name']}「{name}」"}
+        env = dict(os.environ)
+        env[app["env"]] = str(data_dir)
+        inner = f'cd /d "{workdir}" && set "{app["env"]}={data_dir}" && "{exe}"'
+        subprocess.Popen(["cmd", "/c", "start", "cmd", "/k", inner], cwd=workdir, env=env,
+                         close_fds=True, creationflags=DETACHED | NO_WINDOW)
+        return {"ok": True, "msg": f"已在新终端启动 {app['name']}「{name}」"}
 
-    def kill_instance(self):
-        app_id, name, meta = self._selected_instance()
-        if not meta:
-            return
+    if act == "kill":
+        meta = meta_of()
         app = APPS[app_id]
         if app["kind"] == "cli":
-            pid = meta.get("pid", 0)
+            pid = (meta or {}).get("pid", 0)
             if pid_alive(pid):
-                subprocess.run(["taskkill", "/pid", str(pid), "/t", "/f"], capture_output=True)
-                self.status(f"已结束 {name} (PID {pid})")
-            else:
-                self.status("该 CLI 实例未在运行（由 start 启动的窗口请从进程表结束）")
-        else:
-            exe = Path(app["exe"]).name
-            snap = tasklist_snapshot()
-            pids = [p for p, n in snap.items() if n.lower() == exe.lower()]
-            if not pids:
-                self.status("该程序当前没有运行中的进程")
-                return
-            if not messagebox.askyesno(
-                    APP_NAME,
-                    f"将结束 {app['name']} 的全部 {len(pids)} 个进程（含所有实例窗口）。\n"
-                    f"目前按程序名结束，暂无法只结束单个实例。继续？"):
-                return
-            for p in pids:
-                subprocess.run(["taskkill", "/pid", str(p), "/t", "/f"], capture_output=True)
-            self.status(f"已结束 {app['name']} 全部进程")
-        self.refresh_all()
+                subprocess.run(["taskkill", "/pid", str(pid), "/t", "/f"], capture_output=True,
+                               creationflags=NO_WINDOW)
+                return {"ok": True, "msg": f"已结束 PID {pid}"}
+            return {"ok": False, "msg": "该 CLI 实例未在运行"}
+        snap = tasklist_snapshot()
+        exe_name = Path(app["exe"][0]).name.lower()
+        pids = [p for p, nm in snap.items() if nm.lower() == exe_name]
+        if not pids:
+            return {"ok": False, "msg": "该程序当前没有运行中的进程"}
+        for p in pids:
+            subprocess.run(["taskkill", "/pid", str(p), "/t", "/f"], capture_output=True,
+                           creationflags=NO_WINDOW)
+        return {"ok": True, "msg": f"已结束 {app['name']} 全部 {len(pids)} 个进程（含所有实例）"}
 
-    def kill_process(self):
-        sel = self.proc_tree.selection()
-        if not sel:
-            return
-        pids = self.proc_tree.item(sel[0], "values")[2]
-        for pid in str(pids).split(","):
-            pid = pid.strip()
-            if pid.isdigit():
-                subprocess.run(["taskkill", "/pid", pid, "/t", "/f"], capture_output=True)
-        self.status(f"已结束进程 {pids}")
-        self.refresh_all()
+    if act == "kill_pids":
+        for pid in payload.get("pids", []):
+            subprocess.run(["taskkill", "/pid", str(pid), "/t", "/f"], capture_output=True,
+                               creationflags=NO_WINDOW)
+        return {"ok": True, "msg": f"已结束进程 {payload.get('pids')}"}
 
-    def backup_instance(self):
-        app_id, name, meta = self._selected_instance()
+    if act == "delete":
+        meta = meta_of()
         if not meta:
-            return
+            return {"ok": False, "msg": "实例不存在"}
+        shutil.rmtree(meta["data_dir"], ignore_errors=True)
+        Path(meta["_file"]).unlink(missing_ok=True)
+        return {"ok": True, "msg": f"已删除实例「{name}」"}
+
+    if act in ("backup", "restore"):
+        meta = meta_of()
+        if not meta:
+            return {"ok": False, "msg": "实例不存在"}
         data_dir = Path(meta["data_dir"])
-        if not data_dir.exists():
-            return
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        zip_path = BACKUP_DIR / f"{app_id}__{name}__{ts}.zip"
-        skip_dirs = {"Cache", "Code Cache", "GPUCache", "logs", "Crashpad",
-                     "DawnCache", "ShaderCache", "Service Worker"}
-        try:
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        skip = {"Cache", "Code Cache", "GPUCache", "logs", "Crashpad", "DawnCache",
+                "ShaderCache", "Service Worker"}
+        if act == "backup":
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            zp = BACKUP_DIR / f"{app_id}__{name}__{ts}.zip"
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as zf:
                 for f in data_dir.rglob("*"):
-                    if f.is_file() and not any(part in skip_dirs for part in f.parts):
+                    if f.is_file() and not any(p in skip for p in f.parts):
                         zf.write(f, f.relative_to(data_dir))
-            self.status(f"已备份到 {zip_path.name}（{zip_path.stat().st_size // 1024} KB）")
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"备份失败：{e}")
-
-    def restore_instance(self):
-        app_id, name, meta = self._selected_instance()
-        if not meta:
-            return
+            return {"ok": True, "msg": f"已备份 {zp.name}（{zp.stat().st_size // 1024} KB）"}
         cands = sorted(BACKUP_DIR.glob(f"{app_id}__{name}__*.zip"))
         if not cands:
-            messagebox.showinfo(APP_NAME, "没有该实例的备份。")
-            return
-        zip_path = cands[-1]
-        if not messagebox.askyesno(APP_NAME,
-                                   f"用最新备份覆盖实例「{name}」的数据目录？\n{zip_path.name}\n"
-                                   f"（请先关闭该实例的窗口）"):
-            return
-        data_dir = Path(meta["data_dir"])
-        try:
-            if data_dir.exists():
-                shutil.rmtree(data_dir)
-            data_dir.mkdir(parents=True)
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(data_dir)
-            self.status(f"已从 {zip_path.name} 恢复")
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"恢复失败：{e}")
+            return {"ok": False, "msg": "没有该实例的备份"}
+        if data_dir.exists():
+            shutil.rmtree(data_dir)
+        data_dir.mkdir(parents=True)
+        with zipfile.ZipFile(cands[-1]) as zf:
+            zf.extractall(data_dir)
+        return {"ok": True, "msg": f"已从 {cands[-1].name} 恢复（请先关闭该实例窗口）"}
 
-    def open_instance_dir(self):
-        app_id, name, meta = self._selected_instance()
+    if act == "open_dir":
+        meta = meta_of()
         if not meta:
-            return
+            return {"ok": False, "msg": "实例不存在"}
         d = Path(meta["data_dir"])
         d.mkdir(parents=True, exist_ok=True)
         os.startfile(str(d))
+        return {"ok": True, "msg": "已打开数据目录"}
 
-    def delete_instance(self):
-        app_id, name, meta = self._selected_instance()
+    if act == "save_meta":
+        meta = meta_of()
         if not meta:
-            return
-        if not messagebox.askyesno(APP_NAME,
-                                   f"删除实例「{name}」及其数据目录（含登录状态）？\n此操作不可恢复。"):
-            return
-        try:
-            data_dir = Path(meta["data_dir"])
-            if data_dir.exists():
-                shutil.rmtree(data_dir, ignore_errors=True)
-            Path(meta["_file"]).unlink(missing_ok=True)
-            self.status(f"已删除实例「{name}」")
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"删除失败：{e}")
-        self.refresh_apps()
-        self.refresh_instances()
+            return {"ok": False, "msg": "实例不存在"}
+        for key in ("workdir", "credits_total", "credits_left", "expires_on", "token",
+                    "quota_url", "quota_headers", "quota_path"):
+            if key in payload:
+                v = payload[key]
+                if key in ("credits_total", "credits_left"):
+                    v = float(v) if str(v).strip() not in ("", "None") else None
+                meta[key] = v
+        save_instance(app_id, meta)
+        return {"ok": True, "msg": "已保存"}
 
-    def pick_workdir(self):
-        d = filedialog.askdirectory(initialdir=self.workdir.get())
-        if d:
-            self.workdir.set(d)
-            app_id = self.current_app()
-            sel = self.inst_tree.selection()
-            if app_id and sel:
-                name = self.inst_tree.item(sel[0], "values")[1]
-                for meta in self.instances_of(app_id):
-                    if meta["name"] == name:
-                        meta["workdir"] = d
-                        self.save_instance(app_id, meta)
-                self.refresh_instances()
+    if act == "fetch_quota":
+        meta = meta_of()
+        if not meta:
+            return {"ok": False, "msg": "实例不存在"}
+        val, err = fetch_quota(meta)
+        if err:
+            return {"ok": False, "msg": err}
+        meta["credits_left"] = val
+        save_instance(app_id, meta)
+        return {"ok": True, "msg": f"已更新剩余：{val:g}"}
+
+    if act == "proxy_start":
+        PROXY.cfg.update({k: payload[k] for k in ("upstream", "strategy") if payload.get(k)})
+        save_config({"proxy": PROXY.cfg})
+        ok, msg = PROXY.start(PORT + 1)
+        return {"ok": ok, "msg": msg}
+
+    if act == "proxy_stop":
+        ok, msg = PROXY.stop()
+        return {"ok": ok, "msg": msg}
+
+    return {"ok": False, "msg": f"未知动作 {act}"}
+
+
+# ---------------- HTTP ----------------
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/api/state":
+            body = json.dumps(build_state(), ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+        elif self.path.startswith("/api/meta"):
+            qs = parse_qs(urlparse(self.path).query)
+            app_id = qs.get("app", [""])[0]
+            name = qs.get("name", [""])[0]
+            meta = next((m for m in load_instances(app_id) if m["name"] == name), {})
+            body = json.dumps({k: meta.get(k, "") or "" for k in
+                               ("token", "quota_url", "quota_path", "quota_headers")},
+                              ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+        elif self.path in ("/", "/index.html"):
+            self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="replace")  # Windows curl 命令行常按 GBK 传参
+        try:
+            payload = json.loads(text)
+        except Exception:
+            payload = {}
+        res = do_action(payload)
+        self._send(200, json.dumps(res, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+
+PAGE = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent 驾驶舱</title>
+<style>
+:root{
+  --bg:#0C0E14; --panel:#141822; --panel2:#1A202C; --line:rgba(255,255,255,.07);
+  --line2:rgba(255,255,255,.13); --text:#E9E7E2; --muted:#8C93A5; --faint:#5A6172;
+  --accent:#C8956C; --accent-hi:#E4B58A; --accent-dim:rgba(200,149,108,.13);
+  --ok:#3ECF8E; --warn:#E2B34E; --danger:#E5484D; --r:12px;
+  --serif:"Noto Serif SC","Source Han Serif SC","Songti SC",Georgia,"Times New Roman",serif;
+  --sans:"Segoe UI","Microsoft YaHei UI","PingFang SC",system-ui,sans-serif;
+  --mono:"Cascadia Code",Consolas,"Courier New",monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font:14px/1.6 var(--sans);
+     -webkit-font-smoothing:antialiased}
+button{font:inherit;cursor:pointer;border:0;border-radius:8px;background:none;color:inherit}
+input,select{font:inherit;color:var(--text);background:var(--panel2);
+     border:1px solid var(--line2);border-radius:8px;padding:7px 10px;outline:none}
+input:focus,select:focus{border-color:var(--accent)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2A3140;border-radius:5px;border:3px solid var(--bg)}
+
+header{display:flex;align-items:center;gap:16px;padding:0 24px;height:60px;
+  border-bottom:1px solid var(--line)}
+header .logo{font:700 20px/1 var(--serif);letter-spacing:.5px}
+header .logo b{color:var(--accent)}
+header .tag{color:var(--faint);font-size:12px;border-left:1px solid var(--line2);
+  padding-left:16px}
+header .sp{flex:1}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
+  background:var(--panel);border:1px solid var(--line);color:var(--muted);font-size:12px}
+.chip .dot{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.chip.on .dot{background:var(--ok)}
+.chip.on{color:var(--text)}
+
+#alerts{display:none;margin:16px 24px 0;padding:12px 16px;border-radius:var(--r);
+  border:1px solid rgba(229,72,77,.35);background:rgba(229,72,77,.08)}
+#alerts.warn{border-color:rgba(226,179,78,.35);background:rgba(226,179,78,.07)}
+#alerts .t{font:700 13px var(--sans);margin-bottom:4px}
+#alerts ul{list-style:none;display:flex;flex-wrap:wrap;gap:8px}
+#alerts li{font-size:12.5px;color:var(--text)}
+#alerts li b{color:var(--danger)} #alerts.warn li b{color:var(--warn)}
+
+main{display:grid;grid-template-columns:224px 1fr;gap:24px;padding:24px;align-items:start}
+nav{position:sticky;top:24px}
+nav .h{font:700 11px var(--sans);letter-spacing:2px;color:var(--faint);margin:0 0 8px 12px}
+nav button{display:flex;align-items:center;gap:10px;width:100%;padding:9px 12px;
+  border-radius:10px;color:var(--muted);font-size:13.5px;text-align:left}
+nav button .dot{width:7px;height:7px;border-radius:50%;background:var(--faint);flex:none}
+nav button.inst .dot{background:var(--ok)}
+nav button .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+nav button .c{font-size:11px;color:var(--faint);background:var(--panel);
+  border:1px solid var(--line);border-radius:999px;padding:1px 8px}
+nav button:hover{background:var(--panel);color:var(--text)}
+nav button.sel{background:var(--panel2);color:var(--text);
+  box-shadow:inset 2px 0 0 var(--accent)}
+nav .foot{margin:16px 12px 0;font-size:11.5px;color:var(--faint);line-height:1.7}
+
+.toolbar{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.toolbar h2{font:700 19px/1.2 var(--serif)}
+.toolbar .sp{flex:1}
+.btn{padding:8px 16px;border-radius:9px;font-size:13px;font-weight:600;
+  background:var(--panel2);border:1px solid var(--line2);color:var(--text)}
+.btn:hover{border-color:var(--accent);color:var(--accent-hi)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#14100B}
+.btn.primary:hover{background:var(--accent-hi);color:#14100B}
+.btn.danger{color:var(--danger);border-color:rgba(229,72,77,.4)}
+.btn.danger:hover{background:rgba(229,72,77,.12);border-color:var(--danger);color:var(--danger)}
+.btn.sm{padding:5px 11px;font-size:12px;font-weight:500;border-radius:7px}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(312px,1fr));gap:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+  padding:16px;display:flex;flex-direction:column;gap:12px}
+.card .top{display:flex;align-items:flex-start;gap:8px}
+.card .nm{font-size:15px;font-weight:650}
+.card .ap{font-size:12px;color:var(--muted)}
+.card .st{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;
+  color:var(--faint)}
+.card .st .dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
+.card.run .st{color:var(--ok)} .card.run .st .dot{background:var(--ok);
+  box-shadow:0 0 0 3px rgba(62,207,142,.15)}
+.card .quota{background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.card .qrow{display:flex;align-items:baseline;gap:8px;font-size:12.5px;color:var(--muted)}
+.card .qrow .v{font:650 16px var(--mono);color:var(--text)}
+.card .qrow .exp{margin-left:auto;font-size:11.5px;padding:2px 9px;border-radius:999px;
+  background:var(--panel);border:1px solid var(--line)}
+.card .exp.danger{color:var(--danger);border-color:rgba(229,72,77,.45)}
+.card .exp.warn{color:var(--warn);border-color:rgba(226,179,78,.45)}
+.bar{height:5px;border-radius:3px;background:#242B39;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent);border-radius:3px}
+.card .acts{display:flex;gap:8px;flex-wrap:wrap}
+.empty{color:var(--faint);font-size:12.5px;padding:2px 0}
+
+section{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+  padding:16px;margin-top:24px}
+section h3{font:700 15px var(--serif);margin-bottom:12px;display:flex;align-items:center;
+  gap:10px}
+section h3 .sub{font:400 12px var(--sans);color:var(--faint)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{color:var(--faint);font-weight:600;text-align:left;padding:6px 10px;
+  border-bottom:1px solid var(--line)}
+td{padding:7px 10px;border-bottom:1px solid var(--line);color:var(--muted);
+  font-family:var(--mono);font-size:12px}
+td.txt{font-family:var(--sans);font-size:12.5px;color:var(--text)}
+tr:last-child td{border-bottom:0}
+.s200{color:var(--ok)} .s400,.s500{color:var(--danger)}
+
+.prow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.prow label{font-size:12px;color:var(--muted)}
+.prow input{width:280px}
+
+#modal{position:fixed;inset:0;background:rgba(6,8,12,.72);display:none;
+  align-items:center;justify-content:center;z-index:50}
+#modal.show{display:flex}
+#modal .box{width:460px;background:var(--panel);border:1px solid var(--line2);
+  border-radius:14px;padding:20px 22px}
+#modal h4{font:700 16px var(--serif);margin-bottom:14px}
+#modal .f{display:grid;grid-template-columns:96px 1fr;gap:10px;align-items:center;
+  margin-bottom:10px}
+#modal .f label{font-size:12.5px;color:var(--muted)}
+#modal .f input{width:100%}
+#modal .acts{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
+
+#toast{position:fixed;right:24px;bottom:24px;display:flex;flex-direction:column;gap:8px;
+  z-index:60}
+#toast div{background:var(--panel2);border:1px solid var(--line2);border-left:3px solid
+  var(--accent);border-radius:10px;padding:10px 16px;font-size:13px;
+  box-shadow:0 8px 24px rgba(0,0,0,.45);animation:in .18s ease-out}
+#toast div.err{border-left-color:var(--danger)}
+@keyframes in{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">▣ Agent <b>驾驶舱</b></div>
+  <div class="tag">多开 · 额度过期提醒 · 本地反代</div>
+  <div class="sp"></div>
+  <span class="chip" id="c-inst"><span class="dot"></span><span></span></span>
+  <span class="chip" id="c-run"><span class="dot"></span><span></span></span>
+  <span class="chip" id="c-proxy"><span class="dot"></span><span></span></span>
+  <span class="chip" id="c-clock"><span></span></span>
+</header>
+<div id="alerts"></div>
+<main>
+  <nav>
+    <div class="h">AGENTS</div>
+    <div id="applist"></div>
+    <div class="foot">实例 = 独立数据目录<br>首次启动需各自登录账号<br>赠送积分请登记过期日</div>
+  </nav>
+  <div>
+    <div class="toolbar">
+      <h2 id="cur-title">—</h2>
+      <div class="sp"></div>
+      <button class="btn primary" onclick="act('new_instance')">＋ 新建实例</button>
+      <button class="btn" onclick="load()">刷新</button>
+    </div>
+    <div class="cards" id="cards"></div>
+
+    <section>
+      <h3>运行中的进程 <span class="sub">每 4 秒自动刷新</span></h3>
+      <table><thead><tr><th style="width:220px">Agent</th><th>详情</th>
+        <th style="width:150px">PID</th><th style="width:90px"></th></tr></thead>
+        <tbody id="procs"></tbody></table>
+    </section>
+
+    <section>
+      <h3>本地反代 <span class="sub">token 池轮询替换 Authorization · 不常用时保持停止</span></h3>
+      <div class="prow">
+        <label>上游</label><input id="p-up" placeholder="https://api.openai.com">
+        <label>策略</label>
+        <select id="p-st"><option value="round-robin">轮询</option></select>
+        <button class="btn primary sm" id="p-btn" onclick="proxyToggle()">启动反代</button>
+        <span class="chip" id="p-pool"><span></span></span>
+      </div>
+      <table><thead><tr><th style="width:70px">时间</th><th style="width:60px">方法</th>
+        <th>路径</th><th style="width:150px">模型</th><th style="width:60px">状态</th>
+        <th style="width:170px">账号</th></tr></thead>
+        <tbody id="plogs"></tbody></table>
+    </section>
+  </div>
+</main>
+
+<div id="modal"><div class="box">
+  <h4 id="m-title">实例设置</h4>
+  <div class="f"><label>工作目录</label><input id="m-workdir"></div>
+  <div class="f"><label>总额度</label><input id="m-total" type="number" step="any"></div>
+  <div class="f"><label>剩余</label><input id="m-left" type="number" step="any"></div>
+  <div class="f"><label>过期日</label><input id="m-exp" type="date"></div>
+  <div class="f"><label>API Token</label><input id="m-token" type="password"
+    placeholder="用于反代 token 池 / 额度抓取"></div>
+  <div class="f"><label>额度接口</label><input id="m-qurl" placeholder="可选，返回 JSON 的 URL"></div>
+  <div class="f"><label>取值路径</label><input id="m-qpath" placeholder="如 data.remaining，留空自动猜"></div>
+  <div class="acts">
+    <button class="btn sm" onclick="closeModal()">取消</button>
+    <button class="btn primary sm" onclick="saveModal()">保存</button>
+  </div>
+</div></div>
+<div id="toast"></div>
+
+<script>
+let S=null, CUR=null, EDIT=null;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function load(){
+  S=await (await fetch('/api/state')).json();
+  if(!CUR||!S.apps.some(a=>a.id===CUR)) CUR=S.apps[0]?.id;
+  render();
+}
+function render(){
+  $('c-inst').lastElementChild.textContent=`实例 ${S.stats.instances}`;
+  $('c-run').lastElementChild.textContent=`运行中 ${S.stats.running}`;
+  const pc=$('c-proxy'); pc.className='chip'+(S.proxy.running?' on':'');
+  pc.lastElementChild.textContent=S.proxy.running?`反代 :${S.proxy.port}`:'反代 停止';
+  $('c-clock').lastElementChild.textContent=S.now;
+
+  const al=$('alerts');
+  if(S.alerts.length){
+    const danger=S.alerts.some(a=>a.level==='danger');
+    al.style.display='block'; al.className=danger?'':'warn';
+    al.innerHTML=`<div class="t">⏳ ${S.alerts.length} 笔赠送额度临期，请尽快调用</div><ul>`+
+      S.alerts.map(a=>`<li>「${esc(a.app)}/${esc(a.name)}」剩余 ${a.left??'—'} · <b>${a.days} 天后过期</b></li>`).join('')+`</ul>`;
+    document.title=`(${S.alerts.length} 笔临期) Agent 驾驶舱`;
+  }else{al.style.display='none';document.title='Agent 驾驶舱';}
+
+  $('applist').innerHTML=S.apps.map(a=>{
+    const n=S.instances.filter(i=>i.app===a.id).length;
+    const run=S.instances.some(i=>i.app===a.id&&i.running);
+    return `<button class="${a.id===CUR?'sel':''} ${run?'inst':''}" onclick="CUR='${a.id}';render()">
+      <span class="dot"></span><span class="n">${esc(a.name)}${a.installed?'':' · 未安装'}</span>
+      ${n?`<span class="c">${n}</span>`:''}</button>`;}).join('');
+
+  const app=S.apps.find(a=>a.id===CUR);
+  $('cur-title').textContent=app?app.name:'—';
+  const list=S.instances.filter(i=>i.app===CUR);
+  $('cards').innerHTML=list.length?list.map(card).join(''):
+    `<div class="empty">暂无实例。点右上「＋ 新建实例」创建第一个账号档案。</div>`;
+
+  $('procs').innerHTML=S.procs.map(p=>`<tr><td class="txt">${esc(p.app)}</td>
+    <td class="txt">${esc(p.detail)}</td><td>${p.pids.join(',')}</td>
+    <td><button class="btn danger sm" onclick='act("kill_pids",{pids:${JSON.stringify(p.pids)}})'>结束</button></td></tr>`).join('')
+    ||`<tr><td colspan="4" class="txt" style="color:var(--faint)">当前没有运行中的 Agent 进程</td></tr>`;
+
+  $('p-up').value=S.proxy.upstream||'';
+  $('p-st').value=S.proxy.strategy||'round-robin';
+  $('p-btn').textContent=S.proxy.running?'停止反代':'启动反代';
+  $('p-btn').className='btn sm '+(S.proxy.running?'danger':'primary');
+  $('p-pool').lastElementChild.textContent=`token 池 ${S.proxy.pool.length}：${S.proxy.pool.join('、')||'空'}`;
+  $('plogs').innerHTML=S.proxy.logs.map(l=>`<tr><td>${l.ts}</td><td>${l.method}</td>
+    <td>${esc(l.path)}</td><td>${esc(l.model)}</td><td class="s${String(l.status)[0]}00">${l.status}</td>
+    <td class="txt">${esc(l.account)}</td></tr>`).join('')
+    ||`<tr><td colspan="6" class="txt" style="color:var(--faint)">暂无请求记录</td></tr>`;
+}
+function card(i){
+  const q=i.quota; let quota='';
+  if(q.total||q.left||q.expires_on){
+    const pct=q.total?Math.max(0,Math.min(100,q.left/q.total*100)):0;
+    const exp=q.days_left==null?'':(q.days_left<0?`<span class="exp danger">已过期</span>`:
+      q.days_left<=7?`<span class="exp danger">${q.days_left} 天后过期</span>`:
+      q.days_left<=30?`<span class="exp warn">${q.days_left} 天后过期</span>`:
+      `<span class="exp">${q.days_left} 天后过期</span>`);
+    quota=`<div class="quota"><div class="qrow"><span class="v">${q.left??'—'}</span>
+      <span>/ ${q.total??'—'} 积分</span>${exp}</div>
+      ${q.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>`;
+  }else quota=`<div class="quota"><div class="qrow empty">未登记额度 · 赠送积分请登记过期日以便提醒</div></div>`;
+  return `<div class="card ${i.running?'run':''}">
+    <div class="top"><div><div class="nm">${esc(i.name)}</div>
+      <div class="ap">${esc(i.app_name)} · ${i.kind==='cli'?'CLI':'桌面端'} · 建于 ${i.created}</div></div>
+      <div class="st"><span class="dot"></span>${i.running?(i.kind==='cli'?'运行中':`运行中 ×${i.procs}`):'未运行'}</div></div>
+    ${quota}
+    <div class="acts">
+      <button class="btn primary sm" onclick="act('launch',{app:'${i.app}',name:'${esc(i.name)}'})">▶ 启动</button>
+      <button class="btn sm" onclick="act('kill',{app:'${i.app}',name:'${esc(i.name)}'})">■ 结束</button>
+      <button class="btn sm" onclick="openModal('${i.app}','${esc(i.name)}')">额度/设置</button>
+      ${q.quota_url?`<button class="btn sm" onclick="act('fetch_quota',{app:'${i.app}',name:'${esc(i.name)}'})">抓额度</button>`:''}
+      <button class="btn sm" onclick="act('backup',{app:'${i.app}',name:'${esc(i.name)}'})">备份</button>
+      <button class="btn sm" onclick="act('restore',{app:'${i.app}',name:'${esc(i.name)}'})">恢复</button>
+      <button class="btn sm" onclick="act('open_dir',{app:'${i.app}',name:'${esc(i.name)}'})">目录</button>
+      <button class="btn danger sm" onclick="del('${i.app}','${esc(i.name)}')">删除</button>
+    </div></div>`;
+}
+async function act(action,extra={}){
+  const r=await (await fetch('/api/action',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action,...extra})})).json();
+  toast(r.msg,r.ok); load();
+}
+function del(app,name){ if(confirm(`删除实例「${name}」及其数据目录（含登录状态）？不可恢复。`)) act('delete',{app,name}); }
+function proxyToggle(){
+  if(S.proxy.running) act('proxy_stop');
+  else act('proxy_start',{upstream:$('p-up').value,strategy:$('p-st').value});
+}
+function openModal(app,name){
+  EDIT={app,name};
+  const i=S.instances.find(x=>x.app===app&&x.name===name);
+  $('m-title').textContent=`${i.app_name} / ${name}`;
+  $('m-workdir').value=i.workdir||''; $('m-total').value=i.quota.total??'';
+  $('m-left').value=i.quota.left??''; $('m-exp').value=i.quota.expires_on||'';
+  $('m-token').value=''; $('m-qurl').value=''; $('m-qpath').value='';
+  fetch('/api/meta?app='+app+'&name='+encodeURIComponent(name)).then(r=>r.ok?r.json():null)
+    .then(m=>{ if(m){$('m-token').value=m.token||'';$('m-qurl').value=m.quota_url||'';
+      $('m-qpath').value=m.quota_path||'';} });
+  $('modal').classList.add('show');
+}
+function closeModal(){$('modal').classList.remove('show');}
+function saveModal(){
+  act('save_meta',{app:EDIT.app,name:EDIT.name,workdir:$('m-workdir').value,
+    credits_total:$('m-total').value,credits_left:$('m-left').value,
+    expires_on:$('m-exp').value,token:$('m-token').value,
+    quota_url:$('m-qurl').value,quota_path:$('m-qpath').value});
+  closeModal();
+}
+function toast(msg,ok){
+  const d=document.createElement('div'); if(!ok)d.className='err';
+  d.textContent=msg; $('toast').appendChild(d);
+  setTimeout(()=>d.remove(),3600);
+}
+load(); setInterval(load,4000);
+</script>
+</body>
+</html>
+"""
 
 
 def main():
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+        srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError:
+        webbrowser.open(f"http://127.0.0.1:{PORT}")
+        return
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Timer(0.5, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        srv.shutdown()
 
 
 if __name__ == "__main__":
