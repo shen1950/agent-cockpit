@@ -541,6 +541,21 @@ def do_action(payload):
         data_dir = Path(meta["data_dir"])
         data_dir.mkdir(parents=True, exist_ok=True)
         if app["kind"] == "electron":
+            # 防串号自检：实例目录的产品标识须与当前 Agent 同族，否则官方客户端会报
+            # "产物内联的产品是 qoder，当前运行身份是 qoder-cn" 并拒绝启动
+            if app_id.startswith("qoder"):
+                st = data_dir / ".qoder-app-status.json"
+                if st.exists():
+                    try:
+                        prod = json.loads(st.read_text(encoding="utf-8",
+                                                       errors="replace")).get("product")
+                    except Exception:
+                        prod = None
+                    want = "qoder-cn" if app_id.startswith("qoder-cn") else "qoder"
+                    if prod and prod != want:
+                        return {"ok": False,
+                                "msg": f"实例目录身份是 {prod}，与 {app['name']} 不符，"
+                                       f"混用会触发官方自检报错，请删除该实例重建"}
             subprocess.Popen([str(exe), f"--user-data-dir={data_dir}", workdir],
                              cwd=str(exe.parent), close_fds=True, creationflags=DETACHED)
             return {"ok": True, "msg": f"已启动 {app['name']}「{name}」"}
