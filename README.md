@@ -1,6 +1,6 @@
 # Agent 驾驶舱
 
-国内 AI Agent 多开 / 赠送额度过期提醒 / 本地反代 一体机。单文件、零依赖（Python 3.10+ 标准库），启动后自动打开浏览器仪表盘 `http://127.0.0.1:8787`。
+国内 AI Agent 多开 / 赠送额度过期提醒 / 本地反代 一体机。单文件、唯一依赖 pywebview（Python 3.10+），启动后打开原生桌面窗口（WebView2 壳，不打开浏览器）。
 
 ## 快速开始
 
@@ -26,7 +26,9 @@ pythonw agent_cockpit.py
 - **本地反代**（不常用时保持停止）：`127.0.0.1:8788` 起一个 OpenAI 兼容转发
   - token 池 = 所有登记了 API Token 的实例，轮询替换 `Authorization` 头
   - 请求日志（时间/方法/路径/模型/状态/所用账号）在面板实时展示
-- **进程监控**：每 4 秒刷新运行中的 Agent 进程，可一键结束
+- **进程监控**：每 4 秒刷新运行中的 Agent 进程
+  - 实例卡片「■ 结束」= 实例级：按命令行 `--user-data-dir=<实例目录>` 精确匹配，只杀该实例窗口
+  - 进程表「结束全部」= 程序级：杀该程序所有窗口（含正在使用的），带二次确认
 - **账号备份/恢复**：实例数据目录 zip 备份（自动跳过 Cache 等垃圾目录）
 
 ## 数据位置
@@ -47,8 +49,18 @@ pythonw agent_cockpit.py
 
 ## 设计
 
-- 视觉模板：石墨底 `#0C0E14` + 琥珀金 `#C8956C` + 衬线标题（Noto Serif SC 回退 Georgia），8pt 间距网格、12px 圆角、无渐变
-- 单文件 `agent_cockpit.py`：stdlib `http.server` 提供 JSON API + 内嵌前端，无任何第三方依赖
+- **程序架构**（对标 Cockpit Tools / Tauri 的壳原理）：原生桌面壳 + Web 技术 UI + 本地后端
+  - Cockpit Tools = Tauri（WebView2 壳 + Rust 后端）；本项目 = pywebview（WebView2 壳 + Python 后端）
+  - 独立桌面窗口（自有图标、最小尺寸约束），关窗即退出，不打开浏览器
+  - 后端为 stdlib `http.server` JSON API（`127.0.0.1:8787` 仅本机回环），前端内嵌于单文件
+- **视觉模板**：石墨底 `#0C0E14` + 琥珀金 `#C8956C` + 衬线标题（Noto Serif SC 回退 Georgia），8pt 间距网格、12px 圆角、无渐变
+- 单文件 `agent_cockpit.py` + 唯一依赖 `pywebview`（见 requirements.txt）
+
+## 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
 
 ## 隐私
 
