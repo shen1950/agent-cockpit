@@ -19,10 +19,14 @@ pythonw agent_cockpit.py
 - **多开**：每个实例一个独立数据目录，互不干扰，首次启动各自登录账号
   - Electron 系（Qoder / Qoder CN / Qoder CN IDE / WorkBuddy / TraeWork CN / ZCode）：`--user-data-dir` 隔离
   - CLI 系（Codex / Claude Code）：`CODEX_HOME` / `CLAUDE_CONFIG_DIR` 环境变量隔离，新终端窗口运行
+- **换号模式（零空间）**：把 Agent 默认档案目录改成指向实例的 NTFS junction，官方入口直接以该账号运行；原档案自动备份为 `*.cockpit-original`，「还原默认」一键恢复；目录被官方后台进程锁定时会点名提示并可确认强切
+- **空间治理**：每实例「占用」实时统计 MB；「清缓存」删除 Cache/logs/扩展缓存等（登录态与设置保留）
 - **额度台账与过期提醒**：每个实例可登记总额度、剩余、过期日、API Token
   - 剩余/总额以进度条展示；过期倒计时徽章（≤7 天红、≤30 天黄）
   - 顶部横幅汇总所有临期赠送额度，标题栏同步显示待办数
   - 可选 `quota_url` + `quota_path`：自动从返回 JSON 的接口抓取剩余值
+  - 内置适配器：`openai` = 官方 `/dashboard/billing/credit_grants`（需 API Token，自动回填总额）
+  - 国产 IDE 无公开用量接口（token 存于 DPAPI 加密存储），逆向成本过高未内置，走通用接口或手动登记
 - **本地反代**（不常用时保持停止）：`127.0.0.1:8788` 起一个 OpenAI 兼容转发
   - token 池 = 所有登记了 API Token 的实例，轮询替换 `Authorization` 头
   - 请求日志（时间/方法/路径/模型/状态/所用账号）在面板实时展示

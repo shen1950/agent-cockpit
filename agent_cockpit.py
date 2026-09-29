@@ -51,6 +51,22 @@ NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW：pythonw 下调控制台程序不弹
 ALERT_WARN_DAYS = 30
 ALERT_DANGER_DAYS = 7
 
+HOME = Path.home()
+# 各 Agent 默认档案目录（换号模式把该目录改成指向实例的 junction）
+PROFILE_DIRS = {
+    "qoder": HOME / ".qoder", "qoder-cn": HOME / ".qoder-cn",
+    "qoder-cn-ide": HOME / ".qoder-cn-ide", "workbuddy": HOME / ".workbuddy",
+    "traework-cn": HOME / ".trae-cn", "zcode": HOME / ".zcode",
+    "codex": HOME / ".codex", "claude": HOME / ".claude",
+}
+CLEAN_DIRS = {"Cache", "Code Cache", "GPUCache", "logs", "Crashpad", "DawnCache",
+              "DawnGraphiteCache", "DawnWebGPUCache", "ShaderCache", "Service Worker",
+              "CachedData", "CachedExtensionVSIXs", "CachedProfilesData", "tmp",
+              "CrashFeedback", "Backups"}
+# 已知会后台持有 profile 目录句柄的进程（codex 沙箱/桌面版），按 Agent 配置
+LOCK_PROCS = {"chatgpt.exe", "codex.exe"}
+LOCKERS_BY_APP = {"codex": LOCK_PROCS, "qoder": LOCK_PROCS}
+
 
 def resolve_exe(app):
     for p in app["exe"]:
@@ -262,9 +278,7 @@ PROXY = ProxyState()
 
 # ---------------- 额度自动抓取 ----------------
 def fetch_quota(meta):
-    url = (meta.get("quota_url") or "").strip()
-    if not url:
-        return None, "未配置 quota_url"
+    """返回 (剩余, 总额, 错误)。支持 openai 官方适配器与通用 quota_url。"""
     hdrs = {"User-Agent": "agent-cockpit/1.0"}
     tok = (meta.get("token") or "").strip()
     if tok:
@@ -275,10 +289,25 @@ def fetch_quota(meta):
             hdrs.update({k: str(v) for k, v in extra.items()})
         except Exception:
             pass
+    except Exception:
+        pass
+    adapter = (meta.get("quota_adapter") or "").strip()
+    url = ("https://api.openai.com/dashboard/billing/credit_grants" if adapter == "openai"
+           else (meta.get("quota_url") or "").strip())
+    if not url:
+        return None, None, "未配置适配器或 quota_url"
+    if adapter == "openai" and not tok:
+        return None, None, "OpenAI 适配器需要 API Token"
+    try:
         with urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=15) as r:
             data = json.loads(r.read().decode("utf-8", errors="replace"))
     except Exception as e:
-        return None, f"抓取失败：{e}"
+        return None, None, f"抓取失败：{e}"
+    if adapter == "openai":
+        total, used = data.get("total_granted"), data.get("total_used")
+        if not isinstance(total, (int, float)):
+            return None, None, "响应缺少 total_granted（key 可能无账单权限）"
+        return float(total) - float(used or 0), float(total), None
     node = data
     for key in (meta.get("quota_path") or "").split("."):
         if key and isinstance(node, dict):
@@ -290,19 +319,135 @@ def fetch_quota(meta):
                 node = data[key]
                 break
     if not isinstance(node, (int, float)):
-        return None, "响应中未找到数值字段，请设置 quota_path"
-    return float(node), None
+        return None, None, "响应中未找到数值字段，请设置 quota_path"
+    return float(node), None, None
+
+
+# ---------------- 换号模式（junction，零空间） ----------------
+def is_junction(p):
+    return os.path.islink(p) or os.path.isjunction(p)
+
+
+def agent_running(app_id):
+    app = APPS[app_id]
+    if app["kind"] == "electron":
+        snap = tasklist_snapshot()
+        exe_name = Path(app["exe"][0]).name.lower()
+        return any(nm.lower() == exe_name for nm in snap.values())
+    return any(pid_alive(m.get("pid", 0)) for m in load_instances(app_id))
+
+
+def swap_set(app_id, name, force=False):
+    app = APPS[app_id]
+    P = PROFILE_DIRS.get(app_id)
+    if not P:
+        return False, "该 Agent 未登记默认档案目录，不支持换号"
+    meta = next((m for m in load_instances(app_id) if m["name"] == name), None)
+    if not meta:
+        return False, "实例不存在"
+    if agent_running(app_id):
+        return False, f"请先关闭所有 {app['name']} 窗口/终端再换号"
+    snap = tasklist_snapshot()
+    wanted = LOCKERS_BY_APP.get(app_id, set())
+    lockers = [(p, nm) for p, nm in snap.items() if nm.lower() in wanted]
+    if lockers and not force:
+        names = "、".join(sorted({nm for _, nm in lockers}))
+        return False, f"目录被后台进程锁定：{names}（确认后强切会结束它们）"
+    for p, _ in lockers:
+        subprocess.run(["taskkill", "/pid", str(p), "/t", "/f"], capture_output=True,
+                       creationflags=NO_WINDOW)
+    I = Path(meta["data_dir"])
+    cfg = load_config()
+    swaps = cfg.setdefault("swaps", {})
+    cur = swaps.get(app_id)
+    if cur and cur.get("instance") == name:
+        return True, "该实例已是当前账号"
+    if is_junction(P):
+        os.rmdir(P)  # 只删 junction，不碰目标
+    orig = None
+    if P.exists():
+        orig = str(P) + ".cockpit-original"
+        if Path(orig).exists():
+            return False, "已存在 .cockpit-original 备份目录，请先「还原默认」再换号"
+        try:
+            os.rename(P, orig)
+        except PermissionError:
+            return False, (f"{P} 被其他进程锁定（可能是官方客户端后台驻留），"
+                           f"请从托盘/任务管理器完全退出后重试")
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(P), str(I)],
+                       capture_output=True, creationflags=NO_WINDOW)
+    if not is_junction(P):
+        return False, "创建 junction 失败：" + r.stdout.decode("gbk", errors="replace")
+    swaps[app_id] = {"instance": name, "original": orig}
+    save_config(cfg)
+    return True, f"已换号：{app['name']} 默认入口 → 「{name}」，零额外空间"
+
+
+def swap_clear(app_id):
+    app = APPS[app_id]
+    P = PROFILE_DIRS.get(app_id)
+    if not P:
+        return False, "该 Agent 未登记默认档案目录"
+    if agent_running(app_id):
+        return False, f"请先关闭所有 {app['name']} 窗口/终端再还原"
+    cfg = load_config()
+    swaps = cfg.setdefault("swaps", {})
+    cur = swaps.get(app_id)
+    if not cur:
+        return True, "当前未处于换号状态"
+    if is_junction(P):
+        os.rmdir(P)
+    orig = cur.get("original")
+    if orig and Path(orig).exists():
+        os.rename(orig, P)
+    swaps.pop(app_id, None)
+    save_config(cfg)
+    return True, f"已还原 {app['name']} 默认档案"
+
+
+# ---------------- 空间治理 ----------------
+def dir_size(p):
+    total = 0
+    for f in Path(p).rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def clean_cache(app_id, name):
+    meta = next((m for m in load_instances(app_id) if m["name"] == name), None)
+    if not meta:
+        return False, "实例不存在"
+    if agent_running(app_id):
+        return False, "请先关闭该实例窗口再清理"
+    d = Path(meta["data_dir"])
+    freed = 0
+    for sub in list(d.iterdir()):
+        if sub.is_dir() and sub.name in CLEAN_DIRS:
+            freed += dir_size(sub)
+            shutil.rmtree(sub, ignore_errors=True)
+        elif sub.is_file() and sub.suffix == ".log":
+            freed += sub.stat().st_size
+            sub.unlink(missing_ok=True)
+    return True, f"已清理 {freed // 1024 // 1024} MB 缓存（登录态与设置保留）"
 
 
 # ---------------- 业务动作 ----------------
 def build_state():
     snap = tasklist_snapshot()
+    cfg = load_config()
+    swaps = cfg.get("swaps", {})
     apps, instances, alerts = [], [], []
     n_running = 0
     for app_id, app in APPS.items():
         exe = resolve_exe(app)
         apps.append({"id": app_id, "name": app["name"], "kind": app["kind"],
-                     "installed": bool(exe)})
+                     "installed": bool(exe),
+                     "swapped": swaps.get(app_id, {}).get("instance"),
+                     "swap_ok": app_id in PROFILE_DIRS})
         exe_name = Path(app["exe"][0]).name.lower()
         procs = sum(1 for _, nm in snap.items() if nm.lower() == exe_name) if exe else 0
         for meta in load_instances(app_id):
@@ -320,10 +465,12 @@ def build_state():
                 "name": meta["name"], "workdir": meta.get("workdir", ""),
                 "created": time.strftime("%Y-%m-%d", time.localtime(meta.get("created", 0))),
                 "running": running, "procs": procs,
+                "swapped": swaps.get(app_id, {}).get("instance") == meta["name"],
                 "quota": {"total": meta.get("credits_total"), "left": left,
                           "expires_on": meta.get("expires_on"), "days_left": dl,
                           "has_token": bool((meta.get("token") or "").strip()),
-                          "quota_url": bool((meta.get("quota_url") or "").strip())},
+                          "quota_url": bool((meta.get("quota_url") or "").strip()),
+                          "adapter": meta.get("quota_adapter") or ""},
             })
     alerts.sort(key=lambda a: a["days"])
     procs_rows = []
@@ -478,7 +625,7 @@ def do_action(payload):
         if not meta:
             return {"ok": False, "msg": "实例不存在"}
         for key in ("workdir", "credits_total", "credits_left", "expires_on", "token",
-                    "quota_url", "quota_headers", "quota_path"):
+                    "quota_url", "quota_headers", "quota_path", "quota_adapter"):
             if key in payload:
                 v = payload[key]
                 if key in ("credits_total", "credits_left"):
@@ -491,12 +638,33 @@ def do_action(payload):
         meta = meta_of()
         if not meta:
             return {"ok": False, "msg": "实例不存在"}
-        val, err = fetch_quota(meta)
+        left, total, err = fetch_quota(meta)
         if err:
             return {"ok": False, "msg": err}
-        meta["credits_left"] = val
+        meta["credits_left"] = left
+        if total is not None:
+            meta["credits_total"] = total
         save_instance(app_id, meta)
-        return {"ok": True, "msg": f"已更新剩余：{val:g}"}
+        return {"ok": True, "msg": f"已更新剩余：{left:g}" + (f" / 总额 {total:g}" if total else "")}
+
+    if act == "swap_set":
+        ok, msg = swap_set(app_id, name, force=bool(payload.get("force")))
+        return {"ok": ok, "msg": msg}
+
+    if act == "swap_clear":
+        ok, msg = swap_clear(app_id)
+        return {"ok": ok, "msg": msg}
+
+    if act == "calc_size":
+        meta = meta_of()
+        if not meta:
+            return {"ok": False, "msg": "实例不存在"}
+        mb = dir_size(meta["data_dir"]) // 1024 // 1024
+        return {"ok": True, "msg": f"「{name}」占用 {mb} MB"}
+
+    if act == "clean_cache":
+        ok, msg = clean_cache(app_id, name)
+        return {"ok": ok, "msg": msg}
 
     if act == "proxy_start":
         PROXY.cfg.update({k: payload[k] for k in ("upstream", "strategy") if payload.get(k)})
@@ -535,7 +703,8 @@ class Handler(BaseHTTPRequestHandler):
             name = qs.get("name", [""])[0]
             meta = next((m for m in load_instances(app_id) if m["name"] == name), {})
             body = json.dumps({k: meta.get(k, "") or "" for k in
-                               ("token", "quota_url", "quota_path", "quota_headers")},
+                               ("token", "quota_url", "quota_path", "quota_headers",
+                                "quota_adapter")},
                               ensure_ascii=False).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8")
         elif self.path in ("/", "/index.html"):
@@ -554,7 +723,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(text)
         except Exception:
             payload = {}
-        res = do_action(payload)
+        try:
+            res = do_action(payload)
+        except Exception as e:
+            res = {"ok": False, "msg": f"内部错误：{type(e).__name__}: {e}"}
         self._send(200, json.dumps(res, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
 
@@ -755,7 +927,10 @@ tr:last-child td{border-bottom:0}
   <div class="f"><label>过期日</label><input id="m-exp" type="date"></div>
   <div class="f"><label>API Token</label><input id="m-token" type="password"
     placeholder="用于反代 token 池 / 额度抓取"></div>
-  <div class="f"><label>额度接口</label><input id="m-qurl" placeholder="可选，返回 JSON 的 URL"></div>
+  <div class="f"><label>额度适配器</label><select id="m-ad">
+    <option value="">无（手动/通用接口）</option>
+    <option value="openai">OpenAI 官方 billing</option></select></div>
+  <div class="f"><label>额度接口</label><input id="m-qurl" placeholder="可选，返回 JSON 的 URL（适配器优先）"></div>
   <div class="f"><label>取值路径</label><input id="m-qpath" placeholder="如 data.remaining，留空自动猜"></div>
   <div class="acts">
     <button class="btn sm" onclick="closeModal()">取消</button>
@@ -795,6 +970,7 @@ function render(){
     const run=S.instances.some(i=>i.app===a.id&&i.running);
     return `<button class="${a.id===CUR?'sel':''} ${run?'inst':''}" onclick="CUR='${a.id}';render()">
       <span class="dot"></span><span class="n">${esc(a.name)}${a.installed?'':' · 未安装'}</span>
+      ${a.swapped?`<span class="c" style="color:var(--accent-hi);border-color:var(--accent)">⇄${esc(a.swapped)}</span>`:''}
       ${n?`<span class="c">${n}</span>`:''}</button>`;}).join('');
 
   const app=S.apps.find(a=>a.id===CUR);
@@ -820,6 +996,7 @@ function render(){
 }
 function card(i){
   const q=i.quota; let quota='';
+  const ap=S.apps.find(a=>a.id===i.app);
   if(q.total||q.left||q.expires_on){
     const pct=q.total?Math.max(0,Math.min(100,q.left/q.total*100)):0;
     const exp=q.days_left==null?'':(q.days_left<0?`<span class="exp danger">已过期</span>`:
@@ -830,27 +1007,43 @@ function card(i){
       <span>/ ${q.total??'—'} 积分</span>${exp}</div>
       ${q.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>`;
   }else quota=`<div class="quota"><div class="qrow empty">未登记额度 · 赠送积分请登记过期日以便提醒</div></div>`;
+  const swapBtn=ap&&ap.swap_ok?(i.swapped?
+    `<button class="btn danger sm" onclick="act('swap_clear',{app:'${i.app}'})">还原默认</button>`:
+    `<button class="btn sm" onclick="swapSet('${i.app}','${esc(i.name)}')">设为当前</button>`):'';
   return `<div class="card ${i.running?'run':''}">
-    <div class="top"><div><div class="nm">${esc(i.name)}</div>
+    <div class="top"><div><div class="nm">${esc(i.name)}${i.swapped?' <span style="color:var(--accent-hi);font-size:12px">⇄ 当前账号</span>':''}</div>
       <div class="ap">${esc(i.app_name)} · ${i.kind==='cli'?'CLI':'桌面端'} · 建于 ${i.created}</div></div>
       <div class="st"><span class="dot"></span>${i.running?(i.kind==='cli'?'运行中':`运行中 ×${i.procs}`):'未运行'}</div></div>
     ${quota}
     <div class="acts">
       <button class="btn primary sm" onclick="act('launch',{app:'${i.app}',name:'${esc(i.name)}'})">▶ 启动</button>
       <button class="btn sm" onclick="act('kill',{app:'${i.app}',name:'${esc(i.name)}'})">■ 结束</button>
+      ${swapBtn}
       <button class="btn sm" onclick="openModal('${i.app}','${esc(i.name)}')">额度/设置</button>
-      ${q.quota_url?`<button class="btn sm" onclick="act('fetch_quota',{app:'${i.app}',name:'${esc(i.name)}'})">抓额度</button>`:''}
+      ${(q.quota_url||q.adapter)?`<button class="btn sm" onclick="act('fetch_quota',{app:'${i.app}',name:'${esc(i.name)}'})">抓额度</button>`:''}
+      <button class="btn sm" onclick="act('calc_size',{app:'${i.app}',name:'${esc(i.name)}'})">占用</button>
+      <button class="btn sm" onclick="cleanCache('${i.app}','${esc(i.name)}')">清缓存</button>
       <button class="btn sm" onclick="act('backup',{app:'${i.app}',name:'${esc(i.name)}'})">备份</button>
       <button class="btn sm" onclick="act('restore',{app:'${i.app}',name:'${esc(i.name)}'})">恢复</button>
       <button class="btn sm" onclick="act('open_dir',{app:'${i.app}',name:'${esc(i.name)}'})">目录</button>
       <button class="btn danger sm" onclick="del('${i.app}','${esc(i.name)}')">删除</button>
     </div></div>`;
 }
+function cleanCache(app,name){
+  if(confirm(`清理「${name}」的缓存/日志/扩展缓存？登录态与设置保留。需先关闭该实例。`))
+    act('clean_cache',{app,name});
+}
 async function act(action,extra={}){
   const r=await (await fetch('/api/action',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({action,...extra})})).json();
-  toast(r.msg,r.ok); load();
+  toast(r.msg,r.ok); load(); return r;
+}
+function swapSet(app,name){
+  act('swap_set',{app,name}).then(r=>{
+    if(!r.ok&&/锁定/.test(r.msg)&&confirm(r.msg+'\n\n确认结束这些后台进程并换号？'))
+      act('swap_set',{app,name,force:true});
+  });
 }
 function del(app,name){ if(confirm(`删除实例「${name}」及其数据目录（含登录状态）？不可恢复。`)) act('delete',{app,name}); }
 function killAll(pids,app){
@@ -867,10 +1060,10 @@ function openModal(app,name){
   $('m-title').textContent=`${i.app_name} / ${name}`;
   $('m-workdir').value=i.workdir||''; $('m-total').value=i.quota.total??'';
   $('m-left').value=i.quota.left??''; $('m-exp').value=i.quota.expires_on||'';
-  $('m-token').value=''; $('m-qurl').value=''; $('m-qpath').value='';
+  $('m-token').value=''; $('m-qurl').value=''; $('m-qpath').value=''; $('m-ad').value='';
   fetch('/api/meta?app='+app+'&name='+encodeURIComponent(name)).then(r=>r.ok?r.json():null)
     .then(m=>{ if(m){$('m-token').value=m.token||'';$('m-qurl').value=m.quota_url||'';
-      $('m-qpath').value=m.quota_path||'';} });
+      $('m-qpath').value=m.quota_path||'';$('m-ad').value=m.quota_adapter||'';} });
   $('modal').classList.add('show');
 }
 function closeModal(){$('modal').classList.remove('show');}
@@ -878,7 +1071,8 @@ function saveModal(){
   act('save_meta',{app:EDIT.app,name:EDIT.name,workdir:$('m-workdir').value,
     credits_total:$('m-total').value,credits_left:$('m-left').value,
     expires_on:$('m-exp').value,token:$('m-token').value,
-    quota_url:$('m-qurl').value,quota_path:$('m-qpath').value});
+    quota_url:$('m-qurl').value,quota_path:$('m-qpath').value,
+    quota_adapter:$('m-ad').value});
   closeModal();
 }
 function toast(msg,ok){
