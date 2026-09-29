@@ -66,6 +66,14 @@ pythonw agent_cockpit.py
 pip install -r requirements.txt
 ```
 
+## 打包为 exe（可选）
+
+```bat
+build_exe.bat
+```
+
+产物 `dist\AgentCockpit.exe`（约 20 MB 单文件，目标机器无需 Python）。`启动驾驶舱.bat` 优先启动 exe，无 exe 时回退源码模式。
+
 ## 隐私
 
 本仓库为私有仓库。实例数据、Token、备份均只存本机 `~/.agent-cockpit/`，不随代码上传。
