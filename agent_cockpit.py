@@ -80,6 +80,33 @@ def pid_alive(pid):
     return bool(pid) and pid in tasklist_snapshot()
 
 
+def instance_pids(app, meta):
+    """Electron 实例级进程：按命令行里的 --user-data-dir=<实例目录> 精确匹配"""
+    exe_name = Path(app["exe"][0]).name
+    data_dir = str(Path(meta["data_dir"])).lower()
+    ps = (f"Get-CimInstance Win32_Process -Filter \"Name='{exe_name}'\" | "
+          f"ForEach-Object {{ \"$($_.ProcessId)|$($_.CommandLine)\" }}")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, timeout=20, creationflags=NO_WINDOW)
+    except Exception:
+        return []
+    raw = r.stdout
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("gbk", errors="replace")
+    pids = []
+    for line in text.splitlines():
+        pid, _, cmd = line.partition("|")
+        if cmd and data_dir in cmd.lower():
+            try:
+                pids.append(int(pid))
+            except ValueError:
+                pass
+    return pids
+
+
 def days_left(expires_on):
     if not expires_on:
         return None
@@ -387,15 +414,15 @@ def do_action(payload):
                                creationflags=NO_WINDOW)
                 return {"ok": True, "msg": f"已结束 PID {pid}"}
             return {"ok": False, "msg": "该 CLI 实例未在运行"}
-        snap = tasklist_snapshot()
-        exe_name = Path(app["exe"][0]).name.lower()
-        pids = [p for p, nm in snap.items() if nm.lower() == exe_name]
+        if not meta:
+            return {"ok": False, "msg": "实例不存在"}
+        pids = instance_pids(app, meta)
         if not pids:
-            return {"ok": False, "msg": "该程序当前没有运行中的进程"}
+            return {"ok": False, "msg": "该实例没有运行中的窗口（整个程序级结束请用进程表「结束全部」）"}
         for p in pids:
             subprocess.run(["taskkill", "/pid", str(p), "/t", "/f"], capture_output=True,
                            creationflags=NO_WINDOW)
-        return {"ok": True, "msg": f"已结束 {app['name']} 全部 {len(pids)} 个进程（含所有实例）"}
+        return {"ok": True, "msg": f"已结束「{name}」的 {len(pids)} 个窗口进程，不影响其他实例"}
 
     if act == "kill_pids":
         for pid in payload.get("pids", []):
@@ -691,7 +718,7 @@ tr:last-child td{border-bottom:0}
     <div class="toolbar">
       <h2 id="cur-title">—</h2>
       <div class="sp"></div>
-      <button class="btn primary" onclick="act('new_instance')">＋ 新建实例</button>
+      <button class="btn primary" onclick="act('new_instance',{app:CUR})">＋ 新建实例</button>
       <button class="btn" onclick="load()">刷新</button>
     </div>
     <div class="cards" id="cards"></div>
@@ -778,7 +805,7 @@ function render(){
 
   $('procs').innerHTML=S.procs.map(p=>`<tr><td class="txt">${esc(p.app)}</td>
     <td class="txt">${esc(p.detail)}</td><td>${p.pids.join(',')}</td>
-    <td><button class="btn danger sm" onclick='act("kill_pids",{pids:${JSON.stringify(p.pids)}})'>结束</button></td></tr>`).join('')
+    <td><button class="btn danger sm" onclick='killAll(${JSON.stringify(p.pids)},"${esc(p.app)}")'>结束全部</button></td></tr>`).join('')
     ||`<tr><td colspan="4" class="txt" style="color:var(--faint)">当前没有运行中的 Agent 进程</td></tr>`;
 
   $('p-up').value=S.proxy.upstream||'';
@@ -826,6 +853,10 @@ async function act(action,extra={}){
   toast(r.msg,r.ok); load();
 }
 function del(app,name){ if(confirm(`删除实例「${name}」及其数据目录（含登录状态）？不可恢复。`)) act('delete',{app,name}); }
+function killAll(pids,app){
+  if(confirm(`将结束 ${app} 的全部 ${pids.length}+ 个进程——包括你正在使用的窗口！\n只关单个实例请回到上方卡片用「■ 结束」。\n确认继续？`))
+    act('kill_pids',{pids});
+}
 function proxyToggle(){
   if(S.proxy.running) act('proxy_stop');
   else act('proxy_start',{upstream:$('p-up').value,strategy:$('p-st').value});
@@ -862,6 +893,9 @@ load(); setInterval(load,4000);
 """
 
 
+ICON = Path(__file__).resolve().parent / "cockpit.ico"
+
+
 def main():
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
@@ -869,16 +903,27 @@ def main():
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     except OSError:
-        webbrowser.open(f"http://127.0.0.1:{PORT}")
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            0, "Agent 驾驶舱已在运行，本实例退出。", APP_NAME, 0x40)
         return
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    threading.Timer(0.5, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
     try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        srv.shutdown()
+        # 桌面壳：pywebview(WebView2)，与 Cockpit Tools 的 Tauri 同构——原生壳+Web UI+本地后端
+        import webview
+    except ImportError:
+        webbrowser.open(f"http://127.0.0.1:{PORT}")  # 仅缺桌面壳时降级
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            srv.shutdown()
+        return
+    webview.create_window(APP_NAME, f"http://127.0.0.1:{PORT}", width=1280, height=820,
+                          min_size=(1024, 680))
+    webview.start()  # 阻塞至窗口关闭
+    srv.shutdown()
 
 
 if __name__ == "__main__":
