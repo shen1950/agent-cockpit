@@ -1,5 +1,5 @@
 # Agent 驾驶舱：国内 AI Agent 多开 / 额度过期提醒 / 本地反代 一体机
-# 单文件、零依赖（Python 3.10+ stdlib）。启动后自动打开浏览器仪表盘 http://127.0.0.1:8787
+# 单文件、桌面壳（pywebview/WebView2，对标 Cockpit Tools 的 Tauri 架构），缺壳时降级浏览器
 # 多开原理：Electron 系 --user-data-dir 隔离实例；CLI 系 CODEX_HOME / CLAUDE_CONFIG_DIR 隔离账号
 import json
 import os
@@ -96,31 +96,45 @@ def pid_alive(pid):
     return bool(pid) and pid in tasklist_snapshot()
 
 
-def instance_pids(app, meta):
-    """Electron 实例级进程：按命令行里的 --user-data-dir=<实例目录> 精确匹配"""
-    exe_name = Path(app["exe"][0]).name
-    data_dir = str(Path(meta["data_dir"])).lower()
-    ps = (f"Get-CimInstance Win32_Process -Filter \"Name='{exe_name}'\" | "
+_cmd_cache = {"ts": 0.0, "data": {}}
+
+
+def proc_cmdlines(exe_names):
+    """单次 PowerShell 扫描，返回 {pid: 命令行小写}。10 秒内重复调用走缓存。"""
+    if not exe_names:
+        return {}
+    if time.time() - _cmd_cache["ts"] < 10:
+        return _cmd_cache["data"]
+    cond = " -or ".join(f"$_.Name -eq '{nm}'" for nm in sorted(exe_names))
+    ps = (f"Get-CimInstance Win32_Process | Where-Object {{ {cond} }} | "
           f"ForEach-Object {{ \"$($_.ProcessId)|$($_.CommandLine)\" }}")
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, timeout=20, creationflags=NO_WINDOW)
+                           capture_output=True, timeout=15, creationflags=NO_WINDOW)
     except Exception:
-        return []
-    raw = r.stdout
+        return {}
     try:
-        text = raw.decode("utf-8")
+        text = r.stdout.decode("utf-8")
     except UnicodeDecodeError:
-        text = raw.decode("gbk", errors="replace")
-    pids = []
+        text = r.stdout.decode("gbk", errors="replace")
+    out = {}
     for line in text.splitlines():
         pid, _, cmd = line.partition("|")
-        if cmd and data_dir in cmd.lower():
+        if cmd:
             try:
-                pids.append(int(pid))
+                out[int(pid)] = cmd.lower()
             except ValueError:
                 pass
-    return pids
+    _cmd_cache["ts"] = time.time()
+    _cmd_cache["data"] = out
+    return out
+
+
+def instance_pids(app, meta, cmd_snap=None):
+    """Electron 实例级进程：按命令行里的 --user-data-dir=<实例目录> 精确匹配"""
+    data_dir = str(Path(meta["data_dir"])).lower()
+    snap = cmd_snap if cmd_snap is not None else proc_cmdlines({Path(app["exe"][0]).name})
+    return [p for p, cmd in snap.items() if data_dir in cmd]
 
 
 def days_left(expires_on):
@@ -323,6 +337,31 @@ def fetch_quota(meta):
     return float(node), None, None
 
 
+QUOTA_AUTO_SEC = 1800  # 额度自动抓取间隔（30 分钟）
+
+
+def quota_autofetch_loop():
+    """后台线程：每 30 分钟给所有配置了适配器/额度接口的实例抓一次剩余额度。"""
+    time.sleep(20)  # 启动后稍等，避免与窗口初始化抢资源
+    while True:
+        for app_id in APPS:
+            for meta in load_instances(app_id):
+                if not (meta.get("quota_adapter") or (meta.get("quota_url") or "").strip()):
+                    continue
+                left, total, err = fetch_quota(meta)
+                if err:
+                    continue
+                meta["credits_left"] = left
+                if total is not None:
+                    meta["credits_total"] = total
+                meta["quota_fetched_at"] = time.time()
+                try:
+                    save_instance(app_id, meta)
+                except Exception:
+                    pass
+        time.sleep(QUOTA_AUTO_SEC)
+
+
 # ---------------- 换号模式（junction，零空间） ----------------
 def is_junction(p):
     return os.path.islink(p) or os.path.isjunction(p)
@@ -440,6 +479,9 @@ def build_state():
     snap = tasklist_snapshot()
     cfg = load_config()
     swaps = cfg.get("swaps", {})
+    electron_exes = {Path(app["exe"][0]).name for app in APPS.values()
+                     if app["kind"] == "electron" and resolve_exe(app)}
+    cmd_snap = proc_cmdlines(electron_exes)
     apps, instances, alerts = [], [], []
     n_running = 0
     for app_id, app in APPS.items():
@@ -448,17 +490,22 @@ def build_state():
                      "installed": bool(exe),
                      "swapped": swaps.get(app_id, {}).get("instance"),
                      "swap_ok": app_id in PROFILE_DIRS})
-        exe_name = Path(app["exe"][0]).name.lower()
-        procs = sum(1 for _, nm in snap.items() if nm.lower() == exe_name) if exe else 0
         for meta in load_instances(app_id):
             dl = days_left(meta.get("expires_on"))
-            running = (procs > 0) if app["kind"] == "electron" else (meta.get("pid", 0) in snap and meta.get("pid", 0) != 0)
+            if app["kind"] == "electron":
+                inst_pids = instance_pids(app, meta, cmd_snap)
+                running = bool(inst_pids)
+                procs = len(inst_pids)
+            else:
+                pid = meta.get("pid", 0)
+                running = bool(pid) and pid in snap
+                procs = 1 if running else 0
             if running:
                 n_running += 1
             left = meta.get("credits_left")
             if dl is not None and dl <= ALERT_WARN_DAYS and (left is None or left > 0):
-                alerts.append({"app": app["name"], "name": meta["name"], "days": dl,
-                               "left": left,
+                alerts.append({"app": app["name"], "app_id": app_id, "name": meta["name"],
+                               "days": dl, "left": left,
                                "level": "danger" if dl <= ALERT_DANGER_DAYS else "warn"})
             instances.append({
                 "app": app_id, "app_name": app["name"], "kind": app["kind"],
@@ -470,7 +517,8 @@ def build_state():
                           "expires_on": meta.get("expires_on"), "days_left": dl,
                           "has_token": bool((meta.get("token") or "").strip()),
                           "quota_url": bool((meta.get("quota_url") or "").strip()),
-                          "adapter": meta.get("quota_adapter") or ""},
+                          "adapter": meta.get("quota_adapter") or "",
+                          "fetched_at": meta.get("quota_fetched_at")},
             })
     alerts.sort(key=lambda a: a["days"])
     procs_rows = []
@@ -578,6 +626,7 @@ def do_action(payload):
             return {"ok": False, "msg": "该 CLI 实例未在运行"}
         if not meta:
             return {"ok": False, "msg": "实例不存在"}
+        _cmd_cache["ts"] = 0.0  # 结束操作必须用实时进程快照，不走缓存
         pids = instance_pids(app, meta)
         if not pids:
             return {"ok": False, "msg": "该实例没有运行中的窗口（整个程序级结束请用进程表「结束全部」）"}
@@ -659,6 +708,7 @@ def do_action(payload):
         meta["credits_left"] = left
         if total is not None:
             meta["credits_total"] = total
+        meta["quota_fetched_at"] = time.time()
         save_instance(app_id, meta)
         return {"ok": True, "msg": f"已更新剩余：{left:g}" + (f" / 总额 {total:g}" if total else "")}
 
@@ -683,7 +733,9 @@ def do_action(payload):
 
     if act == "proxy_start":
         PROXY.cfg.update({k: payload[k] for k in ("upstream", "strategy") if payload.get(k)})
-        save_config({"proxy": PROXY.cfg})
+        cfg = load_config()
+        cfg["proxy"] = PROXY.cfg
+        save_config(cfg)
         ok, msg = PROXY.start(PORT + 1)
         return {"ok": ok, "msg": msg}
 
@@ -791,7 +843,9 @@ header .sp{flex:1}
 #alerts.warn{border-color:rgba(226,179,78,.35);background:rgba(226,179,78,.07)}
 #alerts .t{font:700 13px var(--sans);margin-bottom:4px}
 #alerts ul{list-style:none;display:flex;flex-wrap:wrap;gap:8px}
-#alerts li{font-size:12.5px;color:var(--text)}
+#alerts li{font-size:12.5px;color:var(--text);cursor:pointer;padding:2px 8px;
+  border-radius:6px}
+#alerts li:hover{background:rgba(255,255,255,.06)}
 #alerts li b{color:var(--danger)} #alerts.warn li b{color:var(--warn)}
 
 main{display:grid;grid-template-columns:224px 1fr;gap:24px;padding:24px;align-items:start}
@@ -976,7 +1030,7 @@ function render(){
     const danger=S.alerts.some(a=>a.level==='danger');
     al.style.display='block'; al.className=danger?'':'warn';
     al.innerHTML=`<div class="t">⏳ ${S.alerts.length} 笔赠送额度临期，请尽快调用</div><ul>`+
-      S.alerts.map(a=>`<li>「${esc(a.app)}/${esc(a.name)}」剩余 ${a.left??'—'} · <b>${a.days} 天后过期</b></li>`).join('')+`</ul>`;
+      S.alerts.map(a=>`<li onclick="CUR='${a.app_id}';render()" title="点击定位到该 Agent">「${esc(a.app)}/${esc(a.name)}」剩余 ${a.left??'—'} · <b>${a.days} 天后过期</b></li>`).join('')+`</ul>`;
     document.title=`(${S.alerts.length} 笔临期) Agent 驾驶舱`;
   }else{al.style.display='none';document.title='Agent 驾驶舱';}
 
@@ -1020,7 +1074,8 @@ function card(i){
       `<span class="exp">${q.days_left} 天后过期</span>`);
     quota=`<div class="quota"><div class="qrow"><span class="v">${q.left??'—'}</span>
       <span>/ ${q.total??'—'} 积分</span>${exp}</div>
-      ${q.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>`;
+      ${q.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}
+      ${q.fetched_at?`<div class="qrow" style="font-size:11px;color:var(--faint)">上次抓取 ${new Date(q.fetched_at*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})} · 每 30 分钟自动</div>`:''}</div>`;
   }else quota=`<div class="quota"><div class="qrow empty">未登记额度 · 赠送积分请登记过期日以便提醒</div></div>`;
   const swapBtn=ap&&ap.swap_ok?(i.swapped?
     `<button class="btn danger sm" onclick="act('swap_clear',{app:'${i.app}'})">还原默认</button>`:
@@ -1102,9 +1157,6 @@ load(); setInterval(load,4000);
 """
 
 
-ICON = Path(__file__).resolve().parent / "cockpit.ico"
-
-
 def main():
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
@@ -1118,6 +1170,7 @@ def main():
         return
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=quota_autofetch_loop, daemon=True).start()
     try:
         # 桌面壳：pywebview(WebView2)，与 Cockpit Tools 的 Tauri 同构——原生壳+Web UI+本地后端
         import webview
