@@ -34,6 +34,7 @@ pythonw agent_cockpit.py
 - **进程监控**：每 4 秒刷新运行中的 Agent 进程
   - 实例卡片「■ 结束」= 实例级：按命令行 `--user-data-dir=<实例目录>` 精确匹配，只杀该实例窗口
   - 进程表「结束全部」= 程序级：杀该程序所有窗口（含正在使用的），带二次确认
+- **系统托盘与开机自启**：关窗最小化到托盘（后台继续抓额度/提醒），托盘菜单可打开面板、切换开机自启（注册表 Run 键）、退出；启动时若有临期额度弹一次气泡提醒；开机自启以 `--minimized` 启动（只驻留托盘不弹窗）
 - **账号备份/恢复**：实例数据目录 zip 备份（自动跳过 Cache 等垃圾目录）
 
 ## 数据位置
@@ -56,10 +57,10 @@ pythonw agent_cockpit.py
 
 - **程序架构**（对标 Cockpit Tools / Tauri 的壳原理）：原生桌面壳 + Web 技术 UI + 本地后端
   - Cockpit Tools = Tauri（WebView2 壳 + Rust 后端）；本项目 = pywebview（WebView2 壳 + Python 后端）
-  - 独立桌面窗口（自有图标、最小尺寸约束），关窗即退出，不打开浏览器
+  - 独立桌面窗口（自有图标、最小尺寸约束），关窗最小化到系统托盘，托盘菜单「退出」才结束进程
   - 后端为 stdlib `http.server` JSON API（`127.0.0.1:8787` 仅本机回环），前端内嵌于单文件
 - **视觉模板**：石墨底 `#0C0E14` + 琥珀金 `#C8956C` + 衬线标题（Noto Serif SC 回退 Georgia），8pt 间距网格、12px 圆角、无渐变
-- 单文件 `agent_cockpit.py` + 唯一依赖 `pywebview`（见 requirements.txt）
+- 单文件 `agent_cockpit.py`，依赖 `pywebview`（桌面壳）+ `pystray`/`Pillow`（托盘图标程序自绘，零素材）（见 requirements.txt）
 
 ## 安装依赖
 

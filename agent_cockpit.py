@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -338,7 +339,6 @@ def fetch_quota(meta):
 
 
 QUOTA_AUTO_SEC = 1800  # 额度自动抓取间隔（30 分钟）
-
 
 def quota_autofetch_loop():
     """后台线程：每 30 分钟给所有配置了适配器/额度接口的实例抓一次剩余额度。"""
@@ -1157,6 +1157,88 @@ load(); setInterval(load,4000);
 """
 
 
+# ---------------- 系统托盘 + 开机自启 ----------------
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "AgentCockpit"
+
+
+def autostart_enabled():
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return bool(winreg.QueryValueEx(k, AUTOSTART_NAME)[0])
+    except OSError:
+        return False
+
+
+def set_autostart(enable):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if enable:
+            if getattr(sys, "frozen", False):
+                cmd = f'"{sys.executable}" --minimized'
+            else:
+                pythonw = Path(sys.executable).with_name("pythonw.exe")
+                cmd = f'"{pythonw}" "{Path(__file__).resolve()}" --minimized'
+            winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)
+        else:
+            try:
+                winreg.DeleteValue(k, AUTOSTART_NAME)
+            except OSError:
+                pass
+
+
+def make_tray_image():
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([2, 2, 62, 62], radius=14, fill=(12, 14, 20, 255),
+                        outline=(200, 149, 108, 255), width=3)
+    d.polygon([(32, 14), (50, 32), (32, 50), (14, 32)], fill=(200, 149, 108, 255))
+    return img
+
+
+def tray_notify_loop(icon):
+    """启动后检查一次临期额度，有则弹气泡提醒（只提醒一次，不刷屏）。"""
+    time.sleep(25)
+    try:
+        alerts = build_state()["alerts"]
+        if alerts:
+            worst = alerts[0]
+            icon.notify(
+                f"{len(alerts)} 笔赠送额度临期，最早 {worst['days']} 天后过期"
+                f"（{worst['app']}/{worst['name']}）", APP_NAME)
+    except Exception:
+        pass
+
+
+def start_tray(window):
+    """返回 pystray.Icon；缺 pystray/Pillow 时返回 None（退化为关窗即退出）。"""
+    import pystray
+
+    def open_panel(icon=None, item=None):
+        window.show()
+
+    def toggle_autostart(icon, item):
+        set_autostart(not autostart_enabled())
+
+    def quit_app(icon=None, item=None):
+        icon.stop()
+        window.destroy()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("打开驾驶舱", open_panel, default=True),
+        pystray.MenuItem("开机自启", toggle_autostart,
+                         checked=lambda item: autostart_enabled()),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("退出", quit_app),
+    )
+    icon = pystray.Icon("agent-cockpit", make_tray_image(), APP_NAME, menu)
+    threading.Thread(target=icon.run, daemon=True).start()
+    threading.Thread(target=tray_notify_loop, args=(icon,), daemon=True).start()
+    return icon
+
+
 def main():
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
@@ -1182,9 +1264,29 @@ def main():
         except KeyboardInterrupt:
             srv.shutdown()
         return
-    webview.create_window(APP_NAME, f"http://127.0.0.1:{PORT}", width=1280, height=820,
-                          min_size=(1024, 680))
-    webview.start()  # 阻塞至窗口关闭
+    window = webview.create_window(APP_NAME, f"http://127.0.0.1:{PORT}",
+                                   width=1280, height=820, min_size=(1024, 680))
+    try:
+        tray = start_tray(window)
+    except ImportError:
+        tray = None
+
+    def on_closing():
+        if tray:
+            window.hide()  # 有关托盘时关窗 = 最小化到托盘，后台提醒/抓额度继续跑
+            return False
+        return True
+
+    window.events.closing += on_closing
+    if "--minimized" in sys.argv:  # 开机自启：只驻留托盘，不弹窗
+        webview.start(lambda: window.hide())
+    else:
+        webview.start()  # 阻塞至窗口销毁（托盘「退出」）
+    if tray:
+        try:
+            tray.stop()
+        except Exception:
+            pass
     srv.shutdown()
 
 
