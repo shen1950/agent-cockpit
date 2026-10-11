@@ -7,6 +7,8 @@ Tauri 2 桌面应用（Rust 后端 + WebView2 前端），产物是单个原生 
 
 > 详细使用手册（含每一步操作说明）见 [docs/USER_MANUAL.md](docs/USER_MANUAL.md)。
 
+**直接下载**：[Releases](https://github.com/shen1950/agent-cockpit/releases) 里有免安装便携版和 NSIS 安装包，下载即用，不必自己编译。
+
 ---
 
 ## 为什么做这个
