@@ -1,0 +1,24 @@
+# 构建产物与缓存（都可由源码重新生成，不入库）
+src-tauri/target/
+node_modules/
+__pycache__/
+*.pyc
+*.spec
+build/
+dist/
+bin/
+installer/
+
+# 日志
+*.log
+
+# 调试草稿（本地留着，不入库）
+_dbg*.js
+_paste_parser.js
+
+# 改动前的回滚副本（留在磁盘上备查，不进历史）
+*.bak-*
+*.pre-migration
+
+# 内部工作交接日志（本地留存，不开源）
+HANDOFF.md

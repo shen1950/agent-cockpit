@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent 驾驶舱</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar" data-tauri-drag-region>
+  <div class="brand" data-tauri-drag-region>
+    <span class="mark" aria-hidden="true" data-tauri-drag-region></span>
+    <span class="name" data-tauri-drag-region>Agent <b>驾驶舱</b></span>
+  </div>
+  <p class="tagline" data-tauri-drag-region>多开 · 换号 · 额度过期提醒 · 本地反代</p>
+  <span class="dragfill" data-tauri-drag-region></span>
+
+  <div class="stats">
+    <span class="chip" id="c-agents"><i class="dot"></i><span>—</span></span>
+    <span class="chip" id="c-inst"><i class="dot"></i><span>—</span></span>
+    <span class="chip" id="c-run"><i class="dot"></i><span>—</span></span>
+    <span class="chip" id="c-proxy"><i class="dot"></i><span>—</span></span>
+    <span class="chip expiring" id="c-alerts" hidden title="有积分临期，点击查看明细"><i class="dot"></i><span>—</span></span>
+  </div>
+
+  <button class="gear" id="btn-settings" title="设置" aria-label="设置"></button>
+
+  <div class="winbtns">
+    <button id="w-min" title="最小化" aria-label="最小化"></button>
+    <button id="w-max" title="最大化" aria-label="最大化"></button>
+    <button id="w-close" title="收进托盘（后台继续监控额度）" aria-label="收进托盘"></button>
+  </div>
+</header>
+
+
+<main class="layout">
+  <nav class="sidebar" aria-label="导航">
+    <!-- 上半截：Agent 列表，只有这一块滚动 -->
+    <div class="side-scroll">
+      <h2 class="navtitle">Agents</h2>
+      <ul id="applist" class="applist"></ul>
+      <div class="sidebtns">
+        <button class="btn sm" id="btn-scan" title="扫描开始菜单与桌面，收录新装的 AI 程序">重新扫描</button>
+        <button class="btn sm" id="btn-inv" title="一键盘点本机 Agent：查注册表卸载表 + 快捷方式 + 安装根目录 + npm 全局，与上次快照比对，报出新装/卸载/内置路径失效">扫描登记</button>
+      </div>
+      <button class="btn addapp" id="btn-add-app"
+              title="登记一个本机程序：只需可执行文件路径。新装软件也可以点「重新扫描」自动收录">＋ 添加程序</button>
+      <p class="legend">
+        徽章含义：<b>多开</b> 可同时开多个账号窗口 · <b>换号</b> 一次一个<br>
+        识别不到的程序用上面「＋ 添加程序」手动登记
+      </p>
+    </div>
+    <!-- 下半截：常驻不滚，切页面的入口始终在手边 -->
+    <div class="side-fixed">
+      <div class="sidehead">
+        <h2 class="navtitle">管理</h2>
+        <button id="btn-nav-toggle" type="button" aria-label="收起导航栏" aria-expanded="true"
+                title="收起导航栏（Ctrl+B）"></button>
+      </div>
+      <ul id="viewlist" class="applist">
+        <li><button data-view="collab"><span class="ico">⇄</span><span class="label">协作</span></button></li>
+        <li><button data-view="keys"><span class="ico">#</span><span class="label">API 与额度</span></button></li>
+        <li><button data-view="settings"><span class="ico">⚙</span><span class="label">设置</span></button></li>
+      </ul>
+    </div>
+  </nav>
+  <div class="nav-resize" id="nav-resize" role="separator" aria-orientation="vertical" tabindex="0"
+       title="拖动调整左侧导航栏宽度，双击恢复默认"></div>
+
+  <div class="content">
+    <!-- ================= 账号库 ================= -->
+    <div id="view-agents" class="view">
+      <div class="toolbar">
+        <h1 id="cur-title">—</h1>
+        <span class="count" id="cur-count"></span>
+        <span class="pill" id="cur-cap"></span>
+        <span class="sp"></span>
+        <button class="btn primary" id="btn-new">＋ 添加账号</button>
+        <button class="btn" id="btn-hide" title="把误收的程序从列表里隐藏（不会卸载，可在设置里恢复）">隐藏此程序</button>
+        <button class="btn" id="btn-forget" title="移除这条已卸载程序的记录（账号目录原样保留）" hidden>清理记录</button>
+        <button class="btn" id="btn-reload" title="立即刷新账号与进程状态">刷新</button>
+      </div>
+      <div class="pagebody">
+      <div class="hintline" id="cur-hint" hidden></div>
+      <div class="cards" id="cards"></div>
+
+      <section class="panel" id="perks-panel">
+        <header class="panelhead">
+          <h2>福利活动</h2>
+          <span class="sub">各家 Agent 的限时免费 / 每日赠送 · 手动登记，过了到期日自动收起</span>
+        </header>
+        <div id="perks-list"></div>
+      </section>
+
+      <section class="panel">
+        <header class="panelhead">
+          <h2>运行中的进程</h2>
+          <span class="sub">实例级精确匹配 · 每 4 秒自动刷新<i id="c-fresh"></i></span>
+        </header>
+        <div class="tablewrap">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th class="col-app">Agent</th>
+                <th class="col-detail">详情</th>
+                <th class="col-pid">PID</th>
+                <th class="col-act"></th>
+              </tr>
+            </thead>
+            <tbody id="procs"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <header class="panelhead">
+          <h2>本地反代</h2>
+          <span class="sub">把某个 Agent 的某个账号 / 某个 Key 归进池子，再生成分发 Key 对外提供 · 不常用时保持停止</span>
+        </header>
+        <div class="proxybar">
+          <label for="p-up">上游</label>
+          <input id="p-up" class="grow" placeholder="https://api.openai.com" autocomplete="off">
+          <label for="p-st">策略</label>
+          <select id="p-st">
+            <option value="round-robin">轮询</option>
+          </select>
+          <button class="btn primary" id="p-btn">启动反代</button>
+          <span class="chip pool" id="p-pool"><span>—</span></span>
+        </div>
+        <!-- 反代编制：池子（谁进哪个池）+ 分发 Key（谁能用哪些池）。由 app.js 渲染 -->
+        <div class="gwbuilder" id="gwb"></div>
+        <div class="tablewrap">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th class="col-time">时间</th>
+                <th class="col-m">方法</th>
+                <th class="col-path">路径</th>
+                <th class="col-model">模型</th>
+                <th class="col-s">状态</th>
+                <th class="col-acct">账号</th>
+                <th class="col-poolx">池子</th>
+                <th class="col-via">分发 Key</th>
+              </tr>
+            </thead>
+            <tbody id="plogs"></tbody>
+          </table>
+        </div>
+      </section>
+      </div><!-- /pagebody -->
+    </div>
+
+    <!-- ================= 协作（AgentHub 工作流看板） ================= -->
+    <div id="view-collab" class="view" hidden>
+      <div class="toolbar">
+        <button class="btn sm back-agents" title="返回账号列表">← 返回</button>
+        <h1>协作</h1>
+        <span class="count" id="collab-status">探测 AgentHub 看板…</span>
+        <span class="sp"></span>
+        <button class="btn" id="btn-collab-retry" title="重新探测本机看板服务（127.0.0.1:8766）">重新连接</button>
+      </div>
+      <div class="pagebody">
+        <div class="setlayout">
+          <div class="setbody col-side">
+            <p class="flabel">这块在干什么</p>
+            <p class="legend">嵌进来的是本机 AgentHub 看板：项目 / 工作流波次进度 / Agent 负载 /
+              派工时间线 / 桌面桥接箱，还有可拖拽编排的工作流编辑器。
+              驾驶舱只负责把它嵌进来，数据都在看板那边。</p>
+            <p class="legend">看板没起时这里会提示：在终端里运行 <code>agenthub ui</code>
+              （默认 <code>http://127.0.0.1:8766</code>，只监听本机），起来后点上面「重新连接」。</p>
+          </div>
+          <div class="setbody">
+            <div class="hintline" id="collab-hint" hidden></div>
+            <div class="collabframe" id="collab-framebox">
+              <iframe id="collab-frame" title="AgentHub 协作看板" hidden></iframe>
+              <div class="collaboff" id="collab-off" hidden>
+                <p><b>AgentHub 看板没有启动</b></p>
+                <p>在终端里运行 <code>agenthub ui</code>（默认 http://127.0.0.1:8766，只监听本机）</p>
+                <p class="collabsub">看板里有：项目 / 工作流波次进度 / Agent 负载 / 派工时间线 / 桌面桥接箱，
+                  以及可拖拽编排的工作流编辑器。启动后点「重新连接」。</p>
+                <button class="btn primary" id="btn-collab-retry2">重新探测</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================= API 与额度 ================= -->
+    <div id="view-keys" class="view" hidden>
+      <div class="toolbar">
+        <button class="btn sm back-agents" title="返回账号列表">← 返回</button>
+        <h1>API 与额度</h1>
+        <span class="count" id="keys-count"></span>
+        <span class="sp"></span>
+        <button class="btn primary" id="btn-key-new">＋ 添加站点</button>
+        <button class="btn" id="btn-keys-expiring" title="只看 30 天内过期的">只看临期</button>
+        <button class="btn" id="btn-keys-dedup" title="按 key 原文找出重复登记的条目，保留一条删其余">查重</button>
+        <button class="btn" id="btn-keys-batch" title="勾选任意多条 key 一次删除">批量删</button>
+      </div>
+      <div class="pagebody">
+        <div class="setlayout">
+          <ul class="setnav" id="key-nav"></ul>
+          <div class="setbody">
+            <div class="hintline">
+              按「站点」管理：<b>接入点和可用模型挂在站点上</b>——一个站通常同时提供
+              OpenAI 兼容 / Anthropic 兼容 / DashScope 几种地址，一处填好，下面每条 key 都能用。
+              <b>一个站点下可以放多个 key</b>，各自记用途（Pot / WorkBuddy / QoderCN…）、额度与过期日；
+              某条 key 确实走别的地址时，再在它自己的表单里覆盖。
+            </div>
+            <div class="panel intake" id="key-intake">
+              <h2>快速登记</h2>
+              <div class="pasteline">
+                <label for="k-intake">把官方或中转站发给你的那段信息原样贴进来，也可以直接 Ctrl+V 贴一张截图</label>
+                <textarea id="k-intake" rows="4" spellcheck="false"
+                  placeholder="不用管排版：站点名、一个或多个 Base URL、若干用途名与其 key、模型清单、余额与过期日，认得出多少算多少。&#10;认出来的东西会当场建成站点和 key 存进台账，之后逐条核对，改哪条点哪条。"></textarea>
+                <div class="ctlrow" style="margin-top:8px">
+                  <button class="btn primary sm" id="k-intake-go">识别并登记</button>
+                  <button class="btn sm" id="k-intake-img">选图片…</button>
+                  <input type="file" id="k-intake-file" accept="image/*" hidden>
+                  <span class="kv" id="k-intake-info">先按本机规则读，规则认不出 key 或地址时才交给多模态模型（ 设置 → AI 识别 ）</span>
+                </div>
+              </div>
+            </div>
+            <div id="keysites" class="keysites"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================= 设置（帮助与教程也在这里，作为一个分组） ================= -->
+    <div id="view-settings" class="view" hidden>
+      <div class="toolbar"><button class="btn sm back-agents" title="返回账号列表">← 返回</button><h1>设置</h1><span class="sp"></span>
+        <span class="count" id="set-hint">改动即时生效并保存在本机</span></div>
+      <div class="pagebody">
+        <div class="setlayout">
+          <ul class="setnav" id="set-nav"></ul>
+          <div class="setbody" id="set-body"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- ================= 自定义右键菜单 ================= -->
+<div class="ctxmenu" id="ctx" hidden></div>
+
+<!-- ================= 添加本机程序 ================= -->
+<div class="modal" id="amodal" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="am-title">
+    <h3 id="am-title">添加本机程序</h3>
+    <div class="fields">
+      <label for="am-exe">程序路径</label>
+      <input id="am-exe" placeholder="D:\Apps\Foo\Foo.exe" autocomplete="off" spellcheck="false">
+      <label for="am-name">显示名</label>
+      <input id="am-name" placeholder="留空则用文件名" autocomplete="off">
+    </div>
+    <p class="askbody" style="margin-top:12px">
+      只需可执行文件路径，不改动该程序的任何文件；能不能多开由内核实测判定。
+      新装软件若在开始菜单或桌面有快捷方式，点「重新扫描」会自动收录，不必走这里。
+    </p>
+    <footer class="dialogfoot">
+      <button class="btn" id="am-scan">重新扫描</button>
+      <span class="sp"></span>
+      <button class="btn" id="am-cancel">取消</button>
+      <button class="btn primary" id="am-add">添加</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= 账号内部设置浮窗（一项一行，左侧分组导航） ================= -->
+<div class="modal blur" id="imodal" hidden>
+  <div class="dialog xl" role="dialog" aria-modal="true" aria-labelledby="im-title">
+    <header class="dlghead">
+      <div class="dlgtitle">
+        <h3 id="im-title">账号设置</h3>
+        <p class="dlgsub" id="im-sub"></p>
+      </div>
+      <button class="dlgx" id="im-x" title="关闭" aria-label="关闭"></button>
+    </header>
+    <div class="dlgbody">
+      <ul class="setnav" id="im-nav"></ul>
+      <div class="setbody" id="im-body"></div>
+    </div>
+    <footer class="dialogfoot">
+      <span class="sp"></span>
+      <button class="btn" id="im-cancel">关闭</button>
+      <button class="btn primary" id="im-save">保存</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= 添加账号（登录方式 → 基本信息 → 数据来源 → 登录 → 额度 → 完成） ================= -->
+<div class="modal" id="wizard" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="wz-title">
+    <header class="wzhead">
+      <h3 id="wz-title">添加账号</h3>
+      <ol class="steps" id="wz-steps"></ol>
+    </header>
+    <div class="wzbody" id="wz-body"></div>
+    <footer class="dialogfoot">
+      <button class="btn" id="wz-back">上一步</button>
+      <span class="sp"></span>
+      <button class="btn" id="wz-cancel">取消</button>
+      <button class="btn primary" id="wz-next">下一步</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= 站点编辑弹窗 ================= -->
+<div class="modal" id="smodal" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true">
+    <h3 id="sm-title">添加站点</h3>
+    <div class="fields">
+      <label for="s-name">站点名</label>
+      <input id="s-name" placeholder="如 LongCat / 阿里云百炼 / 某中转站" autocomplete="off">
+      <label for="s-kind">类型</label>
+      <select id="s-kind">
+        <option value="official">官网 API</option>
+        <option value="relay">中转站</option>
+        <option value="local">本地服务</option>
+      </select>
+      <label for="s-b-openai">OpenAI 兼容</label>
+      <input id="s-b-openai" placeholder="https://…/compatible-mode/v1" autocomplete="off" spellcheck="false">
+      <label for="s-b-anth">Anthropic 兼容</label>
+      <input id="s-b-anth" placeholder="https://…/apps/anthropic" autocomplete="off" spellcheck="false">
+      <label for="s-b-other">其他接入点</label>
+      <input id="s-b-other" placeholder="如 DashScope：https://…/api/v1" autocomplete="off" spellcheck="false">
+      <label for="s-models">可用模型</label>
+      <input id="s-models" placeholder="逗号分隔；存好后也可以点站点头上的「拉模型」自动填" autocomplete="off">
+      <label for="s-total">总额度</label>
+      <input id="s-total" type="number" step="any" autocomplete="off">
+      <label for="s-left">剩余</label>
+      <input id="s-left" type="number" step="any" autocomplete="off">
+      <label for="s-home">主页</label>
+      <input id="s-home" placeholder="可选，登记 key 的那个网站" autocomplete="off">
+      <label for="s-note">备注</label>
+      <input id="s-note" autocomplete="off">
+    </div>
+    <p class="askbody" style="margin-top:12px">
+      <b>接入点挂在站点上</b>：一个站通常同时提供 OpenAI / Anthropic / DashScope 几种口，
+      一处填好，底下每条 key 都能用（某条 key 确实走别的地址时，再在它自己的表单里覆盖）。
+      站点名相同（或地址同族）时会自动并入已有站点，不会重复建。
+    </p>
+    <footer class="dialogfoot">
+      <button class="btn" id="sm-cancel">取消</button>
+      <button class="btn primary" id="sm-save">保存站点</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= key 编辑弹窗 =================
+     只留这条 key 自己的东西：用途、Key 原文、可选的接入点覆盖、过期日、备注、进反代池。
+     额度（总额度/剩余）挂在站点上，在「改站点」里填；接入点和模型清单也归站点。 -->
+<div class="modal" id="kmodal" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true">
+    <h3 id="km-title">添加 key</h3>
+    <div class="fields">
+      <label for="k-label">用途</label>
+      <input id="k-label" placeholder="这个 key 用在哪，如 Pot / WorkBuddy / QoderCN" autocomplete="off">
+      <label for="k-base">接入点覆盖</label>
+      <input id="k-base" placeholder="留空＝用站点上填的接入点（同站多口时在这里指定这一条走哪个）" autocomplete="off" spellcheck="false">
+      <label for="k-key">API Key</label>
+      <input id="k-key" type="password" placeholder="sk-..." autocomplete="off">
+      <label for="k-exp">过期日</label>
+      <input id="k-exp" autocomplete="off" spellcheck="false">
+      <label for="k-note">备注</label>
+      <input id="k-note" autocomplete="off">
+      <label for="k-proxy">进反代池</label>
+      <select id="k-proxy">
+        <option value="0">否</option>
+        <option value="1">是</option>
+      </select>
+    </div>
+    <footer class="dialogfoot">
+      <button class="btn" id="km-cancel">取消</button>
+      <span class="sp"></span>
+      <button class="btn" id="km-test">测试</button>
+      <button class="btn" id="km-next" title="存下这条，接着清空表单再登记同站点的下一个 key">保存并再加一个</button>
+      <button class="btn primary" id="km-save">保存</button>
+    </footer>
+  </div>
+</div>
+
+
+<!-- ================= 接入 Agent：把这条 key 写进某个程序的自定义模型配置 ================= -->
+<div class="modal blur" id="injmodal" hidden>
+  <div class="dialog" role="dialog" aria-modal="true">
+    <h3 id="inj-title">接入到哪些程序</h3>
+    <div class="hintline" id="inj-sub"></div>
+    <div id="inj-list"></div>
+    <footer class="dialogfoot">
+      <button class="btn" id="inj-cancel">关闭</button>
+      <button class="btn primary" id="inj-go">写入所选</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= API 台账：key 查重 / 批量删除 ================= -->
+<div class="modal blur" id="bdmodal" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="bd-title">
+    <h3 id="bd-title">key 查重</h3>
+    <div class="hintline" id="bd-sub"></div>
+    <div class="bdlist" id="bd-list"></div>
+    <footer class="dialogfoot">
+      <span class="kv" id="bd-count"></span>
+      <span class="sp"></span>
+      <button class="btn" id="bd-cancel">关闭</button>
+      <button class="btn danger" id="bd-go">删除所选</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= 反代：池子编辑弹窗 ================= -->
+<div class="modal" id="gpmodal" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="gp-title">
+    <h3 id="gp-title">新建池子</h3>
+    <div class="fields">
+      <label for="gp-name">池子名</label>
+      <input id="gp-name" placeholder="如 主力池 / Qoder 备用 / 便宜中转" autocomplete="off">
+      <label for="gp-en">启用</label>
+      <select id="gp-en">
+        <option value="1">启用（参与分流）</option>
+        <option value="0">停用（先留着不参与）</option>
+      </select>
+    </div>
+    <p class="askbody" style="margin-top:12px">
+      勾进来的每个来源都算一个上游，按「策略」轮流使用。<b>Agent 账号</b>要有 Token 才算数；
+      <b>API Key</b> 用台账里登记的地址。单个成员可单独指定上游地址，留空则用上面的全局上游。
+    </p>
+    <div class="memlist" id="gp-members"></div>
+    <footer class="dialogfoot">
+      <span class="kv" id="gp-count"></span>
+      <span class="sp"></span>
+      <button class="btn" id="gp-cancel">取消</button>
+      <button class="btn primary" id="gp-save">保存池子</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= 反代：分发 Key 编辑弹窗 ================= -->
+<div class="modal" id="gdmodal" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="gd-title">
+    <h3 id="gd-title">生成分发 Key</h3>
+    <div class="fields">
+      <label for="gd-name">给它起个名字</label>
+      <input id="gd-name" placeholder="谁在用，如 给Pot / 团队小王 / 沉浸式翻译" autocomplete="off">
+      <label for="gd-en">状态</label>
+      <select id="gd-en">
+        <option value="1">启用</option>
+        <option value="0">停用（立刻拒掉）</option>
+      </select>
+    </div>
+    <p class="askbody" style="margin-top:12px">
+      这个 Key 会被转发到下面勾选的池子里。<b>一个都不勾 = 所有启用的池子</b>。
+      生成后复制出去填到客户端的 API Key 位置，地址用本机反代地址。
+    </p>
+    <div class="memlist" id="gd-pools"></div>
+    <div class="keyout" id="gd-out" hidden></div>
+    <footer class="dialogfoot">
+      <button class="btn" id="gd-cancel">关闭</button>
+      <button class="btn primary" id="gd-save">保存</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= 积分明细（逐笔到期，照 WorkBuddy 官方「查看明细」） ================= -->
+<div class="modal blur" id="qmodal" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="qm-title">
+    <h3 id="qm-title">积分明细</h3>
+    <div class="qtabs" id="qm-tabs"></div>
+    <p class="qsumline" id="qm-sum"></p>
+    <div class="qitems" id="qm-list"></div>
+    <footer class="dialogfoot">
+      <span class="sp"></span>
+      <button class="btn" id="qm-save" hidden>核对无误，保存</button>
+      <button class="btn" id="qm-close">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= 新手引导 ================= -->
+<div class="tour" id="tour" hidden>
+  <div class="tourmask"></div>
+  <div class="tourcard" id="tour-card">
+    <h4 id="tour-title"></h4>
+    <p id="tour-text"></p>
+    <footer>
+      <span class="touridx" id="tour-idx"></span>
+      <span class="sp"></span>
+      <button class="btn sm" id="tour-skip">跳过引导</button>
+      <button class="btn primary sm" id="tour-next">下一步</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= 通用确认框 =================
+     主窗口是 decorations:false 的无边框窗口，WebView2 在这种窗口上会把原生
+     alert/confirm/prompt 弹成独立顶层窗口，鼠标点不到（只有键盘能确认）。
+     所以所有确认/输入一律走这个页面内弹框。 -->
+<div class="modal" id="ask" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="ask-title">
+    <h3 id="ask-title">请确认</h3>
+    <p class="askbody" id="ask-body"></p>
+    <input class="askinput" id="ask-input" autocomplete="off" hidden>
+    <footer class="dialogfoot">
+      <button class="btn" id="ask-cancel">取消</button>
+      <button class="btn primary" id="ask-ok">确定</button>
+    </footer>
+  </div>
+</div>
+
+<div class="toasts" id="toast" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
