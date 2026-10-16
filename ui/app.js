@@ -7,14 +7,19 @@ let invoke = () => Promise.reject(new Error('bridge 未就绪'));
 let win = { setTitle() {}, hide() {}, onCloseRequested: () => Promise.resolve() };
 const S = {
   inv: null,          // 最近一次「扫描登记」的结果，设置→高级 里展示
-  data: null, cur: null, view: 'agents', busy: false,
+  // 落地页是首页，不是"第一个 Agent"——一进来就先看清今天要处理什么
+  data: null, cur: null, view: 'home', busy: false,
   wizard: null, tour: null, detail: null, keysSoonOnly: false,
   perkForm: null,
   keysOpen: {}, keyNavSite: '',
+  checkinSeen: {},    // 已经弹过提示的"积分到账"通知 id（本会话内不重复弹）
+  // 签到页「产品 → 账号」两级的折叠状态：product → true 表示这家收起来了（默认全展开）
+  ciFold: {},
 };
 
 /* ---------------- 外观：主题/密度/字号都来自设置页，不再占顶栏 ---------------- */
 const navDrag = { active: false };
+const sideDrag = { active: false };
 // 侧栏正在被拖动的 Agent 的 id：非空时 renderNav 不重建列表（重建会把这次拖动掐断）
 let appDrag = null;
 const narrowNav = matchMedia('(max-width: 760px)');
@@ -42,6 +47,7 @@ function applyAppearance(a = {}) {
   if (!navDrag.active) {
     document.documentElement.style.setProperty('--nav-w-user', `${navWidth(a.nav_w)}px`);
   }
+  if (!sideDrag.active) applySideHeight(ratioPx(sideRatio(a)));
   applyRail(railOn(a));
 }
 const NAV_MIN = 170, NAV_MAX = 460, NAV_DEFAULT = 248;
@@ -49,6 +55,41 @@ function navWidth(v) {
   const n = Number(v);
   return Number.isFinite(n) ? Math.round(Math.min(NAV_MAX, Math.max(NAV_MIN, n))) : NAV_DEFAULT;
 }
+/* 侧栏那条横线：0 = 自动（管理区正好装下它那几行，列表吃掉剩余），>0 = 用户把管理区压到多高。
+   存的是**占窗口高度的比例**，不是像素——像素在最大化窗口里显得很矮、在窄窗口里又显得很高，
+   而"它该占多少"本来就是比例问题（2026-10-15 她要求正常窗口和最大化窗口都按比例对应调整）。
+   老版本存的是 mgmt_h 像素，第一次读到就折成比例，不用重新拖一遍。 */
+const SIDE_MIN = 88;                            // 拖动时管理区最矮多少像素
+const MGMT_MIN_R = 0.10, MGMT_MAX_R = 0.40;     // 比例上下限
+function sideRatio(a = {}) {
+  const clamp = (r) => Math.min(MGMT_MAX_R, Math.max(MGMT_MIN_R, r));
+  const r = Number(a.mgmt_ratio);
+  if (Number.isFinite(r) && r > 0) return clamp(r);
+  const legacy = Number(a.mgmt_h);
+  if (Number.isFinite(legacy) && legacy > 0) return clamp(legacy / Math.max(320, window.innerHeight));
+  return 0;   // 0 = 自动：正好装下内容（CSS 里还给了个 22vh 的上限）
+}
+function ratioPx(r) { return r ? Math.round(r * window.innerHeight) : 0; }
+function applySideHeight(px) {
+  const sb = document.querySelector('.sidebar');
+  document.documentElement.style.setProperty('--mgmt-h', `${px || 0}px`);
+  if (sb) sb.classList.toggle('split', !!px);
+}
+function commitSideHeight(px) {
+  const r = px > 0
+    ? Math.min(MGMT_MAX_R, Math.max(MGMT_MIN_R, px / Math.max(320, window.innerHeight)))
+    : 0;
+  applySideHeight(r ? Math.round(r * window.innerHeight) : 0);
+  const cur = sideRatio(S.data?.settings?.appearance || {});
+  if (Math.abs(r - cur) > 0.005) setSetting('appearance', 'mgmt_ratio', r);
+  else toast(r ? `管理区高度 ${Math.round(r * 100)}% 窗口高` : '管理区高度已恢复自动');
+}
+// 窗口变大变小（含最大化 / 还原）时，拖过的那个比例要跟着重算——
+// 不然最大化之后管理区还是原来那点像素，占比反而变小得莫名其妙
+window.addEventListener('resize', () => {
+  if (sideDrag.active) return;
+  applySideHeight(ratioPx(sideRatio(S.data?.settings?.appearance || {})));
+});
 matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
   if (S.data) applyAppearance(S.data.settings?.appearance);
 });
@@ -96,6 +137,93 @@ function iconBtn(act, handler, title) {
   return b;
 }
 function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+/* ---------------- 内置品牌图标 ----------------
+   CLI（Codex / Claude Code）与独立客户端（ChatGPT 桌面版）没有 exe 可供后端提取图标，
+   按 id / 显示名命中后直接画 SVG：24×24 品牌色圆角底 + 白色符号，深浅主题对比度各自成立。
+   花结符号用 simple-icons 的 openai 原始路径（Codex 与 ChatGPT 官方都是这一个标记）。 */
+const OPENAI_KNOT = 'M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9'
+  + 'A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966'
+  + ' 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557'
+  + ' 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729z'
+  + 'm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0'
+  + ' .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944z'
+  + 'm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806'
+  + ' 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464z'
+  + 'M2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543'
+  + '-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963'
+  + ' 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765'
+  + ' 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0'
+  + '-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802'
+  + ' 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757'
+  + '-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069'
+  + ' 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z';
+/* 花结画在 24 格底板上：符号占 62% 居中，四周留出品牌色的边 */
+const knotTile = (bg, edge) => `<svg viewBox="0 0 24 24"><rect width="24" height="24" rx="5.5" fill="${bg}"${edge}/>`
+  + `<g transform="translate(4.56 4.56) scale(.62)" fill="#fff"><path d="${OPENAI_KNOT}"/></g></svg>`;
+/* Claude 星芒：官方标记（simple-icons 的 claude 路径，CC0）。底板 24 格、路径本身占满 0..24，
+   按 0.59 缩放居中——与官方 app 图标实测的墨迹占比（58.8%）对齐；画到 0.66 时那 12% 的放大会
+   把这个标记自带的射线不等长放大成"看着歪"。 */
+const CLAUDE_BURST = 'm4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z';
+const burstTile = (bg) => `<svg viewBox="0 0 24 24"><rect width="24" height="24" rx="5.5" fill="${bg}"/>`
+  + `<g transform="translate(4.92 4.92) scale(.59)" fill="#F0EEE6"><path d="${CLAUDE_BURST}"/></g></svg>`;
+const BUILTIN_ICONS = [
+  // Codex CLI：OpenAI 绿底 + 白色花结
+  [/codex/i, knotTile('#10A37F', '')],
+  // Claude Code：赭橙底 + 白色星芒
+  [/claude/i, burstTile('#D97757')],
+  // ChatGPT / OpenAI：黑底 + 白色花结，深色主题下描一圈边免得和底融了
+  [/chatgpt|chat gpt|openai/i, knotTile('#111', ' stroke="rgba(128,128,128,.45)"')],
+];
+function builtinIcon(a) {
+  const key = `${a.id} ${a.name}`;
+  for (const [re, svg] of BUILTIN_ICONS) if (re.test(key)) return svg;
+  return '';
+}
+
+/* ---------------- 行内问号提示 ----------------
+   设置项的长说明从行里收进 label 旁的问号圈：悬停即看、单击钉住（再点/点别处/Esc/滚动收掉）。
+   气泡 fixed 挂 body 手动定位——设置面板与浮窗都是 overflow 滚动容器，absolute 会被裁。 */
+const DESC_INLINE_MAX = 26;   // 超过这个长度就从行内收进问号（行内只留一眼能看完的）
+let qtipEl = null;
+let qtipAnchor = null;        // 被单击钉住的那个问号；null = 当前只是悬停态
+function qtipShow(anchor, text, pin) {
+  qtipHide();
+  if (pin) qtipAnchor = anchor;
+  qtipEl = el('div', { id: 'qtip', role: 'tooltip' }, text);
+  document.body.appendChild(qtipEl);
+  const r = anchor.getBoundingClientRect();
+  const w = qtipEl.offsetWidth;
+  const h = qtipEl.offsetHeight;
+  const x = Math.max(8, Math.min(r.left, window.innerWidth - w - 12));
+  let y = r.bottom + 8;
+  if (y + h > window.innerHeight - 8) y = Math.max(8, r.top - h - 8);
+  qtipEl.style.left = `${x}px`;
+  qtipEl.style.top = `${y}px`;
+  if (pin) anchor.classList.add('on');
+}
+function qtipHide() {
+  if (qtipAnchor) qtipAnchor.classList.remove('on');
+  qtipAnchor = null;
+  if (qtipEl) { qtipEl.remove(); qtipEl = null; }
+}
+function qhelp(text) {
+  const s = el('span', { class: 'qhelp', role: 'note', tabindex: '0', aria: { label: `说明：${text}` } }, '?');
+  s.addEventListener('mouseenter', () => { if (qtipAnchor !== s) qtipShow(s, text, false); });
+  s.addEventListener('mouseleave', () => { if (!qtipAnchor) qtipHide(); });
+  s.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (qtipAnchor === s) qtipHide();
+    else qtipShow(s, text, true);
+  });
+  return s;
+}
+// 钉住后：点别处 / Esc / 任意滚动（scroll 不冒泡，用捕获阶段）都收掉
+document.addEventListener('click', (e) => {
+  if (qtipAnchor && !qtipAnchor.contains(e.target)) qtipHide();
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') qtipHide(); }, true);
+document.addEventListener('scroll', () => qtipHide(), true);
 function chip(text, cls) { return el('span', { class: `tag ${cls || ''}`.trim() }, text); }
 function fmtTok(n) {
   n = Number(n);
@@ -228,6 +356,9 @@ function editingIn(sel) {
   return !!(a && host && host.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
 }
 
+// 账号库整页重建会跳回页顶，记着"同一个产品"才把滚动位置还回去
+let agentsKey = '';
+
 function render() {
   const d = S.data;
   applyAppearance(d.settings?.appearance);
@@ -235,11 +366,28 @@ function render() {
   renderAlerts(d);
   renderNav(d);
   renderViews();
-  // 设置 / API / 协作 是整窗页面：盖掉侧栏，页面自己带左菜单，右侧内容才有地方放
-  document.querySelector('.layout').classList.toggle('full', S.view !== 'agents');
+  // 签到状态：整份缓存由 4 秒一轮的 state 带回来。这一页自己那份 S.checkin 只用来
+  // 触发刷新，显示一律以 state 里更新鲜的那份为准——否则页面会停在进来那一刻的旧数上。
+  const dc = d.checkin || {};
+  if (dc.ok && (dc.fetched_at || 0) >= ((S.checkin || {}).fetched_at || 0)) S.checkin = dc;
+  notifyArrivals(dc);
+  // 设置 / API / 协作 是整窗页面：盖掉侧栏，页面自己带左菜单，右侧内容才有地方放。
+  // 首页不盖侧栏——它就是"从左边挑一个 Agent"的入口。
+  document.querySelector('.layout').classList.toggle('full', S.view !== 'agents' && S.view !== 'home');
   $('btn-settings').setAttribute('aria-current', String(S.view === 'settings'));
-  if (S.view === 'agents') { renderToolbar(d); renderCards(d); renderPerks(d); renderProcs(d); renderProxy(d); }
+  if (S.view === 'home') renderHome(d);
+  if (S.view === 'agents') {
+    // 卡片/福利/进程这三块每轮都整块重建：清空的那一瞬间 scrollHeight 没了，
+    // 浏览器把 scrollTop 夹回 0——看起来就是"点一下按钮，整个页面跳回最上面"（4 秒轮询同样会跳）
+    const pb = document.querySelector('#view-agents .pagebody');
+    const keep = pb ? pb.scrollTop : 0;
+    const sameApp = agentsKey === `${S.view}|${S.cur}`;
+    agentsKey = `${S.view}|${S.cur}`;
+    renderToolbar(d); renderCards(d); renderPerks(d); renderProcs(d); renderProxy(d);
+    if (pb) pb.scrollTop = sameApp ? keep : 0;
+  }
   if (S.view === 'keys') renderKeys(d);
+  if (S.view === 'checkin') { renderCheckin(); loadCheckin(false); }
   if (S.view === 'settings' && !editingIn('#set-body')) renderSettings();
   // 账号设置浮窗开着时跟着轮询刷新状态；有未保存改动或光标还在框里就不重绘
   if (S.detail && !S.detail.dirty && !editingIn('#im-body')) renderDetail();
@@ -265,6 +413,13 @@ function renderChips(d) {
   pc.querySelector('span').textContent = d.proxy.running ? `反代 :${d.proxy.port}` : '反代 停止';
   pc.classList.toggle('on', d.proxy.running);
   $('c-fresh').textContent = d.now || '';
+  // 顶栏签到角标：只在"今天还有得领"时才出现，全领完或一家都不支持时不占位
+  const cc = $('c-checkin');
+  const pend = (((d.checkin || {}).items) || []).filter((x) => x.claimable === true);
+  cc.hidden = !pend.length;
+  cc.classList.toggle('expiring', pend.length > 0);
+  cc.querySelector('span').textContent = `签到 ${pend.length}`;
+  cc.title = `今天还没领：${pend.map((x) => x.name || x.product).join('、')}\n点开「每日签到」看状态或直接领`;
 }
 
 // 临期提醒不再占窗口空间：顶栏只留一个小徽章，真正快过期时弹一次窗。
@@ -325,16 +480,34 @@ function renderNav(d) {
     const running = d.instances.some((i) => i.app === a.id && i.running)
       || d.procs.some((p) => p.app_id === a.id && (p.windows ?? 1) > 0);
     const cap = a.kind === 'cli' ? '终端' : (a.isolatable ? '可多开' : '仅换号');
-    const icon = a.icon
-      ? el('img', { class: 'fav', src: a.icon, alt: '', width: 18, height: 18 })
-      : el('span', { class: 'fav none' }, (a.short || a.name[0]).slice(0, 2));
+    // 「现在用的是哪个号」：共用一份档案的产品以客户端登录态为准（磁盘换号记录不随登录变化）；
+    // 只有这个产品压根没有本机直读通道、登录态读不到时，才退回按档案认领关系标。
+    const mv = (a.machine && a.machine.value) || {};
+    const loggedName = a.shared_profile
+      ? (d.instances.find((x) => x.app === a.id && x.logged_in)?.name
+          || (mv.ok ? mv.account || '' : ''))
+      : '';
+    const cur = a.shared_profile
+      ? (loggedName ? { name: loggedName, tag: '本机登录中' }
+        : (!a.local_quota ? { name: a.swapped, tag: '当前账号' } : { name: '', tag: '' }))
+      : { name: a.swapped, tag: '当前账号' };
+    // 图标优先级：内置品牌 SVG > 后端从 exe 提取的 PNG > 名字缩写占位。
+    // 内置的排第一是因为后端对没有图标的 exe 会拿到 Windows 那张"空白文档"默认图，
+    // 认不全的品牌才轮到它。
+    const bisvg = builtinIcon(a);
+    const icon = bisvg
+      ? el('span', { class: 'fav svg', title: a.name })
+      : a.icon
+        ? el('img', { class: 'fav', src: a.icon, alt: '', width: 18, height: 18 })
+        : el('span', { class: 'fav none' }, (a.short || a.name[0]).slice(0, 2));
+    if (bisvg) icon.innerHTML = bisvg;
     const b = el('button', {
       class: `nav-btn${running ? ' running' : ''}${a.installed ? '' : ' missing'}`,
       data: { app: a.id },
       aria: { current: S.view === 'agents' && a.id === S.cur },
       title: `${a.name}\n`
         + `${a.installed ? '已安装' : (a.removed ? '已卸载（可执行文件不存在）' : '未找到可执行文件')} · ${cap}`
-        + (a.swapped ? `\n当前账号：${a.swapped}` : '')
+        + (cur.name ? `\n${cur.tag}：${cur.name}` : '')
         + '\n按住拖动可上下排位（右键也有 置顶/上移/下移）',
     },
       el('span', { class: 'dot' }),
@@ -342,12 +515,12 @@ function renderNav(d) {
       el('span', { class: 'label' }, a.name),
       n ? el('span', { class: 'badge' }, n) : null,
       el('span', { class: 'nav-badges' },
-        a.swapped ? el('span', {
+        (cur.name || a.swap_orphan) ? el('span', {
           class: `badge swap${a.swap_orphan ? ' orphan' : ''}`,
           title: a.swap_orphan
             ? `档案目录还指向已删除的账号「${a.swapped}」，点进该程序用「还原默认档案」修好`
-            : `当前账号：${a.swapped}`,
-        }, `⇄${a.swapped}`) : null,
+            : `${cur.tag}：${cur.name}`,
+        }, `⇄${cur.name || a.swapped}`) : null,
         a.new ? el('span', { class: 'badge new', title: '最近新收录的程序' }, '新') : null,
         a.removed ? el('span', { class: 'badge off', title: '可执行文件已不存在，可能已卸载' }, '已卸载') : null,
         el('span', { class: `cap ${a.isolatable ? 'yes' : (a.kind === 'cli' ? 'cli' : 'no')}`, title: cap },
@@ -441,9 +614,593 @@ function applyNavSort(fromId, toId, after) {
 
 /* 视图切换只换右栏内容：每页自己分「左菜单 + 右内容」，标题栏固定不滚 */
 function renderViews() {
-  for (const v of ['agents', 'collab', 'keys', 'settings']) {
+  for (const v of ['home', 'agents', 'collab', 'keys', 'checkin', 'settings']) {
     $(`view-${v}`).hidden = S.view !== v;
   }
+}
+
+/* ---------------- 首页（落地页） ----------------
+   一进来先回答三个问题：这台机器上有什么、今天要处理什么、现在能一键做什么。
+   两个主操作是"一键刷新全部额度"和"一键签到"——以前它们散在各个页面里，
+   要一家一家点。 */
+function homeGo(appId) {
+  S.view = 'agents';
+  if (appId) S.cur = appId;
+  render();
+}
+
+/* 到账提示：后台把"待观察"的那几家读回来，到账了就写进 checkin.arrived。
+   这里认新的 id 弹一条——她说的"下方操作提示区"就是这排 toast。 */
+function notifyArrivals(dc) {
+  for (const n of (dc && dc.arrived) || []) {
+    const id = n.id || '';
+    if (!id || S.checkinSeen[id]) continue;
+    S.checkinSeen[id] = true;
+    toast(n.text || '有积分到账了', true);
+  }
+}
+
+function homeStat(label, value, sub, cls) {
+  return el('div', { class: `hstat${cls ? ` ${cls}` : ''}` },
+    el('span', { class: 'hstat-l' }, label),
+    el('b', { class: 'hstat-v' }, value),
+    sub ? el('span', { class: 'hstat-s' }, sub) : null);
+}
+
+function renderHome(d) {
+  const host = $('home-body');
+  if (!host) return;
+  const pb = host.closest('.pagebody');
+  const keep = pb ? pb.scrollTop : 0;
+  clear(host);
+  $('home-sub').textContent = `${d.stats.agents} 个程序 · ${d.stats.instances} 个账号`
+    + (d.now ? ` · ${d.now}` : '');
+
+  const chk = d.checkin || {};
+  const items = chk.items || [];
+  const claimable = items.filter((x) => x.claimable === true && !x.error);
+  const signed = items.filter((x) => x.signed_today === true);
+  const alerts = d.alerts || [];
+  const urgent = alerts.filter((a) => (a.days ?? 999) <= 7);
+  const job = d.alljob || null;
+  const running = job && job.running;
+
+  // ① 今天的待办 + 两个主操作
+  const todo = [];
+  if (chk.placeholder) todo.push('签到状态正在读（列表已经先摆出来了，状态一两秒内补上）');
+  if (claimable.length) todo.push(`${claimable.length} 家今天还能领：${claimable.map((x) => x.name || x.product).join('、')}`);
+  else if (!chk.placeholder && items.length) todo.push('今天的签到都领完了');
+  if (urgent.length) todo.push(`${urgent.length} 笔积分 7 天内到期`);
+  if (d.stats.running) todo.push(`${d.stats.running} 个程序正在跑`);
+
+  const hero = el('div', { class: 'hhero' },
+    el('div', { class: 'hhero-t' },
+      el('h2', {}, '今天要处理的事'),
+      el('p', { class: 'hhero-sub' }, todo.length ? todo.join(' · ') : '暂时没有要处理的，都挺干净')),
+    el('div', { class: 'hhero-b' },
+      btn(running ? '↻ 正在刷新…' : '↻ 一键刷新全部额度', 'primary lg', () => refreshAllQuota(),
+        '把每个 Agent 每个账号的额度读一遍：能走官网的读逐包明细与各自到期时间，读不到就退本机/服务端汇总。'
+        + '这一轮在后台跑，进度就在按钮下面。'),
+      btn('✓ 一键签到', 'primary lg', () => claimAllCheckin(),
+        '把今天所有能领的一次领掉——领之前会先让你确认一遍清单。领走的当日名额退不回来，所以还是要你点一下。')));
+  if (job) {
+    const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
+    hero.appendChild(el('div', { class: 'hjob' },
+      el('span', { class: 'hjob-t' },
+        running
+          ? `正在读 ${job.done}/${job.total}${job.current ? `：${job.current}` : ''}`
+          : `上次刷新：${job.total} 个账号，成功 ${job.ok} / 失败 ${job.fail}`
+            + (job.finished_at ? ` · ${stampTime(job.finished_at)}` : '')),
+      running ? el('div', { class: 'hbar' }, el('i', { style: `width:${pct}%` })) : null,
+      !running && job.log && job.log.length
+        ? el('div', { class: 'hjoblog' }, ...job.log.filter((x) => !x.ok).slice(0, 4)
+            .map((x) => el('div', { class: 'hjobbad' }, `${x.app} / ${x.name}：${x.msg || '没读到'}`)))
+        : null));
+  }
+  host.appendChild(hero);
+
+  // ② 统计磁贴
+  const totalLeft = (d.instances || []).reduce((s, i) => {
+    const v = numv(i.quota && i.quota.left);
+    return s + (v && v > 0 ? v : 0);
+  }, 0);
+  host.appendChild(el('div', { class: 'hstats' },
+    homeStat('Agent 程序', String(d.stats.agents), `${d.stats.auto} 个是自动发现的`),
+    homeStat('账号', String(d.stats.instances), `${d.stats.running} 个程序正在跑`),
+    homeStat('账上剩余', nfmt(totalLeft), '所有账号的可读积分合计'),
+    homeStat('临期积分', String(alerts.length), urgent.length ? `其中 ${urgent.length} 笔 7 天内到期` : '30 天内到期的笔数',
+      alerts.length ? 'warn' : ''),
+    homeStat('今日签到', `${signed.length}/${items.length || '—'}`,
+      chk.placeholder ? '正在读状态' : (claimable.length ? `${claimable.length} 家还能领` : '都领完了'),
+      claimable.length ? 'go' : '')));
+
+  // ③ 两栏：临期积分 / 今天还能领
+  const cols = el('div', { class: 'hcols' });
+  const acard = el('section', { class: 'panel' },
+    el('header', { class: 'panelhead' }, el('h2', {}, '临期积分'),
+      el('span', { class: 'sub' }, alerts.length ? '点一行进它的账号页' : '30 天内没有到期的')),
+    el('div', { class: 'hlist' },
+      ...(alerts.length
+        ? alerts.slice(0, 8).map((a) => el('button', {
+            class: `hrow${(a.days ?? 999) <= 7 ? ' urgent' : ''}`, type: 'button',
+            onclick: () => homeGo(a.app_id),
+          },
+            el('span', { class: 'hrow-l' }, `${a.app} · ${a.name}${a.label ? ` · ${a.label}` : ''}`),
+            el('span', { class: 'hrow-r' }, `剩 ${nfmt(a.left)}${a.unit ? ` ${utxt(a.unit)}` : ''}`),
+            el('span', { class: `hrow-x ${expCls(a.days, false)}` }, expText(a.days))))
+        : [el('p', { class: 'qempty' }, '没有临期的积分。')])));
+  const ccard = el('section', { class: 'panel' },
+    el('header', { class: 'panelhead' }, el('h2', {}, '今天还能领的'),
+      el('span', { class: 'sub' }, chk.fetched_at ? `状态查于 ${stampTime(chk.fetched_at)}` : '还没查到')),
+    el('div', { class: 'hlist' },
+      ...(claimable.length
+        ? claimable.map((x) => el('button', {
+            class: 'hrow', type: 'button',
+            onclick: () => { S.view = 'checkin'; render(); },
+          },
+            el('span', { class: 'hrow-l' }, x.name || x.product),
+            el('span', { class: 'hrow-r' }, x.reward != null ? `${x.reward} ${x.unit || '积分'}` : '—'),
+            el('span', { class: 'hrow-x go' }, ciActionWord(x))))
+        : [el('p', { class: 'qempty' }, chk.placeholder ? '正在问各家今天的状态…' : '今天没有可领的了。')])));
+  cols.appendChild(acard);
+  cols.appendChild(ccard);
+  host.appendChild(cols);
+
+  // ④ 我的 Agent 一行一个
+  // 每一项都要自己包一层 span：flex 容器里连着几段裸文本会被合成**一个**匿名项，
+  // 中间的 gap 就不生效了（第一版就是这样，"运行中2 个账号可多开"糊成一团）
+  const ciWord = { done: '已签', claimable: '可领', off: '活动未开', error: '读不到' };
+  const rows = (d.apps || []).filter((a) => !a.hidden).map((a) => {
+    const insts = (d.instances || []).filter((i) => i.app === a.id);
+    const mv = (a.machine && a.machine.value) || {};
+    const logged = a.shared_profile
+      ? (insts.find((x) => x.logged_in)?.name || (mv.ok ? mv.account || '' : ''))
+      : (a.swapped || '');
+    const run = insts.some((i) => i.running) || (d.procs || []).some((p) => p.app_id === a.id && (p.windows ?? 1) > 0);
+    const aAlerts = alerts.filter((x) => x.app_id === a.id).length;
+    const ci = insts.map((i) => i.checkin).find((c) => c && c.state);
+    const tags = [
+      run ? '运行中' : '未运行',
+      insts.length ? `${insts.length} 个账号` : '还没有账号',
+      a.isolatable ? '可多开' : (a.shared_profile ? '共用一份档案' : '仅可换号'),
+      logged ? `当前：${logged}` : '',
+      aAlerts ? `${aAlerts} 笔临期` : '',
+      ci ? `签到：${ciWord[ci.state] || '状态未知'}${ci.reward != null ? ` · 每日 ${ci.reward}` : ''}` : '',
+      a.installed ? '' : '可执行文件已不存在',
+    ].filter(Boolean);
+    return el('button', { class: 'hagent', type: 'button', onclick: () => homeGo(a.id) },
+      el('span', { class: 'hagent-n' }, a.name),
+      el('span', { class: 'hagent-t' }, ...tags.map((t) => el('span', {}, t))));
+  });
+  host.appendChild(el('section', { class: 'panel' },
+    el('header', { class: 'panelhead' }, el('h2', {}, '我的 Agent'),
+      el('span', { class: 'sub' }, '点一行进它的账号页')),
+    el('div', { class: 'hlist' }, ...(rows.length ? rows : [el('p', { class: 'qempty' }, '还没有收录任何程序。')]))));
+
+  // ⑤ 最近领过的
+  const log = (((chk.state || {}).log) || []).slice(-6).reverse();
+  if (log.length) {
+    host.appendChild(el('section', { class: 'panel' },
+      el('header', { class: 'panelhead' }, el('h2', {}, '最近领过的'),
+        el('span', { class: 'sub' }, '只记本机动作，不联网')),
+      el('div', { class: 'hlog' }, ...log.map((x) => el('div', { class: 'hlogrow' },
+        el('span', { class: 'hlog-t' }, `${x.at || ''} ${CI_NAMES[x.store] || x.store}`),
+        el('span', { class: x.claimed ? 'hlog-ok' : 'hlog-no' },
+          x.claimed ? `领到 ${x.credit != null ? x.credit : ''}`.trim()
+            : x.already ? '已领过' : `没领成：${x.message || x.error || ''}`))))));
+  }
+
+  if (pb) pb.scrollTop = keep;
+}
+
+/* 一键刷新全部额度：后端起后台任务，这里只管点火 + 提示，进度靠 4 秒轮询自己长出来 */
+async function refreshAllQuota() {
+  const r = await invoke('action', { payload: { action: 'refresh_all' } })
+    .catch((e) => ({ ok: false, msg: String(e) }));
+  toast((r && r.msg) || '没起起来', !!(r && r.ok));
+  load();
+}
+
+/* 一键签到：先把今天能领的摊出来让她点头，再一家一家领。
+   领是写操作，所以即使叫"一键"也必须有这一下确认。 */
+async function claimAllCheckin() {
+  let items = ((S.checkin || {}).items || []).filter((x) => x.claimable === true && !x.error);
+  if (!items.length) {
+    // 手上这份可能是旧的：先强制读一次，再决定要不要领
+    const r = await invoke('action', { payload: { action: 'checkin_refresh' } }).catch(() => null);
+    if (r && r.ok) { S.checkin = r; items = (r.items || []).filter((x) => x.claimable === true && !x.error); }
+  }
+  if (!items.length) { toast('今天没有可领的了', true); load(); return; }
+  const lines = items.map((x) => `· ${x.name || x.product}${x.reward != null ? `（${x.reward} ${x.unit || '积分'}）` : ''}`);
+  const yes = await askConfirm(
+    `今天这 ${items.length} 家一起领掉？\n\n${lines.join('\n')}\n\n`
+    + '领走的当日名额退不回来。逐条结果会写进「最近领过的」。',
+    { title: '一键签到', okText: `领这 ${items.length} 家` });
+  if (!yes) return;
+  let ok = 0, no = 0;
+  const bad = [];
+  for (const x of items) {
+    const r = await invoke('action', { payload: { action: 'checkin_claim', app: '', store: x.product } })
+      .catch((e) => ({ ok: false, msg: String(e) }));
+    const y = (r && r.result) || {};
+    if (y.claimed || y.already || y.settling) ok += 1;
+    else { no += 1; bad.push(`${x.name || x.product}：${y.message || y.error || (r && r.msg) || '没领成'}`); }
+  }
+  toast(`一键签到：${ok} 家已处理${no ? `，${no} 家没成` : ''}`, no === 0);
+  if (bad.length) for (const b of bad.slice(0, 3)) toast(b, false);
+  await invoke('action', { payload: { action: 'checkin_refresh' } }).catch(() => null);
+  load();
+}
+
+/* ---------------- 每日签到 ---------------- */
+/* agenthub 那套 store 名与驾驶舱的程序 id 不完全一样（Trae 两边就不同名），
+   名字在这张表里给全，别去 S.data.apps 里猜——猜错的表现是这一行显示成空白产品名 */
+const CI_NAMES = {
+  workbuddy: 'WorkBuddy', 'workbuddy-intl': 'WorkBuddy 国际版',
+  'workbuddy-activity': 'WorkBuddy 活跃地图', 'workbuddy-travel': 'WorkBuddy 旅行猫',
+  'trae-cn': 'Trae CN', minimax: 'MiniMax Code', astudio: 'AStudio',
+  'qoder-cn': 'Qoder CN', qoder: 'Qoder',
+};
+let ciLoading = false;
+
+/* 进页面 / 点刷新 / 领完才真去问一次，4 秒轮询绝不重打。
+   `checkin_view` 现在**立刻返回**（缓存，或上次落盘的那一份）+ 后台去刷，所以这里
+   不会再有"进一次等半天"；真正刷出来的那份由 4 秒一轮的 state 带回来
+   （见 render() 里同步 S.checkin 的那两行）。「刷新状态」按钮走 checkin_refresh，
+   那一下是同步的——她明确点了要等结果，那就等。 */
+async function loadCheckin(force) {
+  if (ciLoading) return;
+  const cur = S.checkin;
+  if (!force && cur && cur.ok && (Date.now() / 1000 - (cur.fetched_at || 0)) < 120) return;
+  ciLoading = true;
+  if (force) toast('正在问各家今天的状态…', true);
+  const r = await invoke('action', { payload: { action: force ? 'checkin_refresh' : 'checkin_view' } })
+    .catch((e) => ({ ok: false, msg: String(e) }));
+  ciLoading = false;
+  if (r && r.ok) {
+    // 别用旧的把新的盖回去：后台刷出来的那份可能比这次返回的还新
+    if ((r.fetched_at || 0) >= ((S.checkin || {}).fetched_at || 0)) S.checkin = r;
+  } else if (!cur) {
+    S.checkin = r || { ok: false, msg: '没读到' };
+  }
+  if (force) toast(r && r.ok ? '状态已更新' : `读不到：${(r && r.msg) || '未知'}`, !!(r && r.ok));
+  renderCheckin();
+}
+
+/* 状态列说什么：词和样式分开给，首页概览要的是同一句话。
+   `pending` 是"这次还没读到"——列表已经画出来了，状态正在补，不该写成"状态未知"。 */
+function ciState(it) {
+  const w = it.words || {};
+  if (it.pending) return { cls: 'pending', word: '查询中…' };
+  if (it.error) return { cls: 'bad', word: '读不到' };
+  // 旅行猫是状态机不是签到：在路上要说"猫猫在路上"，写成"状态未知"等于什么都没说
+  if (it.mode === 'travel' && it.next_action === 'wait') return { cls: 'wait', word: w.wait_badge || '猫猫在路上' };
+  if (it.signed_today === true) return { cls: 'done', word: w.done || '今天已签' };
+  if (it.claimable === true) return { cls: 'go', word: w.go || '今天可领' };
+  // 接口两条都正常返回、只是今天还没到账：那是"还没登录过"，不许画成红色"读不到"
+  if (it.need_login) return { cls: 'wait', word: w.wait || '今天还没登录' };
+  if (it.activity_on === false) return { cls: 'off', word: '活动未开' };
+  return { cls: 'off', word: '状态未知' };
+}
+
+/* 操作列该写哪个词——**这一列讲的是"现在这一步要做什么"**，不是状态复读：
+   已领完 ≠ 不用领 ≠ 可领；旅行猫还有 派出 / 等待 / 领取 三个真动作。
+   （她 2026-10-15 圈出来："不用领和已领完完全是两个概念"） */
+function ciActionWord(it) {
+  const w = it.words || {};
+  if (it.error) return '';
+  if (it.mode === 'travel') {
+    if (it.next_action === 'depart') return w.depart || '派出';
+    if (it.next_action === 'wait') return w.wait || '等待中';
+    if (it.next_action === 'claim') return w.claim || '领取';
+    return w.done_act || '今天已领完';
+  }
+  if (it.signed_today === true) return w.done_act || '今天已领完';
+  if (it.claimable === true) return w.act || (it.mode === 'activity' ? '发一句对话' : '立刻签到');
+  return '今天不用领';
+}
+
+function ciBadge(it) {
+  const s = ciState(it);
+  return el('span', { class: `ci-badge ${s.cls}` }, s.word);
+}
+
+/* 一行一个按钮，写的是"这一步到底要做什么"。写操作（领取 / 发对话 / 派出）都要先确认。 */
+function ciAction(it, name) {
+  if (it.pending) {
+    return btn('查询中…', 'sm', () => {}, '状态正在读，马上就有');
+  }
+  if (it.need_login) {
+    // 这一家今天还没登录过，光把按钮摆成"不用领"等于什么都没做——直接帮她把客户端拉起来
+    return btn('打开客户端登一次', 'sm primary', async () => {
+      const r = await invoke('action', { payload: { action: 'launch_app', app: it.product, name: '' } });
+      toast(r && r.ok ? '已打开客户端，登进去之后回这页点一次刷新' : (r && r.msg) || '打开失败', !!(r && r.ok));
+      if (r && r.ok) setTimeout(() => loadCheckin(true), 25000);
+    }, '每日积分要今天登录过一次才发；点这个把客户端打开，登录后我自动回来补状态');
+  }
+  const w = it.words || {};
+  const travel = it.mode === 'travel';
+  const act = it.mode === 'activity';      // 国际版那种"当天用过就送"的基础权益，不是签到
+  // 旅行猫三个真动作；到了才能领、领过就不能再派
+  const step = travel ? (it.next_action || 'wait') : '';
+  const doable = travel
+    ? (step === 'depart' || step === 'claim')
+    : (it.claimable === true);
+  const label = ciActionWord(it);
+  const title = !doable
+    ? (travel
+      ? (step === 'wait'
+        ? `猫猫还在路上${it.arrive_at ? `，约 ${it.arrive_at} 到` : ''}，到点了这一格会变成「领取」`
+        : '今天这一趟已经领过了，明天再来')
+      : (it.signed_today === true ? '今天这份已经到手了，明天再来' : '现在没有可领的，点了也是白点'))
+    : (travel
+      ? (step === 'depart' ? '派猫猫出门旅行（写操作）：每天只能派一次，1~4 小时后到，到点了再回来点「领取」'
+        : '领取这一趟的旅行奖励（写操作）')
+      : (act ? '发一句对话（写操作）' : '发一次领取请求（写操作）'));
+  const b = btn(label, doable ? 'sm primary' : 'sm', async () => {
+    if (!doable) return;
+    const yes = await askConfirm(
+      travel
+        ? (step === 'depart'
+          ? `要派「${name}」的猫猫出门旅行吗？\n\n每天只能派一次，1~4 小时后到；到点了这一格会变成「领取」。`
+          : `要领取「${name}」这一趟的旅行奖励吗？\n\n${it.reward != null ? `${it.reward} 积分，` : ''}领完今天就不能再派了。`)
+        : act
+          ? `要给「${name}」发一句对话，让服务端认定今天用过吗？\n\n这一档不是签到，是当天用过就送的基础权益，会真起一次命令行会话。`
+          : `要给「${name}」领今天的签到积分吗？\n\n领完这一家的当日名额就用掉了，撤回不了。`,
+      { title: travel ? (step === 'depart' ? '确认派出' : '确认领取') : (act ? '确认发对话' : '确认领取') });
+    if (!yes) return;
+    // 账号级那行要把账号名一起发过去：两个号各有各的当日名额，
+    // 不带账号就会全落到"当前登着的那个号"头上（2026-10-16 加）
+    const r = await invoke('action', {
+      payload: { action: 'checkin_claim', app: '', store: it.product, account: it.account || '' },
+    });
+    const x = (r && r.result) || {};
+    // claimed 只在 agenthub 回读状态确认过之后才为真——厂商回一句 200 不算领到。
+    // settling 是"写操作做完了、服务端还没结算"，那是等，不是失败。
+    toast(x.claimed ? `已领到 ${x.credit != null ? x.credit : ''} ${x.message || ''}`.trim()
+      : x.settling ? (x.message || '已经发出去了，等它到账')
+        : `没领成：${x.message || x.error || (r && r.msg) || '未知原因'}`,
+      !!(x.claimed || x.settling));
+    loadCheckin(true);
+  }, title);
+  if (!doable) b.disabled = true;
+  return b;
+}
+
+/* 卡片上的签到角标。状态是只读的、信息量小，放得下；动作（去领）留在「每日签到」页，
+   点角标直接跳那一页。缓存里没这家（不支持签到）就什么都不画——摆个"未查"是噪音 */
+function checkinMark(i) {
+  const c = i.checkin;
+  if (!c || !c.state) return null;
+  const txt = { done: '已签', claimable: '可领', off: '签到未开', unknown: '状态未知', error: '读不到' }[c.state];
+  if (!txt) return null;
+  const tip = `${c.name || '每日签到'} · ${txt}`
+    + (c.streak != null ? ` · 连签 ${c.streak} 天` : '')
+    + (c.reward != null ? ` · 每日 ${c.reward}` : '')
+    + (c.msg ? `\n${c.msg}` : '\n点一下去看状态或直接领');
+  const b = el('span', { class: `cimark ${c.state}`, title: tip }, txt);
+  b.addEventListener('click', (e) => { e.stopPropagation(); S.view = 'checkin'; render(); });
+  return b;
+}
+
+/* 提醒是只读的，跟"能不能自动领"两回事：领取要验证码的那几家，照样该到点提醒我去点 */
+async function saveCheckinMute(store, muted) {
+  const mute = { ...(S.checkinMute || {}) };
+  if (muted) mute[store] = true; else delete mute[store];
+  S.checkinMute = mute;
+  await run('checkin_auto', { remind_mute: mute });
+}
+
+/* 一行九格，全部塞进同一个 grid 容器（父级 display:grid、这里 display:contents），
+   列宽只在 .citab 里定义一次，所以"每日多少积分""今天不用领"这些同类内容必然落在同一列。
+   以前每行自己 flex 排，一家少个字段整行就错位——你圈出来的就是这个。 */
+const CI_COLS = ['产品', '状态', '连签', '每日', '累计', '活动截止', '操作', '自动领', '提醒'];
+
+function ciRule(grid) { grid.appendChild(el('div', { class: 'ci-rule' })); }
+
+function ciCells(grid, it, autoOn, opts) {
+  const o = opts || {};
+  const name = it.name || CI_NAMES[it.product] || it.product;
+  // 产品行的标题格：有账号子行时左边挂一个折叠箭头（▾ 展开 / ▸ 收起）。
+  // 账号行缩进一格，左边画一条竖线，一眼看出它属于上面那家。
+  const nameCell = el('div', { class: `ci-name${o.account ? ' acc' : ''}` });
+  // 箭头和名字必须**同一行**：.ci-name 是 column flex，箭头单独放进去会独占一行
+  const nmRow = el('div', { class: 'ci-nmrow' });
+  if (o.kids) {
+    const f = el('button', {
+      class: 'ci-fold', type: 'button',
+      title: o.folded ? `展开 ${o.kids} 个账号` : `收起 ${o.kids} 个账号`,
+    }, o.folded ? '▸' : '▾');
+    f.addEventListener('click', () => {
+      S.ciFold = S.ciFold || {};
+      S.ciFold[it.product] = !o.folded;
+      renderCheckin();
+    });
+    nmRow.appendChild(f);
+  }
+  nmRow.appendChild(el('span', { class: 'ci-nm' }, name));
+  if (o.kids) nmRow.appendChild(el('span', { class: 'ci-kids' }, `${o.kids} 个账号`));
+  nameCell.appendChild(nmRow);
+  if (it.note) nameCell.appendChild(el('span', { class: 'ci-note' }, it.note));
+  grid.appendChild(nameCell);
+  // 有账号子行时，产品行的状态列换成**汇总**：「1/2 已签」。
+  // 不然那一格写的是"这台机器现在登着的那个号"的状态，跟底下两行并排看着就像自相矛盾。
+  if (o.agg) {
+    const all = o.agg.total > 0 && o.agg.done === o.agg.total;
+    grid.appendChild(el('span', {
+      class: `ci-badge ${all ? 'done' : 'go'}`,
+      title: `名下 ${o.agg.total} 个账号里今天已有 ${o.agg.done} 个领到；各自的详细状态看下面那几行`,
+    }, `${o.agg.done}/${o.agg.total} 已签`));
+  } else {
+    grid.appendChild(ciBadge(it));
+  }
+  if (it.error) {
+    // .ci-err 自己 grid-column: 3 / -1 已经占满剩下的列，再补六个空格会把它们
+    // 挤进下一条隐式行——那也是一段对不上的线
+    grid.appendChild(el('div', { class: 'ci-err', title: it.error }, it.error));
+    return;
+  }
+  const u = it.unit || '积分';
+  grid.appendChild(el('span', { class: 'ci-num' }, it.streak != null ? `${it.streak} 天` : '官方没给'));
+  grid.appendChild(el('span', { class: 'ci-num' }, it.reward != null ? `${it.reward} ${u}` : '—'));
+  grid.appendChild(el('span', { class: 'ci-num', title: it.days_signed ? `本季签了 ${it.days_signed} 天` : '' },
+    it.total != null ? `${it.total}` : '—'));
+  grid.appendChild(el('span', { class: 'ci-num' }, it.ends_on || '—'));
+  grid.appendChild(el('div', { class: 'ci-act' }, ciAction(it, name)));
+  // 「自动领」「提醒」是**按产品**设的开关，账号行不重复摆——同一个产品摆两排同样的勾，
+  // 勾哪一个生效就说不清了。这里写清楚它跟着上面那行走。
+  if (o.account) {
+    const tip = '自动领 / 提醒是**按产品**设的开关，在上面那一行（' + (CI_NAMES[it.product] || it.product) + '）上勾';
+    grid.appendChild(el('span', { class: 'cick no', title: tip }, '同上'));
+    grid.appendChild(el('span', { class: 'cick no', title: tip }, '同上'));
+    return;
+  }
+  // 只有厂商给了独立状态接口、领取又不需要验证码的，才允许交给程序自动跑
+  if (it.pending) {
+    // 状态还没读到，这一格先空着——写「不可」是在替一家还没问过的产品下结论
+    grid.appendChild(el('span', { class: 'cick no', title: '状态还没读到，等一下就知道了' }, '—'));
+  } else if (it.auto === true) {
+    const cb = el('input', { type: 'checkbox', class: 'ciauto' });
+    cb.checked = !!autoOn;
+    cb.title = '到时间窗里让驾驶舱自己领一次（一天最多一次）；不勾就等你自己点';
+    cb.addEventListener('change', () => saveCheckinAuto(it.product, cb.checked));
+    grid.appendChild(el('label', { class: 'cick' }, cb));
+  } else {
+    grid.appendChild(el('span', { class: 'cick no', title: '这家没有独立状态接口，或领取要过验证码/要在网页里点，不交给程序自动跑' }, '不可'));
+  }
+  const rb = el('input', { type: 'checkbox', class: 'ciwarn' });
+  rb.checked = !(S.checkinMute || {})[it.product];
+  rb.title = '到点提醒我今天去领（只读提醒，不会替我领）';
+  rb.addEventListener('change', () => saveCheckinMute(it.product, !rb.checked));
+  grid.appendChild(el('label', { class: 'cick' }, rb));
+}
+
+async function saveCheckinAuto(store, on) {
+  const auto = {};
+  for (const it of (S.checkin && S.checkin.items) || []) {
+    if (it.auto === true) auto[it.product] = !!(S.checkinAuto || {})[it.product];
+  }
+  auto[store] = on;
+  if (on) auto[store] = true; else delete auto[store];
+  S.checkinAuto = auto;
+  // 整张 auto 表一次发回去：后端是"给了就整段替换"，一条条发会把别的家顶掉
+  const r = await run('checkin_auto', { enabled: !!S.checkinEnabled, auto });
+  return r;
+}
+
+function renderCheckin() {
+  const host = $('checkin-body');
+  if (!host) return;
+  // 重建会让内容瞬间塌高，外层 pagebody 的 scrollTop 被浏览器夹回 0，先记住再还回去
+  const pb = host.closest('.pagebody');
+  const keep = pb ? pb.scrollTop : 0;
+  clear(host);
+  const d = S.checkin;
+  const st = (S.data && S.data.settings && S.data.settings.checkin) || {};
+  S.checkinAuto = S.checkinAuto || st.auto || {};
+  S.checkinMute = S.checkinMute || st.remind_mute || {};
+  S.checkinEnabled = st.enabled;
+  host.appendChild(el('div', { class: 'hintline' },
+    el('span', {}, '查状态是只读的，随时可以刷；'),
+    el('b', {}, '领取是写操作'),
+    el('span', {}, '——领走的当日名额退不回来，所以默认每家都要你亲手点一下。'
+      + '勾了「自动领」的那几家，驾驶舱会在时间窗里挑一天里的一次自己领，同一家一天只跑一次。'
+      + '「提醒」默认开着：到点把今天还没领的报一次，一天只报一次，不催第二遍。'
+      + '厂商没给状态接口、或领取要过验证码的，这里一律标「不可自动」，但照样会提醒你。')));
+  const bar = el('div', { class: 'cibar' },
+    el('label', { class: 'cisw' }, (() => {
+      const cb = el('input', { type: 'checkbox' });
+      cb.checked = !!st.enabled;
+      cb.addEventListener('change', async () => {
+        S.checkinEnabled = cb.checked;
+        await run('checkin_auto', { enabled: cb.checked, auto: S.checkinAuto || {} });
+      });
+      return cb;
+    })(), '允许自动签到'));
+  const from = el('input', { type: 'number', min: 0, max: 23, value: st.window_start ?? 6, class: 'cinum' });
+  const to = el('input', { type: 'number', min: 1, max: 24, value: st.window_end ?? 12, class: 'cinum' });
+  bar.appendChild(el('span', { class: 'cilab' }, '自动领时间窗'));
+  bar.appendChild(from);
+  bar.appendChild(el('span', { class: 'cilab' }, '点到'));
+  bar.appendChild(to);
+  // 提醒：默认开。到点把"今天还有几家没领"报一次，一天只报一次
+  const warn = el('input', { type: 'checkbox' });
+  warn.checked = st.remind !== false;
+  warn.addEventListener('change', async () => {
+    await run('checkin_auto', { remind: warn.checked });
+  });
+  bar.appendChild(el('label', { class: 'cisw' }, warn, '到点提醒'));
+  const at = el('input', { type: 'text', value: st.remind_at || '10:05', class: 'cinum wide', title: '每天几点提醒（HH:MM，按本机时间）' });
+  bar.appendChild(at);
+  bar.appendChild(btn('保存', 'sm', async () => {
+    await run('checkin_auto', {
+      enabled: !!S.checkinEnabled, auto: S.checkinAuto || {},
+      window_start: Number(from.value) || 0, window_end: Number(to.value) || 24,
+      remind_at: /^\d{1,2}:\d{2}$/.test(at.value.trim()) ? at.value.trim() : '10:05',
+    });
+  }));
+  bar.appendChild(el('span', { class: 'cilab' },
+    d && d.placeholder ? '正在问各家…'
+      : d && d.fetched_at
+        ? `状态查于 ${stampTime(d.fetched_at)}${d.refreshing || ciLoading ? ' · 正在刷新…' : ''}`
+        : '还没查过'));
+  host.appendChild(bar);
+  if (!d || !d.ok) {
+    host.appendChild(el('div', { class: 'qempty' }, `读不到签到状态：${(d && d.msg) || '没数据'}`));
+    return;
+  }
+  const items = d.items || [];
+  // 两级：产品行 + 它名下的账号行（`scope:"account"`，`parent` 指着产品）。
+  // 账号行只有"这台机器上每个号都留着自己那份登录态"的产品才有（现在 Qoder 系与 WorkBuddy 系）——
+  // 其余几家整机一份登录态，硬拆只会给出串号的假答案，所以只有产品行。
+  const prods = items.filter((x) => x.scope !== 'account');
+  const today = (items[0] && items[0].today) || '';
+  const go = prods.filter((x) => x.claimable === true && !x.error);
+  const nAcc = items.length - prods.length;
+  $('checkin-count').textContent = d.placeholder
+    ? '正在读各家状态…'
+    : `${prods.filter((x) => x.signed_today === true).length} 家已签 · ${go.length} 家可领`
+      + (nAcc ? ` · 另有 ${nAcc} 个账号单独看着` : '');
+  if (!items.length) host.appendChild(el('div', { class: 'qempty' }, '一个都没查到'));
+  // 表头 + 所有行共用这一个 grid：列宽定义一次，同类内容不可能错位。
+  // **列表本身是纯 UI，不等任何接口**：一次都没查到时后端会先给一份占位行（状态列写"查询中"），
+  // 查过的直接把上次那份摆出来——以前这里要等六家接口全回来才画第一行。
+  const grid = el('div', { class: 'citab' });
+  for (const c of CI_COLS) grid.appendChild(el('div', { class: `ci-h${c === '产品' ? ' l' : ''}` }, c));
+  // 分隔线一格一条，落点就跟着每格自己的高度跑（带 align-self:center 的那几格只有内容高），
+  // 一行里会出现两三种不同的 y——就是"线不对齐"。改成一行一条、跨满整行。
+  S.ciFold = S.ciFold || {};
+  for (const it of prods) {
+    const kids = items.filter((x) => x.scope === 'account' && x.parent === it.product);
+    const folded = !!S.ciFold[it.product];
+    const agg = kids.length
+      ? { done: kids.filter((x) => x.signed_today === true).length, total: kids.length }
+      : null;
+    ciCells(grid, it, !!(S.checkinAuto || {})[it.product], { kids: kids.length, folded, agg });
+    ciRule(grid);
+    if (folded) continue;
+    for (const k of kids) { ciCells(grid, k, false, { account: true }); ciRule(grid); }
+  }
+  host.appendChild(grid);
+  // 还在等它到账的那几家：写明白"在等什么、等了多久"，别让她以为忘了
+  const pend = Object.values((d.state && d.state.pending) || {});
+  if (pend.length) {
+    host.appendChild(el('div', { class: 'cipend' },
+      el('b', {}, '正在等到账'),
+      ...pend.map((p) => el('span', { class: 'cihit' },
+        `${p.label || p.today || ''}：${p.expect || '今天这份积分'}还没结算到账，驾驶舱每几分钟替你看一次，`
+        + '到账了会在这里提示你（这是服务端按天批量发放的，发放时刻不固定）'))));
+  }
+  const log = ((d.state && d.state.log) || []).slice(-6).reverse();
+  if (log.length) {
+    host.appendChild(el('div', { class: 'cilog' },
+      el('b', {}, '最近领过的'),
+      ...log.map((x) => el('span', { class: 'cihit' },
+        `${x.at || ''} ${CI_NAMES[x.store] || x.store} · `
+        + (x.claimed ? `领到 ${x.credit != null ? x.credit : ''}` : x.already ? '已领过' : `没领成：${x.message || x.error || ''}`)))));
+  }
+  if (today) host.appendChild(el('div', { class: 'cihint' }, `厂商侧的「今天」按本机日期算：${today}`));
+  if (pb) pb.scrollTop = keep;
 }
 
 /* ---------------- 协作（AgentHub 工作流看板 iframe） ---------------- */
@@ -501,7 +1258,7 @@ function renderToolbar(d) {
   if (!app) { cap.hidden = true; hint.hidden = true; return; }
   cap.hidden = false;
   cap.className = `pill ${app.isolatable ? 'yes' : 'no'}`;
-  cap.append(app.isolatable ? '可多开' : '仅可换号');
+  cap.append(app.isolatable ? '可多开' : (app.shared_profile ? '账号共用一份档案' : '仅可换号'));
   hint.hidden = false;
   const forget = $('btn-forget');
   if (forget) forget.hidden = !(app.removed);
@@ -511,10 +1268,17 @@ function renderToolbar(d) {
       : '未找到该程序的可执行文件，无法启动；若已卸载可从列表忽略它。');
   } else if (app.isolatable) {
     hint.append('这类程序支持独立数据目录：每个账号一份目录，可同时开多个窗口。点「＋ 添加账号」按向导走。');
+  } else if (app.shared_profile) {
+    hint.append(app.auth_switch
+      ? '该程序不能同时多开，几个账号还共用同一份档案。驾驶舱存过哪个号的登录态，就能一键切过去（会重启一次客户端——它只在启动时读登录文件，这次重启省不掉）；'
+        + '没存过的号先在程序里登一次，登进来我们自动收下这份登录态，以后来回都是一键。'
+      : '该程序会把第二次启动转交给已开窗口，不能同时多开；它名下几个账号又共用同一份档案，'
+        + '所以切换账号就在程序里做：退出登录 → 登另一个号。不用关掉程序，驾驶舱不搬文件、也不会结束任何进程，'
+        + '登进来之后对应那张卡会自己标成「本机登录中」。');
   } else {
     hint.append(
       '该程序会把第二次启动转交给已开窗口，因此不能同时多开。多账号请用「设为当前」换号：'
-      + '把默认档案目录指向某个账号的目录（零额外空间），一次登录一个账号，随时切回。');
+      + '把默认档案目录指向某个账号的目录（零额外空间），一次登录一个账号，随时切回。换号要先关掉该程序窗口。');
   }
   // 换号记录指向一个已被删掉的账号：档案目录还挂着 junction，程序会读到一个不存在的档案。
   // 不给个还原入口，用户只能看着侧栏那个失效的 ⇄ 标记发愁（ZCode 就卡在这）
@@ -565,7 +1329,7 @@ function staleNote(q) {
   return el('div', { class: 'stale-note', title: q.live_error || '' },
     el('b', {}, expired ? '⚠ 登录令牌已过期 · 下面是旧缓存' : '⚠ 读不到服务端 · 下面是旧缓存'),
     el('span', {}, expired
-      ? '打开一次该产品让它自动续期，或重新登录后再点「从本机读取」'
+      ? '打开一次该产品让它自动续期，或重新登录后再点一次卡片上的「刷新额度」'
       : '这份数是客户端上次联网时留下的，可能已经过期'));
 }
 
@@ -629,14 +1393,14 @@ function quotaMiss(q) {
   const reason = String(q.stale_hint || q.live_error || '').trim();
   // 还没读过（fetched_at 都没有）不能说成"厂商没这一项"——那是没读，不是读不到
   if (!q.fetched_at && !q.stale && !reason) {
-    return '还没读到额度　点卡片上的「读余额」，或「账号设置 → 从本机读取 / 贴官网积分页截图识别」';
+    return '还没读到额度　点卡片上的「↻ 刷新额度」，或「账号设置 → 额度与用量 → 贴官网积分页截图识别」';
   }
   const head = q.stale
     ? '这个产品的额度读不到：服务端没读成，缓存里也没有可用额度记录'
     : '这个产品的额度读不到——厂商接口里没有这一项，或本机还没有可读的登录态';
   const act = q.stale
-    ? '让该产品重新登录一次，再点「从本机读取」'
-    : '能本机直读的点「从本机读取」，读不到的贴官网积分页截图识别';
+    ? '让该产品重新登录一次，再点一次卡片上的「刷新额度」'
+    : '能本机直读或能登官网的点「刷新额度」，两条路都读不到的贴官网积分页截图识别';
   return [head, reason ? `原因：${reason}` : '', act].filter(Boolean).join('　');
 }
 
@@ -791,7 +1555,18 @@ function detailStamp(q) {
   const at = q.detail_at ? stampTime(q.detail_at) : '';
   if (!s && !at) return '';
   return `逐笔明细：${s || '来源未记'}${at ? ` · 截至 ${at}` : ''}`
-    + (q.detail_stale ? '（比上面的汇总数旧，点「读官网逐包额度」补最新的）' : '');
+    + (q.detail_stale ? '（比上面的汇总数旧，点卡片上的「刷新额度」补最新的）' : '');
+}
+
+// 官网那次读数没成：逐包额度和各自的到期时间只有官网给，卡上必须留一句
+// "为什么没补上、下一步点哪儿"——后端只在真读成时才清空它，所以这句会一直跟着这张卡，
+// 直到她把明细补回来。不写这句，卡片就只剩"明细是某天读的"，看起来像读数坏了。
+function webNote(q) {
+  const e = String(q.web_error || '').trim();
+  if (!e || q.stale) return null; // 已经整块标成旧缓存了，不再叠第二句
+  return el('div', { class: 'stale-note', title: e },
+    el('b', {}, '⚠ 官网逐包明细没读成'),
+    el('span', {}, `${e}　点「↻ 刷新额度」会把这个号自己的官网登录窗口打开。`));
 }
 
 function quotaBox(i) {
@@ -799,6 +1574,8 @@ function quotaBox(i) {
   const box = el('div', { class: `quota${q.stale ? ' stale' : ''}` });
   const note = staleNote(q);
   if (note) box.appendChild(note);
+  const wn = webNote(q);
+  if (wn) box.appendChild(wn);
   const groups = quotaRows(i);
   if (!groups.length) {
     if (q.local_used) {
@@ -916,6 +1693,245 @@ function stampTime(sec) {
   return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`;
 }
 
+/* 按天消耗的两张图：波形图（近期走势）+ 热力图（近一年分布）。
+   数据源只有 WorkBuddy 系给得出——它的本地库逐会话记了各资源包扣掉多少 credits。
+   别的产品官方只给余额和逐笔到账时刻，没有逐笔消耗时刻，所以读不到就整块不出现：
+   摆一张空图占位等于骗人（同"官方没给总额不许当 0"那是一条判据）。 */
+const TREND_RANGES = [30, 90, 365];
+
+function svgNode(tag, attrs) {
+  const n = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+}
+
+/* 稀疏的"有数的那几天"要补成连续日序再画：热力图按列=周对齐，
+   波形图若不补零，三天没开机会被画成"消耗骤降"，那是把缺数据说成省着用。 */
+function trendSeries(t) {
+  if (!t || !Array.isArray(t.days) || !t.days.length) return null;
+  const sum = new Map();
+  for (const d of t.days) {
+    const k = String(d.date || '').slice(0, 10);
+    if (!k) continue;
+    const cur = sum.get(k) || { v: 0, n: 0 };
+    cur.v += numv(d.credits) || 0;
+    cur.n += numv(d.sessions) || 0;
+    sum.set(k, cur);
+  }
+  const pad = (x) => String(x).padStart(2, '0');
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setDate(start.getDate() - 364);
+  start.setDate(start.getDate() - start.getDay());
+  const cells = [];
+  for (const dt = new Date(start); dt <= today; dt.setDate(dt.getDate() + 1)) {
+    const k = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+    const hit = sum.get(k);
+    cells.push({ date: k, v: hit ? hit.v : 0, n: hit ? hit.n : 0 });
+  }
+  const nz = cells.map((c) => c.v).filter((x) => x > 0).sort((a, b) => a - b);
+  const cut = (p) => (nz.length ? nz[Math.min(nz.length - 1, Math.floor(nz.length * p))] : 0);
+  // 厂商自己给了分档阈值（Qoder 那条热力图接口就带 levels 四档）就照它的分，
+  // 没给才按我们自己的分位数切——同一份数在官网和驾驶舱分色不同会被当成读数不一致
+  const given = Array.isArray(t.levels) ? t.levels.filter((x) => typeof x === 'number') : [];
+  return {
+    cells, unit: t.unit || 'credits', total: numv(t.total),
+    peak: numv(t.peak), peakDate: String(t.peak_date || ''),
+    counted: nz.length, from: t.from || cells[0].date, to: t.to || cells[cells.length - 1].date,
+    // 这份序列带不带"场会话"：Qoder 那条只有积分数，硬凑一句"0 场会话"就是假话
+    hasSessions: t.days.some((d) => (numv(d.sessions) || 0) > 0),
+    srcNote: String(t.source || ''),
+    levels: given.length === 4 ? given : [cut(0.2), cut(0.4), cut(0.6), cut(0.8)],
+    levelsFromVendor: given.length === 4,
+  };
+}
+
+function heatLevel(v, lv) {
+  if (!v || v <= 0) return 0;
+  for (let i = 0; i < lv.length; i++) if (v <= lv[i]) return i + 1;
+  return 5;
+}
+
+function trendWave(s, range) {
+  const pts = s.cells.slice(-Math.min(range, s.cells.length));
+  const W = 1000, H = 150, TOP = 12, BOT = 16;
+  const max = Math.max(...pts.map((p) => p.v), 1);
+  const dx = pts.length > 1 ? W / (pts.length - 1) : 0;
+  const xy = pts.map((p, i) => [i * dx, H - BOT - (p.v / max) * (H - TOP - BOT)]);
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  // Catmull-Rom 转三次贝塞尔；控制点的 y 按相邻两点夹住，否则低谷会被冲过 0 变成负数
+  let d = `M${xy[0][0].toFixed(2)},${xy[0][1].toFixed(2)}`;
+  for (let i = 0; i < xy.length - 1; i++) {
+    const p0 = xy[i - 1] || xy[i], p1 = xy[i], p2 = xy[i + 1], p3 = xy[i + 2] || p2;
+    const lo = Math.min(p1[1], p2[1]), hi = Math.max(p1[1], p2[1]);
+    const c1 = clamp(p1[1] + (p2[1] - p0[1]) / 6, lo, hi);
+    const c2 = clamp(p2[1] - (p3[1] - p1[1]) / 6, lo, hi);
+    d += ` C${(p1[0] + dx / 3).toFixed(2)},${c1.toFixed(2)}`
+      + ` ${(p2[0] - dx / 3).toFixed(2)},${c2.toFixed(2)}`
+      + ` ${p2[0].toFixed(2)},${p2[1].toFixed(2)}`;
+  }
+  const svg = svgNode('svg', {
+    class: 'wave', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none',
+  });
+  svg.appendChild(svgNode('path', {
+    class: 'wfill', d: `${d} L${W},${H - BOT} L0,${H - BOT} Z`,
+  }));
+  svg.appendChild(svgNode('line', {
+    class: 'wbase', x1: 0, y1: H - BOT, x2: W, y2: H - BOT,
+  }));
+  svg.appendChild(svgNode('path', {
+    class: 'wline', d, 'vector-effect': 'non-scaling-stroke',
+  }));
+  const sel = S.trendSel || '';
+  pts.forEach((p, i) => {
+    const r = svgNode('rect', {
+      class: `whit${p.date === sel ? ' on' : ''}`,
+      x: (xy[i][0] - dx / 2).toFixed(2), y: 0,
+      width: Math.max(dx, 2).toFixed(2), height: H,
+    });
+    const tip = svgNode('title', {});
+    tip.textContent = `${p.date}　${nfmt(p.v)} ${utxt(s.unit)}`
+      + (p.n ? ` · ${p.n} 场会话` : '');
+    r.appendChild(tip);
+    r.addEventListener('click', () => pickTrend(p));
+    svg.appendChild(r);
+  });
+  // 选中那天钉一条竖导引线。不用 circle：preserveAspectRatio="none" 会把它拉成椭圆，
+  // 而带 non-scaling-stroke 的竖线不管窗口多宽都是 1px
+  const si = pts.findIndex((p) => p.date === sel);
+  if (si >= 0) {
+    svg.appendChild(svgNode('line', {
+      class: 'wguide', x1: xy[si][0].toFixed(2), y1: TOP - 7,
+      x2: xy[si][0].toFixed(2), y2: H - BOT, 'vector-effect': 'non-scaling-stroke',
+    }));
+  }
+  const box = el('div', { class: 'wavewrap' },
+    el('div', { class: 'wavey' },
+      el('span', { style: `top:${TOP}px` }, nfmt(max)),
+      // 大数取半档要取整：1,498,222,653 的半档写成 "276,721,718.5" 是噪声不是精度
+      el('span', { style: `top:${(H - BOT) / 2}px` }, nfmt(max >= 1000 ? Math.round(max / 2) : max / 2)),
+      el('span', { style: `top:${H - BOT}px` }, '0')),
+    el('div', { class: 'wavec' }, svg),
+    el('div', { class: 'wavex' },
+      // 近一年这个窗口横跨两个日历年，只写 MM-DD 两头会看不出隔了多久
+      el('span', {}, pts[0].date),
+      el('span', {}, pts[pts.length - 1].date)));
+  return box;
+}
+
+/* 点任意一天就把那天钉住：波形图与热力图共用一个选中态，两边同时高亮，
+   数就常驻在图下面那行里。原来只有悬停 tooltip，鼠标一移开数就没了——
+   她要的是能照着抄进笔记的值，不是划过才闪现的提示。 */
+function pickTrend(p) {
+  S.trendSel = S.trendSel === p.date ? '' : p.date;
+  renderDetail();
+  // 重建浮窗会把热力图的横向滚动位置打回最左（那里正好是一整片空格子），
+  // 所以点完立刻再滚回最近这一个月
+  const w = document.querySelector('#imodal .heatwrap');
+  if (w) w.scrollLeft = w.scrollWidth - w.clientWidth;
+}
+
+function trendHeat(s) {
+  const sel = S.trendSel || '';
+  const weeks = [];
+  for (let i = 0; i < s.cells.length; i += 7) weeks.push(s.cells.slice(i, i + 7));
+  const grid = el('div', { class: 'heat' });
+  const mons = el('div', { class: 'hmonths' });
+  let lastMon = -1;
+  weeks.forEach((wk, wi) => {
+    const head = wk[0];
+    const m = Number(String(head.date).slice(5, 7));
+    // 只在月份第一次出现的那一列打标签，跟官网那种"每月一个刻度"一个画法
+    if (m !== lastMon) {
+      lastMon = m;
+      mons.appendChild(el('span', { style: `left:${wi * 14}px` }, `${m}月`));
+    }
+    for (let r = 0; r < 7; r++) {
+      const c = wk[r];
+      // 最后一周不满七天：缺的那几格是"还没到的日子"，画成 0 消耗等于谎报，
+      // 但也不能不占位——grid 是按列铺的，少一格后面整列都会错位
+      if (!c) {
+        grid.appendChild(el('i', { class: 'hc void' }));
+        continue;
+      }
+      const cell = el('i', {
+        class: `hc l${heatLevel(c.v, s.levels)}${c.date === sel ? ' sel' : ''}`,
+        title: `${c.date}　${nfmt(c.v)} ${utxt(s.unit)}${c.n ? ` · ${c.n} 场会话` : ''}`,
+      });
+      cell.addEventListener('click', () => pickTrend(c));
+      grid.appendChild(cell);
+    }
+  });
+  return el('div', { class: 'heatwrap' }, el('div', { class: 'heatbox' }, mons, grid));
+}
+/* 热力图一年宽 739px、面板只有 500px 宽，默认停在最左等于先给她看一整片空格子。
+   渲染完滚到最右，进来先看见的就是最近这一个月。
+   一次 rAF 不够：浮窗重绘时这个元素可能还没接进文档，scrollWidth 量出来是 0，
+   所以按帧重试到真能量出可滚的宽度为止（最多 8 帧，之后就不管了）。 */
+function heatScrollToRecent(box, tries = 0) {
+  const w = box.isConnected ? box.querySelector('.heatwrap') : null;
+  const max = w ? w.scrollWidth - w.clientWidth : 0;
+  if (max > 0) {
+    w.scrollLeft = max;
+    return;
+  }
+  if (tries < 8) requestAnimationFrame(() => heatScrollToRecent(box, tries + 1));
+}
+
+function trendCharts(q) {
+  const t = q && q.trend;
+  if (!t) return null;
+  if (t.error) {
+    return el('div', { class: 'qnote' }, `按天消耗读不到：${t.error}`);
+  }
+  const s = trendSeries(t);
+  if (!s) return null;
+  const range = S.trendRange || 90;
+  const chips = TREND_RANGES.map((r) => {
+    const b = el('button', { type: 'button', class: `tchip${r === range ? ' on' : ''}` },
+      r === 365 ? '近一年' : `近 ${r} 天`);
+    b.addEventListener('click', () => { S.trendRange = r; renderDetail(); });
+    return b;
+  });
+  const box = el('div', { class: 'trend' });
+  box.appendChild(el('div', { class: 'trhead' },
+    el('b', {}, '消耗趋势'),
+    el('span', { class: 'trsum' },
+      `近一年合计 ${nfmt(s.total)} ${utxt(s.unit)} · ${s.counted} 天有消耗`
+      + (s.peak ? ` · 峰值 ${s.peakDate} ${nfmt(s.peak)}` : '')),
+    el('span', { class: 'trrange' }, ...chips)));
+  const picked = s.cells.find((c) => c.date === (S.trendSel || ''));
+  const pick = el('div', { class: 'trpick' },
+    picked
+      ? el('span', {}, `${picked.date.slice(0, 4)}年${Number(picked.date.slice(5, 7))}月${Number(picked.date.slice(8, 10))}日　`
+        + `${nfmt(picked.v)} ${utxt(s.unit)}`
+        + (picked.v <= 0 ? ' · 那天没有消耗记录'
+          : s.hasSessions && picked.n ? ` · ${picked.n} 场会话` : ''))
+      : el('span', { class: 'trhint' }, '点曲线或方格上的任意一天，这里会钉住那天的消耗'));
+  if (picked) {
+    const cl = el('button', { type: 'button', class: 'tchip' }, '清除');
+    cl.addEventListener('click', () => { S.trendSel = ''; renderDetail(); });
+    pick.appendChild(cl);
+  }
+  box.appendChild(pick);
+  box.appendChild(trendWave(s, range));
+  box.appendChild(trendHeat(s));
+  // 滚到最右要等元素真的进了文档、有了布局再做，这里建好还没插入，scrollWidth 是 0
+  requestAnimationFrame(() => heatScrollToRecent(box));
+  const how = s.srcNote
+    ? `按天分桶来自 ${s.srcNote}`
+    : '归日按会话最后活动时间（跨天的会话整笔算到最后那天，不是逐笔流水）';
+  const lv = s.levelsFromVendor
+    ? '颜色分五档，阈值照厂商给的那份'
+    : '颜色按这一年内有消耗的那些天分五档';
+  box.appendChild(el('div', { class: 'trfoot' },
+    el('span', {}, `热力图一格是一天；${lv}；${how}。`),
+    el('span', { class: 'trlg' }, '少',
+      ...[1, 2, 3, 4, 5].map((k) => el('i', { class: `hc l${k}` })), '多')));
+  return box;
+}
+
 /* 账号设置里的「积分明细」整块：总览 + 每档一行 + 查看明细。版式照 WorkBuddy 官方。 */
 function quotaPanel(i) {
   const q = i.quota;
@@ -924,6 +1940,8 @@ function quotaPanel(i) {
   if (!groups.length) {
     // 一档都没有：明说读不到（带后端给的原因），不摆 0
     wrap.appendChild(el('div', { class: 'qempty', title: String(q.live_error || '').trim() }, quotaMiss(q)));
+    const t0 = trendCharts(q);
+    if (t0) wrap.appendChild(t0);
     return wrap;
   }
   const a = quotaAgg(groups);
@@ -992,6 +2010,8 @@ function quotaPanel(i) {
       g.scope ? el('div', { class: 'qgscope' }, `这一档只用于：${g.scope}`) : null,
       foot));
   }
+  const tc = trendCharts(q);
+  if (tc) wrap.appendChild(tc);
   return wrap;
 }
 /* 查看明细：照官方那层「平台奖励积分明细」——有效期内 / 已过期 两个页签 + 逐笔列表。
@@ -1091,6 +2111,20 @@ function identLine(i) {
   const id = i.identity || { state: 'none', label: '' };
   return el('div', { class: `ident ${id.state}` }, id.label);
 }
+// 「现在用的是哪个号」这一枚标记：能多开/靠 junction 换目录的产品看磁盘（⇄当前账号），
+// 几个账号共用一份档案的产品看客户端登录态（⇄本机登录中）——磁盘记录不会随登录变化。
+// 只有这个产品压根没有本机直读通道、登录态读不到时，才退回按档案认领关系标，并说明我们不知道登的是谁。
+function accountMark(i, app, shared) {
+  if (!shared) return i.swapped ? el('span', { class: 'swapmark' }, '⇄ 当前账号') : null;
+  if (i.logged_in) return el('span', { class: 'swapmark' }, '⇄ 本机登录中');
+  const mv = (app && app.machine && app.machine.value) || {};
+  if (app && app.local_quota && !mv.unsupported) return null;
+  return i.swapped
+    ? el('span', {
+      class: 'swapmark',
+      title: '这个程序没有本机直读通道，读不到现在登的是谁，只能按档案认领关系标出来',
+    }, '⇄ 当前账号') : null;
+}
 // 卡片上的数属于谁 ≠ 本机现在登的是谁。以前不一致时后端直接把新读数挡回去，
 // 界面就永远停在旧号身上，看起来像"刷新坏了"。现在把这件事写在卡片上并给出动作。
 function mismatchLine(i, app) {
@@ -1111,8 +2145,11 @@ function mismatchLine(i, app) {
     toast(r.msg || (r.ok ? '已改绑' : '改绑失败'), !!r.ok);
     if (r.ok) load();
   }, '把这张卡的名字与绑定的 userId 换成机器上现在登录的那个号，并按当前读数重写额度'));
-  n.append(btn('切到这张卡', 'sm', () => swapSetAndLaunch(i.app, i.name),
-    '先把默认档案换回这个账号，再打开程序——换过来之后读到的就是它的真数'));
+  n.append(btn(app && app.shared_profile ? '启动客户端' : '切换到此账号', 'sm',
+    () => swapSetAndLaunch(i.app, i.name),
+    app && app.shared_profile
+      ? '打开这个程序，在里面退出登录再登这张卡的号。共用一份档案的产品切换账号就在客户端里做：不关程序、不搬文件。'
+      : '先把默认档案换回这个账号，再打开程序——换过来之后读到的就是它的真数'));
   return n;
 }
 
@@ -1155,9 +2192,14 @@ function kindLabel(kind) {
 
 function card(i, app) {
   const canIso = !!(app && app.isolatable);
+  // 共用一份档案的产品：所有账号的数据都在默认位置那一份里，切换账号是客户端里的
+  // 退出登录/重新登录，磁盘上没有东西可换——这种卡一律不许走 swap_set
+  const shared = !!(app && app.shared_profile);
   // 主按钮 = 这个账号「现在能不能开、怎么开」。只有一个，避免"点了不知道会发生什么"
+  // 「窗口都关了、进程还挂着」不算开着：Electron 的主进程被结束后，崩溃上报那类子进程
+  // 还会在进程表里赖上一分钟左右，那期间把主按钮留在「■ 结束」上，看着就像按钮卡住了。
   let primary;
-  if (i.running || i.resident) {
+  if (i.running) {
     primary = btn('■ 结束', 'sm', () => run('kill', { app: i.app, name: i.name }),
       canIso
         ? '只结束这个账号自己的窗口，不影响同程序其它实例；未保存的内容会被强制中断'
@@ -1165,6 +2207,23 @@ function card(i, app) {
   } else if (canIso) {
     primary = btn('▶ 启动', 'primary sm', () => run('launch', { app: i.app, name: i.name }),
       '用这个账号自己的数据目录开一个新窗口，可以和其它账号同时开着');
+  } else if (shared) {
+    // 共用一份档案的产品：切号＝把那个号存过的登录态放回档案位置。
+    // 没存过的号只能先去登一次（登进来驾驶舱会自动收下那份登录态），我们绝不替她猜密码。
+    if (i.logged_in) {
+      primary = btn('▶ 打开', 'primary sm', () => openClient(i.app, i.name),
+        `这份档案现在登的就是「${i.name}」，打开就是它。不用换号，也不会动任何进程。`);
+    } else if (app.auth_switch && i.auth_pack) {
+      primary = btn('⇄ 切换到此账号', 'primary sm', () => authSwitch(i.app, i.name),
+        `把「${i.name}」存过的登录态写回 ${i.app_name} 的档案位置，然后自动重开客户端。\n`
+        + `会重启一次 ${i.app_name}（它只在启动时读登录文件），当前这个号的登录态在写之前会先收好，随时切得回来。`);
+    } else {
+      primary = btn('▶ 启动客户端', 'primary sm', () => openClient(i.app, i.name),
+        `打开 ${i.app_name}，在里面退出登录、再登「${i.name}」。\n`
+        + (app.auth_switch
+          ? '登进来之后驾驶舱会自动收下这个号的登录态（约 45 秒内），以后来回切都是一键。'
+          : '这类产品所有账号共用一份档案，切换就在客户端里完成：驾驶舱不搬文件、也不会关掉你的程序。'));
+    }
   } else if (i.swapped) {
     primary = btn('▶ 启动', 'primary sm', () => run('launch_app', { app: i.app, name: i.name }),
       `默认入口现在挂的就是「${i.name}」，打开就是它`);
@@ -1184,9 +2243,26 @@ function card(i, app) {
         ? btn('设为当前', 'sm', () => swapSet(i.app, i.name),
           '这个程序本来就能多开，通常不需要换号；只有在你想让开始菜单/任务栏也直接打开这个账号时才用')
         : null);
-  const pull = app && app.local_quota
-    ? btn('↻ 读余额', 'sm', () => pullLocal(i.app, i.name),
-      '解本机客户端自己存的积分（只读、不联网）。第一次读会把 userId 绑到这个账号，之后每次读都先校验是不是同一个号，防止把 A 号的余额记到 B 号头上')
+  // 一颗按钮读全部：能走官网就走官网（只有那里给得出每个积分包各自的到期时间），
+  // 读不到才退回本机/服务端汇总。以前两条路各摆一颗按钮，她的预期是"点一次就都该有"
+  const pull = app && (app.local_quota || app.web_quota)
+    ? btn('↻ 刷新额度', 'sm', () => refreshQuota(i.app, i.name),
+      '一次把这个号的额度读全：每个积分包各剩多少、各自什么时候作废、已用多少、每日消耗。\n'
+      + '读的是这个号自己的官网会话，跟这台机器的客户端现在登的是谁无关（一个号只需登一次）。\n'
+      + '官网读不到时会退回本机/服务端汇总，并当场说清缺了哪一层。')
+    : null;
+  // 能多开的产品（ZCode 这类）主按钮留给「启动」，一键切号作为次按钮放在旁边：
+  // 它们的登录态同样是全机一份，多开只是窗口多开，账号还是那一个
+  const jumpBtn = canIso && app && app.auth_switch && i.auth_pack && !i.logged_in
+    ? btn('⇄ 切换到此账号', 'sm', () => authSwitch(i.app, i.name),
+      `把「${i.name}」存过的登录态写回 ${i.app_name}，然后自动重开它。\n`
+      + '这个程序的登录态是全机一份，多开窗口并不会多开账号；当前号的登录态会在写之前先收好。')
+    : null;
+  // 残留进程只在真有残留的那一瞬出现：平时不占卡片位置，出现时正好是需要它的时刻
+  const reap = i.resident
+    ? btn(`■ 清残留 ×${i.procs}`, 'sm', () => run('kill', { app: i.app, name: i.name }),
+      '窗口已经关了，这几个进程还挂在系统里（Electron 的崩溃上报、工具进程常见，一般一分钟内自己就退）。'
+      + '不影响你重新打开，但会挡住换号、改名和归位——要立刻腾出来就点这一下')
     : null;
   const detail = btn('账号设置 ⚙', 'sm', () => openDetail(i.app, i.name),
     '打开这个账号的设置：账号信息 → 额度与用量 → 运行与换号 → 目录与数据 → 凭据与反代 → 删除账号');
@@ -1209,8 +2285,9 @@ function card(i, app) {
     el('div', { class: 'top' },
       el('div', {},
         el('div', { class: 'nm' }, i.name,
-          i.swapped ? el('span', { class: 'swapmark' }, '⇄ 当前账号') : null,
-          i.released ? el('span', { class: 'swapmark off' }, '已让位') : null),
+          accountMark(i, app, shared),
+          checkinMark(i),
+          i.released && !i.logged_in ? el('span', { class: 'swapmark off' }, '已让位') : null),
         el('div', { class: 'meta' },
           `${i.app_name} · ${kindLabel(i.kind)} · 建于 ${i.created}`),
         originText(i) ? el('div', { class: 'orig', title: i.seeded_from || '' }, originText(i)) : null,
@@ -1224,12 +2301,16 @@ function card(i, app) {
         ? `该账号有 ${i.procs} 个进程在跑，窗口开着`
         : (i.resident
           ? `窗口都关了，但还有 ${i.procs} 个进程驻留在后台：不算开着，会挡住换号和改名`
-          : (i.app_running ? '该程序有窗口在跑，但登的不是这个账号——要切过来先点「切到本账号并打开」' : '该账号当前没有窗口在运行')) },
+          : (i.app_running
+            ? (shared
+              ? '该程序有窗口在跑，登的是别的号——点「启动客户端」，在里面退出登录再登这个号就行，不用关程序'
+              : '该程序有窗口在跑，但登的不是这个账号——要切过来先点「切到本账号并打开」')
+            : '该账号当前没有窗口在运行')) },
         el('span', { class: i.resident ? 'dot idle' : 'dot' }),
         i.running ? (i.kind === 'cli' ? '运行中' : `运行中 ×${i.procs}`)
           : (i.resident ? `后台驻留 ×${i.procs}` : '未运行'))),
     qbox,
-    el('div', { class: 'acts' }, primary, swapBtn, pull, detail,
+    el('div', { class: 'acts' }, primary, reap, jumpBtn, swapBtn, pull, detail,
       el('span', { class: 'sp' }), delBtn),
     el('div', { class: 'peek' },
       hasQuota
@@ -1304,7 +2385,7 @@ function renderPerks(d) {
   // 正在填表时 4 秒轮询别重绘，否则输入到一半的字会被吞掉
   if (S.perkForm && host.querySelector('.perkform')) return;
   clear(host);
-  const addBtn = btn('＋ 记一条福利', S.perkForm ? 'sm' : 'primary sm',
+  const addBtn = btn('＋ 添加福利', S.perkForm ? 'sm' : 'primary sm',
     () => { S.perkForm = { item: null }; renderPerks(S.data); });
   const all = d.perks || [];
   const live = all.filter((p) => p.live);
@@ -2125,13 +3206,23 @@ async function bdDelete() {
 /* ---------------- 账号内部设置：一项一行，行下小字解释含义 ----------------
    分组顺序按一个人接手陌生账号时的提问顺序：这是谁的号 → 还剩多少额度 →
    怎么开它/换它 → 数据放在哪 → 接口令牌 → 收尾才是删号。 */
+/* 账号设置的左菜单。按标准菜单的形式定：前五项是**名词短语**（这块在讲什么），
+   最后一项是不可撤销的动作，单独一档、红字、前面有分隔线——菜单里"改设置"和
+   "删东西"永远不该长得一样。每一项底下的内容也按同一节奏排：小标题 → 说明 → 一行一项。 */
 const IN_SECTIONS = [
-  ['info', '账号信息'], ['quota', '额度与用量'], ['run', '运行与换号'],
-  ['data', '目录与数据'], ['auth', '凭据与反代'], ['danger', '删除账号'],
+  ['info', '概览'],
+  ['quota', '额度与用量'],
+  ['run', '运行与账号切换'],
+  ['data', '目录与数据'],
+  ['auth', '凭据与接入'],
+  ['danger', '删除账号'],
 ];
 
 async function openDetail(app, name, sec = 'info') {
   S.detail = { app, name, sec, dirty: false, meta: {}, size: null, scroll: 0 };
+  // 换一张卡就把选中的天清掉：上一张卡选中的日期在这张卡的序列里可能根本没有，
+  // 留着会出现"高亮在热力图上、数值行却写着另一天"
+  S.trendSel = '';
   $('imodal').hidden = false;
   renderDetail();
   try { S.detail.meta = await invoke('get_meta', { app, name }) || {}; }
@@ -2191,7 +3282,7 @@ function renderDetail() {
   $('im-sub').textContent =
     `${kindLabel(i.kind)}`
     + ` · 建于 ${i.created} · ${i.running ? `${i.procs} 个进程在跑` : '未运行'}`
-    + (i.swapped ? ' · 当前默认账号' : '');
+    + (a.shared_profile ? (i.logged_in ? ' · 本机登录中' : '') : (i.swapped ? ' · 当前默认账号' : ''));
 
   /* ---- 各分组的行 ---- */
   const secs = {};
@@ -2199,22 +3290,54 @@ function renderDetail() {
   const sub = (t, note) => [el('h3', { class: 'subsec' }, t),
     note ? el('p', { class: 'subsec-desc' }, note) : null];
 
+  const shared = !!a.shared_profile;
   const launchDesc = i.running
     ? (a.isolatable
       ? '只结束这个账号自己的窗口，不动同程序的其它实例；未保存的内容会被强制中断'
       : '该程序不能多开，这会结束整个程序的窗口；未保存的内容会被强制中断')
     : (a.isolatable
       ? '用该账号独立的数据目录开一个新窗口，可与其他账号同时运行；首次打开需在窗口里登录'
-      : '直接打开主程序（走默认档案）。该程序会把第二次启动转交给已开窗口，所以唤出来的可能是当前默认账号；要指定这个账号请先换号');
+      : shared
+        ? (i.logged_in
+          ? `这份档案现在登的就是「${name}」，打开就是它`
+          : `打开程序，在里面退出登录、再登「${name}」。共用一份档案的产品切号就在客户端里做：不用关程序，也不动任何文件`)
+        : '直接打开主程序（走默认档案）。该程序会把第二次启动转交给已开窗口，所以唤出来的可能是当前默认账号；要指定这个账号请先换号');
   // 多开能力决定下面两个按钮走哪条路，所以放在最前面当上下文，别混在动作里
-  const runRows = [row('多开能力', a.isolatable
+  const runRows = [
+    ...sub('多开能力', '这个程序能不能同时开多个账号的窗口——它决定了下面「启动」走哪条路。'
+      + '判定是内核在这台机器上实测出来的，不是你填的。'),
+    row('多开能力', a.isolatable
     ? '内核实测过：这个程序接受独立数据目录，可以和别的账号同屏开窗口'
-    : '实测结论：第二次启动会被已开窗口接管，所以只能一次一个账号。判定错了可在 设置 → 高级 → 重置多开判定 重来',
-    chip(a.isolatable ? '可多开' : (a.kind === 'cli' ? '终端' : '仅可换号'), a.isolatable ? 'official' : 'soon'))];
+    : shared
+      ? '实测结论：第二次启动会被已开窗口接管，只能一次一个账号。它名下几个账号还共用同一份档案，'
+        + '所以切换账号是在程序里退出登录再登录，驾驶舱不搬文件、也不会为了换号去结束你的进程。'
+        + '判定错了可在 设置 → 高级 → 重置多开判定 重来'
+      : '实测结论：第二次启动会被已开窗口接管，所以只能一次一个账号，换号靠把默认档案指向账号目录。'
+        + '判定错了可在 设置 → 高级 → 重置多开判定 重来',
+    chip(a.isolatable ? '可多开' : (shared ? '共用一份档案' : (a.kind === 'cli' ? '终端' : '仅可换号')), a.isolatable ? 'official' : 'soon'))];
+  runRows.push(...sub('启动与结束', i.running
+    ? '现在有窗口在跑，这一行是把它结束掉。'
+    : '这一行是把这个账号打开——共用一份档案的产品，打开的就是程序本身。'));
   runRows.push(row(i.running ? '结束运行' : (a.isolatable ? '启动这个账号' : '打开主程序'), launchDesc,
     btn(i.running ? '■ 结束' : '▶ 启动', i.running ? 'danger sm' : 'primary sm',
       () => run(i.running ? 'kill' : (a.isolatable ? 'launch' : 'launch_app'), { app, name }))));
-  if (a.swap_ok) {
+  if (shared) {
+    const pack = i.auth_pack;
+    runRows.push(...sub('换到这个账号 / 换回去', '一次只登一个号的产品，切号就是这一件事。'));
+    runRows.push(row('切换账号',
+      i.logged_in
+        ? `这份档案现在登的就是「${name}」，不用切。`
+        : pack
+          ? `${a.name} 存过这个号的登录态（收在 ${stampTime(pack.at)}）。点「切换到此账号」依次是：`
+            + '收好当前号的登录态 → 结束客户端 → 把这份写回档案位置 → 重新打开。'
+            + '客户端只在启动时读这份文件，所以这一次重启是必要的；换完这张卡会自己标成「本机登录中」。'
+          : `这个号还没存过登录态。${a.name} 几个账号共用默认位置那一份档案，所以先在程序里退出登录、登它一次——`
+            + '登进来驾驶舱会自动收下这份登录态（约 45 秒内），以后来回切都是一键。',
+      i.logged_in ? chip('本机登录中', 'official')
+        : a.auth_switch && pack
+          ? btn('⇄ 切换到此账号', 'primary sm', () => authSwitch(app, name), '写回这个号存过的登录态，并自动重开客户端')
+          : btn('启动客户端', 'primary sm', () => openClient(app, name), '只把程序打开，不做任何换号动作')));
+  } else if (a.swap_ok) {
     // 标题是"还原"时描述必须讲还原，别一套话术挂在两个相反的动作上
     runRows.push(row(i.swapped ? '还原默认档案' : '设为当前账号（换号）',
       i.swapped
@@ -2231,13 +3354,15 @@ function renderDetail() {
         el('span', { class: 'kv' }, i.usage
           ? `入 ${fmtTok(i.usage.input)} / 出 ${fmtTok(i.usage.output)} / 共 ${fmtTok(i.usage.total)}`
           : '未统计'),
-        btn('抓用量', 'sm', () => run('fetch_usage', { app, name }))))
+        btn('刷新用量', 'sm', () => run('fetch_usage', { app, name }))))
     : null;
-  secs.info = () => secPanel('账号信息',
+  secs.info = () => secPanel('概览',
+    ...sub('这是哪个号', '这一组只说"它是谁"：属于哪个程序、在驾驶舱里叫什么名字。'),
     row('所属程序', '「建于」是这张卡在驾驶舱里登记的日子，不是这个产品的安装时间',
       el('span', { class: 'kv' }, `${i.app_name} · ${kindLabel(i.kind)} · 建于 ${i.created}`)),
     row('账号名', '列表、顶栏临期提醒、备份文件名都按这个名字认人。数据目录会跟着一起改名，但程序正在跑、或这个账号正被挂成默认档案时目录挪不动 —— 那种情况先只改名字，等关掉程序再改一次名字就同步了',
       btn('改名', 'sm', () => renameAccount(app, name))),
+    ...sub('登录与档案', '这个号现在登没登、这份档案从哪来——换号、删号之前先看这两行。'),
     row('登录状态', i.identity && i.identity.state === 'logged'
       ? '已检测到登录痕迹，可以直接用'
       : '还没检测到登录：换号切到空目录会让程序显示未登录甚至黑屏，属正常，登录一次即可',
@@ -2262,21 +3387,19 @@ function renderDetail() {
         + '有效期内几笔、已过期几笔、各自什么时候作废（按到期时间从最早的要作废的排起）。'
         + '官方接口没给的数就写"没给"，不当 0 算比例。30 天内变黄、7 天内变红，顶栏「临期 N」汇总，7 天内弹窗提醒一次。'),
       quotaPanel(i),
-      ...sub('数据从哪来', '下面配好任一种，上面的明细就会自己更新；界面上没有手填入口。'),
-      ...(a.local_quota ? [row('本机直读', meta.quota_user_id
-        ? '这个档案已绑定某个登录态：每次读都会先校验本机当前登的是不是同一个号，不是就拒绝写入，避免把 A 号的余额记到 B 号头上'
-        : '直接解本机客户端自己存的积分（DPAPI + v10/AES-GCM，不联网、不改任何产品文件）。第一次读会把 userId 绑定到这个账号，并顺手把账号名改成真实用户名',
+      ...sub('数据从哪来', '读数只有卡片上那一颗「↻ 刷新额度」：能走官网就走官网（用量、每一个积分包、各自的到期时间、每日消耗一次读全），'
+        + '官网读不到才退回本机/服务端汇总，并把缺了哪一层当场说清楚。下面配好任一种，明细就会自己更新；界面上没有手填入口。'),
+      ...(a.local_quota || a.web_quota ? [row(a.web_quota ? '这个号的官网会话' : '本机直读',
+        a.web_quota
+          ? '每个号一份独立会话（存在数据根 webprofile/这个产品/这个号/ 下面），所以点这张卡的刷新读出来的就是这个号的真数，'
+            + '跟这台机器的客户端现在登的是谁无关。第一次登录一次，之后不用再登；不碰你的浏览器，也不碰这个产品自己的档案。'
+          : '直接解本机客户端自己存的积分（DPAPI + v10/AES-GCM，不联网、不改任何产品文件）。'
+            + '第一次读会把 userId 绑定到这个账号，并顺手把账号名改成真实用户名；之后每次读都先校验是不是同一个号，不是就拒绝写入。',
         el('div', { class: 'ctlrow' },
           el('span', { class: 'kv' }, meta.quota_account ? `已绑定 ${meta.quota_account}` : '未绑定'),
-          btn('从本机读取', 'sm', () => pullLocal(app, name))))] : []),
-      ...(a.web_quota ? [row('官网个人主页',
-        '本机那条接口只给「主额度 + 附加包」两个汇总数，看不到每个资源包各自什么时候作废。'
-        + '这一条读的是官网用量页：驾驶舱自己开一个登录窗口，你在那儿登录一次，'
-        + '之后逐包额度（额度 / 已用 / 到期时间）由它带着自己的会话去取，读回来直接覆盖上面的明细。'
-        + '登录态存在驾驶舱数据根的 webprofile/ 里，不碰你的浏览器，也不碰这个产品自己的档案。',
-        el('div', { class: 'ctlrow' },
-          btn('打开官网登录窗口', 'sm', () => webLogin(app, name)),
-          btn('读官网逐包额度', 'sm', () => webFetch(app, name))))] : []),
+          btn('↻ 刷新额度', 'sm', () => refreshQuota(app, name)),
+          ...(a.web_quota ? [btn('登录这个号', 'sm', () => webLogin(app, name),
+            '只开这个号自己的官网窗口；登一次，之后刷新额度就带着这份会话去读')] : [])))] : []),
       row('额度来源', '留空＝不联网抓。OpenAI 官方 billing 需填「凭据与反代」里的 API Token',
         (() => {
           const s = el('select', {},
@@ -2356,7 +3479,7 @@ function renderDetail() {
   // 「隐藏整个程序」是程序级动作、内容区右上本来就有那颗按钮，不放进"这个账号"的设置里；
   // 改名已挪到「账号信息」，这一组只剩不可回退的那一件事，所以留在最后
   secs.danger = () => secPanel('删除账号',
-    row('删除账号', '删除这个账号的档案与整个数据目录（含登录状态），不可恢复。只是不想看到整个程序的话，用内容区右上的「隐藏此程序」',
+    row('删除账号', '删除这个账号的档案与整个数据目录（含登录状态），不可恢复。只是不想看到整个程序的话，用内容区右上的「隐藏程序」',
       btn('删除账号', 'danger sm', async () => {
         if (await del(app, name)) closeDetailNow();
       })));
@@ -2365,7 +3488,8 @@ function renderDetail() {
   const nav = $('im-nav');
   clear(nav);
   for (const [id, label] of IN_SECTIONS) {
-    const b = el('button', { type: 'button' }, label);
+    if (id === 'danger') nav.appendChild(el('li', { class: 'sep', 'aria-hidden': 'true' }));
+    const b = el('button', { type: 'button', class: id === 'danger' ? 'danger' : '' }, label);
     b.dataset.sec = id;
     b.setAttribute('aria-current', String(d.sec === id));
     b.addEventListener('click', () => { d.sec = id; d.scroll = 0; renderDetail(); });
@@ -2561,8 +3685,6 @@ async function saveKeyModal(again) {
   openKeyModal(fresh, null);
   if (base) $('k-base').value = base;
 }
-
-/** 新建 key 后，按用途/Key 原文回查它刚拿到的 id（用于紧接着测试/拉模型） */
 
 /* ---------------- API 文本粘贴识别：容忍任意排版 ---------------- */
 /* 目标：用户把一整段（可能很乱、含标题/项目符号/多个 base_url/多行）粘进来，
@@ -3137,7 +4259,7 @@ function renderWizard() {
   next.append(
     sid === 'done' ? '确认无误，建这张卡'
       : (sid === 'login' && w.m !== 'apikey'
-        ? (w.login && w.login.ok && w.login.account ? '下一步' : '读一下登录状态')
+        ? (w.login && w.login.ok && w.login.account ? '下一步' : '读取登录状态')
         : '下一步'));
 
   /* ---- ① 登录方式 ---- */
@@ -3238,7 +4360,7 @@ function renderWizard() {
         }
         body.appendChild(el('div', { class: 'hintline' },
           '管理方式：这个程序会把第二次启动转交给已开窗口，不能同时多开，所以账号靠客户端里切换'
-          + '（或驾驶舱的「换号」把默认档案让位给某个卡），一次一个。'));
+          + '（退出登录 → 登另一个号），一次一个。驾驶舱不会为了换号去关你的程序。'));
       } else {
         const prof = srcs.find((s) => s.kind === 'profile');
         const insts = srcs.filter((s) => s.kind === 'instance' && s.has_data);
@@ -3340,14 +4462,14 @@ function renderWizard() {
             + '我先读一下本机现在登的是谁，认出来就直接往下填。'
           : loginHint(w.app)),
         el('div', { class: 'ctlrow' },
-          ...(importing ? [] : [btn('▶ 打开客户端去登录', 'primary', wzOpenClient)]),
-          btn(importing ? '读一下登录状态' : '重新读一次', 'sm', () => wzReadLogin(true)),
-          btn('这一步先跳过', 'sm', () => { w.step += 1; renderWizard(); })));
+          ...(importing ? [] : [btn('▶ 打开客户端登录', 'primary', wzOpenClient)]),
+          btn(importing ? '读取登录状态' : '重新读取', 'sm', () => wzReadLogin(true)),
+          btn('跳过此步', 'sm', () => { w.step += 1; renderWizard(); })));
       const L = w.login;
       if (!L) {
         body.appendChild(el('div', { class: 'hintline' },
           '还没读过登录状态。点「打开客户端」后会每 3 秒自动读一次，认出新的登录账号就自己进下一步；'
-          + '你也可以在客户端里登录完再点「重新读一次」。'));
+          + '你也可以在客户端里登录完再点「重新读取」。'));
       } else if (!L.ok) {
         body.appendChild(el('div', { class: 'hintline bad' },
           L.unsupported
@@ -3406,19 +4528,10 @@ function renderWizard() {
       el('p', {}, '额度这一页没有手填框——读到的样子就是卡片上的样子。三处都读不到就先跳过，'
         + '建好卡之后在「账号设置 → 额度与用量 → 截图识别」把官网积分页截一张图贴进去。'),
       el('div', { class: 'ctlrow' },
-        btn('读官网逐包额度', 'sm', () => wzLoadQuota(true),
-          w.app.web_quota ? '从驾驶舱自己的官网登录窗口里取会话，读个人主页的逐资源包明细' : '这个产品没有登记官网用量页'),
-        btn('读服务端与本机', 'sm', async () => {
-          const L = await run('machine_login', { app: w.app.id, refresh: true });
-          if (S.wizard !== w) return;
-          w.login = L;
-          if (L && L.ok) {
-            w.credits = (L.portions || []).map((p) => ({
-              label: p.label, left: p.left, total: p.total, expires_on: p.expires_on }));
-            toast(`读到「${L.account}」：剩 ${nfmt(L.left || 0)} / 共 ${nfmt(L.total || 0)}`, true);
-          } else toast(L && (L.err || L.msg) || '读不到', false);
-          renderWizard();
-        }),
+        btn('↻ 重新读一次额度', 'sm', () => wzLoadQuota(true),
+          w.app.web_quota
+            ? '一次读全：先从驾驶舱自己的官网登录窗口取这个号的会话，读个人主页的逐资源包明细（每包各自的到期时间只有官网有）；读不到再退服务端与本机。'
+            : '这个产品没有登记官网用量页，直接读服务端与本机。'),
         pasteHint('quota')),
       src,
       (w.credits || []).length ? el('div', { class: 'flabel' }, `读到的逐笔额度（${w.credits.length} 笔）`) : null,
@@ -3460,26 +4573,30 @@ function renderWizard() {
   }
 }
 // 第 5 步的自动取数：官网逐包优先（它有每个资源包的到期日），没有就退回服务端/本机
+/* 向导第②步已经认出登进来的是哪个号了：官网会话就按这个 userId 开格子，
+   这样建完卡第一次「刷新额度」用的是同一份会话，不用登第二次。 */
+const wzUid = () => (S.wizard && S.wizard.login && S.wizard.login.user_id) || '';
 async function wzLoadQuota(force) {
   const w = S.wizard;
   if (!w) return;
+  // 和卡片上那颗「刷新额度」同一套顺序：官网逐包读得到就用它（每包自己的到期时间只有那里有），
+  // 读不到当场接着退到服务端/本机，不再要人多点一颗按钮
+  let webOk = false;
   if (w.app.web_quota && (force || !w.web)) {
     w.web = null; renderWizard();
-    const r = await run('web_fetch', { app: w.app.id });
+    const r = await run('web_fetch', { app: w.app.id, user_id: wzUid() });
     if (S.wizard !== w) return;
-    if (r && r.ok) {
-      w.web = r.data;
+    webOk = !!(r && r.ok);
+    w.web = webOk ? r.data : { ok: false, need_login: !!(r && r.need_login), msg: (r && r.msg) || '读不到' };
+    if (webOk) {
       const ps = (r.data && r.data.portions) || [];
       if (ps.length) {
         w.credits = ps.map((p) => ({ label: p.label, left: p.left, total: p.total, expires_on: p.expires_on }));
       }
-    } else {
-      w.web = { ok: false, need_login: !!(r && r.need_login), msg: (r && r.msg) || '读不到' };
     }
     renderWizard();
-    return;
   }
-  if (!w.credits.length) {
+  if (!webOk && !w.credits.length) {
     const L = await run('machine_login', { app: w.app.id, refresh: true });
     if (S.wizard !== w) return;
     w.login = L;
@@ -3491,11 +4608,9 @@ async function wzLoadQuota(force) {
 }
 async function wzWebLogin() {
   const w = S.wizard;
-  const r = await run('web_login', { app: w.app.id });
-  if (r && r.ok) {
-    toast(r.msg, true);
-    afterWebLogin(w.app.id, '');
-  } else toast((r && r.msg) || '打不开官网窗口', false);
+  const r = await run('web_login', { app: w.app.id, user_id: wzUid() });
+  if (r && r.ok) afterWebLogin(w.app.id, '', wzUid());
+  else toast((r && r.msg) || '打不开官网窗口', false);
 }
 // 一份档案只能被一张卡认领：旧卡还挂着时，把它改名改绑到当前登录的号，而不是再建一张
 async function wzRebind(oldName, newName) {
@@ -3623,10 +4738,17 @@ const HELP = [
   },
   {
     t: '不能多开的产品，怎么用多个账号',
-    h: `<p>用<b>换号</b>：把该程序的默认档案目录改成一个指向账号目录的 NTFS junction，原目录备份为 <code>*.cockpit-original</code>。之后你从开始菜单、任务栏任何入口打开，都是这个账号。</p>
+    h: `<p>分两种，界面会直接写明是哪种，因为要做的事完全不一样：</p>
+      <h4>① 账号共用一份档案（Qoder 系 / WorkBuddy / ZCode / TRAE CN 这类）</h4>
+      <p>这类产品在这台机器上只有一份档案，几个号都住在里面。切换账号<b>就在程序里做</b>：退出登录 → 登另一个号。
+      卡片上的「▶ 启动客户端」只负责把程序打开——不搬文件、不挂链接，也不会关掉你正在用的程序。
+      哪个号登进来了，驾驶舱从登录态里认出来，那张卡自己标上「本机登录中」，额度与临期提醒跟着它走。</p>
+      <h4>② 每个账号一份独立目录、但只能一次开一个</h4>
+      <p>用<b>换号</b>：把该程序的默认档案目录改成一个指向账号目录的 NTFS junction，原目录备份为 <code>*.cockpit-original</code>。
+      之后你从开始菜单、任务栏任何入口打开，都是这个账号。</p>
       <ul>
         <li>零额外磁盘占用——不会存两份数据</li>
-        <li>切换前需先关掉该程序的所有窗口（否则文件被锁住，会点名提示是哪个进程）</li>
+        <li>切换前要先关掉该程序的窗口（文件被占住时会点名是哪个进程，确认后驾驶舱可以替你结束它们）</li>
         <li>「还原默认」一键换回原来的账号目录</li>
       </ul>
       <p>侧栏上带 <code>⇄账号名</code> 标记的，就是当前正在使用的账号。</p>`,
@@ -3665,13 +4787,13 @@ const HELP = [
       <ul>
         <li><b>自动扫描</b>：装完软件点左侧栏「重新扫描」。它在开始菜单和桌面找快捷方式，命中 AI 关键词、或装在 <code>D:\\Artificial_Intelligence</code> 下的直接收录。</li>
         <li><b>手动登记</b>：侧栏下方「＋ 添加程序」（设置 → 高级 里同一个入口）。只需可执行文件路径，不改动该程序任何文件；绿色版、没建快捷方式、名字不含关键词的都走这里。</li>
-        <li><b>隐藏误收</b>：左侧列表右键某程序 →「隐藏此程序」，它就从侧栏消失但数据不动，随时在 设置 → 高级 → 已隐藏的程序 里恢复。手动添加的可以直接「从列表移除」。</li>
+        <li><b>隐藏误收</b>：左侧列表右键某程序 →「隐藏程序」，它就从侧栏消失但数据不动，随时在 设置 → 高级 → 已隐藏的程序 里恢复。手动添加的可以直接「从列表移除」。</li>
       </ul>
       <p>加进来之后能不能多开，是内核<b>实测</b>出来的（同目录有 <code>resources.pak</code> + <code>locales</code> 才认 Chromium 内核），判定错了可在设置里「重置多开判定」重来。</p>`,
   },
   {
     t: '换号后程序空白/黑屏怎么自救',
-    h: `<p>换号会把程序的默认档案目录改成一个指向账号目录的 junction，原档案改名备份。如果切到一个<b>还没登录过的空账号</b>，程序打开就是未登录或空白界面——WorkBuddy 这类程序会直接显示<b>黑屏</b>。这不是坏了，是档案被换走了。</p>
+    h: `<p>这一条只关乎上面第②种「账号各有一份目录」的产品：换号会把程序的默认档案目录改成一个指向账号目录的 junction，原档案改名备份。如果切到一个<b>还没登录过的空账号</b>，程序打开就是未登录或空白界面——WorkBuddy 这类程序会直接显示<b>黑屏</b>。这不是坏了，是档案被换走了。</p>
       <ul>
         <li>回到驾驶舱，在该账号卡片上点<b>「还原默认」</b>即可恢复原档案（需先关掉该程序窗口）</li>
         <li>驾驶舱没开时手动恢复：先删掉 <code>~/.程序名</code> 这个 junction，再把 <code>~/.程序名.cockpit-original</code> 改回 <code>~/.程序名</code></li>
@@ -3699,10 +4821,11 @@ function renderHelp(body, panel) {
 
 /* ---------------- 新手引导 ---------------- */
 const TOUR = [
-  { t: '左边是 Agent 列表', s: '#applist', x: '本机已装的 AI 程序都在这里。绿点表示它正在运行；⇄ 标记表示当前正在使用哪个账号；徽章「多开」＝能同时开多个账号窗口，「换号」＝一次一个。' },
-  { t: '新装的程序怎么加进来', s: '#btn-add-app', x: '有开始菜单/桌面快捷方式的，点左侧「重新扫描」自动收录；绿色版、没快捷方式、名字里不含 AI 关键词的，点这里手动贴可执行文件路径登记。误收的右键「隐藏此程序」，随时可在设置里恢复。' },
-  { t: '中间是每个账号', s: '#cards', x: '一个账号一份独立档案。卡片只放高频动作：启动/结束、设为当前（换号）。' },
-  { t: '其余设置都在账号内部', s: '#cards', x: '点卡片上的「账号设置」或卡片表头进入「账号信息」，点卡片中间那块额度直接进「额度与用量」。左侧六个分组按读得顺的顺序排：账号信息（哪家的号、叫什么、登录状态、档案从哪来）、额度与用量（逐笔明细 → 数据从哪来 → 立即取数）、运行与换号（多开能力 → 启动/结束 → 设为当前/还原默认）、目录与数据（路径 / 空间 / 备份与恢复）、凭据与反代（API Token、反代可用性）、删除账号。一项一行，每行下面有小字说明它是干什么的。' },
+  { t: '落地页是首页', s: '#home-body', x: '一进来先看「今天要处理什么」。右边两颗按钮是这台机器上最常用的两个动作：一键刷新全部额度（把每个 Agent 每个账号的额度都读一遍，进度就长在它下面）和一键签到（今天能领的一次领掉，领之前会把清单摊给你确认）。往下依次是临期积分、今天还能领的、我的 Agent——点任意一行就进它自己的页面。' },
+  { t: '左边是 Agent 列表', s: '#applist', x: '本机已装的 AI 程序都在这里。绿点表示它正在运行；⇄ 标记是当前在用的号（账号共用一份档案的产品按客户端里登着谁算）；徽章「多开」＝能同时开多个账号窗口，「换号」＝一次一个。' },
+  { t: '新装的程序怎么加进来', s: '#btn-add-app', x: '有开始菜单/桌面快捷方式的，点左侧「重新扫描」自动收录；绿色版、没快捷方式、名字里不含 AI 关键词的，点这里手动贴可执行文件路径登记。误收的右键「隐藏程序」，随时可在设置里恢复。' },
+  { t: '中间是每个账号', s: '#cards', x: '一个账号一份档案（或几家共用一份）。卡片只放高频动作：这个号能不能开、怎么开——可多开的产品是「启动」，账号共用一份档案的产品是「启动客户端」，正在跑的是「结束」。' },
+  { t: '其余设置都在账号内部', s: '#cards', x: '点卡片上的「账号设置」或卡片表头进入「账号信息」，点卡片中间那块额度直接进「额度与用量」。左侧六个分组按读得顺的顺序排：账号信息（哪家的号、叫什么、登录状态、档案从哪来）、额度与用量（逐笔明细 → 数据从哪来 → 立即取数）、运行与换号（多开能力 → 启动/结束 → 切换账号或设为当前/还原默认）、目录与数据（路径 / 空间 / 备份与恢复）、凭据与反代（API Token、反代可用性）、删除账号。一项一行，每行下面有小字说明它是干什么的。' },
   { t: '添加账号用向导', s: '#btn-new', x: '点它会走六步，顺序照着你真实的登录过程排：① 选登录方式（官方登录 / 导入已有数据 / API Key，灰色的是还没接通的）→ ② 打开客户端去登录，驾驶舱盯着认出你登成了谁 → ③ 基本信息（名字直接从登录状态读出来填好）→ ④ 数据来源（要不要接着用本机原来那份对话与记忆、换号还是独立目录多开）→ ⑤ 额度（先读官网逐资源包，再退到服务端与本机）→ ⑥ 确认，点「确认无误，建这张卡」才真的动手。' },
   { t: '额度过期看这里', s: 'header', x: '顶栏的「临期 N」徽章汇总所有临期赠送额度（30 天内黄、7 天内红），点一下看明细；7 天内的启动时会弹窗提醒一次。关窗后程序驻留托盘，每 30 分钟自动抓一次额度。' },
   { t: 'Key 与反代', s: '#viewlist', x: '「API 与额度」管各家官网/中转站 Key；本地反代在 127.0.0.1:8788 做 OpenAI 兼容转发。在「本地反代」面板里把账号/Key 归进池子，再生成分发 Key 给客户端用。' },
@@ -3737,7 +4860,7 @@ const SET_SECTIONS = [
   ['profile', '个人资料'], ['general', '常规'], ['appearance', '外观'],
   ['quota', '额度提醒'], ['proxy', '本地反代'], ['ai', 'AI 识别'],
   ['storage', '存储'], ['security', '凭据安全'], ['advanced', '高级'],
-  ['help', '帮助与教程'], ['about', '关于'],
+  ['help', '帮助'], ['about', '关于'],
 ];
 let setSection = 'general';
 // 设置页整块内容会随 4 秒刷新重建，滚动容器的高度瞬间塌回顶部，不自己记住就滚不动
@@ -3755,8 +4878,12 @@ async function setSetting(section, key, value) {
 }
 
 function row(label, desc, ctl) {
+  // 长说明收进 label 旁的问号圈（悬停/单击看全文），行内只留短句，版面不再被说明文字顶得忽高忽低
+  const long = typeof desc === 'string' && desc.length > DESC_INLINE_MAX;
   return el('div', { class: 'setrow' },
-    el('div', {}, el('div', { class: 'lab' }, label), desc ? el('div', { class: 'desc' }, desc) : null),
+    el('div', {},
+      el('div', { class: 'lab' }, label, long ? qhelp(desc) : null),
+      desc && !long ? el('div', { class: 'desc' }, desc) : null),
     el('div', { class: 'ctl' }, ctl));
 }
 function segCtrl(opts, value, pick) {
@@ -4024,7 +5151,7 @@ function storageSection(body, panel, row, actBtn) {
             el('th', { style: 'width:16%' }, '实占'),
             el('th', {}, '各账号'))), itb)),
       row('多账号共用大文件', '新建账号时，程序自己下载的二进制 / 模型 / 虚拟机组件这类可再生大目录不再各存一份：收进 shared/ 只留一份，账号目录里挂一个链接过去。内容对不上（版本不同）就各留各的，如实说明。',
-        btn('现在就去重', 'sm', async () => {
+        btn('立即去重', 'sm', async () => {
           const r = await run('storage_dedup', {});
           if (r && r.ok) toast(r.msg, true);
           loadStorage(true, true);
@@ -4222,7 +5349,13 @@ function renderSettings() {
         el('div', { class: 'ctlrow' },
           numCtrl(navWidth(a.nav_w), NAV_MIN, NAV_MAX, (v) => setSetting('appearance', 'nav_w', v)),
           actBtn('恢复默认', () => setSetting('appearance', 'nav_w', NAV_DEFAULT)))),
-      row('侧栏形态', '收成图标条后只剩一列程序图标，名字与徽章藏起来（悬停仍可看）。点分隔线上的 « / » 或按 Ctrl+B 随时切换，切过一次就以你点的为准',
+      row('左下角管理区高度', sideRatio(a)
+        ? `现在是窗口高度的 ${Math.round(sideRatio(a) * 100)}%（约 ${ratioPx(sideRatio(a))} 像素），比它自己的内容矮时「管理」那一截自己滚动、上面的列表跟着变高。`
+          + '存的是比例，所以窗口最大化 / 还原时它按同一个比例跟着变。拖动左栏中间那条横线即可调整，双击横线恢复自动。'
+        : '自动：管理区正好装下它那几行（最多占窗口高度 22%，再矮的窗口里它自己滚），剩下的全给上面的列表。'
+          + '横线往上拖到管理区显示完就到底，不会再拖出空白；往下拖是压缩它。',
+        actBtn('恢复自动', () => commitSideHeight(0))),
+      row('侧栏形态', '收成图标条后只剩一列程序图标，名字与徽章藏起来（悬停仍可看）。点左上角 Agents 旁的 « / » 或按 Ctrl+B 随时切换，切过一次就以你点的为准',
         segCtrl([['auto', '自动'], ['expand', '总是展开'], ['collapse', '总是收起']],
           a.nav_collapsed === true ? 'collapse' : (a.nav_collapsed === false ? 'expand' : 'auto'),
           (v) => setSetting('appearance', 'nav_collapsed', v === 'auto' ? null : v === 'collapse')))));
@@ -4271,7 +5404,7 @@ function renderSettings() {
     body.appendChild(panel('现在能识别什么',
       row('积分截图 → 逐笔额度', '卡片「账号设置 → 额度与用量 → 截图识别」，截图在剪贴板里时直接 Ctrl+V 也行',
         el('span', { class: 'kv' }, '已接')),
-      row('活动截图 → 一条福利', '「福利活动 → ＋ 记一条福利」表单里 Ctrl+V 贴截图，标题/说明/到期日/每天重复一起填好',
+      row('活动截图 → 一条福利', '「福利活动 → ＋ 添加福利」表单里 Ctrl+V 贴截图，标题/说明/到期日/每天重复一起填好',
         el('span', { class: 'kv' }, '已接')),
       row('文字 / 截图 → API 台账', '「API 与额度」顶部「快速登记」：本机规则先读（离线不花 token），规则认不出 key 或地址才交给模型；认出来的站点、端点、key 与用途名当场建好',
         el('span', { class: 'kv' }, '已接')),
@@ -4369,6 +5502,20 @@ function renderSettings() {
         actBtn('＋ 添加程序', openAddApp))));
 
     const hid = S.data.hidden_apps || [];
+    // 登记表里那批"官方默认路径"的产品（Antigravity / Cursor / Kiro / Windsurf / Zed /
+    // GitHub Copilot / Grok / CodeBuddy / Trae 系）默认只在装了、或已有账号卡时才占侧栏一格。
+    // 这个开关把它们全放出来——要看全量登记表、或者想给还没装的先建卡时用。
+    const showAll = !!(S.data.show_uninstalled);
+    body.appendChild(el('section', { class: 'panel' },
+      el('h2', {}, '未安装的程序'),
+      row('显示未安装的程序',
+        '登记表里预置了十几个 Agent 的官方默认安装位置，换台装了它们的机器就能自动认出来。'
+        + '默认这些"这台机器上没装、也没有账号卡"的条目不出现在左侧列表里——否则光是没装的就会多出十几条。'
+        + `现在：${showAll ? '全部显示' : '只显示装了或有账号卡的'}。`,
+        actBtn(showAll ? '收起未安装的' : '全部显示', async () => {
+          await run('show_uninstalled', { on: !showAll });
+        }))));
+
     const htb = el('tbody');
     for (const h of hid) {
       htb.appendChild(el('tr', {},
@@ -4380,7 +5527,7 @@ function renderSettings() {
       el('h2', {}, `已隐藏的程序（${hid.length}）`),
       el('p', { style: 'font-size:12.5px;color:var(--text-muted);margin-bottom:10px' },
         '这里列出的是已经被隐藏掉的程序，点「恢复显示」把它放回左侧列表。'
-        + '想隐藏某个程序：在左侧程序名上右键选「隐藏此程序」，或选中它后点卡片区右上的「隐藏此程序」。隐藏不会卸载程序，也不动它的账号目录。'),
+        + '想隐藏某个程序：在左侧程序名上右键选「隐藏程序」，或选中它后点卡片区右上的「隐藏程序」。隐藏不会卸载程序，也不动它的账号目录。'),
       hid.length
         ? el('div', { class: 'tablewrap' },
           el('table', { class: 'tbl' },
@@ -4388,7 +5535,7 @@ function renderSettings() {
               el('th', { class: 'col-app' }, '程序'),
               el('th', { style: 'width:20%' }, '来源'),
               el('th', { style: 'width:22%' }, ''))), htb))
-        : el('div', { class: 'empty' }, '还没有隐藏任何程序。不想看到某个程序，就在左侧右键它 →「隐藏此程序」。')));
+        : el('div', { class: 'empty' }, '还没有隐藏任何程序。不想看到某个程序，就在左侧右键它 →「隐藏程序」。')));
   }
 
   if (setSection === 'help') safe(() => renderHelp(body, panel), '帮助与教程');
@@ -4411,50 +5558,71 @@ function renderSettings() {
   host.scrollTop = setScroll;
 }
 // 本机余额直读：串号时先问一句要不要改绑，绝不静默覆盖另一个账号的数
-async function pullLocal(app, name) {
+/* 读数结果的三种收尾：认人（改绑）、缺登录（开这个号自己的窗口）、成功（报一句）。
+   pullLocal 和 refreshQuota 共用，避免两条路各写一遍、说法还不一样。 */
+const readDone = (app, name, r) => {
+  toast(r.msg, r.ok);
+  if (!r.ok) return;
   // 后端可能顺手把「账号N」改成真实用户名：浮窗开着的话得跟上改名，否则下次点击用旧名找不到实例
-  const done = (r) => {
-    toast(r.msg, r.ok);
-    if (!r.ok) return;
-    if (r.renamed && S.detail && S.detail.app === app && S.detail.name === name) S.detail.name = r.renamed;
-    load();
-  };
-  let r;
-  try {
-    r = await invoke('action', { payload: { action: 'pull_local', app, name } });
-  } catch (e) {
-    toast(`读取失败：${e}`, false);
-    return;
-  }
-  if (r.mismatch || r.already_bound) {
-    const f = r.found || {};
-    const again = await askConfirm(
-      `${r.msg}
+  if (r.renamed && S.detail && S.detail.app === app && S.detail.name === name) S.detail.name = r.renamed;
+  load();
+};
+async function rebindAndRetry(app, name, r, act) {
+  const f = r.found || {};
+  const again = await askConfirm(
+    `${r.msg}
 
 本机当前登录：${f.account || '?'}（剩 ${nfmt(f.left)} / 共 ${nfmt(f.total)}，到期 ${dtxt(f.expires_on)}）`,
-      { title: r.already_bound ? '这个登录态已经绑在别的账号上了' : '本机登录的账号和这个档案不是同一个',
-        danger: true, okText: r.already_bound ? '仍然绑定为同一个号' : '改绑为当前账号' });
-    if (!again) return;
-    done(await invoke('action', { payload: { action: 'pull_local', app, name, force: true } }));
-    return;
+    { title: r.already_bound ? '这个登录态已经绑在别的账号上了' : '本机登录的账号和这个档案不是同一个',
+      danger: true, okText: r.already_bound ? '仍然绑定为同一个号' : '改绑为当前账号' });
+  if (!again) return;
+  readDone(app, name, await invoke('action', { payload: { action: act, app, name, force: true } }));
+}
+async function pullLocal(app, name, act = 'pull_local') {
+  const r = await invoke('action', { payload: { action: act, app, name } })
+    .catch((e) => ({ ok: false, msg: `读取失败：${e}` }));
+  if (r.mismatch || r.already_bound) return rebindAndRetry(app, name, r, act);
+  readDone(app, name, r);
+  return r;
+}
+/* 卡片上唯一的读数入口。后端 quota_refresh 自己挑层：
+   官网逐包（用量 + 每个包 + 各自到期 + 每日消耗）→ 读不到才退到本机/服务端汇总。
+   缺会话时不再让她去找第二颗按钮——当场把这个号自己的登录窗口开起来。 */
+async function refreshQuota(app, name) {
+  toast(`正在读「${name}」的额度…`, true);
+  const r = await invoke('action', { payload: { action: 'quota_refresh', app, name } })
+    .catch((e) => ({ ok: false, msg: `读取失败：${e}` }));
+  if (r.mismatch || r.already_bound) return rebindAndRetry(app, name, r, 'quota_refresh');
+  if (r.wrong_account) {
+    const go = await askConfirm(r.msg, { title: '这个号的官网会话登错了人', okText: '打开它的登录窗口' });
+    if (go) await webLogin(app, name);
+    return r;
   }
-  done(r);
+  readDone(app, name, r);
+  if (r.need_login) {
+    const go = await askConfirm(
+      `${r.detail_error || '这个号还没登过官网'}\n\n现在打开「${name}」自己的官网登录窗口？`
+      + '登录一次，之后每次刷新都直接读这个号的逐包额度和到期时间，跟本机客户端登的是谁无关。',
+      { title: '逐包额度和到期时间要登录一次', okText: '打开登录窗口' });
+    if (go) await webLogin(app, name);
+  }
+  return r;
 }
 /* ---------------- 官网逐资源包额度 ----------------
    本机接口只给两个汇总数，每个资源包各自的到期日只有官网用量页有。
-   登录走驾驶舱自己的 WebView2 窗口（会话存在数据根 webprofile/），
+   登录走驾驶舱自己的 WebView2 窗口（会话按账号存在数据根 webprofile/<产品>/<这个号>/），
    取数由 Rust 侧带着那份会话直接调接口。 */
-async function webLogin(app, name) {
-  const r = await invoke('action', { payload: { action: 'web_login', app } })
+async function webLogin(app, name, uid) {
+  const r = await invoke('action', { payload: { action: 'web_login', app, name: name || '', user_id: uid || '' } })
     .catch((e) => ({ ok: false, msg: String(e) }));
   toast((r && r.msg) || '打不开官网登录窗口', !!(r && r.ok));
-  if (r && r.ok) afterWebLogin(app, name || '');
+  if (r && r.ok) afterWebLogin(app, name || '', uid || '');
 }
 /* 官网窗口里一登录成功就自动补一次取数。她的预期是"我登进去了，积分、用量、到期时间
    就该都在"，不该还要再点第二个按钮——早先 wzWebLogin 只设了个 webWaiting 标记，没人读它。
    轮询走 web_session：只翻那个窗口自己的 cookie 罐、不发请求，认到会话才真去取数。 */
 let webPoll = null;
-async function afterWebLogin(app, name) {
+async function afterWebLogin(app, name, uid) {
   if (webPoll) return;
   if (!name && !S.wizard) return;
   webPoll = true;
@@ -4462,50 +5630,18 @@ async function afterWebLogin(app, name) {
   try {
     while (Date.now() - t0 < 6 * 60 * 1000) {
       await new Promise((r) => setTimeout(r, 4000));
-      const s = await invoke('action', { payload: { action: 'web_session', app } })
+      const s = await invoke('action', { payload: { action: 'web_session', app, name: name || '', user_id: uid || '' } })
         .catch(() => null);
       if (!s || !s.signed_in) continue;
       toast('官网登录上了，正在自动读逐包额度…', true);
-      if (name) await webFetch(app, name);
+      if (name) await refreshQuota(app, name);
       else await wzLoadQuota(true);
       return;
     }
-    toast('官网窗口里一直没检测到登录会话：登好了再点一次「读官网逐包额度」。', false);
+    toast('官网窗口里一直没检测到登录会话：登好了再点一次卡片上的「刷新额度」。', false);
   } finally {
     webPoll = null;
   }
-}
-async function webFetch(app, name) {
-  toast('正在从官网读逐资源包额度…', true);
-  let r;
-  try {
-    r = await invoke('action', { payload: { action: 'web_fetch', app, name: name || '' } });
-  } catch (e) {
-    toast(`读取失败：${e}`, false);
-    return;
-  }
-  if (!r) return;
-  if (r.need_login) {
-    const go = await askConfirm(
-      `${r.msg}\n\n现在打开驾驶舱自己的官网登录窗口？在里面登录一次，回来再点「读官网逐包额度」就自动填好。`,
-      { title: '官网还没登录', okText: '打开登录窗口' });
-    if (go) await webLogin(app);
-    return;
-  }
-  if (r.mismatch) {
-    const d = r.data || {};
-    const go = await askConfirm(
-      `${r.msg}\n\n官网读数：剩 ${nfmt(d.left)} / 共 ${nfmt(d.total)}，逐笔 ${(d.portions || []).length} 包`,
-      { title: '官网读到的号和这张卡绑的不是一个', danger: true, okText: '改绑为当前登录的号' });
-    if (!go) return;
-    const r2 = await invoke('action', { payload: { action: 'web_fetch', app, name, force: true } })
-      .catch(() => ({ ok: false, msg: '重读失败' }));
-    toast(r2.msg || '读完了', !!r2.ok);
-    load();
-    return;
-  }
-  toast(r.msg || (r.ok ? '读到了' : '读不到'), !!r.ok);
-  load();
 }
 async function copyText(t) {
   try { await navigator.clipboard.writeText(t); toast('已复制到剪贴板'); }
@@ -4832,7 +5968,7 @@ function bindCtx() {
           ctxItem('置顶', '', () => run('app_move', { app: id, op: 'top' })),
           ctxItem('上移一位', '', () => run('app_move', { app: id, op: 'up' })),
           ctxItem('下移一位', '', () => run('app_move', { app: id, op: 'down' })),
-          ctxItem('隐藏此程序', '', async () => {
+          ctxItem('隐藏程序', '', async () => {
             if (a && await askConfirm(`把「${a.name}」从列表隐藏？\n不会卸载程序，也不动它的账号目录；可在 设置 → 高级 里恢复。`,
               { okText: '隐藏' })) {
               run('hide_app', { app: id });
@@ -4906,6 +6042,72 @@ function bindNavResize() {
   });
 }
 
+/* ---------------- 侧栏管理区的高度：拖那条横线 / 双击复位 / 方向键微调 ---------------- */
+function bindSideResize() {
+  const h = $('side-resize');
+  const sb = h.closest('.sidebar');
+  const top = sb.querySelector('.side-scroll');
+  const fx = sb.querySelector('.side-fixed');
+  const zoom = () => (Number(S.data?.settings?.appearance?.font_scale) || 100) / 100;
+  const store = () => ratioPx(sideRatio(S.data?.settings?.appearance || {}));
+  const contentH = (node) => {
+    const last = node.lastElementChild;
+    if (!last) return 0;
+    return Math.ceil((last.getBoundingClientRect().bottom
+      - node.getBoundingClientRect().top + node.scrollTop) / zoom());
+  };
+  // 只有列表区和管理区参与分配，其余兄弟（顶栏 + 这条手柄）连外边距一起扣掉
+  const avail = () => {
+    let chrome = 0;
+    for (const kid of sb.children) {
+      if (kid === top || kid === fx) continue;
+      const cs = getComputedStyle(kid);
+      chrome += kid.getBoundingClientRect().height
+        + parseFloat(cs.marginTop || 0) + parseFloat(cs.marginBottom || 0);
+    }
+    return sb.getBoundingClientRect().height / zoom() - chrome / zoom();
+  };
+  // 指针越靠下 = 管理区越矮；以列表区的顶边为原点（它不随拖动移动）
+  const at = (y) => Math.round(avail() - (y - top.getBoundingClientRect().top) / zoom());
+  // 上限就是管理区的内容高——再往上拖多出来的空间没人接，就是左下角那片空白
+  const clamp = (px) => {
+    const hi = Math.max(SIDE_MIN, Math.min(contentH(fx), avail() - SIDE_MIN));
+    return Math.round(Math.min(Math.max(px, SIDE_MIN), hi));
+  };
+  const shown = () => store() || Math.round(fx.getBoundingClientRect().height / zoom());
+
+  h.addEventListener('pointerdown', (e) => {
+    if (document.documentElement.classList.contains('rail')) return;   // 图标条模式下这两截没得分配
+    e.preventDefault();
+    sideDrag.active = true;
+    h.classList.add('dragging');
+    applySideHeight(clamp(at(e.clientY)));   // 先给反馈，再要指针捕获
+    h.setPointerCapture(e.pointerId);
+  });
+  h.addEventListener('pointermove', (e) => {
+    if (sideDrag.active) applySideHeight(clamp(at(e.clientY)));
+  });
+  h.addEventListener('pointerup', (e) => {
+    if (!sideDrag.active) return;
+    sideDrag.active = false;
+    h.classList.remove('dragging');
+    commitSideHeight(clamp(at(e.clientY)));
+  });
+  h.addEventListener('pointercancel', () => {
+    if (!sideDrag.active) return;
+    sideDrag.active = false;
+    h.classList.remove('dragging');
+    applySideHeight(store());
+  });
+  h.addEventListener('dblclick', () => commitSideHeight(0));
+  h.addEventListener('keydown', (e) => {
+    const step = e.key === 'ArrowDown' ? 16 : e.key === 'ArrowUp' ? -16 : 0;
+    if (!step) return;
+    e.preventDefault();
+    commitSideHeight(clamp(shown() + step));
+  });
+}
+
 /* ---------------- 交互 ---------------- */
 async function swapSet(app, name) {
   const i = S.data.instances.find((x) => x.app === app && x.name === name);
@@ -4915,7 +6117,10 @@ async function swapSet(app, name) {
       { title: '目标账号是空的', okText: '仍然换号' })) return false;
   }
   let r = await run('swap_set', { app, name });
-  if (!r.ok && /锁定|后台进程|个窗口/.test(r.msg) && await askConfirm(`${r.msg}\n\n确认结束这些后台进程并换号？`,
+  if (r.noop) return true;
+  // 要不要"结束进程再换号"是后端的事实：它知道自己被哪些进程挡住、结束它们能不能解开。
+  // 以前前端拿中文文案做正则匹配，文案一换词按钮就再也不出现，提示却还写着"点强制换号"。
+  if (!r.ok && r.need_force && await askConfirm(`${r.msg}\n\n确认由驾驶舱结束这些进程并换号？`,
     { danger: true, okText: '结束进程并换号' })) {
     r = await run('swap_set', { app, name, force: true });
   }
@@ -4923,8 +6128,42 @@ async function swapSet(app, name) {
 }
 // 不能多开的产品：把"换到这个账号"和"打开它"合成一个动作
 async function swapSetAndLaunch(app, name) {
-  if (!await swapSet(app, name)) return;
+  const a = S.data.apps.find((x) => x.id === app);
+  if (a && a.shared_profile) return openClient(app, name);
+  if (!await swapSet(app, name)) return false;
   await run('launch_app', { app, name });
+  return true;
+}
+// 共用一份档案的产品（Qoder 系 / WorkBuddy / ZCode / TRAE 这类单窗口产品）：
+// 切换账号＝在客户端里退出登录再登录。驾驶舱只把程序打开——不 swap_set、不结束任何进程，
+// 因为她只是换个号，没有任何理由因此被要求关掉正在用的程序。
+async function openClient(app, name) {
+  const i = S.data.instances.find((x) => x.app === app && x.name === name);
+  const a = S.data.apps.find((x) => x.id === app);
+  const r = await invoke('action', { payload: { action: 'launch_app', app, name } })
+    .catch((e) => ({ ok: false, msg: String(e) }));
+  if (!r || !r.ok) { toast((r && r.msg) || '打开失败', false); return false; }
+  toast(i && i.logged_in
+    ? `已打开 ${a ? a.name : ''}`
+    : `已打开 ${a ? a.name : ''}：在里面退出登录、再登「${name}」就行。\n`
+      + '不需要关掉程序，驾驶舱也没有动任何文件；登进来之后这张卡会自己认出来。', true);
+  load();
+  return true;
+}
+// 一键换号：把目标号存过的登录态写回档案位置，再自动重开客户端。
+// 这里"重启"是真的需要——客户端只在启动时读那份文件；和以前那种"文件根本没改却要求关程序"不是一回事。
+async function authSwitch(app, name) {
+  const a = S.data.apps.find((x) => x.id === app) || {};
+  const cur = (S.data.instances || []).find((x) => x.app === app && x.logged_in);
+  if (!await askConfirm(
+    `切到「${name}」？\n\n把「${name}」存过的登录态写回 ${a.name || '该程序'} 的档案位置，然后自动重开它。\n`
+    + (cur
+      ? `当前登着的「${cur.name}」会在写之前先收好，随时切得回来。\n`
+      : '还没读出当前登的是谁时后端不会动手（否则切过去就回不来了）。\n')
+    + `会重启一次 ${a.name || '客户端'}：窗口里没保存的东西会丢。`,
+    { title: '一键换号', okText: '切过去' })) return false;
+  const r = await run('auth_switch', { app, name });
+  return !!r.ok;
 }
 // 把早期 adopt 搬进数据根的档案搬回程序自己的位置（同盘改名，不复制）
 async function rehomeAccount(app, name) {
@@ -5060,6 +6299,27 @@ function bind() {
   });
   $('btn-keys-dedup').addEventListener('click', () => openKeyBatch('dedup'));
   $('btn-keys-batch').addEventListener('click', () => openKeyBatch('all'));
+  $('btn-checkin-refresh').addEventListener('click', () => loadCheckin(true));
+  $('c-checkin').addEventListener('click', () => { S.view = 'checkin'; render(); });
+  $('btn-checkin-all').addEventListener('click', async () => {
+    const items = ((S.checkin || {}).items || []).filter((x) => x.claimable === true);
+    if (!items.length) { toast('今天没有可领的', false); return; }
+    const names = items.map((x) => CI_NAMES[x.product] || x.product).join('、');
+    const yes = await askConfirm(
+      `要给这几家领今天的签到积分：\n${names}\n\n领完当日名额就用掉了，撤回不了。`,
+      { title: '确认领取' });
+    if (!yes) return;
+    const bad = [];
+    for (const x of items) {
+      const r = await invoke('action', { payload: { action: 'checkin_claim', app: '', store: x.product } });
+      const res = (r && r.result) || {};
+      if (!res.claimed) bad.push(`${CI_NAMES[x.product] || x.product}：${res.error || res.message || '没领成'}`);
+    }
+    // "已提交"这种话不算结果——领没领要逐家报，不然又是一堆假成功
+    toast(bad.length ? `${items.length - bad.length} 家领到了，${bad.length} 家没领成：\n${bad.join('\n')}`
+                     : `${items.length} 家都领到了`, !bad.length);
+    loadCheckin(true);
+  });
   $('bd-cancel').addEventListener('click', () => { $('bdmodal').hidden = true; });
   $('bdmodal').addEventListener('click', (e) => { if (e.target.id === 'bdmodal') $('bdmodal').hidden = true; });
   $('bd-go').addEventListener('click', bdDelete);
@@ -5115,6 +6375,7 @@ function bind() {
       if (S.view === 'collab') ensureCollab(false);
     });
   });
+  $('btn-home-reload').addEventListener('click', () => load());
   $('btn-collab-retry').addEventListener('click', () => ensureCollab(true));
   $('btn-collab-retry2').addEventListener('click', () => ensureCollab(true));
   // 窗口控制
@@ -5128,6 +6389,7 @@ function bind() {
     }).catch(() => {});
   });
   bindNavResize();
+  bindSideResize();
   bindAiPaste();
   $('btn-nav-toggle').addEventListener('click', () => {
     setSetting('appearance', 'nav_collapsed', !document.documentElement.classList.contains('rail'));

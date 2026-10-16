@@ -62,17 +62,22 @@ pub fn read(app_id: &str) -> Value {
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
     match local_quota::fetch(store, Some(dir.to_string_lossy().as_ref())) {
-        Ok(q) => json!({
-            "ok": true, "app": app_id, "at": now,
-            "account": q.account, "user_id": q.user_id, "user_type": q.user_type,
-            "left": q.left, "total": q.total, "expires_on": q.expires_on,
-            "source": q.source, "stale": q.is_stale(), "live_error": q.live_error,
-            "auth_from": q.auth_from,
-            // 逐笔积分也带上：向导在建卡之前就要把额度摊给人看，那时还没有卡片可写
-            "portions": q.portions,
-            "profile_dir": dir.to_string_lossy(),
-            "usage_only": q.is_usage_only(),
-        }),
+        Ok(q) => {
+            // 认出现在登的是谁，就顺手把这份登录态收进保管箱：她手动登录那一次是最后一次，
+            // 以后切回来是一键（见 authpack.rs）
+            crate::authpack::capture_current(app_id, &q.account, &q.user_id);
+            json!({
+                "ok": true, "app": app_id, "at": now,
+                "account": q.account, "user_id": q.user_id, "user_type": q.user_type,
+                "left": q.left, "total": q.total, "expires_on": q.expires_on,
+                "source": q.source, "stale": q.is_stale(), "live_error": q.live_error,
+                "auth_from": q.auth_from,
+                // 逐笔积分也带上：向导在建卡之前就要把额度摊给人看，那时还没有卡片可写
+                "portions": q.portions,
+                "profile_dir": dir.to_string_lossy(),
+                "usage_only": q.is_usage_only(),
+            })
+        }
         Err(e) => json!({
             "ok": false, "app": app_id, "at": now, "err": e,
             "profile_dir": dir.to_string_lossy(),
@@ -130,6 +135,14 @@ pub fn refresh_now(app_id: &str) -> Value {
     let v = read(app_id);
     put(app_id, v.clone());
     v
+}
+
+/// 换号写完登录态后把缓存清掉：不清的话界面最长 45 秒还停在上一个号，
+/// 看起来就像"切了没生效"。
+pub fn invalidate(app_id: &str) {
+    if let Ok(mut c) = cache().lock() {
+        c.remove(app_id);
+    }
 }
 
 /// 这张卡的数到底是不是本机当前登录那个号的。

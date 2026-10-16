@@ -12,10 +12,22 @@ use crate::registry::{
 };
 use serde_json::{json, Value};
 
+/// 快照超过这么久就不要再拿它催"临期"：后台自动取数默认半小时一轮，
+/// 六小时读不到就是真读不到（产品没开、令牌掉了），这时候报的到期日多半属于已经花光的笔。
+const STALE_ALERT_SEC: f64 = 6.0 * 3600.0;
+
 fn fmt_date(ts: f64) -> String {
     chrono::DateTime::from_timestamp(ts as i64, 0)
         .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+/// 取"更早到期"的那一条：天数相同时先到先得，不做二次排序。
+fn sooner(cur: &mut Option<i64>, exp: &mut String, d: i64, e: &str) {
+    if cur.map(|p| d < p).unwrap_or(true) {
+        *cur = Some(d);
+        *exp = e.to_string();
+    }
 }
 
 /// 该 Agent 能否真正多开：先看静态判定，再看实测结论（启动后校验失败会写进 app_caps）
@@ -106,10 +118,23 @@ pub fn build_state(proxy: &Proxy) -> Value {
         // 「这台机器现在登的是谁」——产品级的一份真值，和卡片上绑的账号是两件事。
         // 不摆出来，就出现"人早换成另一个号了，卡片还停在旧号"这种看着像 bug 的错。
         let machine = crate::machine::current(&app.id);
+        // 这个产品是不是几个账号共用默认位置那一份档案。共用的那种，切换账号＝在客户端里
+        // 退出登录再登录：界面不许摆"换号要先关程序"，程序级进程也要按现在登着谁归属。
+        let shared = crate::registry::shares_one_profile(&app.id);
+        let m_ok = machine["value"]["ok"].as_bool().unwrap_or(false);
+        let m_uid = machine["value"]["user_id"].as_str().unwrap_or("").to_string();
+        // 认得出当前登录的那个号时，程序级进程才按它归属；一个都对不上（登的是没建过卡的
+        // 第三个号）就退回换号记录，否则整批进程没人认领，卡片上一个「结束」都点不到。
+        let login_known = m_ok
+            && !m_uid.is_empty()
+            && insts.iter().any(|m| m["quota_user_id"].as_str() == Some(m_uid.as_str()));
         apps_out.push(json!({
             "id": app.id, "name": app.name, "short": reg_short_of(&app), "kind": app.kind,
             "installed": installed, "swapped": swapped,
             "machine": machine,
+            "shared_profile": shared,
+            // 这个产品的登录态格式登记了没有：登记了的才能一键换号（见 authpack.rs）
+            "auth_switch": crate::registry::auth_switch_ok(&app.id),
             "web_quota": crate::webquota::supports(&app.id),
             // 换号记录指向一个已经不存在的账号：档案目录还挂着 junction，得能一键还原
             "swap_orphan": !swapped.is_empty() && !inst_names.contains(&swapped.as_str()),
@@ -125,9 +150,23 @@ pub fn build_state(proxy: &Proxy) -> Value {
         for m in insts {
             let cands = account_candidates(&app.id, &m, &swaps);
             let swapped_here = swapped == m["name"].as_str().unwrap_or("");
+            // 客户端里现在登的就是这张卡的号（按 userId 认，读不到当前登录时一律为假）
+            let logged_in =
+                login_known && m["quota_user_id"].as_str().unwrap_or("") == m_uid.as_str();
             // 这个账号名下的进程：先按实例目录精确匹配；匹配不到而它又是当前换号账号，
             // 才按程序级算（换号产品的进程命令行里只有默认档案路径）
             let owned: Vec<u32> = match app.kind.as_str() {
+                // 共用一份档案的产品：每个账号的 data_dir 都是同一个目录，按目录匹配会把
+                // 整棵进程树算到每张卡头上（两张卡同时显示"运行中"）。谁在跑只有登录态知道，
+                // 所以按"现在登着的那个号"归属；读不到登录态才退回换号记录。
+                "electron" if shared => {
+                    let claims = if login_known { logged_in } else { swapped_here };
+                    if claims {
+                        prog_pids.clone()
+                    } else {
+                        Vec::new()
+                    }
+                }
                 "electron" => {
                     let p = instance_pids(&app, &cands, &snap);
                     if !p.is_empty() {
@@ -157,21 +196,25 @@ pub fn build_state(proxy: &Proxy) -> Value {
             let raw_credits = m.get("credits").and_then(|c| c.as_array()).cloned().unwrap_or_default();
             let has_portions = !raw_credits.is_empty();
             // 这份数是从服务端实时读的，还是"客户端上次联网时的缓存"？
-            // 旧缓存（典型：Qoder 登录令牌过期后只剩 8 月的快照）不能当实时数用，
-            // 也不能拿它去报"临期"——否则会弹出一堆早已作废的到期提醒。
+            // 旧缓存不能当实时数用，也不能拿它去报"临期"——否则会催一堆早已作废的到期提醒。
+            // 两条判据：① 这一轮实时读失败了（live_error 非空）；② 这份快照本身就太旧。
+            // 原来还额外要求 quota_source != "server"，可是一张卡上一次读成功就是从服务端读的，
+            // source 会一直写着 server，之后连着几天读不到也永远判不出旧（TRAE 实测踩过：
+            // 程序没开时弹窗还顶着"1 天后过期"，而那笔积分几天前就用光了）。
             let live_error = m["quota_live_error"].as_str().unwrap_or("").trim().to_string();
+            let snap_at = m["quota_detail_at"]
+                .as_f64()
+                .or_else(|| m["quota_fetched_at"].as_f64())
+                .unwrap_or(0.0);
             let quota_stale = !live_error.is_empty()
-                && m["quota_source"].as_str().unwrap_or("") != "server";
+                || snap_at <= 0.0
+                || (now as f64) - snap_at > STALE_ALERT_SEC;
             let mut portions: Vec<Value> = Vec::new();
-            // 临期提醒按"到期日"合并成一条：官网逐资源包能列出二十几笔，
-            // 一天一笔地弹会把真正要看的号埋掉；合并后仍说清"几包、共剩多少"。
-            let mut soon: std::collections::BTreeMap<String, (i64, f64, usize)> = Default::default();
             let mut sum_left = 0.0f64;
             let mut has_left = false;
             let mut sum_total = 0.0f64;
             let mut has_total = false;
-            let mut earliest_dl: Option<i64> = None;
-            let mut earliest_exp = String::new();
+            // 这里只汇总数值，不算到期——到期判定统一放到下面 groups 之后那一处
             for c in &raw_credits {
                 let l = c["left"].as_f64();
                 let t = c["total"].as_f64();
@@ -185,14 +228,6 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     sum_total += x;
                     has_total = true;
                 }
-                // 卡片大字的「N 天后过期」同理会跳过已用光的那笔（见下面 groups 那段）
-                if let Some(x) = d {
-                    let usable = l.is_none() || l.unwrap_or(0.0) > 0.0;
-                    if usable && earliest_dl.map(|p| x < p).unwrap_or(true) {
-                        earliest_dl = Some(x);
-                        earliest_exp = e.clone();
-                    }
-                }
                 portions.push(json!({
                     "label": c["label"].as_str().unwrap_or("").to_string(),
                     "left": l,
@@ -203,23 +238,6 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     "expires_on": e,
                     "days_left": d,
                     "note": c["note"].as_str().unwrap_or("").to_string(),
-                }));
-                // 旧缓存除外：那是过期的数，提醒只会误导
-                if let Some(dd) = d {
-                    if !quota_stale && dd <= warn_days && l.map(|v| v > 0.0).unwrap_or(true) {
-                        let e = soon.entry(e.clone()).or_insert((dd, 0.0, 0));
-                        e.0 = e.0.min(dd);
-                        e.1 += l.unwrap_or(0.0);
-                        e.2 += 1;
-                    }
-                }
-            }
-            for (exp, (dd, left, n)) in &soon {
-                alerts.push(json!({
-                    "app": app.name, "app_id": app.id,
-                    "name": m["name"], "days": dd, "left": left,
-                    "label": format!("{} 笔到期 {}", n, exp),
-                    "level": if *dd <= danger_days { "danger" } else { "warn" },
                 }));
             }
             // 大组（照 WorkBuddy 官方用量弹窗那三档）+ 组内逐笔明细。
@@ -284,6 +302,82 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     "items": items,
                 }));
             }
+            // 「最近到期」与顶栏「临期 N」只在这一处算。
+            // 逐档明细（quota_groups.items）精确到分钟，而且上面现算过"还没作废 + 还没用光"；
+            // 扁平的 credits 桶是厂商侧汇总，expires_on 常常只到日，还把刚作废的那笔当成最早到期。
+            // 以前卡片大字与临期徽章读桶、额度面板读逐档，同一次刷新会给出两个答案：
+            // TRAE 实测面板已经改口「1 天后过期」，卡片上还顶着「今天到期」，这句要挂到半夜才动。
+            let mut earliest_dl: Option<i64> = None;
+            let mut earliest_exp = String::new();
+            if !groups_out.is_empty() {
+                for g in &groups_out {
+                    let e = g["expires"].as_str().unwrap_or("").trim().to_string();
+                    // 这一档没有"还没用完又还没作废"的笔 → expires 是空，不出到期也不出提醒
+                    let Some(d) = days_left(&e) else { continue };
+                    sooner(&mut earliest_dl, &mut earliest_exp, d, &e);
+                    if quota_stale || d > warn_days {
+                        continue;
+                    }
+                    let left = match g["left"].as_f64() {
+                        Some(v) => Some(v),
+                        None => {
+                            let ll = g["live_left"].as_f64().unwrap_or(0.0);
+                            if ll > 0.0 { Some(ll) } else { None }
+                        }
+                    };
+                    if left.map(|v| v <= 0.0).unwrap_or(false) {
+                        continue;
+                    }
+                    alerts.push(json!({
+                        "app": app.name, "app_id": app.id,
+                        "name": m["name"], "days": d, "left": left,
+                        "unit": g["unit"],
+                        "label": format!(
+                            "{} {} 笔在效期 · 最早 {}",
+                            g["name"].as_str().unwrap_or("积分"),
+                            g["usable_count"].as_u64().unwrap_or(0),
+                            e
+                        ),
+                        "level": if d <= danger_days { "danger" } else { "warn" },
+                    }));
+                }
+            } else {
+                // 只有厂商汇总桶的产品：临期按"到期日"合并成一条——一天一笔地弹
+                // 会把真正要看的号埋掉，合并后仍说清"几包、共剩多少"。
+                let mut soon: std::collections::BTreeMap<String, (i64, Option<f64>, usize)> =
+                    Default::default();
+                for p in &portions {
+                    let e = p["expires_on"].as_str().unwrap_or("").trim().to_string();
+                    let (dead, d) = crate::quota::expiry(&e);
+                    let Some(d) = d else { continue };
+                    // 桶级只到日，expiry 按当天 23:59 判作废：跨过去那一档就别再提醒了
+                    if dead {
+                        continue;
+                    }
+                    let l = p["left"].as_f64();
+                    if !l.map(|v| v > 0.0).unwrap_or(true) {
+                        continue;
+                    }
+                    sooner(&mut earliest_dl, &mut earliest_exp, d, &e);
+                    if quota_stale || d > warn_days {
+                        continue;
+                    }
+                    let en = soon.entry(e).or_insert((d, None, 0));
+                    en.0 = en.0.min(d);
+                    if let Some(x) = l {
+                        en.1 = Some(en.1.unwrap_or(0.0) + x);
+                    }
+                    en.2 += 1;
+                }
+                for (exp, (dd, left, n)) in soon {
+                    alerts.push(json!({
+                        "app": app.name, "app_id": app.id,
+                        "name": m["name"], "days": dd, "left": left,
+                        "label": format!("{} 笔到期 {}", n, exp),
+                        "level": if dd <= danger_days { "danger" } else { "warn" },
+                    }));
+                }
+            }
             // 明细与汇总数可能来自两次不同的读数：本机那条接口只有汇总数、逐笔到期只有官网有。
             // 这种时候大字跟最新的汇总数走，明细单独标"截至几点"——拿旧明细逐笔求和冒充
             // 现在的余额，就是把几小时前的数当今天报出去。
@@ -300,35 +394,29 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     earliest_dl,
                 )
             } else if !groups_out.is_empty() {
-                // 只给了分组、没给逐桶明细的产品：合计按组加
+                // 只给了分组、没给逐桶明细的产品：合计按组加，
+                // 到期日直接沿用上面那一处（不再第三次算一遍，否则又会出现两个答案）
                 let mut gl = 0.0f64;
                 let mut gt = 0.0f64;
-                let mut gd: Option<i64> = None;
-                let mut ge = String::new();
                 for g in &groups_out {
                     gl += g["left"].as_f64().unwrap_or(0.0);
                     gt += g["total"].as_f64().unwrap_or(0.0);
-                    let e = g["expires"].as_str().unwrap_or("");
-                    if let Some(d) = days_left(e) {
-                        if gd.map(|p| d < p).unwrap_or(true) {
-                            gd = Some(d);
-                            ge = e.to_string();
-                        }
-                    }
                 }
-                (Some(gl), Some(gt), ge, gd)
+                (Some(gl), Some(gt), earliest_exp, earliest_dl)
             } else {
                 let e = m["expires_on"].as_str().unwrap_or("");
-                let d = days_left(e);
+                let (dead, d) = crate::quota::expiry(e);
                 let l = m["credits_left"].as_f64();
-                if let Some(dd) = d {
-                    if !quota_stale && dd <= warn_days && l.map(|v| v > 0.0).unwrap_or(true) {
-                        alerts.push(json!({
-                            "app": app.name, "app_id": app.id,
-                            "name": m["name"], "days": dd, "left": l,
-                            "label": "",
-                            "level": if dd <= danger_days { "danger" } else { "warn" },
-                        }));
+                if !dead {
+                    if let Some(dd) = d {
+                        if !quota_stale && dd <= warn_days && l.map(|v| v > 0.0).unwrap_or(true) {
+                            alerts.push(json!({
+                                "app": app.name, "app_id": app.id,
+                                "name": m["name"], "days": dd, "left": l,
+                                "label": "",
+                                "level": if dd <= danger_days { "danger" } else { "warn" },
+                            }));
+                        }
                     }
                 }
                 (l, m["credits_total"].as_f64(), e.to_string(), d)
@@ -358,9 +446,16 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 // 程序本身在不在跑：给"未运行但窗口其实开着（登的是别的号）"这种状态留个说法
                 "app_running": !prog_pids.is_empty(),
                 "swapped": swapped_here,
+                // 客户端里登的就是这张卡：共用一份档案的产品用它当"当前账号"，
+                // 磁盘上的换号记录不会随客户端登录变化，拿它当当前账号必然认错
+                "logged_in": logged_in,
+                // 这个号存过登录态没有：存过才能一键切回来，没存过界面只给"去登一次"
+                "auth_pack": crate::authpack::stored(&app.id, m["name"].as_str().unwrap_or("")),
                 "identity": identity::inspect(m["data_dir"].as_str().unwrap_or("")),
                 "usage": m["usage"],
                 "usage_fetched_at": m["usage_fetched_at"],
+                // 今天签到状态：只读后台缓存，绝不在这里发网络请求（见 checkin::for_app）
+                "checkin": crate::checkin::for_app(&app.id),
                 "quota": {
                     "total": total, "left": left,
                     "expires_on": expires_on, "days_left": dl,
@@ -398,6 +493,9 @@ pub fn build_state(proxy: &Proxy) -> Value {
                         m["quota_user_id"].as_str().unwrap_or(""),
                         &machine,
                     ),
+                    // 按天消耗序列（波形图/热力图）：`{unit,days[],total,peak...}` 或 `{error}`；
+                    // Null = 这个产品压根没有逐笔时刻可聚，界面就不许出现图占位
+                    "trend": m["quota_trend"],
                 },
             }));
         }
@@ -455,10 +553,16 @@ pub fn build_state(proxy: &Proxy) -> Value {
         "apps": apps_out,
         "selfcheck": crate::swap::last_report(),
         "hidden_apps": hidden_out,
+        // 「显示未安装的程序」开关（存 config.json，不是 settings.json）
+        "show_uninstalled": crate::registry::show_uninstalled(),
         "instances": instances,
         "procs": procs,
         "alerts": alerts,
         "perks": perks,
+        // 每日签到整份缓存（后台循环负责刷新，这里一律不发网络请求）
+        "checkin": crate::checkin::snapshot(),
+        // 「一键刷新全部额度」的后台任务进度（没在跑时是 Null）
+        "alljob": crate::commands::alljob(),
         "stats": {
             "instances": instances.len(),
             // 在跑的程序数：自动发现的程序没有实例，按实例数算会永远显示 0。

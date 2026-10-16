@@ -32,15 +32,32 @@ Tauri 2 桌面应用（Rust 后端 + WebView2 前端），产物是单个原生 
 
 | 模块 | 能干什么 |
 |---|---|
+| 首页 | 落地页不是"第一个 Agent"：今天要处理什么一眼看完（临期积分 / 今天还能领 / Agent 概览 / 最近领过），两个主操作 **一键刷新全部额度**、**一键签到** |
 | Agent 管理 | 自动扫描本机装了哪些 AI Agent，新增/卸载有标记；六步向导建账号（登录 → 数据来源 → 额度） |
 | 多开/换号 | 可多开的建独立目录同屏跑；仅可换号的 junction 切换，随时切回 |
 | 额度监控 | 本机直读（Qoder / WorkBuddy 系）+ 截图 AI 识别 + 适配器抓取（OpenAI / new-api / one-api 格式） |
+| 每日签到 | 产品 → 账号两级：**每个账号实例各看各的签到状态**，不用先切号才看得到另一个；已领完 ≠ 不用领；没立刻到账的积分自动盯着，到账了在提示区说一声 |
 | API 台账 | 站点 → 多 Key，各带用途标签、额度、过期日、测活；**查重 / 批量删 / 一键接入**到 Qoder 等程序 |
 | 快速登记 | 粘贴任意排版文本或截图 → 本机规则优先解析（离线、零 token）→ 多模态模型兜底 → 核对后落盘 |
 | AI 识别 | 文本/截图两条通道分开配模型；识别全程有进度反馈，同时只跑一次，重复请求直接挡掉 |
 | 本地反代 | 池子（多上游轮询）+ 分发 Key，`127.0.0.1:8788/v1` OpenAI 兼容 |
 | 凭据安全 | 所有 Key / Token 进 DPAPI + 可选主密码的加密保管箱，界面只显示打码串 |
 | 数据治理 | 数据根搬家 / 回滚、可再生大文件去重、本机 Agent 盘点 |
+
+## 支持的 Agent
+
+内置登记表覆盖下面这些（参照 [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools)
+的平台清单补齐）。登记了官方默认安装位置，换台机器装上就自动认出来；
+**这台机器上没装、也没有账号卡的不占侧栏格子**，要看全量去 设置 → 高级 → 「显示未安装的程序」。
+
+| 类别 | Agent |
+|---|---|
+| 国内 | Qoder CN、Qoder CN IDE、WorkBuddy（国内版 / 国际版）、Trae CN、TRAE SOLO CN、千问办公、MiniMax Code、AStudio、ZCode、DeepSeek Harness、Marvis、Xiaomi MiMo、CodeBuddy / CodeBuddy CN |
+| 国际 | Qoder、Trae、TRAE SOLO、Cursor、Kiro、Windsurf、Antigravity、GitHub Copilot（VS Code）、Zed、Grok Bot |
+| CLI | Codex CLI、Claude Code CLI、OpenCode |
+
+> 认不出来的是绿色版 / 没建快捷方式的：侧栏下方「＋ 添加程序」登记一个可执行文件路径即可，
+> 不改动那个程序的任何文件；能不能多开由内核实测判定。
 
 ## 快速开始
 

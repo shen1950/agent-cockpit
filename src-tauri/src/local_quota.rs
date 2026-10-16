@@ -34,6 +34,12 @@ pub fn store_for(app_id: &str) -> Option<&'static str> {
     LOCAL_STORES.iter().find(|(id, _)| *id == app_id).map(|(_, s)| *s)
 }
 
+/// 反查：agenthub 的 store 名 → 驾驶舱的 app id。LOCAL_STORES 是 1:1 的，所以反查唯一。
+/// 签到页要按账号展开时，手上只有 store（agenthub 报的），得换回 app id 才能找到账号卡。
+pub fn app_for_store(store: &str) -> Option<&'static str> {
+    LOCAL_STORES.iter().find(|(_, s)| *s == store).map(|(id, _)| *id)
+}
+
 /// 已登记直读通道的产品显示名（用 registry 的名字，没登记 id 的退回原样）。
 /// 提示文案**别再写死一串名字**——那是第二份真值，加一家忘一家（这次修的就是它过期了）。
 pub fn locally_readable_names() -> String {
@@ -78,6 +84,10 @@ pub struct Quota {
     pub live_error: String,
     /// 登录态实际是从哪个文件读到的（Qoder 0.4.x 换壳后这是唯一能看出"读错档案"的线索）
     pub auth_from: String,
+    /// 按天消耗序列（波形图与热力图的数据源）：`{unit,days[],total,peak,peak_date,from,to}`，
+    /// 读不出来时是 `{error:"…"}`，agenthub 那个产品压根没有逐笔时刻可聚时为 `Null`。
+    /// 只有 WorkBuddy 系有这份数——它的本地库逐会话记了各资源包扣掉多少 credits。
+    pub trend: Value,
 }
 
 impl Quota {
@@ -295,6 +305,15 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
         source: d["source"].as_str().unwrap_or("server").to_string(),
         live_error: d["liveError"].as_str().unwrap_or("").to_string(),
         auth_from: d["authFrom"].as_str().unwrap_or("").to_string(),
+        // 按天序列与它的"为什么没有"合并成一个值：界面只认一种形状，
+        // 有 days 就画图、只有 error 就把那句话原样显示出来，不许自己编一组数。
+        trend: match d.get("trend") {
+            Some(t) if !t.is_null() => t.clone(),
+            _ => match d["trendError"].as_str() {
+                Some(e) if !e.is_empty() => json!({ "error": e }),
+                _ => Value::Null,
+            },
+        },
     })
 }
 
@@ -379,6 +398,9 @@ pub fn apply(meta: &Value, q: &Quota) -> Value {
         obj.insert("quota_sessions".into(), json!(q.sessions));
         obj.insert("quota_last_active".into(), json!(q.last_active));
         obj.insert("quota_local".into(), json!(true));
+        if !q.trend.is_null() {
+            obj.insert("quota_trend".into(), q.trend.clone());
+        }
         obj.insert(
             "quota_fetched_at".into(),
             json!(std::time::SystemTime::now()
@@ -418,6 +440,11 @@ pub fn apply(meta: &Value, q: &Quota) -> Value {
     if !q.auth_from.is_empty() {
         obj.insert("quota_auth_from".into(), json!(q.auth_from));
     }
+    // 按天消耗序列：这一轮没读到就留着上一轮的（它是本机 sqlite 聚合，不联网，
+    // 不会因为服务端掉线就没数），只有 agenthub 真给了新序列才覆盖。
+    if !q.trend.is_null() {
+        obj.insert("quota_trend".into(), q.trend.clone());
+    }
     if !q.expires_on.is_empty() {
         obj.insert("expires_on".into(), json!(q.expires_on));
     }
@@ -448,6 +475,7 @@ mod tests {
             plan_name: "体验版".into(), unit: "credits".into(),
             kind: "full".into(), used: 100.0, sessions: 3, last_active: "2026-10-07 18:00".into(),
             source: "server".into(), live_error: String::new(), auth_from: String::new(),
+            trend: Value::Null,
         };
         let m = apply(&meta, &q);
         assert_eq!(m["quota_user_id"], "u-1");
@@ -592,6 +620,7 @@ mod tests {
             kind: "usage_only".into(), used: 9395.07, sessions: 126,
             last_active: "2026-10-07 19:12".into(),
             source: String::new(), live_error: String::new(), auth_from: String::new(),
+            trend: Value::Null,
         };
         assert!(q.is_usage_only());
         assert!(!q.is_stale(), "只有累计已用的产品不算\"旧缓存\"");
@@ -687,7 +716,23 @@ mod tests {
             portions: vec![], groups: vec![], plan_name: String::new(), unit: "credits".into(), kind: "full".into(), used: 0.0, sessions: 0,
             last_active: String::new(),
             source: source.into(), live_error: live_error.into(), auth_from: String::new(),
+            trend: Value::Null,
         }
+    }
+
+    /// 按天序列：这一轮 agenthub 没给数时**不许**把上一轮的抹掉（它是本机 sqlite 聚合，
+    /// 不随服务端掉线），给了就整包覆盖；只有 error 时把 error 存下来，
+    /// 界面才说得出"为什么这张卡没有图"。
+    #[test]
+    fn trend_survives_a_round_without_data() {
+        let old = json!({ "name": "账号1", "quota_trend": {
+            "unit": "credits", "total": 10.0, "days": [{"date": "2026-10-01", "credits": 10.0}] } });
+        let mut q = mk_quota("server", "");
+        assert!(apply(&old, &q).get("quota_trend").is_some(), "没带新序列就要留着旧的");
+        q.trend = json!({ "error": "没找到 workbuddy.db" });
+        assert_eq!(apply(&old, &q)["quota_trend"]["error"], "没找到 workbuddy.db");
+        q.trend = json!({ "unit": "credits", "days": [{"date": "2026-10-11", "credits": 3.0}] });
+        assert_eq!(apply(&old, &q)["quota_trend"]["days"][0]["date"], "2026-10-11");
     }
 
     /// 「服务端没读成、只剩旧缓存」必须被识别出来，否则界面会把 8 月的数当今天的余额显示

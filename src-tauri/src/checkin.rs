@@ -1,0 +1,820 @@
+// 每日签到与领积分。
+//
+// 分工：查状态和领取的报文都在 agenthub 里（凭据解密、各家域名、UA 那些它已经解决了），
+// 这一层只做三件事——把结果缓存住给界面画、把「领取」限制在明确入口、按天与时间窗
+// 决定后台要不要自己动。
+//
+// 领取是**写操作**：只有界面上点过「立刻签到」，或者这家开了自动签到且今天还没跑过，
+// 才会真发那条请求。厂商侧的当日名额领回来是没有的，所以这里宁可少跑一次。
+use crate::registry;
+use crate::settings;
+use tauri_plugin_notification::NotificationExt;
+use serde_json::{json, Value};
+use std::fs;
+use std::process::Command;
+use std::sync::Mutex;
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 支持签到的产品目录。**只用来在"一次都还没查到过"时先把表格的行画出来**——
+/// 列表（产品 / 操作 / 自动领 / 提醒）本身是纯 UI，没有任何理由等六家接口。
+/// 产品名与顺序跟 agenthub.py 的 CHECKIN_STORES / CHECKIN_LABELS 对齐，
+/// 新增一家时两处都要改（跟 local_quota::LOCAL_STORES 同一条规矩）。
+pub const CATALOG: &[(&str, &str)] = &[
+    ("workbuddy", "WorkBuddy"),
+    ("workbuddy-activity", "WorkBuddy 活跃地图"),
+    ("workbuddy-travel", "WorkBuddy 旅行猫"),
+    ("workbuddy-intl", "WorkBuddy 国际版"),
+    ("trae-cn", "Trae CN"),
+    ("minimax", "MiniMax Code"),
+    ("astudio", "AStudio"),
+    ("qoder-cn", "Qoder CN"),
+    ("qoder", "Qoder"),
+];
+
+/// 哪几家能**按账号各查一次**。判据是两条都成立：
+///   ① 这个产品在这台机器上每个号都留着自己那份登录态（驾驶舱保管箱里的登录包）；
+///   ② agenthub 的 checkin 认得出"用这个号的登录态去查"（qoder 系给 `--profile`，
+///      WorkBuddy 系给 `--auth-file`）。
+/// 其余几家（Trae CN / MiniMax / AStudio）的登录态是**整机一份**、写死在某个固定路径，
+/// 换号必然覆盖掉前一个——硬拆只会给出一个看起来像真的、其实是当前登录号的假答案，
+/// 所以宁可只给产品级一行，也不摆一排串号的假账号行。
+pub const PER_ACCOUNT: &[&str] = &["qoder", "qoder-cn", "workbuddy", "workbuddy-intl"];
+
+/// 最近一次查到的状态（整份数组）。界面每 4 秒刷新，绝不能每次都去发六条网络请求，
+/// 所以只在这里存一份，靠 stale() 决定什么时候重新查。
+static CACHE: Mutex<Option<Value>> = Mutex::new(None);
+
+/// 缓存还没建起来时用的回落快照（落盘的"上次结果"或静态目录），带 15 秒 TTL
+static FALLBACK: Mutex<Option<(f64, Value)>> = Mutex::new(None);
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// 整数就不带小数点（30 而不是 30.0），跟界面上其它积分读数同一套写法
+fn num_text(v: f64) -> String {
+    if v.fract().abs() < 1e-9 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+fn run(extra: &[&str]) -> Result<Value, String> {
+    // agenthub 是 .cmd 包装，CreateProcess 直接执行不了，必须经 cmd.exe 转一手
+    let mut c = Command::new("cmd.exe");
+    let mut args: Vec<&str> = vec!["/d", "/c", "agenthub", "checkin"];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    c.args(&args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = c
+        .output()
+        .map_err(|e| format!("调不到 agenthub（{e}）：本机需要先装 agent-memory-suite"))?;
+    if !out.status.success() {
+        let s = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "agenthub checkin 失败：{}",
+            s.trim().chars().take(180).collect::<String>()
+        ));
+    }
+    let parsed: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("agenthub 输出不是 JSON：{e}"))?;
+    Ok(parsed)
+}
+
+fn state_path() -> std::path::PathBuf {
+    registry::base_dir().join("checkin.json")
+}
+
+fn load_state() -> Value {
+    let v = fs::read_to_string(state_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    let mut o = match v.as_object() {
+        Some(o) => o.clone(),
+        None => serde_json::Map::new(),
+    };
+    for (k, d) in [("done", json!({})), ("log", json!([])), ("pending", json!({})), ("arrived", json!([]))] {
+        if !o.contains_key(k) {
+            o.insert(k.into(), d);
+        }
+    }
+    Value::Object(o)
+}
+
+/// 交给界面那份：`last` 是"上次查到的整份结果"，只给后端自己用来先把表格画出来，
+/// 没必要跟着每 4 秒一轮的状态报文来回传。
+fn public_state(st: &Value) -> Value {
+    let mut s = st.clone();
+    if let Some(o) = s.as_object_mut() {
+        o.remove("last");
+    }
+    s
+}
+
+fn save_state(v: &Value) {
+    let p = state_path();
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    // 先写临时文件再改名：签到记录被半截读走，下一轮就会以为今天还没跑过
+    let tmp = p.with_extension("json.tmp");
+    if let Ok(s) = serde_json::to_string_pretty(v) {
+        if fs::write(&tmp, s).is_ok() {
+            let _ = fs::rename(&tmp, &p);
+        }
+    }
+}
+
+/// 缓存还新不新。查一次要打六家接口，给 5 分钟；手动点「刷新」走 refresh() 不看这个。
+pub fn stale() -> bool {
+    let g = CACHE.lock().unwrap();
+    match &*g {
+        None => true,
+        Some(v) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let at = v["fetched_at"].as_f64().unwrap_or(0.0);
+            now - at > 300.0
+        }
+    }
+}
+
+pub fn refresh() -> Value {
+    match run(&[]) {
+        Ok(items) => {
+            let now = now_secs();
+            // 产品行后面挂上各账号自己的行（只有"登录态按账号各存一份、且存了不止一个号"
+            // 的产品才挂）。这一步是几次额外的 agenthub 调用，所以只在这一条后台路径上做，
+            // 界面那 4 秒一轮读的是缓存。
+            let items = expand_accounts(items);
+            let st = load_state();
+            // 把这次的结果落盘：下次刚开机、后台第一轮还没跑完时，界面就能拿它先把
+            // 整张表画出来（产品名、备注、操作列都在里面），不用干等六家接口。
+            let mut persisted = st.clone();
+            persisted["last"] = json!({ "items": items, "fetched_at": now });
+            save_state(&persisted);
+            let v = json!({ "ok": true, "items": items, "fetched_at": now, "state": public_state(&st) });
+            *CACHE.lock().unwrap() = Some(v.clone());
+            v
+        }
+        Err(e) => json!({ "ok": false, "msg": e }),
+    }
+}
+
+/// 产品级结果 → 产品行 + 它的账号行。产品行标 `scope: "product"`，账号行标 `scope: "account"`，
+/// 界面据此决定画不画那条缩进子行。
+fn expand_accounts(items: Value) -> Value {
+    let arr = match items.as_array() {
+        Some(a) => a.clone(),
+        None => return items,
+    };
+    let mut out: Vec<Value> = Vec::new();
+    for it in arr {
+        let store = it["product"].as_str().unwrap_or("").to_string();
+        let mut prod = it.clone();
+        if let Some(o) = prod.as_object_mut() {
+            o.insert("scope".into(), json!("product"));
+        }
+        out.push(prod);
+        if store.is_empty() {
+            continue;
+        }
+        if let Some(app_id) = crate::local_quota::app_for_store(&store) {
+            out.extend(account_items(app_id, &store));
+        }
+    }
+    json!(out)
+}
+
+/// 后台刷一次；同一时间只放行一个。
+fn spawn_refresh() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = refresh();
+        BUSY.store(false, Ordering::SeqCst);
+    });
+}
+
+/// 界面进来时**立刻**给一份（缓存，或上次落盘的那份），过期就叫后台去刷——
+/// 绝不在这儿等六家接口。以前这里是同步 refresh()：进一次页面要等十几秒到一分钟，
+/// 整页只剩一句"正在问各家今天的状态…"，而列表本身根本不需要等（2026-10-15 她指出来的）。
+pub fn view() -> Value {
+    let mut out = snapshot();
+    if stale() {
+        spawn_refresh();
+        if let Some(o) = out.as_object_mut() {
+            o.insert("refreshing".into(), json!(true));
+        }
+    }
+    out
+}
+
+/// 一次都没查到过时的占位行：把产品名先摆出来，状态列由界面写"查询中"。
+fn catalog_items() -> Vec<Value> {
+    CATALOG
+        .iter()
+        .map(|(p, n)| {
+            json!({
+                "product": p, "name": n, "pending": true, "supported": true,
+                "scope": "product",
+                "auto": false, "activity_on": true, "signed_today": false, "claimable": false,
+            })
+        })
+        .collect()
+}
+
+/// 这个 store 能不能按账号各查一次（登录包登记 + agenthub 认得出这个入口）
+pub fn per_account(store: &str) -> bool {
+    PER_ACCOUNT.contains(&store)
+        && crate::local_quota::app_for_store(store)
+            .map(crate::registry::per_account_login)
+            .unwrap_or(false)
+}
+
+/// 把某个账号自己的登录态铺成临时档案目录，然后让 agenthub 只拿它去查/领。
+/// 返回铺好的临时目录；调用方用完必须 drop_profile。
+fn stage(app_id: &str, store: &str, name: &str) -> Result<std::path::PathBuf, String> {
+    let dir = crate::authpack::materialize(app_id, name)?;
+    // WorkBuddy 系的登录态不在档案目录里（写死在 %LOCALAPPDATA%\CodeBuddyExtension\…），
+    // 所以铺出来的是"一个文件"，得用 --auth-file 指过去；Qoder 系铺的是整个档案目录，
+    // 走 --profile（那边要读 Local State 拿主密钥才解得开 auth.v1.dat）。
+    let _ = store;
+    Ok(dir)
+}
+
+/// 这个账号的登录包铺出来后，该用哪个命令行参数交给 agenthub
+fn stage_arg(app_id: &str, store: &str, dir: &std::path::Path) -> (String, String) {
+    if store.starts_with("workbuddy") {
+        let leaf = crate::registry::auth_pack_files(app_id)
+            .first()
+            .and_then(|f| f.rsplit(['/', '\\']).next())
+            .unwrap_or("auth.info");
+        (
+            "--auth-file".into(),
+            dir.join(leaf).to_string_lossy().into_owned(),
+        )
+    } else {
+        ("--profile".into(), dir.to_string_lossy().into_owned())
+    }
+}
+
+/// 一个产品的每个账号各查一次。只对"登录态按账号各存一份"的产品做，
+/// 且**至少两个号都存过登录包**才展开——一个号的产品，产品级那一行就是它，
+/// 再挂一条同名子行只是重复。
+///
+/// 每个号各起一次 agenthub（一次 python 启动两三秒），所以这条只在后台刷新里跑。
+pub fn account_items(app_id: &str, store: &str) -> Vec<Value> {
+    if !per_account(store) {
+        return Vec::new();
+    }
+    let insts = crate::registry::load_instances(app_id);
+    let names: Vec<String> = insts
+        .iter()
+        .filter_map(|m| m["name"].as_str().map(String::from))
+        .filter(|n| !n.is_empty())
+        // 没存过登录包的账号不硬查：查出来的是"当前登着的那个号"的状态，那就是串号
+        .filter(|n| crate::authpack::stored(app_id, n).is_some())
+        .collect();
+    if names.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for name in names {
+        let dir = match stage(app_id, store, &name) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let (flag, val) = stage_arg(app_id, store, &dir);
+        let item = run(&[store, flag.as_str(), val.as_str()])
+            .ok()
+            .and_then(|v| v.as_array().and_then(|a| a.first().cloned()));
+        crate::authpack::drop_profile(&dir);
+        let mut it = match item {
+            Some(i) => i,
+            None => continue,
+        };
+        if let Some(o) = it.as_object_mut() {
+            o.insert("scope".into(), json!("account"));
+            o.insert("account".into(), json!(name));
+            o.insert("product".into(), json!(store));
+            // 账号行的标题就是账号名（agenthub 报的 name 是产品名，那一层已经由父行说过了）
+            o.insert("name".into(), json!(name));
+            o.insert("parent".into(), json!(store));
+        }
+        out.push(it);
+    }
+    out
+}
+
+/// 领一家。返回 agenthub 那一条结果，并把缓存作废（领完状态必然变了）。
+/// `acct` 给了就按那个账号领（先用它自己的登录包铺临时档案），否则照旧领"当前登着的号"。
+pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
+    if store.is_empty() {
+        return json!({ "ok": false, "msg": "没说要给哪家签到" });
+    }
+    let mut staged: Option<std::path::PathBuf> = None;
+    let mut extra: Vec<String> = vec!["--claim".into(), store.to_string()];
+    if let Some((app_id, name)) = acct {
+        match stage(app_id, store, name) {
+            Ok(d) => {
+                let (flag, val) = stage_arg(app_id, store, &d);
+                extra.push(flag);
+                extra.push(val);
+                staged = Some(d);
+            }
+            Err(e) => return json!({ "ok": false, "result": { "error": e } }),
+        }
+    }
+    let refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+    let r = run(&refs);
+    if let Some(d) = staged {
+        crate::authpack::drop_profile(&d);
+    }
+    let item = match r {
+        Ok(v) => v
+            .as_array()
+            .and_then(|a| a.first().cloned())
+            .unwrap_or_else(|| json!({ "error": "agenthub 没返回结果" })),
+        Err(e) => json!({ "error": e }),
+    };
+    // 记「今天跑过没有」的键：产品级用 store，账号级用 store@账号——
+    // 两个号各自有各自的当日名额，共用一个键会让先领的那个把另一个顶掉
+    let key = match acct {
+        Some((_, n)) => format!("{store}@{n}"),
+        None => store.to_string(),
+    };
+    let today = item["today"].as_str().unwrap_or("").to_string();
+    let got = item["claimed"].as_bool().unwrap_or(false) || item["already"].as_bool().unwrap_or(false);
+    // 写操作已经做完、只是服务端还没结算（现在只有 WorkBuddy 国际版那 30 积分）。
+    // agenthub 用 settling_final 标出这种"今天这一步已经走完了"：
+    //   · 记 done —— 否则下一轮自动领会再发一遍对话；
+    //   · 挂进 pending —— 后台每几分钟替她盯一次，到账了在操作提示区说一声。
+    // 旅行猫那种"先派、到点再领"的 settling 不带这个标记，今天还有第二步要走。
+    let settled = item["settling"].as_bool().unwrap_or(false)
+        && item["settling_final"].as_bool().unwrap_or(false);
+    let mut st = load_state();
+    // 只有真领到了（或今天这份本来就已经在手）才记"这家今天跑过"。
+    // 以前是无条件记，于是 MiniMax 那种"服务端拒了但被解析成成功"的一次点击，
+    // 会把这家钉成今天已完成——当天再怎么重试都不会发第二次，用户看到的就是
+    // "点了半天没反应，底下还一直提示领到了"（2026-10-13）。
+    if (got || settled) && !today.is_empty() {
+        st["done"].as_object_mut().map(|o| {
+            o.insert(key.clone(), json!(today));
+        });
+    }
+    if settled && !today.is_empty() {
+        note_settling(&mut st, &key, &item, &today);
+    }
+    let mut log = st["log"].as_array().cloned().unwrap_or_default();
+    log.push(json!({
+        "at": today, "store": store,
+        // 账号级领取记下是哪个号领的——日志里两家都写 "qoder-cn" 就分不出是谁了
+        "account": acct.map(|(_, n)| n).unwrap_or(""),
+        "claimed": item["claimed"].as_bool().unwrap_or(false),
+        "already": item["already"].as_bool().unwrap_or(false),
+        "verified": item["verified"],
+        "message": item["message"], "credit": item["credit"], "error": item["error"],
+    }));
+    // 日志只留最近 200 条，够看半年
+    if log.len() > 200 {
+        log.drain(0..log.len() - 200);
+    }
+    st["log"] = json!(log);
+    save_state(&st);
+    *CACHE.lock().unwrap() = None;
+    json!({ "ok": item["error"].is_null(), "result": item })
+}
+
+/// 登记一家「写操作已经做完、服务端还没结算到账」的（现在只有 WorkBuddy 国际版那 30 积分）。
+/// 落盘而不是只放内存：她可能过一会儿就把驾驶舱关了再开，这份"还在等"必须跟得住。
+fn note_settling(st: &mut Value, key: &str, item: &Value, today: &str) {
+    let now = now_secs();
+    // 键是 `store` 或 `store@账号`。到账提示要能一眼看出是哪个号，
+    // 所以标题写成「产品 · 账号」——账号级那行的 item.name 已经被换成账号名了，别直接用它
+    let (store, acct) = match key.split_once('@') {
+        Some((s, n)) => (s, Some(n)),
+        None => (key, None),
+    };
+    let prod = item["product"]
+        .as_str()
+        .and_then(|p| CATALOG.iter().find(|(k, _)| *k == p).map(|(_, n)| *n))
+        .unwrap_or(store);
+    let label = match acct {
+        Some(n) => format!("{prod} · {n}"),
+        None => prod.to_string(),
+    };
+    let expect = item["expect"].as_str().unwrap_or("今天这份积分").to_string();
+    let pend = match st["pending"].as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    pend.insert(
+        key.to_string(),
+        json!({
+            "since": now, "today": today, "label": label, "expect": expect,
+            // 超过一天还没到账就别再盯了：那是厂商那边的问题，不是"还没结算"
+            "until": now + 86400.0,
+        }),
+    );
+}
+
+/// 现在有没有在等的到账
+pub fn has_pending() -> bool {
+    !load_state()["pending"].as_object().map(|o| o.is_empty()).unwrap_or(true)
+}
+
+/// 待观察的那几家回来读一次：到账了就挪进 `arrived`（界面据此在操作提示区弹一条）。
+/// 只看"今天这份到没到"，走各家自己的状态接口，不带 --claim——这一步是只读的。
+pub fn check_arrivals() -> Vec<Value> {
+    let st = load_state();
+    let pend = match st["pending"].as_object() {
+        Some(o) if !o.is_empty() => o.clone(),
+        _ => return Vec::new(),
+    };
+    let now = now_secs();
+    let mut arrived: Vec<Value> = Vec::new();
+    let mut done: Vec<String> = Vec::new();
+    for (key, p) in &pend {
+        if p["until"].as_f64().unwrap_or(0.0) < now {
+            done.push(key.clone());
+            continue;
+        }
+        // 待观察的键可能是"账号级"的（store@账号）：那个号的到没到账得用它自己的
+        // 登录包去看，拿当前登着的那个号去读就是串号
+        let (store, acct) = match key.split_once('@') {
+            Some((s, n)) => (s.to_string(), Some(n.to_string())),
+            None => (key.clone(), None),
+        };
+        let app_id = crate::local_quota::app_for_store(&store).unwrap_or("");
+        let staged = match (&acct, app_id.is_empty()) {
+            (Some(n), false) => stage(app_id, &store, n).ok(),
+            _ => None,
+        };
+        let mut extra: Vec<String> = vec![store.clone()];
+        if let Some(d) = &staged {
+            let (f, v) = stage_arg(app_id, &store, d);
+            extra.push(f);
+            extra.push(v);
+        }
+        let refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+        let item = match run(&refs) {
+            Ok(v) => v
+                .as_array()
+                .and_then(|a| a.first().cloned())
+                .unwrap_or_else(|| json!({})),
+            Err(_) => {
+                if let Some(d) = staged {
+                    crate::authpack::drop_profile(&d);
+                }
+                continue; // 这一次没读到就下一轮再说，别把"待观察"当失败清掉
+            }
+        };
+        if let Some(d) = staged {
+            crate::authpack::drop_profile(&d);
+        }
+        if item["signed_today"].as_bool() != Some(true) {
+            continue;
+        }
+        let label = p["label"].as_str().unwrap_or(key).to_string();
+        let expect = p["expect"].as_str().unwrap_or("今天这份积分").to_string();
+        let credit = item["reward"].as_f64();
+        arrived.push(json!({
+            "id": format!("{key}-{}", p["today"].as_str().unwrap_or("")),
+            "at": now, "store": store, "account": acct.clone().unwrap_or_default(),
+            "label": label,
+            "text": format!(
+                "「{label}」的{expect}到账了{}",
+                match credit { Some(c) => format!("（{} 积分）", num_text(c)), None => String::new() }
+            ),
+        }));
+        done.push(key.clone());
+    }
+    if arrived.is_empty() && done.is_empty() {
+        return arrived;
+    }
+    let mut st = load_state();
+    if let Some(o) = st["pending"].as_object_mut() {
+        for k in &done {
+            o.remove(k);
+        }
+    }
+    let mut arr = st["arrived"].as_array().cloned().unwrap_or_default();
+    arr.extend(arrived.iter().cloned());
+    if arr.len() > 20 {
+        arr.drain(0..arr.len() - 20);
+    }
+    st["arrived"] = json!(arr);
+    save_state(&st);
+    arrived
+}
+
+/// 到账监测：每 4 分钟回来读一次，直到到账或超过 24 小时。
+/// 单独一条线程，不挂在 auto_fetch 的间隔上——那个默认几十分钟一轮，
+/// 而 30 积分凌晨三点多才到账，等到下一轮早就没意义了（2026-10-15 她报的正是这个）。
+pub fn arrival_watch_loop(app: tauri::AppHandle) {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(240));
+        if !has_pending() {
+            continue;
+        }
+        for n in check_arrivals() {
+            let text = n["text"].as_str().unwrap_or("").to_string();
+            if text.is_empty() {
+                continue;
+            }
+            // 顺手发一条系统通知：她可能正把窗口收在托盘里
+            let _ = app
+                .notification()
+                .builder()
+                .title("Agent 驾驶舱")
+                .body(text)
+                .show();
+        }
+    }
+}
+
+/// 这一家今天该不该自动跑。判据全部摊开成一个纯函数，好测也好解释：
+/// 总开关开着 → 这家单独开了 → 厂商说活动开着且今天能领 → 允许自动 →
+/// 现在在时间窗内 → 今天还没为这家跑过。
+pub fn should_run(
+    cfg_enabled: bool,
+    store_on: bool,
+    item: &Value,
+    hour: u32,
+    from: u32,
+    to: u32,
+    done_today: bool,
+) -> bool {
+    cfg_enabled
+        && store_on
+        && item["auto"].as_bool().unwrap_or(false)
+        && item["claimable"].as_bool().unwrap_or(false)
+        && item["activity_on"].as_bool().unwrap_or(false)
+        && !done_today
+        && hour >= from
+        && hour < to
+}
+
+/// 给 4 秒一轮的状态快照用：**绝不发网络请求**。
+/// 缓存还没有（刚开机、后台第一轮没跑完）就把**上次查到的那份**交出去，一张表先画出来；
+/// 一次都没查过才退回静态目录占位（界面把状态列写成"查询中"）。
+/// 不许在这里顺手去查一次——那会把六家接口挂到界面刷新上。
+///
+/// 回落那份带 15 秒短缓存：状态构建每 4 秒要为二十来个程序各问一次 for_app，
+/// 不能每次都去读一遍文件。
+pub fn snapshot() -> Value {
+    if let Some(v) = CACHE.lock().unwrap().clone() {
+        return v;
+    }
+    let now = now_secs();
+    if let Ok(g) = FALLBACK.lock() {
+        if let Some((at, v)) = g.as_ref() {
+            if now - at < 15.0 {
+                return v.clone();
+            }
+        }
+    }
+    let st = load_state();
+    let last = &st["last"];
+    let items = last["items"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .cloned()
+        .unwrap_or_else(catalog_items);
+    let v = json!({
+        "ok": true, "items": items,
+        "fetched_at": last["fetched_at"].as_f64().unwrap_or(0.0),
+        "state": public_state(&st),
+        "stale": true, "refreshing": true,
+        "placeholder": last["items"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+    });
+    if let Ok(mut g) = FALLBACK.lock() {
+        *g = Some((now, v.clone()));
+    }
+    v
+}
+
+/// 卡片上那枚签到角标的数据：**只读缓存，不发网络请求**。
+/// app id 与 agenthub 的 store 名不同名的情况（Trae 两边分别叫 traework-cn / trae-cn）
+/// 走 `local_quota::store_for` 那一份真值，别在这里再抄一张映射表。
+/// 缓存里没这家（不支持签到的产品）就回 Null，界面据此不画角标。
+pub fn for_app(app_id: &str) -> Value {
+    let store = match crate::local_quota::store_for(app_id) {
+        Some(s) => s,
+        None => return Value::Null,
+    };
+    // 走 snapshot()：缓存没建起来时它给的是"上次落盘那份"，所以卡片角标不用等后台
+    // 第一轮查完才出现（一次都没查过则是占位行，会被下面判成 unknown，不画角标）
+    let snap = snapshot();
+    let items = match snap["items"].as_array() {
+        Some(a) => a,
+        None => return Value::Null,
+    };
+    let it = match items.iter().find(|x| x["product"].as_str() == Some(store)) {
+        Some(x) => x,
+        None => return Value::Null,
+    };
+    if it["pending"].as_bool() == Some(true) {
+        return Value::Null;
+    }
+    if it.get("error").is_some() {
+        return json!({ "state": "error", "msg": it["error"] });
+    }
+    json!({
+        "state": if it["signed_today"].as_bool() == Some(true) { "done" }
+            else if it["claimable"].as_bool() == Some(true) { "claimable" }
+            else if it["activity_on"].as_bool() == Some(false) { "off" }
+            else { "unknown" },
+        "reward": it["reward"], "streak": it["streak"],
+        "auto": it["auto"], "name": it["name"],
+    })
+}
+
+/// "10:05" → 605。解不开就退回默认 600，别让一个填错的提醒时间把提醒整个关掉。
+pub fn hhmm_to_min(s: &str) -> u32 {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() == 2 {
+        if let (Ok(h), Ok(m)) = (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>()) {
+            if h < 24 && m < 60 {
+                return h * 60 + m;
+            }
+        }
+    }
+    600
+}
+
+/// 今天该不该弹这条提醒：到点了、今天还没弹过。
+pub fn remind_due(now_min: u32, at_min: u32, already_today: bool) -> bool {
+    !already_today && now_min >= at_min
+}
+
+/// 后台每轮自动取数之后调一次。领取要总开关 + 逐家开；提醒是只读的，默认就开着。
+pub fn tick(app: &tauri::AppHandle) {
+    let st = settings::get();
+    let c = &st["checkin"];
+    let auto_on = c["enabled"].as_bool().unwrap_or(false);
+    let remind_on = c["remind"].as_bool().unwrap_or(true);
+    if !auto_on && !remind_on {
+        return;
+    }
+    let v = view();
+    let items = match v["items"].as_array() {
+        Some(a) => a.clone(),
+        None => return,
+    };
+    let first = match items.first() {
+        Some(x) => x,
+        None => return,
+    };
+    let today = first["today"].as_str().unwrap_or("").to_string();
+    let now_min = first["hour"].as_u64().unwrap_or(0) as u32 * 60
+        + first["minute"].as_u64().unwrap_or(0) as u32;
+    let mut state = load_state();
+
+    if auto_on {
+        let from = c["window_start"].as_u64().unwrap_or(6) as u32;
+        let to = c["window_end"].as_u64().unwrap_or(12) as u32;
+        for it in &items {
+            // 自动领只走产品级那一行：账号行是"同一件事的另一个视角"，
+            // 照它们各领一次会把同一家的当日名额重复消耗
+            if it["scope"].as_str() == Some("account") {
+                continue;
+            }
+            let store = match it["product"].as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let already = state["done"][store].as_str() == Some(today.as_str());
+            if !should_run(
+                true,
+                c["auto"][store].as_bool().unwrap_or(false),
+                it,
+                now_min / 60,
+                from,
+                to,
+                already,
+            ) {
+                continue;
+            }
+            claim(store, None);
+        }
+        state = load_state();
+    }
+
+    // 到点提醒：把"今天还有几家没领"报一次，一天只报一次，不催第二遍
+    if !remind_on || today.is_empty() {
+        return;
+    }
+    let at = hhmm_to_min(c["remind_at"].as_str().unwrap_or("10:05"));
+    if !remind_due(now_min, at, state["reminded"].as_str() == Some(today.as_str())) {
+        return;
+    }
+    let mute = &c["remind_mute"];
+    let pending: Vec<String> = items
+        .iter()
+        .filter(|it| {
+            it["claimable"].as_bool().unwrap_or(false)
+                && !mute.get(it["product"].as_str().unwrap_or("")).and_then(|v| v.as_bool()).unwrap_or(false)
+        })
+        .map(|it| {
+            let n = it["name"].as_str().unwrap_or("");
+            match it["reward"].as_u64() {
+                Some(v) => format!("{}（{}）", if n.is_empty() { "?" } else { n }, v),
+                None => n.to_string(),
+            }
+        })
+        .collect();
+    // 不管有没有可领的，今天都算"报过"了：没可领的更不该晚上再弹一次
+    state["reminded"] = json!(today);
+    save_state(&state);
+    if pending.is_empty() {
+        return;
+    }
+    let body = format!("今天还没领：{}。点开「每日签到」看一眼。", pending.join("、"));
+    let _ = app
+        .notification()
+        .builder()
+        .title("Agent 驾驶舱")
+        .body(body)
+        .show();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(auto: bool, claimable: bool, active: bool) -> Value {
+        json!({ "auto": auto, "claimable": claimable, "activity_on": active })
+    }
+
+    /// 六道闸门少一道都会变成"没让她开她却自己签了"，所以每条单独钉
+    #[test]
+    fn auto_claim_needs_every_gate_open() {
+        let ok = item(true, true, true);
+        assert!(should_run(true, true, &ok, 9, 6, 12, false));
+        assert!(!should_run(false, true, &ok, 9, 6, 12, false), "总开关关着不能跑");
+        assert!(!should_run(true, false, &ok, 9, 6, 12, false), "这家没单独开不能跑");
+        assert!(!should_run(true, true, &item(false, true, true), 9, 6, 12, false),
+                "厂商要验证码/只能网页点的不能自动");
+        assert!(!should_run(true, true, &item(true, false, true), 9, 6, 12, false),
+                "今天没得领不能跑");
+        assert!(!should_run(true, true, &item(true, true, false), 9, 6, 12, false),
+                "活动没开不能跑");
+        assert!(!should_run(true, true, &ok, 9, 6, 12, true), "今天已经跑过不能再跑");
+        assert!(!should_run(true, true, &ok, 5, 6, 12, false), "窗口之前不跑");
+        assert!(!should_run(true, true, &ok, 13, 6, 12, false), "窗口之后不跑");
+    }
+
+    /// 真机：整条 refresh() 跑一遍（含按账号展开），把结果打出来。
+    /// 跑：cargo test -- --ignored --nocapture refresh_real
+    #[test]
+    #[ignore]
+    fn refresh_real_machine() {
+        crate::secrets::load();
+        let v = refresh();
+        println!("ok={:?} err={:?}", v["ok"], v["msg"]);
+        if let Some(a) = v["items"].as_array() {
+            for x in a {
+                println!(
+                    "  {:<20} scope={:<8} account={:<20} signed={:?} claimable={:?} err={:?}",
+                    x["product"].as_str().unwrap_or("?"),
+                    x["scope"].as_str().unwrap_or("-"),
+                    x["account"].as_str().unwrap_or("-"),
+                    x["signed_today"], x["claimable"],
+                    x["error"].as_str().map(|s| s.chars().take(40).collect::<String>()),
+                );
+            }
+        }
+    }
+
+    /// 提醒时间解析：填错要退回默认，不能把提醒整个关掉
+    #[test]
+    fn remind_time_parses_and_falls_back() {
+        assert_eq!(hhmm_to_min("10:05"), 605);
+        assert_eq!(hhmm_to_min("0:00"), 0);
+        assert_eq!(hhmm_to_min("23:59"), 1439);
+        assert_eq!(hhmm_to_min("乱填"), 600);
+        assert_eq!(hhmm_to_min("25:00"), 600);
+        assert_eq!(hhmm_to_min("10:75"), 600);
+        assert!(remind_due(605, 600, false), "到点且今天没弹过");
+        assert!(!remind_due(599, 600, false), "没到点");
+        assert!(!remind_due(900, 600, true), "今天已经弹过就不再弹");
+    }
+}
