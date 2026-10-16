@@ -14,13 +14,52 @@ const inst = (app, app_name, name, kind, running, procs, q, extra = {}) => ({
       : { state: 'init', label: '已写入 241 个文件，未见登录痕迹', files: 241, product: '' }),
   usage: extra.usage ?? null,
   usage_fetched_at: extra.usage_fetched_at ?? null,
-  quota: { total: null, left: null, expires_on: '', days_left: null, has_token: false, quota_url: false, adapter: '', fetched_at: null, credits: [], groups: [], plan_name: '', source: '', stale: false, live_error: '', auth_from: '', detail_source: '', detail_at: null, detail_stale: false, web_error: '', ...q },
+  quota: { total: null, left: null, expires_on: '', days_left: null, has_token: false, quota_url: false, adapter: '', fetched_at: null, credits: [], groups: [], plan_name: '', source: '', stale: false, live_error: '', auth_from: '', detail_source: '', detail_at: null, detail_stale: false, web_error: '', trend: null, ...q },
   ...extra,
 });
 
 /* WorkBuddy 那种"一个大组底下几十笔各自到期"的形状（agenthub 从 free/paid-packages 拿回来的） */
 // 2026-10-11 真从 qoder.com.cn/account/usage 抓回来的形状：24 个 100 积分的赠送包，
 // 各自一个到期时间——这正是"本机接口看不到、只有官网有"的那一层。
+/* WorkBuddy 按天消耗：真从 ~/.workbuddy/workbuddy.db 的 session_usage 里聚合出来的
+   31 天（2026-06-20 ~ 2026-10-12，合计 10550.30 credits，峰值 9-09 那天 2668.24），
+   不是编的样例——界面预览要能跟 agenthub 实测数字逐位对上。 */
+function wbTrend() {
+  const rows = [['2026-06-20', 178.97, 15], ['2026-06-26', 1.41, 5], ['2026-07-20', 3.86, 1], ['2026-07-21', 364.41, 3], ['2026-07-22', 1340.1, 3], ['2026-07-26', 3.52, 1], ['2026-07-27', 860.72, 4], ['2026-07-30', 49.79, 1], ['2026-07-31', 158.13, 1], ['2026-08-02', 574.33, 1], ['2026-08-18', 41.84, 1], ['2026-08-19', 59.95, 1], ['2026-08-25', 586.05, 4], ['2026-08-27', 322.99, 3], ['2026-08-28', 28.92, 1], ['2026-08-29', 121.82, 2], ['2026-09-02', 176.68, 1], ['2026-09-04', 102.67, 1], ['2026-09-09', 2668.24, 27], ['2026-09-13', 1200.34, 3], ['2026-09-25', 30.48, 3], ['2026-09-26', 73.37, 4], ['2026-09-27', 29.96, 2], ['2026-09-28', 30.88, 2], ['2026-09-30', 18.16, 1], ['2026-10-03', 0.21, 1], ['2026-10-04', 1.04, 1], ['2026-10-07', 76.73, 2], ['2026-10-09', 498.59, 6], ['2026-10-10', 941.27, 1], ['2026-10-12', 4.87, 1]];
+  return {
+    unit: 'credits',
+    total: 10550.3,
+    peak: 2668.24,
+    peak_date: '2026-09-09',
+    from: rows[0][0],
+    to: rows[rows.length - 1][0],
+    db: 'C:\\Users\\LENOVO\\.workbuddy\\workbuddy.db',
+    days: rows.map((r) => ({ date: r[0], credits: r[1], sessions: r[2] })),
+  };
+}
+
+/* Qoder 那条官网热力图接口的真实形状（2026-10-12 实测）：厂商自己把 371 天补零成连续
+   序列、带 unit/total/levels 四档阈值，items[] 只有 date+value，**没有场次数**。
+   数值用实测到的那两天，其余按形状补零——够验"厂商分档"和"没有会话数时不许编"这两条。 */
+function qoderTrend() {
+  const pad = (x) => String(x).padStart(2, '0');
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = [];
+  for (let i = 370; i >= 0; i--) {
+    const dt = new Date(today);
+    dt.setDate(dt.getDate() - i);
+    days.push({ date: `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`, credits: 0 });
+  }
+  const known = { '2026-10-05': 36.0456504078, '2026-10-10': 1190.5914247282, '2026-10-11': 206.69 };
+  for (const d of days) if (known[d.date] != null) d.credits = known[d.date];
+  return {
+    unit: 'credits', total: 9836.16, peak: 1190.5914247282, peak_date: '2026-10-10',
+    levels: [29.35, 206.69, 879.14, 1190.59], from: days[0].date, to: days[days.length - 1].date,
+    source: '官网热力图接口', days,
+  };
+}
+
 function webGroups() {
   const at = (days, hh, mm) => {
     const d = new Date((now + days * 86400) * 1000);
@@ -102,7 +141,7 @@ const DATA = {
     { id: 'qoder', name: 'Qoder', kind: 'electron', installed: true, swapped: '', swap_ok: true },
     { id: 'qoder-cn', name: 'Qoder CN', kind: 'electron', installed: true, swapped: '账号2', swap_ok: true,
       isolatable: false,
-      local_quota: true, web_quota: true,
+      local_quota: true, web_quota: true, auth_switch: true,
       machine: { known: true, refreshing: false, value: {
         ok: true, account: 'shen1950', user_id: '019e8247-2e21-7aa6-9e87-b0720003b387',
         user_type: 'personal_standard', left: 1751, total: 2400, expires_on: '未给出',
@@ -141,18 +180,25 @@ const DATA = {
     // 演示"本机已经换成另一个号"：这张卡已让位，只留历史额度。
     // 明细是两小时前从官网读回来的 24 笔，本机那条接口只有两个汇总数——守卫让它只刷汇总数，
     // 不许把明细压回一行，所以这里就是修完之后卡片该长的样子（大字新、明细旧且自己说明）
-    inst('qoder-cn', 'Qoder CN', '账号1', 'electron', true, 8, {
+    inst('qoder-cn', 'Qoder CN', '账号1', 'electron', false, 0, {
       total: 4100, left: 4000, expires_on: '2026-10-20', days_left: 9, quota_url: true, fetched_at: now - 5000,
       local_account: 'nick9994374911', user_id: '019e0000-0000-0000-0000-000000000001',
       bound_mismatch: true, source: 'server',
       groups: webGroups(), detail_source: 'web', detail_at: now - 2 * 3600, detail_stale: true,
-    }, { released: true, released_to: 'shen1950', origin: 'adopt' }),
+    }, { released: true, released_to: 'shen1950', origin: 'adopt', app_running: true,
+      auth_pack: {
+        at: now - 7200, account: 'nick9994374911',
+        user_id: '019e0000-0000-0000-0000-000000000001',
+        dir: 'C:\\Users\\LENOVO\\AppData\\Roaming\\com.qodercn.app.stable',
+        files: [{ name: 'auth.v1.dat', bytes: 414 }],
+      } }),
     // 演示官网逐资源包读数：三个大组 + 组内逐笔各带自己的到期时间
-    inst('qoder-cn', 'Qoder CN', 'shen1950', 'electron', false, 0, {
+    // 共用一份档案的产品：整棵进程树记在"现在登着的那个号"头上，不是磁盘换号记录里那个
+    inst('qoder-cn', 'Qoder CN', 'shen1950', 'electron', true, 8, {
       total: 2400, left: 1751, expires_on: '2026-10-24 21:13', days_left: 13,
       local_account: 'shen1950', user_id: '019e8247-2e21-7aa6-9e87-b0720003b387',
       source: 'web', plan_name: '体验版', fetched_at: now - 60,
-      groups: webGroups(), detail_source: 'web', detail_at: now - 60,
+      groups: webGroups(), detail_source: 'web', detail_at: now - 60, trend: qoderTrend(),
     }),
     inst('qoder-cn', 'Qoder CN', '账号2', 'electron', false, 0, {}, { swapped: true }),
     inst('workbuddy', 'WorkBuddy', '账号1', 'electron', false, 0, {
@@ -160,7 +206,7 @@ const DATA = {
       source: 'server', fetched_at: now - 900, plan_name: '体验版',
       local_account: 'DuckDeity',
       auth_from: 'C:\\Users\\LENOVO\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info',
-      groups: wbGroups(),
+      groups: wbGroups(), trend: wbTrend(),
     }),
     inst('traework-cn', 'TRAE CN', '账号1', 'electron', true, 6, { total: 800, left: 760, expires_on: '2026-11-02', days_left: 32 }),
     // 演示：这个账号的数据是"接管"进来的（对话与记忆都在里面）
@@ -247,11 +293,21 @@ const DATA = {
 
 DATA.apps.forEach((a) => {
   if (a.isolatable === undefined) a.isolatable = a.kind !== 'plain';
+  // 后端 state.rs 的 shared_profile：账号全共用默认位置那一份档案，切号＝客户端里退出登录再登录
+  if (a.shared_profile === undefined) a.shared_profile = a.kind === 'electron' && !a.isolatable;
   if (a.icon === undefined) a.icon = null;
   if (a.discovered === undefined) a.discovered = false;
   if (a.removed === undefined) a.removed = a.discovered && !a.installed;
   if (a.new === undefined) a.new = false;
   if (a.exe === undefined) a.exe = 'D:/apps/' + a.id + '/' + a.name + '.exe';
+});
+// state.rs 的 instances[].logged_in：卡上绑的 userId 就是本机当前登录那个
+DATA.instances.forEach((x) => {
+  const a = DATA.apps.find((y) => y.id === x.app) || {};
+  const mv = (a.machine && a.machine.value) || {};
+  if (x.logged_in === undefined) {
+    x.logged_in = !!(mv.ok && mv.user_id && x.quota && x.quota.user_id === mv.user_id);
+  }
 });
 DATA.hidden_apps = [{ id: 'auto-skinbox', name: '皮肤盒子', discovered: true, exe: 'D:/Artificial_Intelligence/skinbox/skin.exe' }];
 
@@ -338,10 +394,95 @@ DATA.keys = [
 DATA.settings = {
   profile: { nickname: '', note: '' },
   general: { autostart: false, close_action: 'tray', notify_alerts: true, refresh_sec: 4, auto_scan: true },
-  appearance: { theme: 'dark', density: 'comfortable', font_scale: 100, nav_w: 248 },
+  appearance: { theme: 'dark', density: 'comfortable', font_scale: 100, nav_w: 248, nav_h: 0, nav_collapsed: false },
   quota: { warn_days: 30, danger_days: 7, auto_fetch_min: 30 },
   proxy: { port: 8788, upstream: 'https://api.openai.com', log_keep: 100 },
+  checkin: { enabled: false, window_start: 6, window_end: 12, auto: { workbuddy: true },
+    remind: true, remind_at: '10:05', remind_mute: {} },
 };
+/* 六家今天的状态：2026-10-12 用本机凭据只读查到的真实返回，不是编的样例 */
+const CI_ITEMS = [
+  { product: 'workbuddy', account: 'DuckDeity', supported: true, auto: true, activity_on: true,
+    signed_today: true, claimable: false, streak: 13, reward: 100, today_credit: 100,
+    total: 1300, days_signed: 13, ends_on: '2026-10-15', unit: '积分',
+    source: 'https://www.codebuddy.cn/v2/billing/meter/checkin-activity-status' },
+  { product: 'workbuddy-activity', supported: true, auto: true, activity_on: true, mode: 'activity',
+    signed_today: false, claimable: true, streak: 100, unit: '活跃',
+    words: { done: '今天已打卡', go: '今天还没打卡', act: '发一句对话', done_act: '今天已领完' },
+    note: '活跃地图要「完成一次对话」才记录当天（连登 14 天可兑换奖励）；这一条只管打卡，签到是上面 WorkBuddy 那条' },
+  { product: 'workbuddy-travel', supported: true, auto: true, activity_on: true, mode: 'travel',
+    signed_today: false, claimable: true, travel_state: 'traveling', next_action: 'wait',
+    reward: 10, unit: '积分', arrive_at: '10-15 18:20',
+    words: { done: '今天已领取', go: '今天可派可领', depart: '派出', wait: '等待中',
+      claim: '领取', wait_badge: '猫猫在路上', done_act: '今天已领完' },
+    note: '1~4 小时一趟、每天一趟；先派、到点再领（这一趟约 10-15 18:20 到）' },
+  { product: 'workbuddy-intl', account: 'shen1950', supported: true, auto: true, activity_on: true,
+    mode: 'activity', signed_today: false, claimable: true, streak: 0, reward: 30, unit: '积分',
+    words: { done: '今天已到账', go: '今天还没到账', act: '发一句对话', done_act: '今天已领完' },
+    note: '30 积分/天是服务端按天结算的基础权益（历史发放时刻 00:20~08:02 不等）' },
+  { product: 'trae-cn', account: 'shen195', supported: true, auto: true, activity_on: true,
+    signed_today: true, claimable: false, reward: 100, extra: 100, unit: '积分' },
+  { product: 'minimax', supported: true, auto: true, activity_on: true, signed_today: true,
+    claimable: false, streak: 6, reward: 400, unit: '积分' },
+  { product: 'qoder-cn', supported: true, auto: false, activity_on: false, signed_today: false,
+    claimable: false, streak: 0, reward: 100, unit: '积分', campaign: 'cn_daily_check_in_legacy' },
+  // 账号级子行（`scope:"account"` + `parent`）：只有"每个号都留着自己那份登录态"的
+  // 产品才有——现在 Qoder 系与 WorkBuddy 系。后端在 refresh 里按账号各查一次，
+  // 前端把 scope!=="account" 的当产品行，其余挂到它 parent 底下。
+  { product: 'qoder-cn', scope: 'account', parent: 'qoder-cn', account: 'shen1950',
+    supported: true, auto: false, activity_on: true, signed_today: true, claimable: false,
+    streak: 3, reward: 100, unit: '积分', ends_on: '2026-11-15 11:23' },
+  { product: 'qoder-cn', scope: 'account', parent: 'qoder-cn', account: 'nick9994374911',
+    supported: true, auto: true, activity_on: true, signed_today: false, claimable: true,
+    streak: 5, reward: 100, unit: '积分', ends_on: '2026-11-14 11:32' },
+  { product: 'qoder', supported: true, auto: false, activity_on: false, signed_today: null,
+    claimable: false, unit: '积分',
+    note: '国际版只有活动开关，领取在网页里点，程序不代点' },
+];
+/* 后端现在把显示名与本机时间一起带回来（提醒文案、卡片角标都读它），mock 照同一形状 */
+const CI_LABEL = {
+  workbuddy: 'WorkBuddy', 'workbuddy-intl': 'WorkBuddy 国际版', 'trae-cn': 'Trae CN',
+  minimax: 'MiniMax Code', 'qoder-cn': 'Qoder CN', qoder: 'Qoder', astudio: 'AStudio',
+  'workbuddy-activity': 'WorkBuddy 活跃地图', 'workbuddy-travel': 'WorkBuddy 旅行猫',
+};
+CI_ITEMS.forEach((x) => {
+  // 账号行的标题是账号名（后端 refresh 里就是这么改的），别被产品名盖掉
+  x.name = x.scope === 'account' ? x.account : (CI_LABEL[x.product] || x.product);
+  x.today = new Date().toISOString().slice(0, 10);
+  x.hour = new Date().getHours();
+  x.minute = new Date().getMinutes();
+});
+DATA.checkin = {
+  ok: true, items: CI_ITEMS, fetched_at: Date.now() / 1000,
+  state: { done: { workbuddy: CI_ITEMS[0].today }, reminded: '',
+    // 正在等到账 + 已到账的提示：首页与签到页都要看这两段
+    pending: { 'workbuddy-intl': { since: Date.now() / 1000 - 3600,
+      today: CI_ITEMS[0].today, label: 'WorkBuddy 国际版', expect: '今天这 30 积分',
+      until: Date.now() / 1000 + 86400 } },
+    arrived: [],
+    log: [{ at: CI_ITEMS[0].today, store: 'workbuddy', claimed: true, credit: 100, message: '已领到' }] },
+};
+// 「一键刷新全部额度」的后台任务：mock 里先给一个跑完的，进度条与失败清单有得看
+DATA.alljob = {
+  running: false, done: 9, total: 9, current: '', ok: 8, fail: 1,
+  started_at: Date.now() / 1000 - 120, finished_at: Date.now() / 1000 - 90,
+  log: [{ app: 'Qoder CN', name: 'nick9994374911', ok: false,
+    msg: '这个号的官网会话还没登录：先在驾驶舱打开的官网窗口里登录一次' }],
+};
+/* 真后端是按 app id 去缓存里查这家再挂到实例上（state.rs 的 checkin::for_app），
+   mock 照同一份映射挂，卡片角标才有得显示 */
+const APP_STORE = {
+  workbuddy: 'workbuddy', 'workbuddy-intl': 'workbuddy-intl', 'traework-cn': 'trae-cn',
+  minimax: 'minimax', 'qoder-cn': 'qoder-cn', qoder: 'qoder',
+};
+DATA.instances.forEach((i) => {
+  const it = CI_ITEMS.find((x) => x.product === APP_STORE[i.app]);
+  if (!it) return;
+  i.checkin = {
+    state: it.signed_today ? 'done' : it.claimable ? 'claimable' : it.activity_on === false ? 'off' : 'unknown',
+    reward: it.reward, streak: it.streak, auto: it.auto, name: it.name,
+  };
+});
 DATA.app_version = '2.0.0';
 
 DATA.backups = [
@@ -407,6 +548,79 @@ window.__TAURI__ = {
         DATA.apps = DATA.apps.filter((a) => a.id !== args.app);
         return Promise.resolve({ ok: true, msg: '已从列表移除，账号目录原样保留' });
       }
+      if (cmd === 'action' && (args.payload || {}).action === 'refresh_all') {
+        // 真后端是起后台任务 + 4 秒轮询进度；mock 里直接给一份"刚跑完"的，形状保持一致
+        DATA.alljob = {
+          running: false, done: DATA.instances.length, total: DATA.instances.length,
+          current: '', ok: DATA.instances.length, fail: 0,
+          started_at: Date.now() / 1000 - 40, finished_at: Date.now() / 1000,
+          log: [],
+        };
+        return Promise.resolve({ ok: true, started: true, msg: '已经开始逐个读各账号的额度（演示数据）' });
+      }
+      if (cmd === 'action' && /^checkin_(view|refresh)$/.test((args.payload || {}).action || '')) {
+        const today = new Date().toISOString().slice(0, 10);
+        const items = JSON.parse(JSON.stringify(CI_ITEMS)).map((x) => {
+          x.today = today; x.hour = new Date().getHours(); return x;
+        });
+        return Promise.resolve({
+          ok: true, items, fetched_at: Date.now() / 1000,
+          state: { done: { workbuddy: today },
+            pending: DATA.checkin.state.pending, arrived: DATA.checkin.state.arrived,
+            log: [{ at: today, store: 'workbuddy', claimed: true, credit: 100, message: '已领到' }] },
+        });
+      }
+      if (cmd === 'action' && (args.payload || {}).action === 'checkin_claim') {
+        return Promise.resolve({ ok: true, result: { claimed: true, already: false,
+          credit: 100, message: '已领到（演示数据）', today: new Date().toISOString().slice(0, 10) } });
+      }
+      if (cmd === 'action' && (args.payload || {}).action === 'checkin_auto') {
+        const p = args.payload || {};
+        DATA.settings.checkin = { ...DATA.settings.checkin,
+          ...(p.enabled === undefined ? {} : { enabled: p.enabled }),
+          ...(p.auto ? { auto: p.auto } : {}),
+          ...(p.window_start === undefined ? {} : { window_start: p.window_start }),
+          ...(p.window_end === undefined ? {} : { window_end: p.window_end }) };
+        return Promise.resolve({ ok: true, msg: '已保存（演示数据）' });
+      }
+      if (cmd === 'action' && args.payload?.action === 'auth_switch') {
+        const p = args.payload;
+        const a = DATA.apps.find((x) => x.id === p.app) || {};
+        const i = DATA.instances.find((x) => x.app === p.app && x.name === p.name);
+        if (!i || !i.auth_pack) {
+          return Promise.resolve({ ok: false, msg: `「${p.name}」还没存过登录态，切不过去。` });
+        }
+        const cur = DATA.instances.find((x) => x.app === p.app && x.logged_in);
+        if (cur) { cur.logged_in = false; cur.running = false; cur.procs = 0; }
+        i.logged_in = true;
+        if (i.auth_pack) i.auth_pack.at = Date.now() / 1000;
+        const mv = ((a.machine || {}).value) || {};
+        mv.account = i.auth_pack.account; mv.user_id = i.auth_pack.user_id;
+        return Promise.resolve({
+          ok: true,
+          msg: `已切到「${p.name}」：收下了「${cur ? cur.name : '当前号'}」的登录态 → 结束客户端（8 个进程）`
+            + ` → 写回目标登录态 → 重新打开。\n原来那份备份在 ~/.agent-cockpit/backups/auth/${p.app}-1760000000，随时能切回来。`,
+        });
+      }
+      if (cmd === 'action' && args.payload?.action === 'swap_set') {
+        const p = args.payload;
+        const a = DATA.apps.find((x) => x.id === p.app) || {};
+        // 共用一份档案：后端把"这次什么都没换"如实说回来（noop），界面不许再去关程序
+        if (a.shared_profile) {
+          return Promise.resolve({
+            ok: true, noop: true, need_force: false,
+            msg: `${a.name} 的所有账号共用这一份档案，切到「${p.name}」在磁盘上没有东西要换。\n`
+              + '真正的切换在客户端里做：退出登录，再登这个号。',
+          });
+        }
+        if (p.force) return Promise.resolve({ ok: true, msg: `已换号：${a.name} → 「${p.name}」（演示）` });
+        // 真被进程挡住时后端给结构化 need_force，前端据此摆「结束进程并换号」
+        return Promise.resolve({
+          ok: false, need_force: true,
+          msg: 'C:\\Users\\x\\AppData\\Roaming\\com.qoder.app.stable 现在被这些进程占着：qoder.exe（PID 4108）。\n'
+            + '它们没有窗口但在后台驻留（换号、改名都会被挡住）。确认后驾驶舱可以替你结束这些进程再换号。',
+        });
+      }
       if (cmd === 'action' && args.payload?.action === 'key_probe_models') {
         return Promise.resolve({ ok: true, msg: '拉到 7 个模型（演示数据）',
           models: ['gpt-5.5', 'gpt-5.5-mini', 'claude-opus-4-6', 'claude-sonnet-4-6',
@@ -450,6 +664,23 @@ window.__TAURI__ = {
             { label: '主额度', left: 0, total: 0, expires_on: '无限期', category: '套餐基础积分' },
             { label: '平台奖励积分·平台赠送', left: 1751, total: 2400, expires_on: '2026-10-24 21:13', category: '平台奖励积分' },
           ],
+        });
+      }
+      if (cmd === 'action' && args.payload?.action === 'quota_refresh') {
+        // 后端这一条自己挑层：官网逐包（唯一给得出每包各自到期的）→ 读不到才退服务端/本机。
+        // 演两条路：qoder-cn 有这个号的官网会话，其它产品还没登过——要看的就是那句"缺了哪一层"
+        if (args.payload.app === 'qoder-cn') {
+          return Promise.resolve({
+            ok: true, source: 'web',
+            msg: '官网读数已刷新：剩 1751 / 共 2400 积分，已用 649 · 逐包 4 笔（最早 2026-10-22 09:30 作废）\n'
+              + '套餐：体验版 · 每日消耗 371 天',
+          });
+        }
+        return Promise.resolve({
+          ok: true, source: 'server', need_login: true, detail_error: '这个号的官网会话还没登录',
+          msg: '读到「DuckDeity」：剩 4194.84 / 4943 credits，到期 未给出\n\n'
+            + '这一轮的逐包额度和各自的到期时间没读到：这个号的官网会话还没登录\n'
+            + '点「去登录」，在弹出的窗口里登这个号的阿里云账号（只登一次），之后每次刷新都直接补齐。',
         });
       }
       if (cmd === 'action' && args.payload?.action === 'web_fetch') {

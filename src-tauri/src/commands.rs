@@ -28,7 +28,6 @@ fn cmd_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 static SCAN_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub fn scan_stamp() -> String {
     let t = SCAN_AT.load(std::sync::atomic::Ordering::Relaxed);
     if t == 0 {
@@ -239,6 +238,100 @@ pub fn get_state(state_ref: tauri::State<AppState>) -> Value {
     state::build_state(&state_ref.proxy)
 }
 
+/* ---------------- 一键刷新全部额度 ----------------
+   首页那颗按钮要"把所有 Agent 所有账号的额度读一遍"。十几个账号挨个读，官网那条还要
+   建隐藏窗口调三次接口，整轮是分钟级的——绝不能挂在一次 invoke 上。所以：
+   任务本体跑在单独线程里，界面每 4 秒读一份进度快照画进度条。 */
+static ALLJOB: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+/// 给界面看的那份进度快照（没有任务时是 Null）
+pub fn alljob() -> Value {
+    ALLJOB.lock().ok().and_then(|g| g.clone()).unwrap_or(Value::Null)
+}
+
+fn job_patch(f: impl FnOnce(&mut Value)) {
+    if let Ok(mut g) = ALLJOB.lock() {
+        if let Some(j) = g.as_mut() {
+            f(j);
+        }
+    }
+}
+
+/// 起一轮全量刷新。已经在跑就直接复用，不排队——连点两下不该变成两轮。
+/// 返回 false = 已经有一轮在跑。
+pub fn spawn_refresh_all(app: &tauri::AppHandle) -> bool {
+    {
+        let g = ALLJOB.lock().unwrap_or_else(|p| p.into_inner());
+        if g.as_ref().map(|j| j["running"].as_bool() == Some(true)).unwrap_or(false) {
+            return false;
+        }
+    }
+    // 清单先摊平：只有"有账号卡、而且这个产品有读数通道"的才排进去
+    let mut jobs: Vec<(String, String, String)> = Vec::new();
+    for a in reg::all_apps() {
+        if reg::resolve_exe(&a).is_none() {
+            continue;
+        }
+        if crate::local_quota::store_for(&a.id).is_none() && !crate::webquota::supports(&a.id) {
+            continue;
+        }
+        for m in reg::load_instances(&a.id) {
+            let n = m["name"].as_str().unwrap_or("").to_string();
+            if !n.is_empty() {
+                jobs.push((a.id.clone(), a.name.clone(), n));
+            }
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    *ALLJOB.lock().unwrap_or_else(|p| p.into_inner()) = Some(json!({
+        "running": true, "done": 0, "total": jobs.len(), "current": "",
+        "ok": 0, "fail": 0, "log": [], "started_at": now, "finished_at": 0.0,
+    }));
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        use tauri::Manager;
+        let st = handle.state::<AppState>();
+        let (mut ok, mut fail) = (0usize, 0usize);
+        let mut log: Vec<Value> = Vec::new();
+        for (i, (aid, aname, nm)) in jobs.iter().enumerate() {
+            job_patch(|j| j["current"] = json!(format!("{aname} / {nm}")));
+            // 直接复用卡片上那颗「↻ 刷新额度」的同一条路（官网逐包 → 退本机汇总），
+            // 免得两条路各写一遍、说法还不一样。这里**不拿** CMD_LOCK：
+            // 整轮是分钟级的，拿着它界面上的其它动作全得排队。
+            let r = run_action("quota_refresh", aid, nm, &json!({}), &st);
+            let good = r["ok"].as_bool() == Some(true);
+            if good {
+                ok += 1;
+            } else {
+                fail += 1;
+            }
+            log.push(json!({
+                "app": aname, "name": nm, "ok": good,
+                "msg": r["msg"].as_str().unwrap_or("").chars().take(160).collect::<String>(),
+            }));
+            job_patch(|j| {
+                j["done"] = json!(i + 1);
+                j["ok"] = json!(ok);
+                j["fail"] = json!(fail);
+                j["log"] = json!(log.clone());
+            });
+        }
+        let end = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        job_patch(|j| {
+            j["running"] = json!(false);
+            j["finished_at"] = json!(end);
+            j["current"] = json!("");
+        });
+    });
+    true
+}
+
 /// 同步命令跑在主线程上，任何耗时实现都会把整个窗口冻住（标题栏挂「未响应」，
 /// 网络请求一等就是几十秒）。带网络/磁盘等待的动作一律 async：Tauri 会把它们
 /// 丢给工作线程执行，主线程只管画界面。
@@ -246,11 +339,21 @@ pub fn get_state(state_ref: tauri::State<AppState>) -> Value {
 /// 业务失败还是走 `{ok:false,msg}` 那套，前端不用改）
 #[tauri::command]
 pub async fn action(
+    handle: tauri::AppHandle,
     payload: Value,
     state_ref: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
     let _g = cmd_guard();
     let act = payload["action"].as_str().unwrap_or("").to_string();
+    // 「一键刷新全部额度」不在这里同步跑：十几个账号挨个读，官网那条还要建隐藏窗口，
+    // 一路同步下去窗口要冻好几分钟。起个后台任务，界面靠 4 秒一轮的进度自己看。
+    if act == "refresh_all" {
+        let started = spawn_refresh_all(&handle);
+        return Ok(json!({
+            "ok": true, "started": started,
+            "msg": if started { "已经开始逐个读各账号的额度" } else { "上一轮还在跑，等它跑完" },
+        }));
+    }
     let app_id = payload["app"].as_str().unwrap_or("").to_string();
     let name = payload["name"].as_str().unwrap_or("").to_string();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1040,7 +1143,9 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                 .any(|o| o["name"].as_str().unwrap_or("") == acct.as_str() && acct != name);
             let mut renamed = String::new();
             let mut rename_note = String::new();
-            if usable && !taken && (placeholder || bound_here) {
+            // 名字已经等于读到的账号时压根不该走这一步——否则 rename_instance 原地改名会成功，
+            // 于是弹一条「账号名已从「shen1950」改成「shen1950」」的废话（她 10-14 抓到）
+            if acct != name && usable && !taken && (placeholder || bound_here) {
                 let (o, m) = space::rename_instance(app_id, name, &acct);
                 if o {
                     renamed = acct.clone();
@@ -1086,6 +1191,71 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             })
         }
 
+        // 卡片上那一颗「↻ 刷新额度」= 一次把这个号的用量、每一个积分包、各自的到期时间全读回来。
+        // 官网那一层三样都有（逐包自带到期时间，还带每日消耗热力图），所以能走官网就走官网；
+        // 只有它读不到时才退回本机/服务端汇总——那条本来只给两个总数，缺了哪一层要当场说清楚，
+        // 不能让她以为"刷新了还没明细"是厂商没数。
+        "quota_refresh" => {
+            let meta = match meta {
+                Some(m) => m,
+                None => return err("实例不存在"),
+            };
+            if !crate::webquota::supports(app_id) {
+                return run_action("pull_local", app_id, name, payload, st);
+            }
+            let d = crate::webquota::fetch(app_id, &meta);
+            if d["ok"].as_bool() == Some(true) {
+                let uid = d["user_id"].as_str().unwrap_or("").trim().to_string();
+                let bound = meta["quota_user_id"].as_str().unwrap_or("").trim().to_string();
+                let card_acct = meta["quota_account"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(name)
+                    .to_string();
+                if !bound.is_empty() && !uid.is_empty() && bound != uid {
+                    return json!({
+                        "ok": false, "wrong_account": true, "app": app_id, "name": name,
+                        "card_account": card_acct,
+                        "found_account": d["account"].as_str().unwrap_or(&uid),
+                        "msg": format!(
+                            "「{}」自己的官网窗口里登的是「{}」，不是这张卡绑的号。\n\
+                             在那个窗口里退出登录、再登「{}」的阿里云号，回来点一次刷新就补齐。\n\
+                             这次没写进卡片：把别人的余额记到这张卡上就是串号。",
+                            card_acct,
+                            d["account"].as_str().unwrap_or("?"),
+                            card_acct),
+                    });
+                }
+                let fresh = crate::webquota::apply(&meta, &d);
+                reg::save_instance(app_id, &fresh);
+                return json!({ "ok": true, "msg": web_quota_msg(&d), "source": "web" });
+            }
+            let why = d["msg"].as_str().unwrap_or("官网读不到").to_string();
+            let need_login = d["need_login"].as_bool().unwrap_or(false);
+            let mut v = run_action("pull_local", app_id, name, payload, st);
+            if v["ok"].as_bool() == Some(true) {
+                // 只报"缺了哪一层、为什么"。该点哪个按钮归界面说——后端文案里点按钮名，
+                // 界面一改按钮就叫不上了（这条规矩是 10-12 那回"提示指着一个不存在的按钮"定下的）
+                v["msg"] = json!(format!(
+                    "{}\n\n这一轮的逐包额度和各自的到期时间没读到：{}",
+                    v["msg"].as_str().unwrap_or(""),
+                    why
+                ));
+                // 把"官网这次为什么没读成"留在卡上（读成时由 webquota::apply 清空）。
+                // 不记的话卡片只剩一句"明细是某天读的"，用户既不知道这次为什么没补上，
+                // 也不知道该去哪个窗口重新登一次——"读取不出来"就卡在这一步没法自救。
+                // 必须在 pull_local **之后**写：pull_local 用的是进这个动作时抓的那份 meta，
+                // 先写会被它原样盖回去。
+                if let Some(mut m) = reg::find_instance(app_id, name) {
+                    m["quota_web_error"] = json!(why.clone());
+                    reg::save_instance(app_id, &m);
+                }
+            }
+            v["need_login"] = json!(need_login);
+            v["detail_error"] = json!(why);
+            v
+        }
+
         "fetch_usage" => {
             let meta = match meta {
                 Some(m) => m,
@@ -1113,11 +1283,119 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
         }
 
         "swap_set" => {
-            let (o, m) = swap::swap_set(app_id, name, payload["force"].as_bool().unwrap_or(false));
-            if o {
-                ok(m)
-            } else {
-                err(m)
+            let o = swap::swap_set(app_id, name, payload["force"].as_bool().unwrap_or(false));
+            json!({
+                "ok": o.ok, "msg": o.msg,
+                // 界面靠这两个布尔决定摆什么按钮，不再拿 msg 去正则匹配中文
+                "noop": o.noop, "need_force": o.need_force,
+            })
+        }
+
+        // 一键换号：把目标号存过的登录态放回档案位置。
+        // 这条路上"关掉客户端"是**真的需要**——它只在启动时读这份文件，运行中写回去
+        // 会被它自己退出时整个覆盖掉；和 swap_set 那种"根本没改文件却要求关程序"不是一回事。
+        "auth_switch" => {
+            if meta.is_none() {
+                return err("实例不存在");
+            }
+            if reg::auth_pack_files(app_id).is_empty() {
+                return err("这个产品的登录态格式还没登记，暂时不能一键换号");
+            }
+            let mv = crate::machine::current(app_id);
+            if !mv["value"]["ok"].as_bool().unwrap_or(false) {
+                return err(format!(
+                    "还没读到本机现在登的是谁（{}），等十几秒再切——现在切过去，回不来的是当前这个号。",
+                    mv["value"]["err"]
+                        .as_str()
+                        .or(mv["value"]["msg"].as_str())
+                        .unwrap_or("读登录态要一会儿")
+                ));
+            }
+            let cur_account = mv["value"]["account"].as_str().unwrap_or("").to_string();
+            let cur_uid = mv["value"]["user_id"].as_str().unwrap_or("").to_string();
+            if crate::authpack::stored(app_id, name).is_none() {
+                return err(format!(
+                    "「{name}」还没存过登录态，切不过去。\n\
+                     请先在客户端里退出登录、登它一次——登进来驾驶舱会自动收下这份登录态（约 45 秒内），\
+                     之后这个号来回切都是一键。"
+                ));
+            }
+            // 先把当前这个号收下来，否则切过去就回不来了
+            let cur_card = crate::authpack::card_for_login(app_id, &cur_account, &cur_uid);
+            let captured = match &cur_card {
+                Some(cn) => {
+                    if let Err(e) = crate::authpack::capture(app_id, cn, &cur_account, &cur_uid) {
+                        return err(format!("当前号「{cn}」的登录态没能收下来：{e}\n一个文件都没改。"));
+                    }
+                    cn.clone()
+                }
+                None => {
+                    return err(format!(
+                        "现在登着的「{cur_account}」还没有对应的账号卡，收了也不知道记在谁头上。\n\
+                         先点「＋ 添加账号」给它建一张卡，再回来切号。"
+                    ));
+                }
+            };
+            // 结束客户端（整个程序树：这类产品本来就不能多开）。
+            // Electron 退出是异步的，进程树常常还要驻留一两秒，不等干净就写会被它覆盖回去，
+            // 所以这里轮询到真没了指信号再去写文件（restore 自己还会再确认一遍）。
+            let exe_lower = reg::exe_name(&app).to_lowercase();
+            let mut killed = 0usize;
+            let mut left: Vec<u32> = Vec::new();
+            for i in 0..12 {
+                left = procs::program_pids(&exe_lower, &procs::snapshot_fresh());
+                killed = killed.max(left.len());
+                if left.is_empty() {
+                    break;
+                }
+                if i == 0 {
+                    procs::kill_pids(&left);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if !left.is_empty() {
+                return err(format!(
+                    "{} 结束不掉（还剩 {} 个进程：PID {}），登录态没动。\n\
+                     手动退出它一次再切（任务管理器按名字搜）。",
+                    app.name,
+                    left.len(),
+                    left.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
+                ));
+            }
+            match crate::authpack::restore(app_id, name) {
+                Ok(r) => {
+                    let exe = match reg::resolve_exe(&app) {
+                        Some(e) => e,
+                        None => {
+                            return ok(format!(
+                                "已切到「{name}」（登录态已写回，备份在 {}），但没找到 {} 的可执行文件，\
+                                 你自己打开一次就是它了。",
+                                r["backup"].as_str().unwrap_or(""),
+                                app.name
+                            ))
+                        }
+                    };
+                    let back = r["backup"].as_str().unwrap_or("").to_string();
+                    match procs::launch_plain(&exe) {
+                        Ok(_) => {
+                            crate::machine::invalidate(app_id);
+                            ok(format!(
+                                "已切到「{}」：收下了「{}」的登录态 → 结束客户端（{} 个进程）→ 写回目标登录态 → 重新打开。\n\
+                                 原来那份备份在 {}，随时能切回来。",
+                                name, captured, killed, back
+                            ))
+                        }
+                        Err(e) => err(format!(
+                            "登录态已写成「{name}」那份（备份在 {back}），但重新打开失败：{e}。\n\
+                             你从开始菜单或桌面图标打开它，就是「{name}」。"
+                        )),
+                    }
+                }
+                Err(e) => err(format!(
+                    "没能写回「{name}」的登录态：{e}\n\
+                     客户端已经被结束了（当前号的登录态已经收进保管箱，没丢），\
+                     直接重新打开它还是原来那个号。"
+                )),
             }
         }
 
@@ -1168,6 +1446,15 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
         "unhide_app" => {
             reg::set_hidden(app_id, false);
             ok("已恢复显示")
+        }
+
+        // 登记表里那些"官方默认路径"的产品（Antigravity / Cursor / Kiro / Windsurf …）
+        // 默认只在**装了、或有账号卡**时才占侧栏一格——不然没装的机器上会多出十几条。
+        // 这个开关让想看全量登记表的人把它们放出来。
+        "show_uninstalled" => {
+            let on = payload["on"].as_bool().unwrap_or(false);
+            reg::set_show_uninstalled(on);
+            ok(if on { "已显示未安装的程序" } else { "未安装的程序已收起" })
         }
 
         // 左侧列表手动排序：置顶 / 上移 / 下移，次序存进 settings.app_order
@@ -1337,6 +1624,52 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         "rescan" => {
             let n = do_rescan();
             ok(format!("已重新扫描本机，收录 {} 个 AI 程序", n))
+        }
+
+        // ===== 每日签到 =====
+        // view 用缓存（界面 4 秒一轮不能每次都打六家接口），refresh 才真去查
+        "checkin_view" => crate::checkin::view(),
+        "checkin_refresh" => crate::checkin::refresh(),
+        "checkin_claim" => {
+            // account 给了就是"领这个号那一份"：签到页按账号展开之后，两个号各有各的
+            // 当日名额，不能都落到"当前登着的那个号"头上
+            let store = payload["store"].as_str().unwrap_or("");
+            let acct = payload["account"].as_str().unwrap_or("");
+            let app = crate::local_quota::app_for_store(store).unwrap_or("");
+            let pair = if acct.is_empty() || app.is_empty() {
+                None
+            } else {
+                Some((app, acct))
+            };
+            crate::checkin::claim(store, pair)
+        }
+        "checkin_auto" => {
+            // 只提交改到的那几个键。整份 settings 当补丁传回去，会顺带把
+            // ai.key 那种"界面上是空的、真值在保管箱里"的字段当成用户清空了
+            let mut patch = serde_json::Map::new();
+            if let Some(v) = payload["enabled"].as_bool() {
+                patch.insert("enabled".into(), json!(v));
+            }
+            if let Some(v) = payload["auto"].as_object() {
+                patch.insert("auto".into(), json!(v.clone()));
+            }
+            if let Some(v) = payload["window_start"].as_u64() {
+                patch.insert("window_start".into(), json!(v));
+            }
+            if let Some(v) = payload["window_end"].as_u64() {
+                patch.insert("window_end".into(), json!(v));
+            }
+            if let Some(v) = payload["remind"].as_bool() {
+                patch.insert("remind".into(), json!(v));
+            }
+            if let Some(v) = payload["remind_at"].as_str() {
+                patch.insert("remind_at".into(), json!(v));
+            }
+            if let Some(v) = payload["remind_mute"].as_object() {
+                patch.insert("remind_mute".into(), json!(v.clone()));
+            }
+            crate::settings::update(&json!({ "checkin": patch }));
+            ok("已保存")
         }
 
         "kill_pids" => {
@@ -1824,26 +2157,33 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             }
         }
 
-        "web_login" => match crate::webquota::open_login(payload["app"].as_str().unwrap_or("")) {
-            Ok(m) => ok(m),
-            Err(e) => err(e),
-        },
+        "web_login" => {
+            let aid = payload["app"].as_str().unwrap_or("").to_string();
+            // 每个号一份会话：开的是「这张卡自己的」窗口，不是全产品共用那一个
+            match crate::webquota::open_login(&aid, &slot_meta_for(&aid, payload)) {
+                Ok(m) => ok(m),
+                Err(e) => err(e),
+            }
+        }
 
         // 「她在官网窗口里登录上了没有」——只翻 cookie 罐、不发请求，给前端那条轮询用。
-        // 没有这一条，登录完还得再点一次「读官网逐包额度」才出明细，
-        // 而她的预期是"我登录了，积分/用量/时间就该都在"。
-        "web_session" => json!({
-            "ok": true,
-            "signed_in": crate::webquota::has_session(payload["app"].as_str().unwrap_or("")),
-        }),
+        // 没有这一条，登录完还得再点一次读数才出明细，而她的预期是"我登录了，
+        // 积分/用量/时间就该都在"。
+        "web_session" => {
+            let aid = payload["app"].as_str().unwrap_or("").to_string();
+            json!({
+                "ok": true,
+                "signed_in": crate::webquota::has_session(&aid, &slot_meta_for(&aid, payload)),
+            })
+        }
 
         "web_fetch" => {
             let aid = payload["app"].as_str().unwrap_or("").to_string();
-            let data = crate::webquota::fetch(&aid);
+            let nm = payload["name"].as_str().unwrap_or("").trim().to_string();
+            let data = crate::webquota::fetch(&aid, &slot_meta_for(&aid, payload));
             if data["ok"].as_bool() != Some(true) {
                 return Some(data);
             }
-            let nm = payload["name"].as_str().unwrap_or("").trim().to_string();
             if nm.is_empty() {
                 return Some(json!({ "ok": true, "data": data }));
             }
@@ -2038,6 +2378,59 @@ fn gfmt(v: f64) -> String {
     }
 }
 
+/// 这条动作该用哪一份官网会话：有卡片就按卡片认（绑死的 userId，其次账号名），
+/// 向导里卡还没建出来，就按第②步已经认出的那个 userId 开格子——这样建完卡第一次
+/// 「刷新额度」用的还是同一份会话，不至于让人登两次。
+fn slot_meta_for(app_id: &str, payload: &Value) -> Value {
+    let nm = payload["name"].as_str().unwrap_or("").trim().to_string();
+    if !nm.is_empty() {
+        if let Some(m) = reg::find_instance(app_id, &nm) {
+            return m;
+        }
+    }
+    json!({ "quota_user_id": payload["user_id"].as_str().unwrap_or("").trim().to_string() })
+}
+
+/// 一次刷新读回来的东西全写进这一句：还剩多少、逐包几笔、最早哪一笔什么时候作废、
+/// 每日消耗读没读到。她点一次就该知道"这次到底补齐了没有"，不用再去翻界面核对。
+fn web_quota_msg(d: &Value) -> String {
+    let portions = d["portions"].as_array().cloned().unwrap_or_default();
+    let earliest = portions
+        .iter()
+        .filter_map(|p| p["expires_on"].as_str())
+        .filter(|s| !s.is_empty() && *s != "未给出" && *s != "无限期")
+        .min()
+        .unwrap_or("")
+        .to_string();
+    let mut msg = format!(
+        "官网读数已刷新：剩 {} / 共 {} 积分，已用 {} · 逐包 {} 笔",
+        gfmt(d["left"].as_f64().unwrap_or(0.0)),
+        gfmt(d["total"].as_f64().unwrap_or(0.0)),
+        gfmt(d["used"].as_f64().unwrap_or(0.0)),
+        portions.len()
+    );
+    if !earliest.is_empty() {
+        msg.push_str(&format!("（最早 {} 作废）", earliest));
+    }
+    let pn = d["plan_name"].as_str().unwrap_or("");
+    let pe = d["next_reset"].as_str().unwrap_or("");
+    if !pn.is_empty() || !pe.is_empty() {
+        msg.push_str(&format!(
+            "\n套餐：{}{}",
+            pn,
+            if pe.is_empty() { String::new() } else { format!(" · {} 刷新配额", pe) }
+        ));
+    }
+    match d["heatmap"]["items"].as_array() {
+        Some(v) => msg.push_str(&format!(" · 每日消耗 {} 天", v.len())),
+        None => msg.push_str(&format!(
+            "\n每日消耗没读到：{}",
+            d["heatmap"]["error"].as_str().unwrap_or("官网没返回")
+        )),
+    }
+    msg
+}
+
 /// 接管账号的数据目录＝默认档案目录本身；其它来源才在 instances/ 下新建。
 /// 这条判据钉死「接管不许搬家」——早期 adopt 把用户天天用的档案 rename 进
 /// instances/，档案因此离开原位，还原默认还没有退路。
@@ -2095,6 +2488,8 @@ mod tests {
             // 快捷方式三连：空入参下 create/remove 都在起 PowerShell 之前就报错回绝，
             // 只验它们被 app_free 接住；status 会真起子进程，不放这儿
             "shell_shortcut_create", "shell_shortcut_remove",
+            // 签到这组里只验不打网络的两条：view/refresh 会真去调 agenthub
+            "checkin_claim", "checkin_auto",
         ] {
             let p = json!({ "action": act });
             assert!(app_free(act, &p, &st).is_some(), "{} 应该被 app_free 接住", act);

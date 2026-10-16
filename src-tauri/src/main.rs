@@ -4,6 +4,8 @@
 #![recursion_limit = "256"]
 
 mod ai;
+mod authpack;
+mod checkin;
 mod commands;
 mod discover;
 mod gateway;
@@ -117,6 +119,13 @@ fn main() {
             }
             let handle = app.handle().clone();
             std::thread::spawn(move || quota_watch_loop(handle));
+            // 积分到账监测单独一条线程：30 积分那种服务端按天结算的，几十分钟一轮的
+            // 自动取数根本追不上（2026-10-15 她报的正是"昨天 3:50 才到账"）
+            let h2 = app.handle().clone();
+            std::thread::spawn(move || checkin::arrival_watch_loop(h2));
+            // 签到状态也单独一条：不能再挂在额度自动取数后面（见 checkin_loop 注释）
+            let h3 = app.handle().clone();
+            std::thread::spawn(move || checkin_loop(h3));
             // 便携 exe 不进开始菜单就搜不到，而搜不到就没人能进设置去点那个按钮——
             // 启动后自己在后台补一条（要起 PowerShell，不放启动路径上）
             std::thread::spawn(shelllink::ensure_start_menu);
@@ -155,10 +164,14 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let data_dir = MenuItem::with_id(app, "data_dir", "打开数据目录", true, None::<&str>)?;
     let auto = CheckMenuItem::with_id(app, "autostart", "开机自启", true, false, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
+    // 换了新版 exe、或程序自己卡住时，从这里重起一次最省事：不用去任务管理器找进程，
+    // 也不会把"关窗＝收进托盘"那条习惯路径变成真的退出
+    let restart = MenuItem::with_id(app, "restart", "重启应用", true, None::<&str>)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open, &rescan, &refresh, &proxy, &data_dir, &sep, &auto, &sep, &quit],
+        &[&open, &rescan, &refresh, &proxy, &data_dir, &sep, &auto, &sep2, &restart, &quit],
     )?;
 
     if let Ok(enabled) = app.autolaunch().is_enabled() {
@@ -230,6 +243,9 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     let _ = auto_item.set_checked(!enabled);
                 }
             }
+            // 重启＝把当前 exe 原样再拉一遍：换过新版 exe、或者后台线程卡住时，
+            // 这一下比"去任务管理器结束进程再双击"清楚得多
+            "restart" => app.restart(),
             "quit" => app.exit(0),
             _ => {}
         }
@@ -253,6 +269,23 @@ fn quota_watch_loop(app: tauri::AppHandle) {
         let mins = settings::auto_fetch_min(&st);
         // 分段睡眠，让改完间隔后下一轮就生效
         for _ in 0..mins * 4 {
+            std::thread::sleep(Duration::from_secs(15));
+        }
+    }
+}
+
+/// 签到状态单独一条循环：**不再挂在额度自动取数后面**。
+/// 额度那一轮里只要有一张卡走官网、会话又读不到，光那几次重试就能拖几分钟，
+/// 签到状态跟着一起等——表现就是"进签到页要等半天才出状态"（2026-10-15 她报的第 4 条）。
+/// 自己一条线程：开机 6 秒先查一次（界面正好起来），之后每 5 分钟一轮，
+/// 与 `checkin::stale` 的 300 秒 TTL 对齐。自动领取与到点提醒仍由 `checkin::tick` 把关
+/// （它自己看总开关、时间窗、"今天跑过没有"），所以这里只是让它有机会被更及时地调到。
+fn checkin_loop(app: tauri::AppHandle) {
+    std::thread::sleep(Duration::from_secs(6));
+    loop {
+        let _ = checkin::refresh();
+        checkin::tick(&app);
+        for _ in 0..20 {
             std::thread::sleep(Duration::from_secs(15));
         }
     }
@@ -282,15 +315,23 @@ fn autofetch_once() {
                     // 起线程再 join：官网取数要建隐藏窗口、调三次接口，万一在这儿 panic，
                     // 直接跑在循环线程上会把整轮自动取数和临期提醒一起带走
                     let id = app_def.id.clone();
-                    let w = std::thread::spawn(move || webquota::fetch(&id))
+                    let mm = meta.clone();
+                    let w = std::thread::spawn(move || webquota::fetch(&id, &mm))
                         .join()
                         .unwrap_or_else(|_| serde_json::json!({ "ok": false, "msg": "官网取数崩了一次" }));
                     if w["ok"].as_bool() == Some(true) {
-                        // 防串号同一条规矩：官网现在登的是另一个号，就不能写进这张卡
+                        // 防串号同一条规矩：这个号的会话里登成了别人，就不能写进这张卡。
+                        // 光跳过不行——卡片会一声不响地停在旧数上，得把原因记下来让它说得出话
                         if w["user_id"].as_str().unwrap_or("") == bound {
                             registry::save_instance(&app_def.id, &webquota::apply(&meta, &w));
                             continue;
                         }
+                        let mut m = meta.clone();
+                        m["quota_web_error"] = serde_json::json!(format!(
+                            "这个号自己的官网窗口里登的是「{}」，不是卡上绑的号",
+                            w["account"].as_str().unwrap_or("?")
+                        ));
+                        registry::save_instance(&app_def.id, &m);
                     } else {
                         let mut m = meta.clone();
                         m["quota_web_error"] = serde_json::json!(

@@ -22,3 +22,9 @@ _paste_parser.js
 
 # 内部工作交接日志（本地留存，不开源）
 HANDOFF.md
+
+# 调试草稿
+_noserve.py
+
+# 界面预览图（本地留存，发布时作为 Release 附件）
+docs/*.png

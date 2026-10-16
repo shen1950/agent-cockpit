@@ -67,12 +67,29 @@ fn base64(bytes: &[u8]) -> String {
     s
 }
 
+/// 脚本文件自己没有图标资源，ExtractAssociatedIcon 对它们只能给出 Windows 那张
+/// 「空白文档」默认图——存下来前端会当成真图标显示（Codex CLI 的白纸就是这么来的）。
+/// 这类目标一律不抽，让界面回退到内置品牌 SVG 或名字缩写。
+fn carries_own_icon(path: &str) -> bool {
+    !matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("cmd") | Some("bat") | Some("ps1") | Some("vbs") | Some("js") | Some("mjs")
+            | Some("ts") | Some("py") | Some("sh")
+    )
+}
+
 /// 一次性把所有缺失的图标抽出来（单个 PowerShell 进程，避免逐个启动）
 pub fn refresh(items: &[(String, String)]) {
     let _ = fs::create_dir_all(icon_dir());
     let missing: Vec<&(String, String)> = items
         .iter()
-        .filter(|(k, exe)| !file_for(k).exists() && Path::new(exe).exists())
+        .filter(|(k, exe)| {
+            !file_for(k).exists() && Path::new(exe).exists() && carries_own_icon(exe)
+        })
         .collect();
     if missing.is_empty() {
         return;
@@ -130,4 +147,30 @@ pub fn get(key: &str) -> Option<String> {
     let uri = data_uri(&png)?;
     g.insert(key.to_string(), uri.clone());
     Some(uri)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::carries_own_icon;
+
+    #[test]
+    fn script_launchers_are_not_worth_extracting() {
+        // CLI 的入口常常是个 .cmd 包装，抽出来只会是系统那张空白文档图
+        for p in [
+            r"D:\npm-global\codex.cmd",
+            r"D:\npm-global\claude.CMD",
+            r"C:\tools\run.bat",
+            r"C:\tools\probe.ps1",
+        ] {
+            assert!(!carries_own_icon(p), "{p} 是脚本，不该去抽图标");
+        }
+        for p in [
+            r"D:\Apps\WorkBuddy.exe",
+            r"C:\x\Qoder CN.EXE",
+            r"C:\Users\me\Desktop\TRAE.lnk",
+            r"D:\Apps\node_modules\opencode\bin\opencode",
+        ] {
+            assert!(carries_own_icon(p), "{p} 有真实图标可抽");
+        }
+    }
 }

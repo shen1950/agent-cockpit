@@ -12,9 +12,22 @@ pub fn defaults() -> Value {
             "refresh_sec": 4,
             "auto_scan": true
         },
-        "appearance": { "theme": "system", "density": "comfortable", "font_scale": 100, "nav_w": 248, "nav_collapsed": false },
+        // mgmt_h：左下角「管理」那一截被拖出来的定高，0 = 自动（按内容高）。
+        // 旧键 nav_h（列表区定高）已废弃——它会让窗口最大化后多出的空间灌进管理区长出空白，读它的代码全没了，留着也只是账本上一行死数据。
+        "appearance": { "theme": "system", "density": "comfortable", "font_scale": 100, "nav_w": 248, "mgmt_h": 0, "nav_collapsed": false },
         "quota": { "warn_days": 30, "danger_days": 7, "auto_fetch_min": 30 },
         "proxy": { "port": 8788, "upstream": "https://api.openai.com", "log_keep": 100 },
+        // 每日签到：领取是写操作，总开关默认关，开了还要逐家勾（auto 里没写到的就是关）。
+        // 提醒是只读的，默认开着——到点把"今天还有几家没领"报一次，一天只报一次，不催第二遍。
+        "checkin": {
+            "enabled": false,
+            "window_start": 6,
+            "window_end": 12,
+            "auto": {},
+            "remind": true,
+            "remind_at": "10:05",
+            "remind_mute": {}
+        },
         "app_order": [],
         "ai": {
             "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",

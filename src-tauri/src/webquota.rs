@@ -26,31 +26,40 @@ fn app_handle() -> Result<&'static tauri::AppHandle, String> {
 }
 
 pub struct Site {
-    /// 接口与页面所在域名
-    host: &'static str,
-    /// 用量页（也是取 cookie 时给的 URI，只回这个作用域能看到的 cookie）
-    usage_page: &'static str,
+    /// 官网域名，按优先级排。同一个产品的官网可能有两个域名在同时活着
+    /// （Qoder CN 的 `qoder.cn` 与 `qoder.com.cn` DNS 都指向同一台 aliyun 主机），
+    /// 但 **cookie 是按域分开的**——会话落在哪个域名下，就只能用哪个域名去调接口。
+    /// 所以取会话时两个域都问一遍，谁那儿有 `qoder_session_cookie` 就用谁。
+    hosts: &'static [&'static str],
+}
+
+impl Site {
+    fn usage_page(&self, host: &str) -> String {
+        format!("https://{host}/account/usage")
+    }
     /// 登录页：登录后由 oauth_callback 跳回用量页
-    sign_in: &'static str,
+    fn sign_in(&self, host: &str) -> String {
+        format!(
+            "https://{host}/users/sign-in?oauth_callback={}",
+            url_encode(&self.usage_page(host))
+        )
+    }
+}
+
+/// 只给 oauth_callback 这一个参数用：域名里只有字母数字和点，
+/// 需要转义的只有 `:` 与 `/`（先转 `:`，否则会把刚插进去的 `%2F` 里的 `/` 也当成原字符）。
+fn url_encode(s: &str) -> String {
+    s.replace(':', "%3A").replace('/', "%2F")
 }
 
 const SITES: &[(&str, Site)] = &[
     (
         "qoder-cn",
         Site {
-            host: "qoder.com.cn",
-            usage_page: "https://qoder.com.cn/account/usage",
-            sign_in: "https://qoder.com.cn/users/sign-in?oauth_callback=https%3A%2F%2Fqoder.com.cn%2Faccount%2Fusage",
+            hosts: &["qoder.com.cn", "qoder.cn"],
         },
     ),
-    (
-        "qoder",
-        Site {
-            host: "qoder.com",
-            usage_page: "https://qoder.com/account/usage",
-            sign_in: "https://qoder.com/users/sign-in?oauth_callback=https%3A%2F%2Fqoder.com%2Faccount%2Fusage",
-        },
-    ),
+    ("qoder", Site { hosts: &["qoder.com"] }),
 ];
 
 pub fn site_for(store: &str) -> Option<&'static Site> {
@@ -67,63 +76,153 @@ fn store_of(app_id: &str) -> Result<&'static str, String> {
         .ok_or_else(|| "这个程序还没有本机直读通道，也就没有对应的官网接口".to_string())
 }
 
-fn label_for(store: &str) -> String {
-    format!("webq-{}", store)
+fn label_for(store: &str, slot: &str) -> String {
+    format!("webq-{}-{}", store, slot)
 }
 
-/// 登录态存放处：数据根下的独立 WebView2 档案目录，和驾驶舱主窗口分开，
-/// 删掉这个目录就等于在这个产品上退出登录。
-fn web_profile(store: &str) -> PathBuf {
-    let p = crate::registry::base_dir().join("webprofile").join(store);
+/// 这张卡该用哪一份官网会话。
+///
+/// 以前整个产品只有一份 `webprofile/<store>/`，于是官网读数永远只属于当初登进那个浏览器
+/// 档案的那一个号：另一张卡点刷新要么读不到、要么被防串号守卫挡回去。而官网那份是唯一
+/// 给得出「每个积分包各自什么时候到期」的，卡上点一次刷新就该出这个号的真数，
+/// 所以会话必须按账号隔离——不管这台机器的客户端现在登的是谁。
+/// 键优先用绑死的 userId（UUID，稳定），第一次读还没有 userId 时才用账号名，
+/// 读完立刻把实际用的这一格记进 `quota_web_slot`，之后再也不换（否则一绑定就把
+/// 刚登好的会话丢在了别的目录下）。
+fn slot_of(meta: &Value) -> String {
+    let keep = meta["quota_web_slot"].as_str().unwrap_or("").trim().to_string();
+    if !keep.is_empty() {
+        return keep;
+    }
+    let raw = ["quota_user_id", "quota_account", "name"]
+        .iter()
+        .map(|k| meta[k].as_str().unwrap_or("").trim().to_string())
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let clean: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if clean == raw {
+        clean
+    } else {
+        // 中文名整段被洗成连字符会撞车（两张卡共用一份档案），补一段原名指纹
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in raw.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        format!("{}-{:08x}", clean.trim_matches('-'), (h >> 32) as u32)
+    }
+}
+
+/// 登录态存放处：数据根下的独立 WebView2 档案目录，和驾驶舱主窗口分开。
+/// 一个账号一格，删掉某一格就等于只在这个号上退出登录。
+fn web_profile(store: &str, slot: &str) -> PathBuf {
+    let p = crate::registry::base_dir()
+        .join("webprofile")
+        .join(store)
+        .join(slot);
     let _ = std::fs::create_dir_all(&p);
     p
 }
 
 /// 打开（或唤到前台）官网登录窗口。用户在这个窗口里用阿里云账号登录一次，
-/// 会话就留在 webprofile/ 里，之后取额度不用再登。
-pub fn open_login(app_id: &str) -> Result<String, String> {
+/// 会话就留在 webprofile/<产品>/<这个号> 里，之后取额度不用再登。
+pub fn open_login(app_id: &str, meta: &Value) -> Result<String, String> {
     let store = store_of(app_id)?;
     let site = site_for(store).ok_or("这个产品没有登记官网地址")?;
     let app = app_handle()?.clone();
-    let label = label_for(store);
+    let slot = slot_of(meta);
+    let label = label_for(store, &slot);
+    let who = meta["quota_account"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| meta["name"].as_str())
+        .unwrap_or("这个账号")
+        .to_string();
     if let Some(w) = app.get_webview_window(&label) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
-        return Ok("登录窗口已经在开着了，切到前台了。".into());
+        return Ok(format!("「{who}」的登录窗口已经在开着了，切到前台了。"));
     }
+    // 这个号已经登过的域名优先：会话是按域分开的，重登要登在同一个域上，
+    // 否则新会话落在另一个域名、原来那份读数就白读了。没登过才用第一个（主域名）。
+    let host = preferred_host(store, &slot);
     let url: tauri::Url = site
-        .sign_in
+        .sign_in(host)
         .parse()
         .map_err(|e| format!("登录地址解析失败：{e}"))?;
     let win = tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(url))
-        .title("Qoder 官网登录（驾驶舱专用窗口）")
+        .title(&format!(
+            "{} 官网登录 · {who}（驾驶舱专用窗口）",
+            crate::registry::app_def(app_id).map(|a| a.name).unwrap_or_else(|| "Agent".into())
+        ))
         .inner_size(1000.0, 780.0)
         .min_inner_size(520.0, 420.0)
-        .data_directory(web_profile(store))
+        .data_directory(web_profile(store, &slot))
         .visible(true)
         .build()
         .map_err(|e| format!("登录窗口打不开：{e}"))?;
     let _ = win.set_focus();
-    Ok("已打开官网登录窗口：在里面用阿里云账号登录一次，登录成功后回来点「读官网额度」。".into())
+    Ok(format!(
+        "已打开「{who}」自己的官网登录窗口（{host}）：在里面用这个号的阿里云账号登录一次，\
+         之后每次刷新额度都由它带着自己的会话去读，跟这台机器的客户端登的是谁无关。"
+    ))
+}
+
+/// 这张卡的会话该用哪个域名：先看哪个域名的 cookie 罐里已经有登录会话，
+/// 都没有就用候选里的第一个（主域名）。窗口还没建起来时一律回落到第一个。
+fn preferred_host(store: &str, slot: &str) -> &'static str {
+    let site = match site_for(store) {
+        Some(s) => s,
+        None => return "",
+    };
+    site.hosts
+        .iter()
+        .copied()
+        .find(|h| cookie_for_host(store, slot, h).is_some())
+        .unwrap_or_else(|| site.hosts.first().copied().unwrap_or(""))
+}
+
+/// 只问这一个域名的 cookie 罐（不建窗口、不发请求）：有 `qoder_session_cookie` 就返回它。
+fn cookie_for_host(store: &str, slot: &str, host: &str) -> Option<String> {
+    let app = app_handle().ok()?;
+    let site = site_for(store)?;
+    let label = label_for(store, slot);
+    if app.get_webview_window(&label).is_none() {
+        return None;
+    }
+    let list = once(app, &label, &site.usage_page(host)).ok()?;
+    list.iter()
+        .find(|(n, _)| n == "qoder_session_cookie")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// 关掉可见的登录窗口后重建一个隐藏的同名窗口，只为读 cookie 用。
 /// 已经在建（比如刚点过登录又立刻取数）就直接复用。
-fn ensure_hidden(app: &tauri::AppHandle, store: &str) -> Result<(), String> {
-    let label = label_for(store);
+fn ensure_hidden(app: &tauri::AppHandle, store: &str, slot: &str) -> Result<(), String> {
+    let label = label_for(store, slot);
     if app.get_webview_window(&label).is_some() {
         return Ok(());
     }
     let site = site_for(store).ok_or("这个产品没有登记官网地址")?;
     let url: tauri::Url = site
-        .usage_page
+        .usage_page(preferred_host(store, slot))
         .parse()
         .map_err(|e| format!("地址解析失败：{e}"))?;
     tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::External(url))
-        .title("Qoder 官网会话")
+        .title("官网会话")
         .inner_size(900.0, 700.0)
-        .data_directory(web_profile(store))
+        .data_directory(web_profile(store, slot))
         // 隐藏窗口也要能被 WebView2 建出来：先建再立刻隐藏比 visible(false) 稳，
         // 后者在某些版本上不会创建底层 webview，cookie 也就读不到
         .visible(true)
@@ -134,59 +233,83 @@ fn ensure_hidden(app: &tauri::AppHandle, store: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 从那个窗口自己的 cookie 罐里取会话 cookie。
+/// 从那个窗口自己的 cookie 罐里取会话 cookie，连"它属于哪个域名"一起给出来。
 /// 发起在 UI 线程（with_webview 的闭包），等待在这个工作线程——
 /// 窗口刚建好时底层 webview 可能还没起来，所以带几次重试。
 /// `ensure = false` 时只在窗口已经存在的前提下读，绝不顺手建隐藏窗口
 /// （轮询"她登录上了没有"要走这条，否则关掉了登录窗口就会冒出一个看不见的窗口）。
-fn cookie_of(store: &str, ensure: bool) -> Result<String, String> {
+///
+/// 两个域名都要问：`qoder.cn` 与 `qoder.com.cn` 是同一套后端的两个域名，
+/// 但会话 cookie 是按域分开的——只问主域名的话，会话落在另一个域上就永远"读不到"。
+fn cookie_of(store: &str, slot: &str, ensure: bool) -> Result<(String, String), String> {
     let app = app_handle()?.clone();
     let site = site_for(store).ok_or("这个产品没有登记官网地址")?;
-    let label = label_for(store);
+    let label = label_for(store, slot);
     if app.get_webview_window(&label).is_none() {
         if !ensure {
             return Err("登录窗口已经关了".to_string());
         }
-        ensure_hidden(&app, store)?;
+        ensure_hidden(&app, store, slot)?;
     }
     let mut last = String::from("没读到 cookie");
     for attempt in 0..8 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(500));
         }
-        match once(&app, &label, site.usage_page) {
-            Ok(list) => {
-                return list
-                    .iter()
-                    .find(|(n, _)| n == "qoder_session_cookie")
-                    .map(|(_, v)| v.clone())
-                    .filter(|v| !v.trim().is_empty())
-                    .ok_or_else(|| {
-                        "这个窗口里还没有登录态：先在驾驶舱打开的官网窗口里登录一次（用阿里云账号）".to_string()
-                    });
-            }
-            Err(e) => {
-                last = e;
-                // 只有"窗口还没起来"值得重试；其它错误重试也是白试
-                if !last.contains("还没就绪") && !last.contains("超时") && !last.contains("没回应") {
-                    break;
+        // 每次重试都把两个域名重问一遍：窗口刚起来时第一次往往什么都拿不到
+        let mut ok_hosts = 0usize;
+        let mut retryable = false;
+        for host in site.hosts {
+            match once(&app, &label, &site.usage_page(host)) {
+                Ok(list) => {
+                    ok_hosts += 1;
+                    if let Some(v) = list
+                        .iter()
+                        .find(|(n, _)| n == "qoder_session_cookie")
+                        .map(|(_, v)| v.clone())
+                        .filter(|v| !v.trim().is_empty())
+                    {
+                        return Ok(((*host).to_string(), v));
+                    }
+                }
+                Err(e) => {
+                    // 只有"窗口还没起来"值得重试；其它错误重试也是白试
+                    if e.contains("还没就绪") || e.contains("超时") || e.contains("没回应") {
+                        retryable = true;
+                    } else {
+                        return Err(e);
+                    }
+                    last = e;
                 }
             }
+        }
+        // **每一个**域名都问到了、谁那儿都没有会话 cookie：这是"没登录"，不是"窗口没起来"，
+        // 重试也变不出来——直接把该怎么做说清楚
+        if ok_hosts == site.hosts.len() {
+            return Err(format!(
+                "这个号的官网会话还没登录：{} 的 cookie 罐里都没有登录会话。\
+                 先在驾驶舱打开的官网窗口里登录一次（用阿里云账号）。",
+                site.hosts.join(" / ")
+            ));
+        }
+        if !retryable {
+            break;
         }
     }
     Err(last)
 }
 
-fn session_cookie(store: &str) -> Result<String, String> {
-    cookie_of(store, true)
+/// 取会话，连它落在哪个域名一起带回来（调接口必须用同一个域名）。
+fn session_cookie(store: &str, slot: &str) -> Result<(String, String), String> {
+    cookie_of(store, slot, true)
 }
 
-/// 官网窗口里现在有没有登录会话——只翻 cookie 罐，不发任何请求。
+/// 这个号自己的官网窗口里有没有登录会话——只翻 cookie 罐、不发任何请求。
 /// 给「她登录成功 → 自动补一次取数」那条轮询用。
-pub fn has_session(app_id: &str) -> bool {
+pub fn has_session(app_id: &str, meta: &Value) -> bool {
     match store_of(app_id) {
-        Ok(s) => cookie_of(s, false)
-            .map(|c| !c.trim().is_empty())
+        Ok(s) => cookie_of(s, &slot_of(meta), false)
+            .map(|(_, c)| !c.trim().is_empty())
             .unwrap_or(false),
         Err(_) => false,
     }
@@ -345,9 +468,10 @@ fn f(v: &Value, k: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// 抓一次官网额度：逐资源包 + 身份 + 套餐。
+/// 抓一次官网额度：逐资源包 + 身份 + 套餐 + 每日消耗热力图。
+/// 用的是这张卡自己那份会话，所以读回来的一定是这个号的数。
 /// 返回 {ok, account, user_id, plan, plan_expire, left, total, used, packs:[...], portions:[...]}
-pub fn fetch(app_id: &str) -> Value {
+pub fn fetch(app_id: &str, meta: &Value) -> Value {
     let store = match store_of(app_id) {
         Ok(s) => s,
         Err(e) => return json!({ "ok": false, "msg": e }),
@@ -356,36 +480,83 @@ pub fn fetch(app_id: &str) -> Value {
         Some(s) => s,
         None => return json!({ "ok": false, "msg": "这个产品没有登记官网地址" }),
     };
-    let cookie = match session_cookie(store) {
-        Ok(c) => c,
+    let slot = slot_of(meta);
+    // 会话落在哪个域名下，这一轮就整条走哪个域名（cookie 是按域分开的，
+    // 拿 A 域的会话去调 B 域的接口只会 401）
+    let (host, cookie) = match session_cookie(store, &slot) {
+        Ok(v) => v,
         Err(e) => {
-            return json!({ "ok": false, "need_login": true, "msg": e });
+            return json!({ "ok": false, "need_login": true, "slot": slot, "msg": e });
         }
     };
     let hdr = format!("qoder_session_cookie={}", cookie);
+    let referer = site.usage_page(&host);
     let usage = match get_json(
-        &format!("https://{}/api/v2/me/usages/big_model_credits", site.host),
+        &format!("https://{}/api/v2/me/usages/big_model_credits", host),
         &hdr,
-        site.usage_page,
+        &referer,
     ) {
         Ok(v) => v,
         Err(e) => return json!({ "ok": false, "msg": e }),
     };
     // 身份与套餐读不到不影响额度，单独降级成空
-    let me = get_json(
-        &format!("https://{}/api/v1/me", site.host),
+    let me = get_json(&format!("https://{}/api/v1/me", host), &hdr, &referer)
+        .unwrap_or_else(|_| json!({}));
+    let plan = get_json(&format!("https://{}/api/v1/me/userplan", host), &hdr, &referer)
+        .unwrap_or_else(|_| json!({}));
+    // 官网用量页那张「近一年每日 Credits 消耗」热力图就是这条接口给的：
+    // 厂商自己把 371 天补零成连续序列，还顺带给四档分色阈值（levels）。
+    // 读不到只少一张图，不许把额度本身打挂，所以跟 me/plan 一样降级成 error 装进报文。
+    let heatmap = get_json(
+        &format!("https://{}/api/v1/me/ai-conversations/credits-heatmap?days=371", host),
         &hdr,
-        site.usage_page,
+        &referer,
     )
-    .unwrap_or_else(|_| json!({}));
-    let plan = get_json(
-        &format!("https://{}/api/v1/me/userplan", site.host),
-        &hdr,
-        site.usage_page,
-    )
-    .unwrap_or_else(|_| json!({}));
+    .unwrap_or_else(|e| json!({ "error": e }));
 
-    parse_usage(&usage, &me, &plan, site.usage_page)
+    let mut out = parse_usage(&usage, &me, &plan, &referer);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("slot".into(), json!(slot));
+        o.insert("host".into(), json!(host));
+        o.insert("heatmap".into(), heatmap);
+    }
+    out
+}
+
+/// 官网热力图 → 驾驶舱那份按天序列。单位、分档阈值一律照厂商给的，
+/// 不许我们另按分位数重切（同一份数在官网和驾驶舱分色不同，用户会以为读数不一致）。
+fn trend_of_heatmap(h: &Value) -> Option<Value> {
+    let items = h["items"].as_array()?;
+    let days: Vec<Value> = items
+        .iter()
+        .filter_map(|it| {
+            let d = it["date"].as_str()?;
+            Some(json!({ "date": d, "credits": it["value"].as_f64().unwrap_or(0.0) }))
+        })
+        .collect();
+    if days.is_empty() {
+        return None;
+    }
+    let mut peak: f64 = 0.0;
+    let mut peak_date = String::new();
+    for it in &days {
+        let v = it["credits"].as_f64().unwrap_or(0.0);
+        if v > peak {
+            peak = v;
+            peak_date = it["date"].as_str().unwrap_or("").to_string();
+        }
+    }
+    Some(json!({
+        "unit": h["unit"].as_str().unwrap_or("credits"),
+        "days": days,
+        "total": h["total"].as_f64(),
+        "peak": peak,
+        "peak_date": peak_date,
+        "levels": h["levels"].as_array().cloned().unwrap_or_default(),
+        "from": days.first().and_then(|v| v["date"].as_str()).unwrap_or(""),
+        "to": days.last().and_then(|v| v["date"].as_str()).unwrap_or(""),
+        "source": "官网热力图接口",
+    }))
 }
 
 /// 把官网三个接口的原始返回整理成驾驶舱那套「大组 + 逐笔」。
@@ -535,6 +706,14 @@ pub fn apply(meta: &Value, w: &Value) -> Value {
     obj.insert("quota_groups".into(), w["groups"].clone());
     obj.insert("quota_plan_name".into(), json!(w["plan_name"]));
     obj.insert("quota_user_id".into(), json!(w["user_id"]));
+    // 这份会话存在哪一格，就在卡片上钉死哪一格：第一次读还没有 userId，
+    // 目录是按账号名开的，读完就有了——不钉住的话下次刷新会去找一个空目录，
+    // 等于刚登好的会话被丢在原地，又让她重登一次。
+    if let Some(s) = w["slot"].as_str() {
+        if !s.trim().is_empty() {
+            obj.insert("quota_web_slot".into(), json!(s));
+        }
+    }
     obj.insert("quota_account".into(), json!(w["account"]));
     obj.insert("quota_plan".into(), json!(w["plan"]));
     obj.insert("quota_local".into(), json!(true));
@@ -562,6 +741,22 @@ pub fn apply(meta: &Value, w: &Value) -> Value {
     if !earliest.is_empty() {
         obj.insert("expires_on".into(), json!(earliest));
     }
+    // 按天消耗序列（波形图与热力图）
+    match trend_of_heatmap(&w["heatmap"]) {
+        Some(t) => {
+            obj.insert("quota_trend".into(), t);
+        }
+        None => {
+            // 这一轮没读到：档案里已经有图就留着，一张都没有才记下原因——
+            // 一次网络抖动不该把能用的图换成一句报错
+            if obj.get("quota_trend").map_or(true, |v| v.is_null()) {
+                let e = w["heatmap"]["error"]
+                    .as_str()
+                    .unwrap_or("官网没返回每日消耗序列");
+                obj.insert("quota_trend".into(), json!({ "error": e }));
+            }
+        }
+    }
     m
 }
 
@@ -575,6 +770,58 @@ mod tests {
         assert!(site_for("qoder").is_some());
         assert!(site_for("workbuddy").is_none());
         assert!(supports("qoder-cn"));
+    }
+
+    /// Qoder CN 的官网有两个域名同时在活着（DNS 都指向同一台 aliyun 主机），
+    /// 但会话 cookie 是按域分开的：只问主域名，会话落在另一个域上就永远"读不到"。
+    /// 这条钉的是两个域名都在候选里、且拼出来的地址与 oauth_callback 转义都对。
+    #[test]
+    fn qoder_cn_has_both_live_hosts_and_a_well_formed_sign_in() {
+        let s = site_for("qoder-cn").unwrap();
+        assert_eq!(s.hosts, &["qoder.com.cn", "qoder.cn"]);
+        assert_eq!(s.usage_page("qoder.cn"), "https://qoder.cn/account/usage");
+        assert_eq!(
+            s.sign_in("qoder.cn"),
+            "https://qoder.cn/users/sign-in?oauth_callback=https%3A%2F%2Fqoder.cn%2Faccount%2Fusage"
+        );
+        // 转义顺序不能反：先 `:` 再 `/`，否则会把刚插进去的 %2F 里的 `/` 也吃掉
+        assert_eq!(
+            url_encode("https://qoder.com.cn/account/usage"),
+            "https%3A%2F%2Fqoder.com.cn%2Faccount%2Fusage"
+        );
+        // 国际版只有一个域名：不能把 CN 站当成它的回落（那是另一套账号体系）
+        assert_eq!(site_for("qoder").unwrap().hosts, &["qoder.com"]);
+    }
+
+    /// 两个号必须落在两个格子里：共用一份会话时官网读数永远只属于登进去的那一个号，
+    /// 另一张卡点刷新要么读不到、要么被防串号守卫挡回去（她 10-14 就是撞在这上面）。
+    #[test]
+    fn each_account_gets_its_own_web_session_slot() {
+        let a = json!({ "quota_user_id": "019e8247-2e21-7aa6-9e87-b0720003b387" });
+        let b = json!({ "quota_user_id": "01a05beb-b936-746a-93ae-371662bc1b57" });
+        assert_ne!(slot_of(&a), slot_of(&b));
+        assert_eq!(slot_of(&a), "019e8247-2e21-7aa6-9e87-b0720003b387");
+        // 中文账号名整段会被洗成连字符，不补指纹两张卡会共用一份档案
+        let c = slot_of(&json!({ "name": "你鸭神永远是你鸭神" }));
+        let d = slot_of(&json!({ "name": "你鸭神也是你鸭神" }));
+        assert_ne!(c, d);
+        // 目录名与窗口 label 都不许带斜杠、空格这类禁忌字符
+        for raw in ["a/b c", "你鸭神永远是你鸭神", ""] {
+            let s = slot_of(&json!({ "name": raw }));
+            assert!(
+                s.chars().all(|x| x.is_ascii_alphanumeric() || matches!(x, '-' | '_' | '.')),
+                "「{raw}」洗出来还是不能当目录名：{s}"
+            );
+        }
+        assert_eq!(slot_of(&json!({ "name": "a-b.c" })), "a-b.c");
+    }
+
+    /// 格子一旦记下就以它为准：第一次读之前目录是按账号名开的，读完就绑上了 userId，
+    /// 不钉住的话下一次刷新会去找一个空目录，等于刚登好的会话被丢在原地又要重登。
+    #[test]
+    fn recorded_slot_wins_over_a_newly_bound_user_id() {
+        let m = json!({ "quota_web_slot": "账号2", "quota_user_id": "019e8247-2e21" });
+        assert_eq!(slot_of(&m), "账号2");
     }
 
     #[test]
@@ -700,5 +947,41 @@ mod tests {
         let w3 = parse_usage(&no_top, &json!({}), &json!({"plan_tier_name": "PLAN_TIER_FREE"}), "");
         assert_eq!(w3["groups"][0]["items"][0]["expires_on"], "未给出");
         assert_eq!(w3["groups"][0]["items"][0]["label"], "套餐额度");
+    }
+
+    /// 官网热力图那份真实报文（厂商自己把 371 天补零、还给了四档分色阈值）转成按天序列。
+    /// 阈值必须原样带上：同一份数在官网和驾驶舱分色不一样，用户只会认为读数不一致。
+    #[test]
+    fn heatmap_payload_becomes_a_daily_trend() {
+        let h = json!({
+            "year": 2026, "unit": "credits",
+            "levels": [29.35, 206.69, 879.14, 1190.59],
+            "total": 9836.16,
+            "items": [{"date": "2025-10-07", "value": 0},
+                      {"date": "2026-10-05", "value": 36.0456504078},
+                      {"date": "2026-10-10", "value": 1190.5914247282}],
+        });
+        let t = trend_of_heatmap(&h).expect("这份形状要能聚出序列");
+        assert_eq!(t["unit"], "credits");
+        assert_eq!(t["days"].as_array().unwrap().len(), 3);
+        assert_eq!(t["peak"], 1190.5914247282);
+        assert_eq!(t["peak_date"], "2026-10-10");
+        assert_eq!(t["levels"].as_array().unwrap().len(), 4, "厂商给的分档阈值不许丢");
+        assert_eq!(t["from"], "2025-10-07");
+        assert_eq!(t["to"], "2026-10-10");
+        assert!(trend_of_heatmap(&json!({ "items": [] })).is_none());
+        assert!(trend_of_heatmap(&json!({ "error": "401" })).is_none());
+        let m = apply(
+            &json!({ "name": "Qoder CN" }),
+            &json!({ "left": 100, "total": 200, "portions": [], "groups": [], "heatmap": h }),
+        );
+        assert_eq!(m["quota_trend"]["days"].as_array().unwrap().len(), 3);
+        // 这一轮读挂了、档案里已有图：留着上一轮的，不许换成报错
+        let bad = apply(
+            &m,
+            &json!({ "left": 100, "total": 200, "portions": [], "groups": [],
+                     "heatmap": { "error": "官网会话掉了" } }),
+        );
+        assert_eq!(bad["quota_trend"]["days"].as_array().unwrap().len(), 3);
     }
 }

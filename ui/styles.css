@@ -19,6 +19,7 @@
 
   --nav-w-user: 248px;
   --nav-w: var(--nav-w-user);
+  --mgmt-h: 184px;  /* 左下角「管理」那一截的定高，只有拖过那条横线才生效（.sidebar.split） */
   --topbar-h: 48px;
 }
 
@@ -243,8 +244,8 @@ input:focus, select:focus { border-color: var(--accent) }
   overflow: hidden;
 }
 
-/* 侧栏收起按钮：摆在「管理」那一行的右边，跟着侧栏一起走。
-   以前它是绝对定位骑在分隔线上的，和拖宽手柄叠在一处，真机上点十次九次没反应 */
+/* 侧栏收起按钮：摆在顶部「Agents」那一行的右边。
+   它历史上是绝对定位骑在分隔线上的，和拖宽手柄叠在一处、真机上点十次九次没反应——别再那么放 */
 #btn-nav-toggle {
   width: 24px; height: 24px; padding: 0; flex: none;
   display: grid; place-items: center;
@@ -271,12 +272,42 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
   padding-right: var(--sp-1); scrollbar-gutter: stable;
 }
 .side-fixed {
-  flex: 0 0 auto; margin-top: var(--sp-2); padding-top: var(--sp-2);
-  border-top: 1px solid var(--line);
-  display: flex; flex-direction: column; gap: var(--sp-2);
+  flex: 0 0 auto; padding-top: var(--sp-1);
+  display: flex; flex-direction: column; gap: var(--sp-1);
 }
+/* 左下角「管理」这一截：项目加多之后不能跟着一路长高——字号、行距、图标列都压到最小，
+   再给一个占窗口高度的上限，窗口矮的时候它自己滚，窗口大起来也不会去抢上面列表的地方。
+   （2026-10-15 她指出"项目多了显得非常高"） */
+.side-fixed .navtitle { margin: 0 var(--sp-3) 1px; font-size: 10px; letter-spacing: 1.6px }
+#viewlist { gap: 1px; max-height: min(22vh, 208px); overflow-y: auto; scrollbar-gutter: stable }
+#viewlist button { padding: 4px 9px; font-size: 12px; border-radius: 7px; gap: 2px 6px }
+#viewlist .ico { width: 14px; font-size: 11.5px }
+/* 危险项（删除账号这类）在菜单里自成一档：分隔线 + 红字，标准菜单的做法 */
+.setnav .sep { height: 1px; margin: 6px 4px; background: var(--line) }
+.setnav button.danger { color: var(--danger) }
+.setnav button.danger:hover { background: var(--danger-soft); color: var(--danger) }
+.setnav button.danger[aria-current="true"] {
+  background: var(--danger-soft); color: var(--danger); box-shadow: inset 2px 0 0 var(--danger);
+}
+/* 两段之间这条横线自己就是拖拽手柄（.side-fixed 的 border-top 移到了这里） */
+.side-resize {
+  flex: 0 0 auto; height: 11px; margin-top: var(--sp-1);
+  position: relative; cursor: row-resize; touch-action: none;
+}
+.side-resize::before {
+  content: ""; position: absolute; inset: 5px 0 auto; height: 1px;
+  background: var(--line); border-radius: var(--r-pill);
+  transition: background .14s ease;
+}
+.side-resize:hover::before, .side-resize.dragging::before { background: var(--accent); height: 3px; top: 4px }
+.side-resize:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px }
+/* 列表区永远吃掉剩余高度（flex:1 1 0），拖线只改「管理」那一截的定高。
+   这样窗口无论变大变小，多出来的空间都只会落到列表区，左下角不可能长出空白 */
+.sidebar.split .side-fixed { flex: 0 0 var(--mgmt-h); min-height: 0; overflow-y: auto; scrollbar-gutter: stable }
 .sidehead { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2) }
 .sidehead .navtitle { margin: 0 }
+/* 侧栏最上面那行：Agents 标题 + 收起按钮。不参与两段高度的分配，所以 flex 定死不许缩 */
+.sidehead.top { flex: none; margin: 0 var(--sp-3) var(--sp-2) 0 }
 /* 拖宽时给个实时反馈：手柄 hover/拖动时高亮 */
 .nav-resize {
   cursor: col-resize; position: relative; align-self: stretch;
@@ -795,6 +826,23 @@ html[data-theme="light"] .modal.blur { background: rgba(80, 72, 60, .30) }
 @media (max-width: 720px) {
   .dlgbody { grid-template-columns: 104px minmax(0, 1fr) }
 }
+/* ============================ 行内问号提示 ============================ */
+/* 长说明收进 label 旁的问号圈，悬停即看、单击钉住；气泡 fixed 挂 body，不被面板 overflow 裁 */
+.qhelp {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px; margin-left: 6px; border-radius: 50%;
+  border: 1px solid var(--line-strong); color: var(--text-faint);
+  font-size: 10px; line-height: 1; cursor: help; user-select: none; vertical-align: 1px;
+}
+.qhelp:hover, .qhelp.on { color: var(--accent); border-color: var(--accent) }
+#qtip {
+  position: fixed; z-index: 90; max-width: 320px; padding: 8px 12px;
+  font-size: 12px; line-height: 1.75; white-space: pre-line;
+  background: var(--bg-raised); color: var(--text);
+  border: 1px solid var(--line-strong); border-radius: var(--r-md);
+  box-shadow: var(--shadow); pointer-events: none;
+}
+
 /* ============================ 轻提示 ============================ */
 .toasts {
   position: fixed; right: var(--sp-5); bottom: var(--sp-5); z-index: 60;
@@ -804,6 +852,7 @@ html[data-theme="light"] .modal.blur { background: rgba(80, 72, 60, .30) }
   background: var(--bg-sunken); border: 1px solid var(--line-strong);
   border-left: 3px solid var(--accent); border-radius: var(--r-md);
   padding: 10px var(--sp-4); font-size: 13px; box-shadow: var(--shadow);
+  white-space: pre-line;
   animation: toastin .18s ease-out;
 }
 .toasts div.err { border-left-color: var(--danger) }
@@ -818,6 +867,8 @@ html[data-theme="light"] .modal.blur { background: rgba(80, 72, 60, .30) }
   display: grid; place-items: center; background: var(--bg-sunken);
   border: 1px solid var(--line); font: 600 9px/18px var(--font-mono); color: var(--text-muted);
 }
+.applist .fav.svg { display: inline-flex }
+.applist .fav.svg svg { width: 100%; height: 100%; border-radius: 4px; display: block }
 .applist .cap {
   flex: none; font-size: 10px; padding: 1px 6px; border-radius: var(--r-pill);
   border: 1px solid var(--line-strong); color: var(--text-faint); white-space: nowrap;
@@ -1194,6 +1245,10 @@ html.rail { --nav-w: 68px }
 html.rail .navtitle, html.rail .navfoot, html.rail .legend,
 html.rail .applist .label, html.rail .applist .badge, html.rail .applist .cap,
 html.rail .applist .nav-badges, html.rail .nav-resize { display: none }
+/* 图标条模式下这两截没什么可分配的，线留着当分隔、不许拖 */
+html.rail .side-resize { cursor: default; height: 9px }
+html.rail .side-resize:hover::before { background: var(--line); height: 1px; top: 5px }
+html.rail .sidebar.split .side-fixed { flex: 0 0 auto; overflow-y: visible }
 html.rail .applist button { justify-content: center; padding: 8px 0; gap: 0 }
 html.rail .applist .dot { display: none }
 html.rail .applist .fav { width: 24px; height: 24px }
@@ -1201,6 +1256,7 @@ html.rail .btn.addapp { font-size: 0; margin: var(--sp-2) var(--sp-1) 0; width: 
 html.rail .btn.addapp::after { content: "＋"; font-size: 15px }
 /* 图标条模式下两个扫描按钮竖排、只留图标 */
 html.rail .sidehead { justify-content: center }
+html.rail .sidehead.top { margin-right: 0 }
 html.rail .sidebtns { flex-direction: column; margin: var(--sp-2) var(--sp-1) 0 }
 html.rail .sidebtns .btn { padding: 6px 0; font-size: 0 }
 html.rail .sidebtns .btn::after { font-size: 14px }
@@ -1211,6 +1267,7 @@ html.rail .layout { grid-template-columns: var(--nav-w) minmax(0, 1fr) }
   #btn-nav-toggle { display: none }
   .layout { grid-template-columns: minmax(0, 1fr) }
   .sidebar, .side-scroll { overflow: visible }
+  .side-resize { display: none }
   .content { padding-left: 0 }
   .applist { flex-direction: row; overflow-x: auto }
   .cards { grid-template-columns: minmax(0, 1fr) }
@@ -1292,3 +1349,234 @@ html.rail .layout { grid-template-columns: var(--nav-w) minmax(0, 1fr) }
 .bdrow input[type="checkbox"]:disabled { cursor: default }
 .bdrow b { color: var(--text); font-weight: 600 }
 .bdrow .mono { font-size: 12px }
+
+/* ---------- 消耗趋势：波形图 + 热力图 ---------- */
+/* 配色一律从 --accent 派生（深色琥珀金 / 浅色深琥珀），不引入新色相：
+   截图那种绿色是别家的品牌色，我们的图必须跟着主题走 */
+.trend { margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--line) }
+.trhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap }
+.trhead > b { font-size: 13px }
+.trsum { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums }
+.trrange { margin-left: auto; display: flex; gap: 4px }
+.tchip { font: inherit; font-size: 11px; color: var(--text-muted); background: transparent;
+  border: 1px solid var(--line-strong); border-radius: 999px; padding: 2px 9px; cursor: pointer }
+.tchip:hover { color: var(--text); border-color: var(--accent) }
+.tchip.on { color: var(--accent-ink); background: var(--accent); border-color: var(--accent) }
+.wavewrap { display: grid; grid-template-columns: 48px 1fr; grid-template-rows: 150px auto;
+  column-gap: 6px; margin-top: 10px }
+.wavey { grid-column: 1; grid-row: 1; position: relative }
+.wavey span { position: absolute; right: 0; transform: translateY(-50%); font-size: 10px;
+  color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap }
+.wavec { grid-column: 2; grid-row: 1; overflow: hidden }
+svg.wave { display: block; width: 100%; height: 150px }
+.wfill { fill: color-mix(in srgb, var(--accent) 20%, transparent); stroke: none }
+.wline { fill: none; stroke: var(--accent); stroke-width: 1.6; vector-effect: non-scaling-stroke }
+.wbase { stroke: var(--line-strong); stroke-width: 1; vector-effect: non-scaling-stroke }
+.whit { fill: transparent }
+.whit:hover { fill: color-mix(in srgb, var(--accent) 14%, transparent) }
+.wavex { grid-column: 2; grid-row: 2; display: flex; justify-content: space-between;
+  padding-top: 3px; font-size: 10px; color: var(--text-faint); font-variant-numeric: tabular-nums }
+.heatwrap { margin-top: 12px; overflow-x: auto; padding-bottom: 2px }
+.heatbox { min-width: max-content }
+.hmonths { position: relative; height: 13px; font-size: 10px; color: var(--text-faint) }
+.hmonths span { position: absolute; top: 0; white-space: nowrap }
+.heat { display: grid; grid-template-rows: repeat(7, 11px); grid-auto-flow: column;
+  grid-auto-columns: 11px; gap: 3px }
+.hc { width: 11px; height: 11px; border-radius: 2px; background: var(--bg-sunken) }
+.hc.l1 { background: color-mix(in srgb, var(--accent) 22%, var(--bg-sunken)) }
+.hc.l2 { background: color-mix(in srgb, var(--accent) 42%, var(--bg-sunken)) }
+.hc.l3 { background: color-mix(in srgb, var(--accent) 62%, var(--bg-sunken)) }
+.hc.l4 { background: color-mix(in srgb, var(--accent) 82%, var(--bg-sunken)) }
+.hc.l5 { background: var(--accent) }
+.trfoot { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; margin-top: 9px;
+  font-size: 11px; color: var(--text-faint); line-height: 1.55 }
+.trlg { margin-left: auto; display: inline-flex; align-items: center; gap: 3px; white-space: nowrap }
+.trlg .hc { width: 9px; height: 9px }
+.hc.void { background: transparent }
+/* 点击取值：两边共用同一个选中态，导引线与方格描边同时亮 */
+.whit { cursor: pointer }
+.whit.on { fill: color-mix(in srgb, var(--accent) 16%, transparent) }
+.wguide { stroke: var(--accent-hi); stroke-width: 1; stroke-dasharray: 3 3 }
+.hc { cursor: pointer }
+.hc.void { cursor: default }
+.hc.sel { box-shadow: 0 0 0 2px var(--accent-hi) }
+.trpick { display: flex; align-items: baseline; gap: 10px; margin-top: 8px; font-size: 12px;
+  color: var(--text); font-variant-numeric: tabular-nums }
+.trpick .tchip { margin-left: auto }
+.trhint { color: var(--text-faint) }
+
+/* ---------- 每日签到 ---------- */
+.cipad { max-width: 940px; padding: 4px 2px 22px }
+.cibar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0 14px;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-raised) }
+.cisw, .cisw input, .ciauto { accent-color: var(--accent); cursor: pointer }
+.cilab { color: var(--text-muted); font-size: 12px }
+.cinum { width: 54px; font: inherit; font-size: 12px; color: var(--text); background: var(--bg-sunken);
+  border: 1px solid var(--line-strong); border-radius: 6px; padding: 3px 6px }
+.ci-badge { font-size: 11px; padding: 2px 9px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--line) }
+.ci-badge.go { color: var(--accent-ink); background: var(--accent); border-color: var(--accent) }
+.ci-badge.done { color: var(--ok); background: var(--ok-soft) }
+.ci-badge.off { color: var(--text-faint); background: var(--bg-sunken) }
+.ci-badge.bad { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line) }
+.cihint { color: var(--text-faint); font-size: 11px; line-height: 1.55 }
+.cilog { display: flex; flex-direction: column; gap: 4px; margin-top: 16px; font-size: 11px;
+  color: var(--text-faint) }
+.cihit { font-variant-numeric: tabular-nums }
+/* 卡片上的签到角标 + 提醒控件 */
+#c-checkin { cursor: pointer }
+.cimark { font-size: 10px; padding: 1px 7px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--line); color: var(--text-faint); background: var(--bg-sunken); cursor: pointer }
+.cimark.claimable { color: var(--accent-ink); background: var(--accent); border-color: var(--accent) }
+.cimark.done { color: var(--ok); background: var(--ok-soft) }
+.cimark.error { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line) }
+.cinum.wide { width: 70px }
+.ciwarn { accent-color: var(--accent) }
+
+/* .chip 是 inline-flex，会把 [hidden] 的 UA 默认样式盖掉——顶栏两枚角标都得靠 hidden 切换 */
+.chip[hidden] { display: none }
+
+/* ---------- 每日签到：一张 grid 表格 ---------- */
+/* 列宽只在这里定义一次，行用 display:contents 直接落进这个 grid，
+   所以"每日多少积分""今天不用领"这些同类内容不可能错位。整块居中，
+   说明行与开关条也在同一列宽里，不再上宽下窄 */
+.cipad { max-width: 900px; margin: 0 auto; padding: 4px 2px 26px }
+.citab { display: grid; column-gap: 0; row-gap: 0;
+  grid-template-columns: minmax(126px, 1.4fr) 82px 74px 96px 74px 128px 96px 52px 46px; }
+.citab > * { padding: 11px 8px; min-width: 0 }
+/* 一行一条分隔线，跨满九列。以前是每格各画一条，而 .ci-badge/.ci-act/.cick 带
+   align-self:center（盒子只有内容高），线就落在各自文字底下，
+   同一行出现两三种不同的 y——看着就是断线 */
+.ci-rule { grid-column: 1 / -1; height: 0; padding: 0; border-bottom: 1px solid var(--line) }
+.citab > .ci-h { padding: 8px; border-bottom: 1px solid var(--line-strong);
+  font-size: 11px; color: var(--text-faint); letter-spacing: .02em }
+.ci-h.l, .ci-name { text-align: left }
+.ci-name { display: flex; flex-direction: column; gap: 2px; font-weight: 600 }
+.ci-note { font-weight: 400; font-size: 11px; color: var(--text-faint); line-height: 1.45 }
+.ci-badge { justify-self: center; align-self: center }
+.ci-num { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px;
+  color: var(--text-muted) }
+.ci-act { justify-self: center; align-self: center }
+.cick { justify-self: center; align-self: center }
+.cick input { accent-color: var(--accent); cursor: pointer }
+.cick.no { font-size: 11px; color: var(--text-faint); cursor: default }
+.ci-err { grid-column: 3 / -1; font-size: 11px; color: var(--danger);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+/* 表头跟着所在列的对齐方式走：状态/操作/两个勾选列居中，四个数字列右对齐。
+   每行固定九格（读不到那行也补齐九格），所以 9n+k 能稳定命中列 */
+.citab > .ci-h:nth-child(9n+2), .citab > .ci-h:nth-child(9n+7),
+.citab > .ci-h:nth-child(9n+8), .citab > .ci-h:nth-child(9n+9) { text-align: center }
+.citab > .ci-h:nth-child(9n+3), .citab > .ci-h:nth-child(9n+4),
+.citab > .ci-h:nth-child(9n+5), .citab > .ci-h:nth-child(9n+6) { text-align: right }
+
+/* ============================================================
+   首页（落地页）
+   一进来先看"今天要处理什么、能一键做什么"，不是直接落到某个 Agent 上。
+   顶部两块：左边一句话待办，右边两个主操作（一键刷新全部额度 / 一键签到）。
+   ============================================================ */
+.homepad { max-width: 1000px; padding: 4px 2px 28px }
+.hhero { display: flex; gap: var(--sp-5); align-items: flex-start; flex-wrap: wrap;
+  padding: var(--sp-5); margin-bottom: var(--sp-4);
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--r-lg) }
+.hhero-t { flex: 1 1 320px; min-width: 260px }
+.hhero-t h2 { font: 700 19px/1.3 var(--font-serif); margin-bottom: 6px }
+.hhero-sub { font-size: 13px; color: var(--text-muted); line-height: 1.6 }
+.hhero-b { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap }
+.btn.lg { padding: 10px 18px; font-size: 14px; font-weight: 600; border-radius: var(--r-md) }
+/* 进度条 + 失败清单：整条横跨，不挤在按钮那一列里 */
+.hjob { flex: 1 1 100%; display: flex; flex-direction: column; gap: 6px;
+  padding-top: var(--sp-3); border-top: 1px solid var(--line) }
+.hjob-t { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums }
+.hbar { height: 6px; border-radius: 999px; background: var(--track); overflow: hidden }
+.hbar > i { display: block; height: 100%; background: var(--accent); border-radius: 999px;
+  transition: width .4s ease }
+.hjoblog { display: flex; flex-direction: column; gap: 3px }
+.hjobbad { font-size: 11.5px; color: var(--danger); line-height: 1.5 }
+
+/* 统计磁贴 */
+.hstats { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+  gap: var(--sp-3); margin-bottom: var(--sp-4) }
+.hstat { display: flex; flex-direction: column; gap: 2px; padding: var(--sp-3) var(--sp-4);
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--r-md) }
+.hstat-l { font-size: 11.5px; color: var(--text-faint) }
+.hstat-v { font: 700 22px/1.2 var(--font-serif); font-variant-numeric: tabular-nums }
+.hstat-s { font-size: 11.5px; color: var(--text-muted); line-height: 1.45 }
+.hstat.warn { border-color: var(--warn-line); background: var(--warn-soft) }
+.hstat.warn .hstat-v { color: var(--warn) }
+.hstat.go { border-color: var(--accent); background: var(--accent-soft) }
+.hstat.go .hstat-v { color: var(--accent) }
+
+/* 两栏：临期 / 今天还能领 */
+.hcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: var(--sp-4); margin-bottom: var(--sp-4) }
+.hcols > .panel { margin: 0 }
+.hlist { display: flex; flex-direction: column; gap: 2px }
+/* 一行 = 一个对象 + 一个动作。整行可点，落到它自己的页面去 */
+.hrow { display: flex; align-items: center; gap: var(--sp-3); width: 100%; text-align: left;
+  padding: 9px var(--sp-2); border: 0; border-radius: var(--r-sm); background: none;
+  color: var(--text); font: inherit; font-size: 13px; cursor: pointer }
+.hrow:hover { background: var(--bg-hover) }
+.hrow.urgent { background: var(--danger-soft) }
+.hrow-l { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+/* 右边两列定宽右对齐：不定宽的话，一行的动作词是"发一句对话"、下一行是"等待中"，
+   两列就会各错各的，看起来像没对齐 */
+.hrow-r { flex: 0 0 92px; text-align: right; color: var(--text-muted); font-size: 12px;
+  font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.hrow-x { flex: 0 0 80px; text-align: right; font-size: 12px; font-weight: 600 }
+.hrow-x.go { color: var(--accent) }
+
+/* Agent 概览：一行一个程序，点进它的账号页 */
+.hagent { display: flex; align-items: baseline; gap: var(--sp-3); width: 100%; text-align: left;
+  padding: 10px var(--sp-2); border: 0; border-radius: var(--r-sm); background: none;
+  color: var(--text); font: inherit; cursor: pointer }
+.hagent:hover { background: var(--bg-hover) }
+.hagent-n { flex: 0 0 180px; font-weight: 600; font-size: 13.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.hagent-t { flex: 1 1 auto; display: flex; gap: 10px; flex-wrap: wrap;
+  font-size: 12px; color: var(--text-muted) }
+.hagent-t > span:empty { display: none }
+
+/* 最近领过的 */
+.hlog { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px }
+.hlogrow { display: flex; gap: var(--sp-3) }
+.hlog-t { flex: 0 0 210px; color: var(--text-faint); font-variant-numeric: tabular-nums }
+.hlog-ok { color: var(--ok) }
+.hlog-no { color: var(--danger) }
+
+/* 每日签到：状态列的两种新状态 */
+.ci-badge.wait { color: var(--text-muted); background: var(--bg-sunken) }
+.ci-badge.pending { color: var(--text-faint); background: var(--bg-sunken);
+  border-style: dashed }
+/* 正在等到账：这一段说清"在等什么、谁在盯"，免得她以为程序忘了 */
+.cipend { display: flex; flex-direction: column; gap: 4px; margin-top: 16px; font-size: 11px;
+  color: var(--text-muted); line-height: 1.55; padding: var(--sp-3);
+  background: var(--accent-soft); border: 1px solid var(--line); border-radius: var(--r-md) }
+.cipend b { color: var(--text); font-weight: 650 }
+
+/* ============================================================
+   每日签到：产品 → 账号 两级
+   账号行只在"每个号都留着自己那份登录态"的产品下出现（Qoder 系 / WorkBuddy 系）。
+   缩进 + 左侧一条竖线，一眼看出它属于上面那家；折叠箭头在产品的标题格里。
+   ============================================================ */
+/* 箭头 + 名字 + 「N 个账号」同一行：.ci-name 是 column flex，
+   箭头直接放进去会变成块级、独占一行（2026-10-16 实测到） */
+.ci-nmrow { display: flex; align-items: center; gap: 4px; min-width: 0 }
+.ci-fold {
+  flex: 0 0 auto; border: 0; background: none; color: var(--text-muted);
+  cursor: pointer; font: inherit; font-size: 11px; padding: 0; line-height: 1;
+}
+.ci-nmrow .ci-nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.ci-fold:hover { color: var(--text) }
+.ci-name .ci-nm { display: inline }
+/* 产品名后面那枚「N 个账号」——不是徽章，只是把"下面还有内容"说清楚 */
+.ci-kids {
+  margin-left: 7px; font-size: 11px; color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+/* 账号行：往右缩进一格，左边一条竖线连着上面那家 */
+.ci-name.acc { padding-left: 18px; position: relative; font-weight: 500 }
+.ci-name.acc::before {
+  content: ''; position: absolute; left: 8px; top: 50%;
+  width: 7px; height: 1px; background: var(--line);
+}
+.ci-name.acc .ci-note { display: none }

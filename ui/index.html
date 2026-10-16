@@ -21,6 +21,7 @@
     <span class="chip" id="c-run"><i class="dot"></i><span>—</span></span>
     <span class="chip" id="c-proxy"><i class="dot"></i><span>—</span></span>
     <span class="chip expiring" id="c-alerts" hidden title="有积分临期，点击查看明细"><i class="dot"></i><span>—</span></span>
+    <span class="chip" id="c-checkin" hidden title="每日签到：今天还有几家没领，点开看"><i class="dot"></i><span>—</span></span>
   </div>
 
   <button class="gear" id="btn-settings" title="设置" aria-label="设置"></button>
@@ -35,9 +36,14 @@
 
 <main class="layout">
   <nav class="sidebar" aria-label="导航">
+    <!-- 顶栏：Agents 标题 + 收起按钮。按钮以前摆在下面「管理」那一行，要滚到侧栏最底才点得到 -->
+    <div class="sidehead top">
+      <h2 class="navtitle">Agents</h2>
+      <button id="btn-nav-toggle" type="button" aria-label="收起导航栏" aria-expanded="true"
+              title="收起导航栏（Ctrl+B）"></button>
+    </div>
     <!-- 上半截：Agent 列表，只有这一块滚动 -->
     <div class="side-scroll">
-      <h2 class="navtitle">Agents</h2>
       <ul id="applist" class="applist"></ul>
       <div class="sidebtns">
         <button class="btn sm" id="btn-scan" title="扫描开始菜单与桌面，收录新装的 AI 程序">重新扫描</button>
@@ -50,16 +56,18 @@
         识别不到的程序用上面「＋ 添加程序」手动登记
       </p>
     </div>
+    <!-- 两段之间这条横线可拖：上截给多高由它定，双击恢复自动 -->
+    <div class="side-resize" id="side-resize" role="separator" aria-orientation="horizontal" tabindex="0"></div>
     <!-- 下半截：常驻不滚，切页面的入口始终在手边 -->
     <div class="side-fixed">
       <div class="sidehead">
         <h2 class="navtitle">管理</h2>
-        <button id="btn-nav-toggle" type="button" aria-label="收起导航栏" aria-expanded="true"
-                title="收起导航栏（Ctrl+B）"></button>
       </div>
       <ul id="viewlist" class="applist">
+        <li><button data-view="home"><span class="ico">◎</span><span class="label">首页</span></button></li>
         <li><button data-view="collab"><span class="ico">⇄</span><span class="label">协作</span></button></li>
         <li><button data-view="keys"><span class="ico">#</span><span class="label">API 与额度</span></button></li>
+        <li><button data-view="checkin"><span class="ico">✓</span><span class="label">每日签到</span></button></li>
         <li><button data-view="settings"><span class="ico">⚙</span><span class="label">设置</span></button></li>
       </ul>
     </div>
@@ -68,15 +76,30 @@
        title="拖动调整左侧导航栏宽度，双击恢复默认"></div>
 
   <div class="content">
+    <!-- ================= 首页（落地页） =================
+         一进来先回答"今天要处理什么、能一键做什么"，而不是直接落到某个 Agent 上。
+         两个主操作（一键刷新全部额度 / 一键签到）都在这页顶部。 -->
+    <div id="view-home" class="view">
+      <div class="toolbar">
+        <h1>驾驶舱首页</h1>
+        <span class="count" id="home-sub"></span>
+        <span class="sp"></span>
+        <button class="btn" id="btn-home-reload" title="立刻刷新状态（只读，不改动任何账号）">刷新</button>
+      </div>
+      <div class="pagebody">
+        <div id="home-body" class="homepad"></div>
+      </div>
+    </div>
+
     <!-- ================= 账号库 ================= -->
-    <div id="view-agents" class="view">
+    <div id="view-agents" class="view" hidden>
       <div class="toolbar">
         <h1 id="cur-title">—</h1>
         <span class="count" id="cur-count"></span>
         <span class="pill" id="cur-cap"></span>
         <span class="sp"></span>
         <button class="btn primary" id="btn-new">＋ 添加账号</button>
-        <button class="btn" id="btn-hide" title="把误收的程序从列表里隐藏（不会卸载，可在设置里恢复）">隐藏此程序</button>
+        <button class="btn" id="btn-hide" title="把误收的程序从列表里隐藏（不会卸载，可在设置里恢复）">隐藏程序</button>
         <button class="btn" id="btn-forget" title="移除这条已卸载程序的记录（账号目录原样保留）" hidden>清理记录</button>
         <button class="btn" id="btn-reload" title="立即刷新账号与进程状态">刷新</button>
       </div>
@@ -229,6 +252,20 @@
     </div>
 
     <!-- ================= 设置（帮助与教程也在这里，作为一个分组） ================= -->
+    <div id="view-checkin" class="view" hidden>
+      <div class="toolbar">
+        <button class="btn sm back-agents" title="返回账号列表">← 返回</button>
+        <h1>每日签到</h1>
+        <span class="count" id="checkin-count"></span>
+        <span class="sp"></span>
+        <button class="btn" id="btn-checkin-refresh" title="重新问一遍各家今天的状态（只读，不领取）">刷新状态</button>
+        <button class="btn primary" id="btn-checkin-all" title="把今天可领的一次领掉——会先让你确认">一键领取</button>
+      </div>
+      <div class="pagebody">
+        <div id="checkin-body" class="cipad"></div>
+      </div>
+    </div>
+
     <div id="view-settings" class="view" hidden>
       <div class="toolbar"><button class="btn sm back-agents" title="返回账号列表">← 返回</button><h1>设置</h1><span class="sp"></span>
         <span class="count" id="set-hint">改动即时生效并保存在本机</span></div>

@@ -67,6 +67,17 @@ pub fn self_check() -> Vec<String> {
             None => continue,
         };
         let rec = swaps_of(&cfg).get(id).cloned();
+        // 共用一份档案的产品（Qoder 系 / WorkBuddy / ZCode / TRAE…）：账号目录就是默认档案
+        // 本身，压根没有"换号"这回事。记录里若还留着一条，只可能是早期版本或一次失败的换号
+        // 留下的残渣——照下面那套按磁盘对账，只会得出"记录说 A、磁盘说 B"这种谁也看不懂的
+        // 告警（Qoder CN 上就是这么冒出来的），而磁盘本来就是对的。清掉即可，不用报。
+        if crate::registry::shares_one_profile(id) {
+            if swaps_of(&cfg).get(id).is_some() {
+                set_swap(&mut cfg, id, None);
+                changed = true;
+            }
+            continue;
+        }
         let rec_name = rec
             .as_ref()
             .and_then(|c| c["instance"].as_str())
@@ -225,37 +236,76 @@ fn blocker_names(list: &[(u32, String)]) -> String {
     names.join("、")
 }
 
-pub fn swap_set(app_id: &str, name: &str, force: bool) -> (bool, String) {
+/// 换号的结果。`need_force` 是结构化信号：界面据此决定摆不摆「结束进程并换号」，
+/// 不再拿中文文案去正则匹配（曾经文案改了个词，那个按钮就再也出不来，
+/// 而提示还写着"点「强制换号」"——用户对着一个不存在的按钮干着急）。
+#[derive(Debug, Clone)]
+pub struct SwapOut {
+    pub ok: bool,
+    pub msg: String,
+    /// 这个账号的档案就是程序默认档案本身，切过去在磁盘上什么都不改（共用一份档案的产品）
+    pub noop: bool,
+    /// 被在跑的进程挡住了，而结束它们确实能解开
+    pub need_force: bool,
+}
+
+impl SwapOut {
+    fn ok(msg: impl Into<String>) -> Self {
+        SwapOut { ok: true, msg: msg.into(), noop: false, need_force: false }
+    }
+    fn err(msg: impl Into<String>) -> Self {
+        SwapOut { ok: false, msg: msg.into(), noop: false, need_force: false }
+    }
+}
+
+pub fn swap_set(app_id: &str, name: &str, force: bool) -> SwapOut {
     let app = match crate::registry::app_def(app_id) {
         Some(a) => a,
-        None => return (false, "未知 Agent".into()),
+        None => return SwapOut::err("未知 Agent"),
     };
     let p = match profile_dir(app_id) {
         Some(p) => p,
-        None => return (false, "该 Agent 未登记默认档案目录，不支持换号".into()),
+        None => return SwapOut::err("该 Agent 未登记默认档案目录，不支持换号"),
     };
     // 运行时家目录守卫：Qoder 系这类目录（.auth / ipc / host-actions / projects / mcp-router.json）
     // 是 Agent 自己的家，不是"能换号的登录档案"。换它既换不动登录，又必然被在跑的 agent 占住；
     // 万一以后 products 表又被写错，这里拦住，别去 rename 一个正在使用的运行时目录。
     if crate::registry::looks_like_runtime_home(&p) {
-        return (
-            false,
-            format!(
-                "{} 是 Agent 运行时家目录（.auth / ipc / host-actions / projects 都在里面），不是能换号的账号档案。\n\
-                 换号要换登录态所在的那个目录：Qoder 0.4.x 是 %APPDATA%\\com.qoder.app.stable（auth.v1.dat），\
-                 旧壳才是 %APPDATA%\\Qoder。这里不动它，免得把正在跑的 Agent 弄坏。",
-                p.display()
-            ),
-        );
+        return SwapOut::err(format!(
+            "{} 是 Agent 运行时家目录（.auth / ipc / host-actions / projects 都在里面），不是能换号的账号档案。\n\
+             换号要换登录态所在的那个目录：Qoder 0.4.x 是 %APPDATA%\\com.qoder.app.stable（auth.v1.dat），\n\
+             旧壳才是 %APPDATA%\\Qoder。这里不动它，免得把正在跑的 Agent 弄坏。",
+            p.display()
+        ));
     }
     let meta = match find_instance(app_id, name) {
         Some(m) => m,
-        None => return (false, "实例不存在".into()),
+        None => return SwapOut::err("实例不存在"),
     };
+    let instance_dir = match meta["data_dir"].as_str() {
+        Some(d) => std::path::PathBuf::from(d),
+        None => return SwapOut::err("实例缺少 data_dir"),
+    };
+    // 共用一份档案的产品（单窗口换号：Qoder 系、WorkBuddy、ZCode、TRAE…）：这个账号的档案
+    // 就是默认档案那一份，切过去磁盘上一个字节都不改。必须挡在占用检查**前面**——
+    // 她只是换个号，没有任何理由因此被要求关掉程序。
+    if crate::registry::swap_changes_nothing(app_id, &instance_dir) {
+        return SwapOut {
+            ok: true,
+            noop: true,
+            need_force: false,
+            msg: format!(
+                "{} 的所有账号共用这一份档案（{}），切到「{}」在磁盘上没有东西要换。\n\
+                 真正的切换在客户端里做：退出登录，再登「{}」。\n\
+                 不用关掉程序，驾驶舱也不会去动你的进程；登进来之后这张卡会自己认出当前登录的是它。",
+                app.name, p.display(), name, name
+            ),
+        };
+    }
     let snap = snapshot_fresh();
     if app.kind == "cli" {
         if agent_running(app_id, &snap) {
-            return (false, format!("请先关闭所有 {} 窗口/终端再换号", app.name));
+            return SwapOut::err(format!("请先关闭所有 {} 窗口/终端再换号", app.name));
         }
     }
     let blockers = blockers_of(&app, app_id, &p, &snap);
@@ -264,19 +314,19 @@ pub fn swap_set(app_id: &str, name: &str, force: bool) -> (bool, String) {
             &blockers.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
             &crate::procs::windowed_pids(),
         );
-        return (
-            false,
-            format!(
+        return SwapOut {
+            need_force: true,
+            ..SwapOut::err(format!(
                 "{} 现在被这些进程占着：{}。\n{}",
                 p.display(),
                 blocker_names(&blockers),
                 if wins > 0 {
-                    "先关掉它们的窗口；还留着就点「强制换号」，驾驶舱来结束它们。"
+                    "换号要把这个目录改名，得先关掉它们的窗口。确认后驾驶舱可以替你结束这些进程再换号。"
                 } else {
-                    "它们没有窗口但在后台驻留（换号、改名都会被挡住）。点「强制换号」驾驶舱来结束它们。"
+                    "它们没有窗口但在后台驻留（换号、改名都会被挡住）。确认后驾驶舱可以替你结束这些进程再换号。"
                 }
-            ),
-        );
+            ))
+        };
     }
     if !blockers.is_empty() {
         kill_pids(&blockers.iter().map(|(p, _)| *p).collect::<Vec<_>>());
@@ -285,16 +335,12 @@ pub fn swap_set(app_id: &str, name: &str, force: bool) -> (bool, String) {
 
     let mut cfg = load_config();
     let cur = swaps_of(&cfg).get(app_id).cloned();
-    let instance_dir = match meta["data_dir"].as_str() {
-        Some(d) => std::path::PathBuf::from(d),
-        None => return (false, "实例缺少 data_dir".into()),
-    };
     // 「已经是当前账号」得让磁盘认账，不能只看记录：记录说已经是、链接却指着别处
     // 或者已经断了，这里直接返回就永远修不好——Qoder 国际版那次断链就是这么留下的。
     if cur.as_ref().and_then(|c| c["instance"].as_str()) == Some(name)
         && crate::registry::is_bound_to(app_id, &instance_dir)
     {
-        return (true, "该实例已是当前账号".into());
+        return SwapOut::ok("该实例已是当前账号");
     }
     if is_junction(&p) {
         let _ = remove_link(&p); // 只删链接，不碰目标
@@ -309,31 +355,28 @@ pub fn swap_set(app_id: &str, name: &str, force: bool) -> (bool, String) {
         let orig_path = format!("{}.cockpit-original", p.display());
         let orig = Path::new(&orig_path);
         if orig.exists() {
-            return (false, "已存在 .cockpit-original 备份目录，请先「还原默认」再换号".into());
+            return SwapOut::err("已存在 .cockpit-original 备份目录，请先「还原默认」再换号");
         }
         if let Err(e) = fs::rename(&p, orig) {
             // 走到这里说明上面那一轮没能清干净（或者占用者根本不是本产品的进程）。
             // 别把 os error 5 直接丢给用户——重新抓一次实时快照，把还占着的进程点名出来。
             let fresh = snapshot_fresh();
             let left = blockers_of(&app, app_id, &p, &fresh);
-            return (
-                false,
-                if left.is_empty() {
-                    format!(
-                        "换不动 {}：Windows 说「拒绝访问」（{}）。可能有别的程序（杀毒/同步盘/资源管理器）正停在这个目录上，\
-                         或者有进程把它当工作目录。关掉那个窗口再试一次。",
-                        p.display(),
-                        e
-                    )
-                } else {
-                    format!(
-                        "换不动 {}：还被这些进程占着——{}。\n它们可能刚被其它程序重新拉起，\
-                         手动结束它们（任务管理器按名字搜）后再点「设为当前」。",
-                        p.display(),
-                        blocker_names(&left)
-                    )
-                },
-            );
+            return SwapOut::err(if left.is_empty() {
+                format!(
+                    "换不动 {}：Windows 说「拒绝访问」（{}）。可能有别的程序（杀毒/同步盘/资源管理器）正停在这个目录上，\
+                     或者有进程把它当工作目录。关掉那个窗口再试一次。",
+                    p.display(),
+                    e
+                )
+            } else {
+                format!(
+                    "换不动 {}：还被这些进程占着——{}。\n它们可能刚被其它程序重新拉起，\
+                     手动结束它们（任务管理器按名字搜）后再点「设为当前」。",
+                    p.display(),
+                    blocker_names(&left)
+                )
+            });
         }
         original = Some(orig.to_path_buf());
     }
@@ -351,14 +394,14 @@ pub fn swap_set(app_id: &str, name: &str, force: bool) -> (bool, String) {
         if let Some(orig) = &original {
             let _ = fs::rename(orig, &p);
         }
-        return (false, format!("创建 junction 失败：{}", e));
+        return SwapOut::err(format!("创建 junction 失败：{}", e));
     }
     if !is_junction(&p) {
         if let Some(orig) = &original {
             let _ = fs::remove_dir(&p);
             let _ = fs::rename(orig, &p);
         }
-        return (false, "创建 junction 失败：链接未生效".into());
+        return SwapOut::err("创建 junction 失败：链接未生效");
     }
 
     set_swap(
@@ -377,13 +420,10 @@ pub fn swap_set(app_id: &str, name: &str, force: bool) -> (bool, String) {
     } else {
         ""
     };
-    (
-        true,
-        format!(
-            "已换号：{} 默认入口 → 「{}」，零额外空间{}",
-            app.name, name, note
-        ),
-    )
+    SwapOut::ok(format!(
+        "已换号：{} 默认入口 → 「{}」，零额外空间{}",
+        app.name, name, note
+    ))
 }
 
 /// 切到一个「原地账号」：链接上面已经摘掉了，这里把让位时改名的那份换回默认位置。
@@ -393,24 +433,21 @@ fn swap_to_in_place(
     name: &str,
     cfg: &mut serde_json::Value,
     p: &Path,
-) -> (bool, String) {
+) -> SwapOut {
     if p.is_dir() {
         // 默认位置已经就是这个账号，只是记录没跟上
     } else {
         let aside = crate::registry::aside_backup_of(p);
         let orig = Path::new(&aside);
         if aside.is_empty() || !orig.exists() {
-            return (
-                false,
-                format!(
-                    "换不过去：{} 空着，且同级没有 .cockpit-original 可以换回来。\n\
-                     这个账号的数据可能已经被手工挪动过，先确认它现在在哪。",
-                    p.display()
-                ),
-            );
+            return SwapOut::err(format!(
+                "换不过去：{} 空着，且同级没有 .cockpit-original 可以换回来。\n\
+                 这个账号的数据可能已经被手工挪动过，先确认它现在在哪。",
+                p.display()
+            ));
         }
         if let Err(e) = fs::rename(orig, p) {
-            return (false, format!("把「{}」换回默认位置失败：{e}", name));
+            return SwapOut::err(format!("把「{}」换回默认位置失败：{e}", name));
         }
     }
     set_swap(
@@ -419,10 +456,11 @@ fn swap_to_in_place(
         Some(serde_json::json!({ "instance": name, "in_place": true })),
     );
     save_config(cfg);
-    (
-        true,
-        format!("已换号：「{}」的档案本来就在 {}，没有搬家。", name, p.display()),
-    )
+    SwapOut::ok(format!(
+        "已换号：「{}」的档案本来就在 {}，没有搬家。",
+        name,
+        p.display()
+    ))
 }
 
 pub fn swap_clear(app_id: &str) -> (bool, String) {
@@ -434,9 +472,6 @@ pub fn swap_clear(app_id: &str) -> (bool, String) {
         Some(p) => p,
         None => return (false, "该 Agent 未登记默认档案目录".into()),
     };
-    if agent_running(app_id, &snapshot_fresh()) {
-        return (false, format!("请先关闭所有 {} 窗口/终端再还原", app.name));
-    }
     let mut cfg = load_config();
     let cur = swaps_of(&cfg).get(app_id).cloned();
     let cur = match cur {
@@ -445,6 +480,7 @@ pub fn swap_clear(app_id: &str) -> (bool, String) {
     };
     // 原地账号本来就是这台机器的默认档案：默认位置没有链接、也没有让位备份，
     // 磁盘上没有任何东西可还原。记录保留（否则启动体检会照着磁盘把它重新写回来）。
+    // 这一条必须走在"程序在跑"之前：没有文件要动，就没有资格要求用户关掉客户端。
     if cur["in_place"].as_bool().unwrap_or(false) && !is_junction(&p) {
         return (
             true,
@@ -456,6 +492,10 @@ pub fn swap_clear(app_id: &str) -> (bool, String) {
             ),
         );
     }
+    if agent_running(app_id, &snapshot_fresh()) {
+        return (false, format!("请先关闭所有 {} 窗口/终端再还原", app.name));
+    }
+    // 原地账号的换号记录若真挂着链接（下面要改名），才需要程序停着
     if is_junction(&p) {
         let _ = remove_link(&p);
     }
@@ -648,4 +688,56 @@ pub fn rehome(app_id: &str, name: &str, force: bool) -> (bool, String) {
 
 fn leaf(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "aside".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真机才跑（`cargo test -- --include-ignored`）。手动往 config 里塞一条 Qoder CN 的换号记录，
+    /// 再跑一遍启动体检：**共用一份档案的产品不该有换号记录可以对账**——照旧对账只会得出
+    /// 「记录说 A、磁盘说 B」这种谁也看不懂的告警（她 10-15 截图里那条红框），而磁盘本来就是对的。
+    /// 记录该被静默清掉，且不许报出任何带产品名的句子。
+    /// 跑完把 config 原样还回去，失败也还（Drop 兜底）。
+    #[test]
+    #[ignore]
+    fn real_machine_shared_profile_records_are_dropped_without_a_warning() {
+        if !crate::registry::shares_one_profile("qoder-cn") {
+            println!("这台机器的 Qoder CN 不是共用档案形态，跳过");
+            return;
+        }
+        let before = crate::registry::load_config();
+        struct Restore(serde_json::Value);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::registry::save_config(&self.0);
+            }
+        }
+        let _guard = Restore(before.clone());
+
+        let mut cfg = crate::registry::load_config();
+        crate::registry::set_swap(
+            &mut cfg,
+            "qoder-cn",
+            Some(serde_json::json!({ "instance": "nick9994374911" })),
+        );
+        crate::registry::save_config(&cfg);
+        assert!(crate::registry::swaps_of(&crate::registry::load_config())
+            .get("qoder-cn")
+            .is_some());
+
+        let out = self_check();
+        for m in &out {
+            assert!(
+                !m.contains("Qoder CN"),
+                "共用一份档案的产品不该冒出换号对账告警：{m}"
+            );
+        }
+        assert!(
+            crate::registry::swaps_of(&crate::registry::load_config())
+                .get("qoder-cn")
+                .is_none(),
+            "残留的换号记录该被清掉"
+        );
+    }
 }

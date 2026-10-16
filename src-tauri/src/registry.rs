@@ -150,6 +150,67 @@ pub fn apps() -> Vec<AppDef> {
             Some(".local/share/opencode|{APPDATA}/ai.opencode.desktop"), false),
         curated("codex", "Codex CLI", "cli", &["D:/npm-global/codex.cmd"], "CODEX_HOME", Some(".codex"), true),
         curated("claude", "Claude Code CLI", "cli", &["D:/npm-global/claude.cmd"], "CLAUDE_CONFIG_DIR", Some(".claude"), true),
+        // ------------------------------------------------------------------
+        // 以下这批是 2026-10-16 照着 jlcodes99/cockpit-tools 的平台清单补的：
+        // Antigravity / Cursor / Kiro / Windsurf / GitHub Copilot / Zed / Grok Bot /
+        // CodeBuddy(CN) / Trae(国际) / TRAE SOLO(CN)。
+        // 路径一律先给**官方默认安装位置**（%LOCALAPPDATA%\Programs\<名> 或 %ProgramFiles%），
+        // 再把本机 D:\Artificial_Intelligence\ 下的实际位置作为候选兜底——
+        // 这份登记是要跟着仓库发出去的，别人机器上没有 D 盘那一层，默认位置必须排第一。
+        // kind 一律 electron：这几个（除 Grok Bot 待定）都是 VS Code / Chromium 壳，
+        // isolatable 先按"能吃 --user-data-dir"记 true，与本机实测过的 Trae CN / ZCode 同规格。
+        curated("antigravity", "Antigravity", "electron",
+            &["{LOCALAPPDATA}/Programs/antigravity/Antigravity.exe",
+              "{LOCALAPPDATA}/Programs/Antigravity/Antigravity.exe",
+              "{PROGRAMFILES}/Antigravity/Antigravity.exe"], "",
+            Some("{APPDATA}/Antigravity"), true),
+        curated("cursor", "Cursor", "electron",
+            &["{LOCALAPPDATA}/Programs/cursor/Cursor.exe",
+              "{LOCALAPPDATA}/Programs/Cursor/Cursor.exe",
+              "{PROGRAMFILES}/cursor/Cursor.exe"], "",
+            Some("{APPDATA}/Cursor"), true),
+        curated("kiro", "Kiro", "electron",
+            &["{LOCALAPPDATA}/Programs/Kiro/Kiro.exe",
+              "{PROGRAMFILES}/Kiro/Kiro.exe"], "",
+            Some("{APPDATA}/Kiro"), true),
+        curated("windsurf", "Windsurf", "electron",
+            &["{LOCALAPPDATA}/Programs/Windsurf/Windsurf.exe",
+              "{PROGRAMFILES}/Windsurf/Windsurf.exe"], "",
+            Some("{APPDATA}/Windsurf"), true),
+        // GitHub Copilot 本身不是独立程序，它跑在 VS Code 里——档案就是 VS Code 的 userData。
+        // 登录态在 User/globalStorage/state.vscdb 里那块 github.copilot 的 secret。
+        curated("github-copilot", "GitHub Copilot", "electron",
+            &["{LOCALAPPDATA}/Programs/Microsoft VS Code/Code.exe",
+              "{PROGRAMFILES}/Microsoft VS Code/Code.exe"], "",
+            Some("{APPDATA}/Code|{APPDATA}/Code - Insiders"), true),
+        curated("zed", "Zed", "electron",
+            &["{LOCALAPPDATA}/Programs/Zed/Zed.exe", "{PROGRAMFILES}/Zed/Zed.exe"], "",
+            Some("{APPDATA}/Zed"), true),
+        // Grok：xAI 的桌面客户端叫 Grok Bot（Electron 壳，同目录有 resources.pak+locales）。
+        // CLI 那份 ~/.grok 是它自己的运行时家目录，一并放进候选，换号两处都算得到。
+        curated("grok", "Grok Bot", "electron",
+            &["{LOCALAPPDATA}/Programs/Grok Bot/Grok Bot.exe",
+              "D:/Artificial_Intelligence/Grok Bot/Grok Bot.exe"], "",
+            Some("{APPDATA}/Grok Bot|.grok"), true),
+        curated("codebuddy", "CodeBuddy", "electron",
+            &["{LOCALAPPDATA}/Programs/CodeBuddy/CodeBuddy.exe",
+              "{PROGRAMFILES}/CodeBuddy/CodeBuddy.exe"], "",
+            Some("{APPDATA}/CodeBuddy"), true),
+        curated("codebuddy-cn", "CodeBuddy CN", "electron",
+            &["{LOCALAPPDATA}/Programs/CodeBuddy CN/CodeBuddy CN.exe",
+              "{PROGRAMFILES}/CodeBuddy CN/CodeBuddy CN.exe"], "",
+            Some("{APPDATA}/CodeBuddy CN"), true),
+        curated("trae", "Trae", "electron",
+            &["{LOCALAPPDATA}/Programs/Trae/Trae.exe", "{PROGRAMFILES}/Trae/Trae.exe"], "",
+            Some("{APPDATA}/Trae"), true),
+        curated("trae-solo", "TRAE SOLO", "electron",
+            &["{LOCALAPPDATA}/Programs/TRAE SOLO/TRAE SOLO.exe",
+              "{PROGRAMFILES}/TRAE SOLO/TRAE SOLO.exe"], "",
+            Some("{APPDATA}/TRAE SOLO"), true),
+        curated("trae-solo-cn", "TRAE SOLO CN", "electron",
+            &["D:/Artificial_Intelligence/TRAE SOLO CN/TRAE SOLO CN.exe",
+              "{LOCALAPPDATA}/Programs/TRAE SOLO CN/TRAE SOLO CN.exe"], "",
+            Some("{APPDATA}/TRAE SOLO CN"), true),
     ]
 }
 
@@ -533,12 +594,48 @@ pub fn set_hidden(app_id: &str, hide: bool) {
     save_config(&cfg);
 }
 
+/// 「显示未安装的程序」开关。默认关：登记表里补进来的那批官方默认路径的产品，
+/// 在没装的机器上不该占侧栏格子（见 worth_showing）。
+pub fn set_show_uninstalled(on: bool) {
+    let mut cfg = load_config();
+    cfg["show_uninstalled"] = json!(on);
+    save_config(&cfg);
+}
+
+pub fn show_uninstalled() -> bool {
+    load_config()["show_uninstalled"].as_bool().unwrap_or(false)
+}
+
 /// 侧栏展示用：排除被用户屏蔽的条目
+/// 一条产品在界面上值不值得占一格：装了、或被自动发现过、或名下已经有账号卡。
+/// 2026-10-16 照着 cockpit-tools 的平台清单补进一批（Antigravity / Cursor / Kiro /
+/// Windsurf / GitHub Copilot / Zed / Grok / CodeBuddy / Trae 系）之后，这台机器上
+/// 大多数都没装——**它们必须被登记**（换台装了的机器要能自动认出来、路径与档案目录都是对的），
+/// 但不该在没装的机器上把侧栏塞满。想看得见去 设置 → 高级 → 「显示未安装的程序」。
+/// 判据只认三件磁盘事实，不看"登记表里有没有"——否则刚补进来的这批会全部冒出来。
+fn worth_showing(a: &AppDef) -> bool {
+    if a.discovered {
+        return true;
+    }
+    if resolve_exe(a).is_some() {
+        return true;
+    }
+    std::fs::read_dir(instances_dir(&a.id))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                e.path().extension().map(|x| x == "json").unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn all_apps() -> Vec<AppDef> {
     let h = hidden();
+    let show_all = load_config()["show_uninstalled"].as_bool().unwrap_or(false);
     all_apps_raw()
         .into_iter()
         .filter(|a| !h.iter().any(|x| x == &a.id))
+        .filter(|a| show_all || worth_showing(a))
         .collect()
 }
 
@@ -561,6 +658,19 @@ pub fn short_name(app_id: &str) -> &'static str {
         "marvis" => "MV",
         "xiaomi-mimo" => "XM",
         "opencode" => "OC",
+        // 2026-10-16 补齐的那批：首字母会撞（T/C/Q 各三家），所以都留两三个字母
+        "antigravity" => "AG",
+        "cursor" => "CU",
+        "kiro" => "KI",
+        "windsurf" => "WS",
+        "github-copilot" => "GH",
+        "zed" => "ZD",
+        "grok" => "GK",
+        "codebuddy" => "CB",
+        "codebuddy-cn" => "CB中",
+        "trae" => "TR",
+        "trae-solo" => "TS",
+        "trae-solo-cn" => "TS中",
         _ => "?",
     }
 }
@@ -671,7 +781,34 @@ pub fn profile_dir(app_id: &str) -> Option<PathBuf> {
     if let Some(p) = adopted_profile_dir(app_id, spec) {
         return Some(p);
     }
-    resolve_profile(spec)
+    resolve_profile(app_id, spec)
+}
+
+/// 这个候选目录上的链接是不是**本产品换号挂上去的入口**。
+///
+/// 只有目标落在本产品自己的 `instances/<产品>/` 下才算换号——那种必须认它，
+/// 否则换号之后解析会漂回另一个"有登录数据"的候选，`swap_clear` 就把备份还到没换过的目录上。
+///
+/// **指向别处的不算。** Qoder CN 的 `%APPDATA%\QoderCN` 就被一次失败的换号重新接成了
+/// 指向同一个真实档案 `com.qodercn.app.stable` 的自指链接（`.cockpit-original` 也还躺在旁边）：
+/// `resolve_profile` 每次挑走这个别名 → `shares_one_profile` 又把它当成"已被换号接管" →
+/// 卡片掉进「仅可换号」，点切换就去杀整个客户端进程树，而磁盘上一个字节都不需要改。
+/// 别名链接必须被看穿，继续按登录数据挑真档案。
+///
+/// 断链（目标已被删）仍算换号入口：那正是最需要被认出来并修掉的形态（见 swap::self_check）。
+fn is_swap_link_in(p: &Path, instances: &Path) -> bool {
+    if !is_reparse_point(p) {
+        return false;
+    }
+    match reparse_bound_dir(p) {
+        None => true,
+        Some(t) => instance_name_under(&t, instances).is_some(),
+    }
+}
+
+/// 见 `is_swap_link_in`：按本产品自己的 instances 目录判。
+pub(crate) fn is_swap_link(app_id: &str, p: &Path) -> bool {
+    is_swap_link_in(p, &instances_dir(app_id))
 }
 
 fn path_key(p: &str) -> String {
@@ -822,6 +959,79 @@ pub fn aside_backup_of(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 把「换到这个账号」在磁盘上真正要做的事说清楚。换号按钮与账号设置里那行说明都读它，
+/// 免得两处各自猜——猜错的代价是用户只是换个号，却被程序要求把客户端关掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapOp {
+    /// 默认档案此刻已经就是这个账号：磁盘上没有任何东西可换。
+    /// 这类产品所有账号共用一份档案，切换账号＝在客户端里退出登录再登录。
+    Nothing,
+    /// 要摘/挂 junction，或要把同级让位备份换回来：真动文件，必须先让程序退出。
+    Moves,
+    /// 这个产品压根没登记可换号的档案目录。
+    Unsupported,
+}
+
+pub fn swap_op(app_id: &str, dir: &Path) -> SwapOp {
+    let p = match profile_dir(app_id) {
+        Some(p) => p,
+        None => return SwapOp::Unsupported,
+    };
+    swap_op_for(&p, dir, is_swap_link(app_id, &p), !aside_backup_of(&p).is_empty())
+}
+
+/// `swap_op` 的决策表本体（磁盘事实由调用方给），单测钉的是这张表而不是某台机器的状态。
+/// `prof_is_link` 是"默认入口挂着**本产品换号**的链接"（见 is_swap_link），
+/// 同产品另一个真实档案目录上的别名链接不算——那种换号照样什么都不用动。
+fn swap_op_for(prof: &Path, dir: &Path, prof_is_link: bool, has_aside: bool) -> SwapOp {
+    if path_key(&prof.to_string_lossy()) != path_key(&dir.to_string_lossy()) {
+        return SwapOp::Moves;
+    }
+    // 目录名相同但默认入口是链接：那是这个账号正被挂成默认档案，
+    // 换走它要摘链接、还原还要把真身改回来——仍是要动文件的活
+    if prof_is_link || has_aside {
+        return SwapOp::Moves;
+    }
+    SwapOp::Nothing
+}
+
+/// 换号是不是空操作（见 `SwapOp::Nothing`）。按磁盘形状判定，不按产品名单硬编码：
+/// Qoder 系、WorkBuddy、ZCode、TRAE 这些单窗口产品都会自然落在这里。
+pub fn swap_changes_nothing(app_id: &str, dir: &Path) -> bool {
+    matches!(swap_op(app_id, dir), SwapOp::Nothing)
+}
+
+/// 这个产品是不是「几个账号共用同一份档案」：默认档案位置此刻就是某个账号的本尊——
+/// 没挂换号链接、同级也没有让位备份，而且真有一张卡认领着它。
+///
+/// 四条都不能少。要它不隔离（能多开的产品每个账号有自己的 `--user-data-dir`，
+/// 窗口本来分得清，不该按登录态归并）；要它不是 CLI（终端类靠环境变量隔离，另一套）；
+/// 默认位置挂着**本产品换号的**链接说明现在正走 junction 换号，那种确实要先关程序
+/// （同产品另一个真实档案目录上的**别名**链接不算——那种磁盘上什么都不用动，见 is_swap_link）；
+/// 最后还得真有一张卡认领这份档案，否则"共用"无从谈起。
+pub fn shares_one_profile(app_id: &str) -> bool {
+    let app = match app_def(app_id) {
+        Some(a) => a,
+        None => return false,
+    };
+    if app.kind == "cli" || app.isolatable {
+        return false;
+    }
+    let p = match profile_dir(app_id) {
+        Some(p) => p,
+        None => return false,
+    };
+    if is_swap_link(app_id, &p) || !aside_backup_of(&p).is_empty() {
+        return false;
+    }
+    // 有没有账号真的住在这份档案上——只看 data_dir 相等，不看「让位」标记：
+    // 两张卡都标了让位也不能让产品退回"换号要先关程序"那套，那是错觉
+    let key = path_key(&p.to_string_lossy());
+    load_instances(app_id)
+        .into_iter()
+        .any(|m| m["data_dir"].as_str().map(path_key).as_deref() == Some(key.as_str()))
+}
+
 /// 这个账号是不是「被搬进 instances/ 的接管账号」，是的话返回它原来的位置。
 /// 归位动作与界面入口共用这一条判据，别在两处各写一遍。
 pub fn rehome_slot(app_id: &str, meta: &Value) -> Option<PathBuf> {
@@ -838,12 +1048,17 @@ pub fn rehome_slot(app_id: &str, meta: &Value) -> Option<PathBuf> {
 }
 
 /// 从候选里挑真正在用的那个档案目录，优先级：
-///   ① 已经是 junction 的候选 —— 那就是换号目标，必须认它。
-///      否则换号之后目标目录变成指向空账号的链接、has_login_data 变假，
+///   ① **真换号链接**（reparse point 且目标落在本产品 `instances/` 下）—— 那就是换号目标，
+///      必须认它。否则换号之后目标目录变成指向空账号的链接、has_login_data 变假，
 ///      解析会漂回另一个"有登录数据"的候选，还原（swap_clear）就还错了地方。
+///      同产品另一个真实档案目录上挂着的**别名**链接不算（见 is_swap_link_in）。
 ///   ② 有登录数据的候选（按候选顺序）
 ///   ③ 第一个候选（谁都没有时也得给个目标，新建账号要用）
-fn resolve_profile(spec: &str) -> Option<PathBuf> {
+fn resolve_profile(app_id: &str, spec: &str) -> Option<PathBuf> {
+    resolve_profile_in(spec, &instances_dir(app_id))
+}
+
+fn resolve_profile_in(spec: &str, instances: &Path) -> Option<PathBuf> {
     let cands: Vec<PathBuf> = spec
         .split('|')
         .map(str::trim)
@@ -851,7 +1066,7 @@ fn resolve_profile(spec: &str) -> Option<PathBuf> {
         .map(one_profile)
         .collect();
     let first = cands.first()?.clone();
-    if let Some(j) = cands.iter().find(|c| is_reparse_point(c)) {
+    if let Some(j) = cands.iter().find(|c| is_swap_link_in(c, instances)) {
         return Some(j.clone());
     }
     for c in &cands {
@@ -921,6 +1136,76 @@ pub fn looks_like_runtime_home(dir: &Path) -> bool {
         .filter(|m| dir.join(m).exists())
         .count()
         >= 2
+}
+
+/// 「一键换号」要存/要写的就是这几个文件：它们决定"从这个入口打开是哪个号"。
+/// 条目可以是相对 `profile_dir` 的路径，也可以是带 `{LOCALAPPDATA}` 这类占位符的绝对路径
+/// （WorkBuddy 的登录态就不在它自己的档案目录里）。
+/// 只列真正含登录态的文件——`auth.machine-id` 这种机器身份绝不能跟着号走，
+/// 换了它等于让服务端看见一台新设备。没登记的产品返回空，界面就不摆一键换号。
+pub fn auth_pack_files(app_id: &str) -> &'static [&'static str] {
+    match app_id {
+        // 0.4.x 新壳：os_crypt v10 包着的 {token, refreshToken, expiresAt, user}
+        "qoder" | "qoder-cn" => &["auth.v1.dat"],
+        // ZCode：一个 JSON 里装着 oauth access_token / jwt / api-key。
+        // 里面也夹着这个号自己的 bot 与项目配置——那本来就是它的配置，一起换回去是对的。
+        "zcode" => &["v2/credentials.json"],
+        // WorkBuddy：登录态不在 ~/.workbuddy，在 CodeBuddy 扩展那份 .info 里。
+        // 里面是 $wbEncrypted 信封——我们不解它（解不出来是"读余额"那条路的坎），
+        // 换号只要把整份文件原样搬回去就行。
+        "workbuddy" => &[
+            "{LOCALAPPDATA}/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info",
+        ],
+        "workbuddy-intl" => &[
+            "{LOCALAPPDATA}/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop-ai.info",
+        ],
+        // TRAE CN 故意不做：它的秘密都在 User/globalStorage/state.vscdb 那个 868 KB 的
+        // SQLite 里，登录只是其中一小块，整份换会把对话、插件、设置一起换走。
+        _ => &[],
+    }
+}
+
+/// 把一条登录包条目解析成绝对路径：带占位符或以路径分隔符/盘符开头的按模板展开，
+/// 其余相对该产品的档案目录。
+pub fn auth_pack_path(app_id: &str, entry: &str) -> Option<PathBuf> {    let e = entry.trim();
+    if e.is_empty() {
+        return None;
+    }
+    if e.starts_with('{') || e.starts_with('/') || e.starts_with('\\')
+        || e.as_bytes().get(1) == Some(&b':')
+    {
+        return Some(expand(e));
+    }
+    let dir = profile_dir(app_id)?;
+    Some(dir.join(e))
+}
+
+/// 这个产品能不能一键换号（登记表里有文件、且路径解析得出来）
+pub fn auth_switch_ok(app_id: &str) -> bool {
+    auth_pack_files(app_id)
+        .iter()
+        .any(|e| auth_pack_path(app_id, e).map(|p| p.is_file()).unwrap_or(false))
+}
+
+/// 光有登录文件还解不开它——这些是**同一台机器上、跟着档案目录走的辅助文件**，
+/// 缺了它们那份登录态就是一堆读不了的密文。按账号铺临时档案目录时要一并带过去。
+///
+/// Qoder 系：auth.v1.dat 是 os_crypt v10 信封，主密钥由 DPAPI 包在 `Local State` 里。
+/// 同一个 Windows 账户下这份主密钥是稳定的，所以把**当前**那份 Local State 借过去，
+/// 就能解开**这台机器上任何一个号**存过的 auth.v1.dat。
+pub fn auth_pack_support_files(app_id: &str) -> &'static [&'static str] {
+    match app_id {
+        "qoder" | "qoder-cn" => &["Local State"],
+        _ => &[],
+    }
+}
+
+/// 这个产品的登录态是**按账号各存一份**的吗——只有这种才做得出"按账号查签到"。
+/// 判据落在磁盘事实上：登记了登录包文件，且这些文件落在该产品的档案目录**里面**
+/// （落在目录外面的，比如 WorkBuddy 那份 %LOCALAPPDATA%\CodeBuddyExtension\…，
+///  是按账号铺得出来的，靠 auth_file 走另一条路，见 checkin.rs 的 materialize_kind）。
+pub fn per_account_login(app_id: &str) -> bool {
+    !auth_pack_files(app_id).is_empty()
 }
 
 /// 已知会后台持有登录档案句柄的进程（进程名小写）。
@@ -1317,6 +1602,7 @@ mod tests {
     fn profile_candidates_pick_the_dir_with_login_data() {
         let tmp = std::env::temp_dir().join("cockpit-profile-cands-test");
         let _ = fs::remove_dir_all(&tmp);
+        let instances = tmp.join("instances");
         let new_shell = tmp.join("com.qoder.app.stable");
         let legacy = tmp.join("Qoder");
         fs::create_dir_all(&new_shell).unwrap();
@@ -1324,25 +1610,37 @@ mod tests {
 
         let spec = format!("{}|{}", new_shell.to_string_lossy(), legacy.to_string_lossy());
         // 谁都没有登录数据 → 取第一个候选（新建账号时也得有个目标）
-        assert_eq!(resolve_profile(&spec).as_deref(), Some(new_shell.as_path()));
+        assert_eq!(
+            resolve_profile_in(&spec, &instances).as_deref(),
+            Some(new_shell.as_path())
+        );
 
         // 只有旧壳有 state.vscdb → 选旧壳
         fs::create_dir_all(legacy.join("User").join("globalStorage")).unwrap();
         fs::write(legacy.join("Local State"), "{}").unwrap();
         fs::write(legacy.join("User").join("globalStorage").join("state.vscdb"), "").unwrap();
-        assert_eq!(resolve_profile(&spec).as_deref(), Some(legacy.as_path()));
+        assert_eq!(
+            resolve_profile_in(&spec, &instances).as_deref(),
+            Some(legacy.as_path())
+        );
         assert!(has_login_data(&legacy));
 
         // 新壳也有 auth.v1.dat → 按候选顺序优先新壳（0.4.3 就是它）
         fs::write(new_shell.join("auth.v1.dat"), b"v10xx").unwrap();
-        assert_eq!(resolve_profile(&spec).as_deref(), Some(new_shell.as_path()));
+        assert_eq!(
+            resolve_profile_in(&spec, &instances).as_deref(),
+            Some(new_shell.as_path())
+        );
         assert!(has_login_data(&new_shell));
         // 只有 Local State 还不算登录过
         assert!(!has_login_data(&new_shell.join("nonexistent")));
 
         // 单个候选（不带 `|`）照旧可用
         let one = legacy.to_string_lossy().to_string();
-        assert_eq!(resolve_profile(&one).as_deref(), Some(legacy.as_path()));
+        assert_eq!(
+            resolve_profile_in(&one, &instances).as_deref(),
+            Some(legacy.as_path())
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1364,6 +1662,30 @@ mod tests {
                 "{id} 的换号目标看着不对：{d:?}"
             );
         }
+    }
+
+    /// 换号到底要不要动文件——这张表决定驾驶舱有没有资格要求用户关掉客户端。
+    /// 共用一份档案的产品（Qoder 系 / WorkBuddy / ZCode / TRAE…）账号目录就是默认档案本身，
+    /// 切过去一个字节都不改，却曾被按"换号"流程去 kill 整个程序的进程树。
+    #[test]
+    fn switching_to_the_shared_profile_itself_moves_nothing() {
+        let prof = std::path::Path::new("C:/Users/x/AppData/Roaming/com.qodercn.app.stable");
+        // 目标 == 默认档案、没挂链接、同级没让位备份：空操作
+        assert_eq!(
+            swap_op_for(prof, prof, false, false),
+            SwapOp::Nothing,
+            "共用一份档案的换号不该要求关程序"
+        );
+        // 路径只差大小写与尾斜杠，仍是同一份
+        let same = std::path::Path::new("C:\\users\\x\\AppData\\Roaming\\com.qodercn.app.stable\\");
+        assert_eq!(swap_op_for(prof, same, false, false), SwapOp::Nothing);
+        // 别的目录（instances/ 下的账号档案）：要挂 junction，是真活
+        let other = std::path::Path::new("D:/AgentData/.agent-cockpit/instances/qoder-cn/账号2");
+        assert_eq!(swap_op_for(prof, other, false, false), SwapOp::Moves);
+        // 同名但默认入口现在是 junction（这个号正被挂着）：换走要摘链接
+        assert_eq!(swap_op_for(prof, prof, true, false), SwapOp::Moves);
+        // 同级躺着让位备份：换回来要改名
+        assert_eq!(swap_op_for(prof, prof, false, true), SwapOp::Moves);
     }
 
     /// TRAE CN（原 TraeWork）的换号目标必须是 userData（%APPDATA% 下的登录目录，
@@ -1393,9 +1715,11 @@ mod tests {
     fn swapped_junction_wins_over_other_candidates_with_login() {
         let tmp = std::env::temp_dir().join("cockpit-junction-resolve-test");
         let _ = fs::remove_dir_all(&tmp);
+        let instances = tmp.join("instances");
         let new_shell = tmp.join("com.qoder.app.stable");
         let legacy = tmp.join("Qoder");
-        let inst = tmp.join("账号1");
+        // 换号链接的目标必须是本产品 instances/ 下的账号目录（is_swap_link 的判据）
+        let inst = instances.join("账号1");
         for d in [&new_shell, &legacy, &inst] {
             fs::create_dir_all(d).unwrap();
         }
@@ -1408,7 +1732,10 @@ mod tests {
             new_shell.to_string_lossy(),
             legacy.to_string_lossy()
         );
-        assert_eq!(resolve_profile(&spec).as_deref(), Some(legacy.as_path()));
+        assert_eq!(
+            resolve_profile_in(&spec, &instances).as_deref(),
+            Some(legacy.as_path())
+        );
 
         // 把新壳那个目录换成指向账号目录的 junction（就是"已换号"的状态）→ 解析必须认它
         let _ = fs::remove_dir(&new_shell);
@@ -1428,13 +1755,92 @@ mod tests {
             String::from_utf8_lossy(&st.stdout)
         );
         assert!(is_reparse_point(&new_shell), "该是 reparse point");
-        assert_eq!(resolve_profile(&spec).as_deref(), Some(new_shell.as_path()));
+        assert!(is_swap_link_in(&new_shell, &instances), "目标在 instances/ 下，算换号链接");
+        assert_eq!(
+            resolve_profile_in(&spec, &instances).as_deref(),
+            Some(new_shell.as_path())
+        );
 
         // 即便这时旧壳那份仍然是"有登录数据"的，也不能把它选走
         assert!(has_login_data(&legacy));
-        assert_eq!(resolve_profile(&spec).as_deref(), Some(new_shell.as_path()));
+        assert_eq!(
+            resolve_profile_in(&spec, &instances).as_deref(),
+            Some(new_shell.as_path())
+        );
         let _ = fs::remove_dir(&new_shell);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// 别名链接不算换号：`%APPDATA%\QoderCN` 曾被一次失败的换号重新接成了指向同一个
+    /// 真实档案 `com.qodercn.app.stable` 的自指链接，`.cockpit-original` 也还躺在旁边。
+    /// 以前 resolve_profile 只要看见 reparse point 就选它，于是 profile_dir 变成那个别名，
+    /// `shares_one_profile` 又因为"默认入口挂着链接"判成"已被换号接管"——
+    /// 卡片掉进「仅可换号」，点「切到本账号并打开」就去 kill 整个 qoder.cn.exe 进程树，
+    /// 而磁盘上一个字节都不需要改。别名必须被看穿，继续按登录数据挑真档案。
+    #[test]
+    fn alias_link_does_not_hijack_the_real_profile() {
+        let tmp = std::env::temp_dir().join("cockpit-alias-link-test");
+        let _ = fs::remove_dir_all(&tmp);
+        let instances = tmp.join("instances");
+        let real = tmp.join("com.qodercn.app.stable");
+        let alias = tmp.join("QoderCN");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&instances).unwrap();
+        // 真档案里有登录数据（0.4.x 新壳就写这儿）
+        fs::write(real.join("auth.v1.dat"), b"v10xx").unwrap();
+        fs::write(real.join("Local State"), "{}").unwrap();
+        // 别名：指向同一个真档案的链接（不是换号——目标是同级的真档案，不在 instances/ 下）
+        let st = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", &alias.to_string_lossy(), &real.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "mklink /J 失败：{}", String::from_utf8_lossy(&st.stdout));
+        assert!(is_reparse_point(&alias));
+        assert!(!is_swap_link_in(&alias, &instances), "指向同级真档案的别名不是换号链接");
+
+        let spec = format!("{}|{}", real.to_string_lossy(), alias.to_string_lossy());
+        assert_eq!(
+            resolve_profile_in(&spec, &instances).as_deref(),
+            Some(real.as_path()),
+            "别名不该把真档案挤走（挤走了这张卡就会掉进「仅可换号」）"
+        );
+
+        // 断链仍是换号入口：目标已被删的那种最需要被认出来并修掉
+        let dangling = tmp.join("QoderCN-dangling");
+        let gone = tmp.join("no-such-account");
+        let st = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", &dangling.to_string_lossy(), &gone.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "mklink /J 失败：{}", String::from_utf8_lossy(&st.stdout));
+        assert!(is_swap_link_in(&dangling, &instances), "断链该被认成换号入口");
+        let _ = fs::remove_dir(&alias);
+        let _ = fs::remove_dir(&dangling);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// 真机才跑（`cargo test -- --include-ignored`）：这台机器上 Qoder CN 的默认入口
+    /// `%APPDATA%\QoderCN` 是一次失败换号留下的**自指别名链接**（指向同一个真实档案
+    /// `com.qodercn.app.stable`，`.cockpit-original` 还躺在旁边）。
+    /// 别名不许把真档案挤走，也不许把产品判成「仅可换号」——掉进那条分支之后，
+    /// 点「切到本账号并打开」会去 kill 整个 qoder.cn.exe 进程树，而磁盘上一个字节都不需要改。
+    #[test]
+    #[ignore]
+    fn real_machine_qoder_cn_is_a_shared_profile_not_a_swap() {
+        let d = profile_dir("qoder-cn").expect("Qoder CN 该有档案目录");
+        assert!(
+            d.to_string_lossy().ends_with("com.qodercn.app.stable"),
+            "别名链接不该把真档案挤走：{d:?}"
+        );
+        assert!(!is_swap_link("qoder-cn", &d), "真档案本身不该被认成换号链接：{d:?}");
+        assert!(shares_one_profile("qoder-cn"), "它就该被认成「账号共用一份档案」");
+        let inst = load_instances("qoder-cn");
+        let dir = inst
+            .first()
+            .and_then(|m| m["data_dir"].as_str())
+            .map(std::path::PathBuf::from)
+            .expect("这台机器上该有 Qoder CN 的账号卡");
+        assert!(swap_changes_nothing("qoder-cn", &dir), "切到共用档案不该动任何文件");
     }
 
     fn mk_junction(link: &Path, target: &Path) {
