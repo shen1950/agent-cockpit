@@ -1,6 +1,6 @@
 [package]
 name = "agent-cockpit"
-version = "2.1.2"
+version = "2.1.3"
 description = "Agent 驾驶舱：国内 AI Agent 多开 / 额度过期提醒 / 本地反代"
 edition = "2021"
 

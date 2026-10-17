@@ -67,7 +67,7 @@ function navWidth(v) {
    而"它该占多少"本来就是比例问题（2026-10-15 她要求正常窗口和最大化窗口都按比例对应调整）。
    老版本存的是 mgmt_h 像素，第一次读到就折成比例，不用重新拖一遍。 */
 const SIDE_MIN = 88;                            // 拖动时管理区最矮多少像素
-const MGMT_MIN_R = 0.10, MGMT_MAX_R = 0.40;     // 比例上下限
+const MGMT_MIN_R = 0.02, MGMT_MAX_R = 0.40;     // 比例上下限（真正的下限由整条菜单决定，见 snapMgmt）
 function sideRatio(a = {}) {
   const clamp = (r) => Math.min(MGMT_MAX_R, Math.max(MGMT_MIN_R, r));
   const r = Number(a.mgmt_ratio);
@@ -77,10 +77,91 @@ function sideRatio(a = {}) {
   return 0;   // 0 = 自动：正好装下内容（CSS 里还给了个 22vh 的上限）
 }
 function ratioPx(r) { return r ? Math.round(r * window.innerHeight) : 0; }
+/* 「管理」那一截的几何：标题多高、一条菜单多高、全部显示多高。
+   三个数只在这里算一次，naturalMgmtH / mgmtMetrics / 拖拽全用它——
+   以前 head 是"自然高 − 列表总高"反推的，列表一旦被 22vh 截断就减错，
+   吸附出来的高度会差出小半条（2026-10-17 实测到"2 条 + 半条"）。 */
+function mgmtParts() {
+  const fx = document.querySelector('.side-fixed');
+  const listEl = fx && fx.querySelector('#viewlist');
+  if (!fx || !listEl) return null;
+  const lis = [...listEl.children];
+  if (!lis.length) return null;
+  const zoom = (Number(S.data?.settings?.appearance?.font_scale) || 100) / 100;
+  const cs = getComputedStyle(fx);
+  const pad = ((parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0)) / zoom;
+  const gap = (parseFloat(cs.rowGap) || 0) / zoom;
+  const headEl = fx.querySelector('.sidehead');
+  const headH = headEl ? headEl.getBoundingClientRect().height / zoom : 0;
+  const listGap = (parseFloat(getComputedStyle(listEl).rowGap) || 0) / zoom;
+  let sum = 0;
+  for (const li of lis) sum += li.getBoundingClientRect().height / zoom;
+  const listFull = sum + listGap * Math.max(0, lis.length - 1);
+  const ih = (listFull + listGap) / lis.length;        // 一条 + 一个行距
+  // 列表自己那条 `max-height: min(22vh, 208px)`，再**向下取整到整条**——
+  // 否则窗口一矮，"全部显示"本身就只有 4.8 条，最底下永远挂着半条
+  const cap0 = Math.min(window.innerHeight * 0.22, 208);
+  const listH = ih ? Math.min(listFull, Math.floor(cap0 / ih) * ih) : Math.min(listFull, cap0);
+  const head = pad + headH + gap;
+  return { ih, head, listFull, listH, natural: head + listH };
+}
+
+/* 全部显示的高度——管理区能到的最高值。
+   她 2026-10-17："他最高只能是恰好几条菜单全部显示，不能出现大段的空白"。
+   拖拽、读旧配置、窗口变小，任何来源的高度都要先过这一关。 */
+function naturalMgmtH() {
+  const m = mgmtParts();
+  return m ? Math.round(m.natural) : 0;
+}
+
+/* 能压到多矮、能长到多高——两端都是"整条菜单"的边界。
+   `lo` = 标题 + 2 条（再矮点不利索），`hi` = 全部显示且给上面列表留 SIDE_MIN。 */
+function mgmtMetrics() {
+  const m = mgmtParts();
+  if (!m) return null;
+  const fx = document.querySelector('.side-fixed');
+  const sb = fx && fx.closest('.sidebar');
+  const zoom = (Number(S.data?.settings?.appearance?.font_scale) || 100) / 100;
+  let avail = 0;
+  if (sb) {
+    let chrome = 0;
+    for (const kid of sb.children) {
+      if (kid === fx || kid.classList.contains('side-scroll')) continue;
+      const cs = getComputedStyle(kid);
+      chrome += (kid.getBoundingClientRect().height
+        + (parseFloat(cs.marginTop) || 0) + (parseFloat(cs.marginBottom) || 0)) / zoom;
+    }
+    avail = sb.getBoundingClientRect().height / zoom - chrome;
+  }
+  const natural = Math.round(m.natural);
+  const hi = Math.max(0, Math.min(natural, avail ? Math.round(avail - SIDE_MIN) : natural));
+  const lo = Math.min(hi, Math.round(m.head + m.ih * 2));
+  return { ih: m.ih, head: m.head, lo, hi };
+}
+
+/* 把任意高度吸附到"整条菜单"的边界上 */
+function snapMgmt(px) {
+  const m = mgmtMetrics();
+  const v = Number(px) || 0;
+  if (!m) return Math.round(v);
+  if (!m.ih) return Math.round(Math.min(Math.max(v, m.lo), m.hi));
+  const n = Math.round((v - m.head) / m.ih);
+  return Math.min(Math.max(Math.round(m.head + n * m.ih), m.lo), m.hi);
+}
+
 function applySideHeight(px) {
   const sb = document.querySelector('.sidebar');
-  document.documentElement.style.setProperty('--mgmt-h', `${px || 0}px`);
-  if (sb) sb.classList.toggle('split', !!px);
+  // 吸附 + 封顶：拖过头、存的旧比例偏大、窗口变小，都不许留空白也不许切出半条
+  const v = px > 0 ? snapMgmt(px) : 0;
+  document.documentElement.style.setProperty('--mgmt-h', `${v || 0}px`);
+  if (sb) sb.classList.toggle('split', !!v);
+  const fx = document.querySelector('.side-fixed');
+  // 滚动位置归零：压缩时如果滚过一半，切回来"管理"两个字就卡在分割线上被切掉
+  if (fx && !sideDrag.active) fx.scrollTop = 0;
+  if (!sideDrag.active) {
+    const h = document.getElementById('side-resize');
+    if (h) h.dataset.readout = '';
+  }
 }
 function commitSideHeight(px) {
   const r = px > 0
@@ -89,7 +170,14 @@ function commitSideHeight(px) {
   applySideHeight(r ? Math.round(r * window.innerHeight) : 0);
   const cur = sideRatio(S.data?.settings?.appearance || {});
   if (Math.abs(r - cur) > 0.005) setSetting('appearance', 'mgmt_ratio', r);
-  else toast(r ? `管理区高度 ${Math.round(r * 100)}% 窗口高` : '管理区高度已恢复自动');
+  else {
+    // 提示写"显示几条菜单"而不是百分比：她看到"40% 窗口高"只会更糊涂
+    // （2026-10-17 的截图里就是这个）
+    const m = mgmtMetrics();
+    const total = document.querySelectorAll('#viewlist > li').length;
+    const n = m && m.ih ? Math.round((px - m.head) / m.ih) : 0;
+    toast(px > 0 && n ? `管理区显示 ${n} 条菜单（共 ${total} 条）` : '管理区已恢复自动高度');
+  }
 }
 // 窗口变大变小（含最大化 / 还原）时，拖过的那个比例要跟着重算——
 // 不然最大化之后管理区还是原来那点像素，占比反而变小得莫名其妙
@@ -6428,23 +6516,29 @@ function bindNavResize() {
   });
 }
 
-/* ---------------- 侧栏管理区的高度：拖那条横线 / 双击复位 / 方向键微调 ---------------- */
 /* ---------------- 侧栏管理区的高度：拖那条横线 / 双击复位 / 方向键微调 ----------------
-   2026-10-17 重写：原来是"指针越靠下管理区越矮，上限取管理区内容高"——
-   于是往上拖到内容高就再也拖不动，用户看到的是"往哪边移动也不确定"；
-   而单击一下会走 pointerdown+pointerup 把当前高度原样提交一次，弹一个看不懂的
-   "管理区高度 13% 窗口高"，看着就像"只能点、不能拖"。
+   2026-10-17 两次修正叠起来才是对的：
 
-   现在改成**按位移算**：按下时记住起点 y 与当前高度，之后每移动 1px 就加减 1px。
-   方向恒定（往上＝变高、往下＝变矮），上限是"给列表至少留 SIDE_MIN"，不再卡内容高；
-   没真移动过就不提交、不弹提示。 */
+   ① 第一次：原来是"指针越靠下管理区越矮"，单击又会把当前高度原样提交一次，
+      于是"只能点、不能拖"、方向也不确定。改成**按位移算**（按下记起点与当前高，
+      移动 1px 就加减 1px，往上＝变高），没真移动过就不提交。
+   ② 第二次（她这次的原话："他最高只能是恰好几条菜单全部显示，不能出现大段的空白"）：
+      上一次把"上限取内容高"整个去掉了，于是能拖到 40% 窗口高，底下留一大片空白。
+      上限必须回来，但**用自然高**（`naturalMgmtH()`），并且**高度吸附到整条菜单**——
+      这样压缩时也不会出现"半条菜单被切掉"的样子，上下都不会被遮盖。
+
+   另外两件让手感稳定的：拖动期间的 move/up 挂在 window 上（WebView2 里
+   setPointerCapture 偶尔不生效，松手在别处就收不到 pointerup，读数会一直挂在屏幕上）；
+   到顶时读数写"全部显示"，不用猜为什么拖不动了。 */
 function bindSideResize() {
   const h = $('side-resize');
   const sb = h.closest('.sidebar');
   const top = sb.querySelector('.side-scroll');
   const fx = sb.querySelector('.side-fixed');
+  const listEl = fx.querySelector('#viewlist');
   const zoom = () => (Number(S.data?.settings?.appearance?.font_scale) || 100) / 100;
   const store = () => ratioPx(sideRatio(S.data?.settings?.appearance || {}));
+
   // 两截一共能分多少（扣掉顶栏与这条手柄本身）
   const avail = () => {
     let chrome = 0;
@@ -6456,28 +6550,51 @@ function bindSideResize() {
     }
     return sb.getBoundingClientRect().height / zoom() - chrome / zoom();
   };
-  const shown = () => store() || Math.round(fx.getBoundingClientRect().height / zoom());
-  // 下限 SIDE_MIN，上限"给列表至少留 SIDE_MIN"——不再被内容高卡住。
-  // 管理区比内容高的时候多出来的是它自己的空白，那正是用户拖出来的结果，不该被吃掉。
-  const clamp = (px) => {
-    const hi = Math.max(SIDE_MIN, avail() - SIDE_MIN);
-    return Math.round(Math.min(Math.max(px, SIDE_MIN), hi));
-  };
+
+  // 度量与吸附都用模块级那一套（mgmtMetrics / snapMgmt）：
+  // applySideHeight 也走它，三条路（拖拽、读配置、窗口缩放）才不会各算各的。
+  const snap = (px) => snapMgmt(px);
+
   let from = 0;      // pointerdown 时的 clientY
   let base = 0;      // pointerdown 时的管理区高度
   let moved = false;
-  const label = () => {
-    const px = Math.round(parseFloat(
-      getComputedStyle(document.documentElement).getPropertyValue('--mgmt-h')) || 0);
-    h.dataset.readout = px ? `${px}px` : '';
+
+  const readout = (px) => {
+    const m = mgmtMetrics();
+    h.dataset.readout = m && px >= m.hi - 1 ? '全部显示' : `${Math.round(px)}px`;
   };
-  const stop = (e) => {
+  const stop = () => {
     if (!sideDrag.active) return;
     sideDrag.active = false;
     h.classList.remove('dragging');
     h.dataset.readout = '';
-    if (e && h.hasPointerCapture?.(e.pointerId)) h.releasePointerCapture(e.pointerId);
+    window.removeEventListener('pointermove', onMove, true);
+    window.removeEventListener('pointerup', onUp, true);
+    window.removeEventListener('pointercancel', onCancel, true);
   };
+  function onMove(e) {
+    if (!sideDrag.active) return;
+    e.preventDefault();
+    const dy = from - e.clientY;        // 往上为正
+    if (Math.abs(dy) > 2) moved = true;
+    const px = snap(base + dy / zoom());
+    applySideHeight(px);
+    readout(px);
+  }
+  function onUp(e) {
+    if (!sideDrag.active) return;
+    const px = snap(base + (from - e.clientY) / zoom());
+    stop();
+    if (!moved) {                       // 只是点了一下：什么都不改，也不弹提示
+      applySideHeight(store());
+      return;
+    }
+    commitSideHeight(px);
+  }
+  function onCancel() {
+    stop();
+    applySideHeight(store());
+  }
 
   h.addEventListener('pointerdown', (e) => {
     if (document.documentElement.classList.contains('rail')) return;   // 图标条模式下这两截没得分配
@@ -6486,41 +6603,23 @@ function bindSideResize() {
     sideDrag.active = true;
     moved = false;
     from = e.clientY;
-    base = clamp(shown());
+    base = snap(store() || Math.round(fx.getBoundingClientRect().height / zoom()));
     h.classList.add('dragging');
-    // 一按下就把管理区锁成定高：不锁的话它还是"内容高"，
-    // 往下拖会先吃掉那几像素的弹性，手感是"拖了没反应"
+    // 一按下就锁成定高：不锁的话它还是"内容高"，往下拖会先吃掉那几像素弹性
     applySideHeight(base);
-    h.setPointerCapture(e.pointerId);
+    // 挂在 window 上而不是靠 setPointerCapture：WebView2 里捕获偶尔失效，
+    // 松手在别处就收不到 pointerup，读数会一直挂在屏幕上
+    window.addEventListener('pointermove', onMove, true);
+    window.addEventListener('pointerup', onUp, true);
+    window.addEventListener('pointercancel', onCancel, true);
   });
-  h.addEventListener('pointermove', (e) => {
-    if (!sideDrag.active) return;
-    const dy = from - e.clientY;        // 往上为正
-    if (Math.abs(dy) > 2) moved = true;
-    applySideHeight(clamp(base + dy / zoom()));
-    label();
-  });
-  h.addEventListener('pointerup', (e) => {
-    if (!sideDrag.active) return;
-    const px = clamp(base + (from - e.clientY) / zoom());
-    stop(e);
-    if (!moved) {                       // 只是点了一下：什么都不改，也不弹提示
-      applySideHeight(store());
-      return;
-    }
-    commitSideHeight(px);
-  });
-  h.addEventListener('pointercancel', (e) => {
-    if (!sideDrag.active) return;
-    stop(e);
-    applySideHeight(store());
-  });
+
   h.addEventListener('dblclick', () => commitSideHeight(0));
   h.addEventListener('keydown', (e) => {
     const step = e.key === 'ArrowDown' ? 16 : e.key === 'ArrowUp' ? -16 : 0;
     if (!step) return;
     e.preventDefault();
-    commitSideHeight(clamp(shown() + step));
+    commitSideHeight(snap((store() || Math.round(fx.getBoundingClientRect().height / zoom())) + step));
   });
 }
 
