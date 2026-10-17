@@ -488,10 +488,15 @@ pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
         "already": item["already"].as_bool().unwrap_or(false),
         "verified": item["verified"],
         "message": item["message"], "credit": item["credit"], "error": item["error"],
+        // 活跃地图那种"发一句对话"的，把用的模型也记下来——
+        // 她 2026-10-17 问过"以后能用免费模型完成对话吗"，日志里能直接看出走的哪个档
+        "model": item["model"],
     }));
-    // 日志只留最近 200 条，够看半年
-    if log.len() > 200 {
-        log.drain(0..log.len() - 200);
+    // 日志留最近 2000 条。她 2026-10-17："有时候我要查看很多天前的记录，能帮我保留吗"——
+    // 一天十来条，2000 条够看一年；再长就没意义了（一年的签到记录也翻不完）。
+    // 界面按天筛（今天 / 近 7 天 / 近 30 天 / 全部），不在这里压。
+    if log.len() > 2000 {
+        log.drain(0..log.len() - 2000);
     }
     st["log"] = json!(log);
     save_state(&st);
