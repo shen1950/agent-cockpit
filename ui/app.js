@@ -163,6 +163,10 @@ function applySideHeight(px) {
     if (h) h.dataset.readout = '';
   }
 }
+/* 提交管理区高度。**不弹右下角提示**——
+   拖动时手柄上那条浮标已经把"全部显示 / 多少 px"说清楚了，
+   松手再弹一条纯属噪音（她 2026-10-17："调整这个的时候，右下角不用提示"）。
+   设置页那个「恢复自动」按钮自己弹一句，因为那是明确的一次操作。 */
 function commitSideHeight(px) {
   const r = px > 0
     ? Math.min(MGMT_MAX_R, Math.max(MGMT_MIN_R, px / Math.max(320, window.innerHeight)))
@@ -170,14 +174,6 @@ function commitSideHeight(px) {
   applySideHeight(r ? Math.round(r * window.innerHeight) : 0);
   const cur = sideRatio(S.data?.settings?.appearance || {});
   if (Math.abs(r - cur) > 0.005) setSetting('appearance', 'mgmt_ratio', r);
-  else {
-    // 提示写"显示几条菜单"而不是百分比：她看到"40% 窗口高"只会更糊涂
-    // （2026-10-17 的截图里就是这个）
-    const m = mgmtMetrics();
-    const total = document.querySelectorAll('#viewlist > li').length;
-    const n = m && m.ih ? Math.round((px - m.head) / m.ih) : 0;
-    toast(px > 0 && n ? `管理区显示 ${n} 条菜单（共 ${total} 条）` : '管理区已恢复自动高度');
-  }
 }
 // 窗口变大变小（含最大化 / 还原）时，拖过的那个比例要跟着重算——
 // 不然最大化之后管理区还是原来那点像素，占比反而变小得莫名其妙
@@ -5828,7 +5824,7 @@ function renderSettings() {
           + '存的是比例，所以窗口最大化 / 还原时它按同一个比例跟着变。拖动左栏中间那条横线即可调整，双击横线恢复自动。'
         : '自动：管理区正好装下它那几行（最多占窗口高度 22%，再矮的窗口里它自己滚），剩下的全给上面的列表。'
           + '横线往上拖到管理区显示完就到底，不会再拖出空白；往下拖是压缩它。',
-        actBtn('恢复自动', () => commitSideHeight(0))),
+        actBtn('恢复自动', () => { commitSideHeight(0); toast('管理区已恢复自动高度'); })),
       row('侧栏形态', '收成图标条后只剩一列程序图标，名字与徽章藏起来（悬停仍可看）。点左上角 Agents 旁的 « / » 或按 Ctrl+B 随时切换，切过一次就以你点的为准',
         segCtrl([['auto', '自动'], ['expand', '总是展开'], ['collapse', '总是收起']],
           a.nav_collapsed === true ? 'collapse' : (a.nav_collapsed === false ? 'expand' : 'auto'),
