@@ -279,7 +279,11 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
    再给一个占窗口高度的上限，窗口矮的时候它自己滚，窗口大起来也不会去抢上面列表的地方。
    （2026-10-15 她指出"项目多了显得非常高"） */
 .side-fixed .navtitle { margin: 0 var(--sp-3) 1px; font-size: 10px; letter-spacing: 1.6px }
-#viewlist { gap: 1px; max-height: min(22vh, 208px); overflow-y: auto; scrollbar-gutter: stable }
+/* 管理区列表：正常窗口与最大化窗口都必须把 5 个菜单项**恰好全部显示**。
+   以前这里压着 min(22vh, 208px)，800px 高的正常窗口只能显示 4 条多，
+   「设置」直接被切掉（她 2026-10-17 实测截图）。现在上限放到 60vh / 420px：
+   5 条菜单在任何窗口尺寸下都装得下，真到了菜单多到装不下时才滚动。 */
+#viewlist { gap: 1px; max-height: min(60vh, 420px); overflow-y: auto; scrollbar-gutter: stable }
 #viewlist button { padding: 4px 9px; font-size: 12px; border-radius: 7px; gap: 2px 6px }
 #viewlist .ico { width: 14px; font-size: 11.5px }
 /* 危险项（删除账号这类）在菜单里自成一档：分隔线 + 红字，标准菜单的做法 */
@@ -766,6 +770,19 @@ html[data-theme="light"] .modal { background: rgba(60, 55, 48, .32) }
   color: var(--text); padding: 8px 10px; outline: none;
 }
 .pasteline textarea:focus { border-color: var(--accent) }
+/* 添加 key 弹窗里的快速识别：textarea 与候选行 */
+#km-quick-box textarea {
+  width: 100%; min-height: 78px; resize: vertical; font-family: var(--font-mono); font-size: 12px;
+  background: var(--bg-sunken); border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  color: var(--text); padding: 8px 10px; outline: none;
+}
+#km-quick-box textarea:focus { border-color: var(--accent) }
+#km-quick-list { margin-top: 4px }
+.kmcand { display: flex; align-items: center; gap: 6px; margin-top: 6px }
+.kmcand-i { width: 18px; text-align: center; color: var(--text-muted); font-size: 11px; flex: none }
+.kmcand input { flex: 1 1 auto; min-width: 0 }
+.kmcand-k { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); flex: none }
+.kmcand-b, .kmcand-e { font-size: 11px; color: var(--text-muted); white-space: nowrap; flex: none }
 .dialogfoot { display: flex; justify-content: flex-end; gap: var(--sp-3); margin-top: var(--sp-5) }
 .dialogfoot .sp { flex: 1 }
 .askbody { white-space: pre-line; font-size: 13.5px; line-height: 1.7; color: var(--text-muted) }

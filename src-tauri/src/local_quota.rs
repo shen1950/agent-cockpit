@@ -28,6 +28,15 @@ pub const LOCAL_STORES: &[(&str, &str)] = &[
     ("marvis", "marvis"),
     // Xiaomi MiMo：{APPDATA}\Xiaomi MiMo\Partitions\xiaomi-account\Network\Cookies（SQLite, os_crypt）
     ("xiaomi-mimo", "xiaomi-mimo"),
+    // 2026-10-18 新登记两家（都只能认出"登的是谁"、读不到额度，照 MiMo 的规矩：
+    // left/total 报 None，绝不拿 0 冒充余额；登录态都是整机一份的固定位置）：
+    //   antigravity  {APPDATA}\Antigravity\User\globalStorage\state.vscdb 的
+    //                antigravityAuthStatus 明文 JSON（name/apiKey/email，Google OAuth 账号）。
+    //                厂商没有任何余额接口——按 Google 账号计费。
+    //   coze         {APPDATA}\Coze\Partitions\coze-browser…\Local Storage\leveldb 里
+    //                view_mode 的 "user" 字段（数字 userId）。没有昵称/邮箱/余额接口。
+    ("antigravity", "antigravity"),
+    ("coze", "coze"),
 ];
 
 pub fn store_for(app_id: &str) -> Option<&'static str> {
@@ -52,7 +61,7 @@ pub fn locally_readable_names() -> String {
         .join(" / ")
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Quota {
     pub user_id: String,
     pub account: String,
@@ -95,6 +104,13 @@ impl Quota {
         self.kind == "usage_only"
     }
 
+    /// 只认到账号、没有任何额度数字的产品（MiMo / Antigravity / Coze）：
+    /// left/total/逐笔明细全空。话术上必须避开"剩 未给出 / 未给出"——那不是
+    /// "没读到"，是"厂商根本没有可显示的余额"（拿 0 冒充更是撒谎）。
+    pub fn is_account_only(&self) -> bool {
+        self.left.is_none() && self.total.is_none() && self.portions.is_empty() && !self.is_usage_only()
+    }
+
     /// 界面话术用的单位词：`元` 直接显示，其余（credits/积分/token）保持厂商原词。
     pub fn unit(&self) -> &str {
         if self.unit.is_empty() { "credits" } else { self.unit.as_str() }
@@ -104,7 +120,11 @@ impl Quota {
     /// Qoder 的登录令牌过期后就是这样——服务端 401，本地只剩 8 月的旧快照，
     /// 若照原样显示，用户看到的是一个早已作废的「剩 500/500」。
     pub fn is_stale(&self) -> bool {
-        !self.is_usage_only() && self.source != "server" && !self.live_error.trim().is_empty()
+        // account_only 也排除：它的 live_error 说的是"厂商没有余额接口"（解释），
+        // 不是"服务端没读成、只剩旧缓存"（警告）——把解释当警告会弹出一句
+        // "上面的数字是缓存"对着一个根本没有数字的画面
+        !self.is_usage_only() && !self.is_account_only()
+            && self.source != "server" && !self.live_error.trim().is_empty()
     }
 
     /// 令牌过期（要重新登录，或打开一次产品让它自动续期）
@@ -174,6 +194,15 @@ pub fn falls_back_to_default(store: &str, data_dir: &str) -> bool {
     if matches!(store, "qwenwork" | "dsh" | "marvis" | "xiaomi-mimo") {
         return true;
     }
+    // 2026-10-18 两家同理（登录态整机一份：antigravity 的 state.vscdb 在
+    // {APPDATA}\Antigravity\User\globalStorage、coze 的分区 localStorage 在
+    // {APPDATA}\Coze\Partitions——实例目录里都不会有，按目录读只会误报"没登录过"）。
+    // 换号后 junction 把 {APPDATA}\<产品> 指向当前账号的实例目录，agenthub 按
+    // default_profile 给的固定路径读，拿到的就是当前挂着的那个号；能不能写进某张卡
+    // 仍由 commands.rs 的 userId 绑定守卫把关。
+    if matches!(store, "antigravity" | "coze") {
+        return true;
+    }
     (store.starts_with("qoder") || store == "astudio" || store == "minimax")
         && !crate::registry::has_login_data(Path::new(data_dir))
 }
@@ -207,6 +236,9 @@ fn default_profile(store: &str) -> Option<String> {
     // mobile_address.json 在 .marvis 链接目标、Cookies 在 {APPDATA}\Xiaomi MiMo\Partitions），
     // profile_dir(store) 展开候选后返回的就是那个固定位置——把 --profile 交给 agenthub，
     // 读的还是整机一份，但落点由 registry 这一侧说了算，candidates 换了壳也不用两头改。
+    // 2026-10-18 的 antigravity / coze 同理：profile_dir 给的是 {APPDATA}\Antigravity 与
+    // {APPDATA}\Coze，agenthub 端各自往下找 User\globalStorage\state.vscdb /
+    // Partitions\*\Local Storage\leveldb（换号后这条路径跟着 junction 走，读到的是当前账号）。
     crate::registry::profile_dir(store).map(|p| p.to_string_lossy().into_owned())
 }
 
@@ -462,9 +494,35 @@ pub fn apply(meta: &Value, q: &Quota) -> Value {
 mod tests {
     use super::*;
 
+    /// 只认账号、没有额度数字的店（MiMo/Antigravity/Coze）必须被认出来：
+    /// 不认出来的话，界面会把"剩 未给出 / 未给出"当成没读到，更糟的复古做法是填 0
     #[test]
-    fn apply_writes_binding_and_portions() {
-        let meta = json!({ "name": "账号1", "app": "qoder-cn" });
+    fn account_only_is_detected_without_any_numbers() {
+        let q = Quota {
+            user_id: "u".into(), account: "昵称".into(), user_type: "Google 账号".into(),
+            left: None, total: None, expires_on: String::new(), exceeded: false,
+            portions: vec![], groups: vec![], plan_name: String::new(), unit: String::new(),
+            kind: "full".into(), used: 0.0, sessions: 0, last_active: String::new(),
+            source: "local-cache".into(),
+            live_error: "没有余额接口".into(), auth_from: String::new(),
+            trend: Value::Null,
+        };
+        assert!(q.is_account_only());
+        // live_error 是"厂商没有接口"的解释，不是"服务端没读成"的警告——不算 stale
+        assert!(!q.is_stale());
+        // 有任何一个数字就不算 account_only
+        let mut with_left = q.clone();
+        with_left.left = Some(0.0);
+        assert!(!with_left.is_account_only());
+        // usage_only 走另一条道（累计已用），别混
+        let mut usage = q.clone();
+        usage.kind = "usage_only".into();
+        usage.used = 12.0;
+        assert!(!usage.is_account_only());
+    }
+
+    #[test]
+    fn apply_writes_binding_and_portions() {        let meta = json!({ "name": "账号1", "app": "qoder-cn" });
         let q = Quota {
             user_id: "u-1".into(), account: "nick1".into(), user_type: "personal_professional".into(),
             left: Some(3100.0), total: Some(3200.0), expires_on: "2026-10-20".into(), exceeded: false,
@@ -599,6 +657,8 @@ mod tests {
         let s = locally_readable_names();
         for name in [
             "Qoder CN", "WorkBuddy", "千问办公", "DeepSeek Harness", "Marvis", "Xiaomi MiMo",
+            // 2026-10-18 两家：只读账号的也登记在册，提示文案不能再把它们漏成"没通道"
+            "Antigravity", "Coze",
         ] {
             assert!(s.contains(name), "清单里该有 {name}：{s}");
         }

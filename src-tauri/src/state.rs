@@ -206,9 +206,24 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 .as_f64()
                 .or_else(|| m["quota_fetched_at"].as_f64())
                 .unwrap_or(0.0);
-            let quota_stale = !live_error.is_empty()
-                || snap_at <= 0.0
-                || (now as f64) - snap_at > STALE_ALERT_SEC;
+            // 只认到账号、压根没有额度数字的店（MiMo / Antigravity / Coze）：
+            // agenthub 那句 live_error 是"厂商没有余额接口"的**解释**，不是"服务端没读成"的
+            // **警告**——把它喂给 stale 那套话术，界面会对着一个根本没有数字的画面说
+            // "下面是旧缓存"。所以 account_only 的卡片一律不算 stale。
+            let account_only = m["quota_local"].as_bool().unwrap_or(false)
+                && !m["quota_account"].as_str().unwrap_or("").trim().is_empty()
+                && m["credits_left"].is_null()
+                && m["credits_total"].is_null()
+                && !has_portions
+                && m["quota_used_local"].is_null()
+                && m["quota_groups"]
+                    .as_array()
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true);
+            let quota_stale = !account_only
+                && (!live_error.is_empty()
+                    || snap_at <= 0.0
+                    || (now as f64) - snap_at > STALE_ALERT_SEC);
             let mut portions: Vec<Value> = Vec::new();
             let mut sum_left = 0.0f64;
             let mut has_left = false;
@@ -477,6 +492,9 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     // 数据来源：server = 服务端实时；local-cache = 客户端旧缓存（stale=true 时不可信）
                     "source": m["quota_source"].as_str().unwrap_or(""),
                     "stale": quota_stale,
+                    // 只有登录账号、没有余额接口的店（MiMo/Antigravity/Coze）：
+                    // live_error 是解释不是警告，话术层据此换一套说法（见 quotaMiss/staleNote）
+                    "account_only": account_only,
                     "live_error": live_error,
                     // 逐笔明细自己那份来源与时间：官网逐包读回来的明细会留着不动，而汇总数
                     // 每半小时被本机读数刷一次，界面必须能说出"明细是几点从哪读的"。

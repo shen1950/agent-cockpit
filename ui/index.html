@@ -219,7 +219,7 @@
         <button class="btn primary" id="btn-key-new">＋ 添加站点</button>
         <button class="btn" id="btn-keys-expiring" title="只看 30 天内过期的">只看临期</button>
         <button class="btn" id="btn-keys-dedup" title="按 key 原文找出重复登记的条目，保留一条删其余">查重</button>
-        <button class="btn" id="btn-keys-batch" title="勾选任意多条 key 一次删除">批量删</button>
+        <button class="btn" id="btn-keys-batch" title="勾选任意多条 key 一次删除">批量删除</button>
       </div>
       <div class="pagebody">
         <div class="setlayout">
@@ -228,7 +228,7 @@
             <div class="hintline">
               按「站点」管理：<b>接入点和可用模型挂在站点上</b>——一个站通常同时提供
               OpenAI 兼容 / Anthropic 兼容 / DashScope 几种地址，一处填好，下面每条 key 都能用。
-              <b>一个站点下可以放多个 key</b>，各自记用途（Pot / WorkBuddy / QoderCN…）、额度与过期日；
+              <b>一个站点下可以放多个 key</b>，各自记用途（Pot / WorkBuddy / QoderCN…）、额度与截止日期；
               某条 key 确实走别的地址时，再在它自己的表单里覆盖。
             </div>
             <div class="panel intake" id="key-intake">
@@ -236,7 +236,7 @@
               <div class="pasteline">
                 <label for="k-intake">把官方或中转站发给你的那段信息原样贴进来，也可以直接 Ctrl+V 贴一张截图</label>
                 <textarea id="k-intake" rows="4" spellcheck="false"
-                  placeholder="不用管排版：站点名、一个或多个 Base URL、若干用途名与其 key、模型清单、余额与过期日，认得出多少算多少。&#10;认出来的东西会当场建成站点和 key 存进台账，之后逐条核对，改哪条点哪条。"></textarea>
+                  placeholder="不用管排版：站点名、一个或多个 Base URL、若干用途名与其 key、模型清单、余额与截止日期，认得出多少算多少。&#10;认出来的东西会当场建成站点和 key 存进台账，之后逐条核对，改哪条点哪条。"></textarea>
                 <div class="ctlrow" style="margin-top:8px">
                   <button class="btn primary sm" id="k-intake-go">识别并登记</button>
                   <button class="btn sm" id="k-intake-img">选图片…</button>
@@ -336,10 +336,10 @@
     </header>
     <div class="wzbody" id="wz-body"></div>
     <footer class="dialogfoot">
-      <button class="btn" id="wz-back">上一步</button>
+      <button class="btn" id="wz-back">后退</button>
       <span class="sp"></span>
       <button class="btn" id="wz-cancel">取消</button>
-      <button class="btn primary" id="wz-next">下一步</button>
+      <button class="btn primary" id="wz-next">继续</button>
     </footer>
   </div>
 </div>
@@ -364,7 +364,7 @@
       <label for="s-b-other">其他接入点</label>
       <input id="s-b-other" placeholder="如 DashScope：https://…/api/v1" autocomplete="off" spellcheck="false">
       <label for="s-models">可用模型</label>
-      <input id="s-models" placeholder="逗号分隔；存好后也可以点站点头上的「拉模型」自动填" autocomplete="off">
+      <input id="s-models" placeholder="逗号分隔；存好后也可以点站点头上的「获取模型」自动填" autocomplete="off">
       <label for="s-total">总额度</label>
       <input id="s-total" type="number" step="any" autocomplete="off">
       <label for="s-left">剩余</label>
@@ -387,11 +387,29 @@
 </div>
 
 <!-- ================= key 编辑弹窗 =================
-     只留这条 key 自己的东西：用途、Key 原文、可选的接入点覆盖、过期日、备注、进反代池。
-     额度（总额度/剩余）挂在站点上，在「改站点」里填；接入点和模型清单也归站点。 -->
+     只留这条 key 自己的东西：用途、Key 原文、可选的接入点覆盖、截止日期、备注、进反代池。
+     额度（总额度/剩余）挂在站点上，在「修改站点」里填；接入点和模型清单也归站点。 -->
 <div class="modal" id="kmodal" hidden>
   <div class="dialog wide" role="dialog" aria-modal="true">
     <h3 id="km-title">添加 key</h3>
+    <!-- 快速识别：和页顶「快速登记」同一套本机规则 + 同一个 AI 兜底，
+         认出来的多条 key 列在这先给看，用途可改，确认后一次存进这个站点 -->
+    <div class="ctlrow" style="margin-bottom:6px">
+      <button class="btn sm" id="km-quick">粘贴识别多个 key</button>
+      <button class="btn sm" id="km-quick-img">贴截图…</button>
+      <input type="file" id="km-quick-file" accept="image/*" hidden>
+      <span class="kv">一次贴一整段：站点下好几把 key 一起认出来，省得一条条填</span>
+    </div>
+    <div id="km-quick-box" hidden>
+      <textarea id="km-quick-text" rows="4" spellcheck="false"
+        placeholder="把发给你的那段 API 信息原样贴进来（截图也可以）：每个 key、各自的用途名、截止日期，认得出多少算多少。"></textarea>
+      <div class="ctlrow" style="margin-top:8px">
+        <button class="btn primary sm" id="km-quick-go">识别</button>
+        <button class="btn sm" id="km-quick-cancel">收起</button>
+        <span class="kv" id="km-quick-info">先按本机规则读，认不出才交给多模态模型（设置 → AI 识别）</span>
+      </div>
+      <div id="km-quick-list"></div>
+    </div>
     <div class="fields">
       <label for="k-label">用途</label>
       <input id="k-label" placeholder="这个 key 用在哪，如 Pot / WorkBuddy / QoderCN" autocomplete="off">
@@ -399,7 +417,7 @@
       <input id="k-base" placeholder="留空＝用站点上填的接入点（同站多口时在这里指定这一条走哪个）" autocomplete="off" spellcheck="false">
       <label for="k-key">API Key</label>
       <input id="k-key" type="password" placeholder="sk-..." autocomplete="off">
-      <label for="k-exp">过期日</label>
+      <label for="k-exp">截止日期</label>
       <input id="k-exp" autocomplete="off" spellcheck="false">
       <label for="k-note">备注</label>
       <input id="k-note" autocomplete="off">
@@ -526,7 +544,7 @@
       <span class="touridx" id="tour-idx"></span>
       <span class="sp"></span>
       <button class="btn sm" id="tour-skip">跳过引导</button>
-      <button class="btn primary sm" id="tour-next">下一步</button>
+      <button class="btn primary sm" id="tour-next">继续</button>
     </footer>
   </div>
 </div>

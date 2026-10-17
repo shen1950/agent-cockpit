@@ -381,11 +381,18 @@ fn autofetch_once() {
                     changed = true;
                 }
             }
-            // CLI 工具的本地会话用量（Codex 等）：不依赖官方配额接口
-            if app_def.id == "codex" {
-                if let Some(u) = usage::compute(&app_def.id, meta["data_dir"].as_str().unwrap_or("")) {
+            // CLI 工具的本地会话用量（Codex / Claude Code）：不依赖官方配额接口
+            if app_def.id == "codex" || app_def.id == "claude" {
+                let dir = meta["data_dir"].as_str().unwrap_or("");
+                if let Some(u) = usage::compute(&app_def.id, dir) {
                     m["usage"] = u;
                     m["usage_fetched_at"] = serde_json::json!(now_ts());
+                    changed = true;
+                }
+                // 按天序列：波形图 / 热力图的数据源。读不到就留旧的那份，
+                // 不用 null 覆盖（local_quota 对 trend 也是同样口径）
+                if let Some(t) = usage::compute_trend(&app_def.id, dir) {
+                    m["quota_trend"] = t;
                     changed = true;
                 }
             }
