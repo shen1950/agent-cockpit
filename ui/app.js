@@ -20,6 +20,8 @@ const S = {
   ciWait: {},
   // API 页勾选中的 key（键 = 站点id|keyid）。站点内批量操作全靠它。
   keySel: null,
+  // 签到页领取日志的时间范围：today / d7 / d30 / all（默认只看今天）
+  ciLogRange: 'today',
 };
 
 /* ---------------- 外观：主题/密度/字号都来自设置页，不再占顶栏 ---------------- */
@@ -808,19 +810,36 @@ async function refreshAllQuota() {
 
 /* 一键签到：先把今天能领的摊出来让她点头，再一家一家领。
    领是写操作，所以即使叫"一键"也必须有这一下确认。 */
+/* 一键签到：把今天能做的全做一遍。
+   2026-10-17 改两件事：
+   ① 只走**产品行**——按账号展开之后，账号行也会带 claimable，照它们再领一次
+      会把同一家的当日名额重复消耗；
+   ② 确认清单逐家写清"这一步到底做什么"（领积分 / 发一句对话 / 派出），
+      不再笼统说"领今天的签到积分"——活跃地图和旅行猫根本不是"领"。
+   她问"领完当日名额就用掉了，撤回不了"是什么意思：那就是一句"领了退不回来"的告警，
+   现在换成白话，并且说清结果会记进日志。 */
 async function claimAllCheckin() {
-  let items = ((S.checkin || {}).items || []).filter((x) => x.claimable === true && !x.error);
+  const pick = (d) => ((d && d.items) || []).filter(
+    (x) => x.claimable === true && !x.error && x.scope !== 'account');
+  let items = pick(S.checkin);
   if (!items.length) {
     // 手上这份可能是旧的：先强制读一次，再决定要不要领
     const r = await invoke('action', { payload: { action: 'checkin_refresh' } }).catch(() => null);
-    if (r && r.ok) { S.checkin = r; items = (r.items || []).filter((x) => x.claimable === true && !x.error); }
+    if (r && r.ok) { S.checkin = r; items = pick(r); }
   }
   if (!items.length) { toast('今天没有可领的了', true); load(); return; }
-  const lines = items.map((x) => `· ${x.name || x.product}${x.reward != null ? `（${x.reward} ${x.unit || '积分'}）` : ''}`);
+  const lines = items.map((x) => {
+    const name = x.name || CI_NAMES[x.product] || x.product;
+    const what = x.mode === 'travel' ? '派出猫猫（到点了再回来领）'
+      : x.mode === 'activity' ? '发一句对话打卡'
+        : `领 ${x.reward != null ? `${x.reward} ${x.unit || '积分'}` : '今天的积分'}`;
+    return `· ${name} —— ${what}`;
+  });
   const yes = await askConfirm(
-    `今天这 ${items.length} 家一起领掉？\n\n${lines.join('\n')}\n\n`
-    + '领走的当日名额退不回来。逐条结果会写进「最近领过的」。',
-    { title: '一键签到', okText: `领这 ${items.length} 家` });
+    `今天有 ${items.length} 家可以处理，逐家这样做：\n\n${lines.join('\n')}\n\n`
+    + '这些都是"当天一次"的操作：做过就用掉了，不能撤销、也不能重来。'
+    + '逐条结果会记进下面的「领取日志」。',
+    { title: '一键签到', okText: `开始这 ${items.length} 家` });
   if (!yes) return;
   let ok = 0, no = 0;
   const bad = [];
@@ -1294,16 +1313,100 @@ function renderCheckin() {
         `${p.label || p.today || ''}：${p.expect || '今天这份积分'}还没结算到账，驾驶舱每几分钟替你看一次，`
         + '到账了会在这里提示你（这是服务端按天批量发放的，发放时刻不固定）'))));
   }
-  const log = ((d.state && d.state.log) || []).slice(-6).reverse();
-  if (log.length) {
-    host.appendChild(el('div', { class: 'cilog' },
-      el('b', {}, '最近领过的'),
-      ...log.map((x) => el('span', { class: 'cihit' },
-        `${x.at || ''} ${CI_NAMES[x.store] || x.store} · `
-        + (x.claimed ? `领到 ${x.credit != null ? x.credit : ''}` : x.already ? '已领过' : `没领成：${x.message || x.error || ''}`)))));
-  }
+  // 领取日志：默认只看今天，可切近 7 / 30 天 / 全部，也能导出。
+  // 她 2026-10-17："这部分可以直接改成日志，有时候我要查看很多天前的记录，能帮我保留吗，
+  // 平时可以只显示近一天的，但是我要可以选择近几天的"。
+  // 所以后端保留 2000 条（每天十来条，够一年），界面按天筛——不再压成"最近 6 条"。
+  host.appendChild(ciLogPanel(d));
   if (today) host.appendChild(el('div', { class: 'cihint' }, `厂商侧的「今天」按本机日期算：${today}`));
   if (pb) pb.scrollTop = keep;
+}
+
+/* 本地日期串 YYYY-MM-DD：和后端 agenthub 报的 `today` / 日志里的 `at` 同一格式，
+   直接按字符串比大小就能筛天，不用管时区 */
+function localDay(offset = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() - offset);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/* 领取日志面板：今天 / 近 7 天 / 近 30 天 / 全部 + 导出 CSV */
+const CI_LOG_RANGES = [
+  ['today', '今天', 0],
+  ['d7', '近 7 天', 6],
+  ['d30', '近 30 天', 29],
+  ['all', '全部', null],
+];
+function ciLogPanel(d) {
+  // 新的在前。按 `at` 排而不是只 reverse：日志是按写入顺序追加的，但补记的、
+  // 跨天到账后回填的那几条时间戳不一定单调，光 reverse 会把旧记录顶到最上面。
+  const all = (((d.state || {}).log) || [])
+    .map((x, i) => ({ x, i }))
+    .sort((a, b) => String(b.x.at || '').localeCompare(String(a.x.at || '')) || (b.i - a.i))
+    .map((v) => v.x);
+  const range = S.ciLogRange || 'today';
+  const def = CI_LOG_RANGES.find((x) => x[0] === range) || CI_LOG_RANGES[0];
+  const from = def[2] == null ? '' : localDay(def[2]);
+  const rows = from ? all.filter((x) => (x.at || '') >= from) : all;
+
+  const box = el('section', { class: 'cilogbox' });
+  const head = el('div', { class: 'ciloghead' },
+    el('b', {}, '领取日志'),
+    el('span', { class: 'kv' }, rows.length ? `${rows.length} 条${from ? `（${from} 起）` : ''}` : '这段时间没有记录'));
+  head.appendChild(el('span', { class: 'sp' }));
+  for (const [id, label] of CI_LOG_RANGES) {
+    head.appendChild(el('button', {
+      class: `ci-chip${range === id ? ' on' : ''}`, type: 'button',
+      title: id === 'all' ? '台账里保留的全部记录（后端留最近 2000 条）' : `只看${label}`,
+    }, label)).addEventListener('click', () => { S.ciLogRange = id; renderCheckin(); });
+  }
+  head.appendChild(btn('导出', 'sm', () => ciLogExport(rows), '把当前这几天的记录导成 CSV（Excel 能直接开）'));
+  box.appendChild(head);
+
+  if (!rows.length) {
+    box.appendChild(el('div', { class: 'qempty' }, all.length
+      ? '这几天没有领取记录，换个时间段看看（或点「全部」）。'
+      : '还没有领取记录：领过一次之后这里会逐条记下来。'));
+    return box;
+  }
+  const list = el('div', { class: 'cilogrows' });
+  for (const x of rows) {
+    const name = CI_NAMES[x.store] || x.store || '—';
+    const who = x.account ? `${name} · ${x.account}` : name;
+    const ok = x.claimed === true;
+    const text = ok
+      ? `领到${x.credit != null ? ` ${x.credit}` : ''}${x.message ? ` · ${x.message}` : ''}`
+      : x.already ? '今天已领过'
+        : `没领成${x.error || x.message ? `：${x.error || x.message}` : ''}`;
+    list.appendChild(el('div', { class: 'cilogrow' },
+      el('span', { class: 'cl-t' }, x.at || '—'),
+      el('span', { class: 'cl-who', title: who }, who),
+      el('span', { class: `cl-r ${ok ? 'ok' : x.already ? 'mid' : 'bad'}` }, text)));
+  }
+  box.appendChild(list);
+  return box;
+}
+
+function ciLogExport(rows) {
+  if (!rows.length) { toast('这段时间没有记录', false); return; }
+  const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+  const lines = ['日期,产品,账号,结果,积分,说明'];
+  for (const x of rows) {
+    lines.push([
+      x.at || '', CI_NAMES[x.store] || x.store || '', x.account || '',
+      x.claimed ? '领到' : x.already ? '已领过' : '没领成',
+      x.credit == null ? '' : x.credit,
+      (x.error || x.message || '').replace(/[\r\n]+/g, ' '),
+    ].map(esc).join(','));
+  }
+  // 带 BOM：Excel 打开中文不乱码
+  const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = el('a', { href: URL.createObjectURL(blob), download: `领取日志-${localDay()}.csv` });
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  toast(`已导出 ${rows.length} 条`);
 }
 
 /* ---------------- 协作（AgentHub 工作流看板 iframe） ---------------- */
@@ -6614,25 +6717,9 @@ function bind() {
   $('btn-keys-batch').addEventListener('click', () => openKeyBatch('all'));
   $('btn-checkin-refresh').addEventListener('click', () => loadCheckin(true));
   $('c-checkin').addEventListener('click', () => { S.view = 'checkin'; render(); });
-  $('btn-checkin-all').addEventListener('click', async () => {
-    const items = ((S.checkin || {}).items || []).filter((x) => x.claimable === true);
-    if (!items.length) { toast('今天没有可领的', false); return; }
-    const names = items.map((x) => CI_NAMES[x.product] || x.product).join('、');
-    const yes = await askConfirm(
-      `要给这几家领今天的签到积分：\n${names}\n\n领完当日名额就用掉了，撤回不了。`,
-      { title: '确认领取' });
-    if (!yes) return;
-    const bad = [];
-    for (const x of items) {
-      const r = await invoke('action', { payload: { action: 'checkin_claim', app: '', store: x.product } });
-      const res = (r && r.result) || {};
-      if (!res.claimed) bad.push(`${CI_NAMES[x.product] || x.product}：${res.error || res.message || '没领成'}`);
-    }
-    // "已提交"这种话不算结果——领没领要逐家报，不然又是一堆假成功
-    toast(bad.length ? `${items.length - bad.length} 家领到了，${bad.length} 家没领成：\n${bad.join('\n')}`
-                     : `${items.length} 家都领到了`, !bad.length);
-    loadCheckin(true);
-  });
+  // 签到页那颗「一键领取」和首页那颗走同一条路：以前这里是第二份实现，
+  // 文案与结果判定都跟首页不一样（不认 already/settling，也不刷新）。
+  $('btn-checkin-all').addEventListener('click', () => claimAllCheckin());
   $('bd-cancel').addEventListener('click', () => { $('bdmodal').hidden = true; });
   $('bdmodal').addEventListener('click', (e) => { if (e.target.id === 'bdmodal') $('bdmodal').hidden = true; });
   $('bd-go').addEventListener('click', bdDelete);

@@ -478,7 +478,30 @@ DATA.checkin = {
       today: CI_ITEMS[0].today, label: 'WorkBuddy 国际版', expect: '今天这 30 积分',
       until: Date.now() / 1000 + 86400 } },
     arrived: [],
-    log: [{ at: CI_ITEMS[0].today, store: 'workbuddy', claimed: true, credit: 100, message: '已领到' }] },
+    // 领取日志：跨几天造几条，验证"今天 / 近 7 天 / 近 30 天 / 全部"这四档真能筛出不同条数
+    log: (() => {
+      const day = (n) => { const d = new Date(); d.setDate(d.getDate() - n);
+        const p2 = (x) => String(x).padStart(2, '0');
+        return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`; };
+      const rows = [];
+      const push = (n, store, claimed, credit, account, extra) => rows.push({
+        at: day(n), store, claimed, already: !claimed && extra === 'already',
+        credit: claimed ? credit : null, account: account || '',
+        message: claimed ? '已领到' : extra === 'already' ? '' : '',
+        error: claimed || extra === 'already' ? null : '服务端回了「今天已签」，状态里没变',
+        model: store === 'workbuddy-activity' ? 'step-5-preview' : null,
+      });
+      push(0, 'workbuddy', true, 100, 'DuckDeity');
+      push(0, 'workbuddy-activity', true, null, '', '');
+      push(0, 'minimax', false, null, '', 'already');
+      push(1, 'qoder-cn', true, 100, 'nick9994374911');
+      push(2, 'trae-cn', false, null, '', 'fail');
+      push(4, 'qoder-cn', true, 100, 'shen1950');
+      push(9, 'minimax', true, 400, '');
+      push(21, 'workbuddy', true, 100, 'DuckDeity');
+      push(45, 'astudio', true, 100, '');
+      return rows;
+    })() },
 };
 // 「一键刷新全部额度」的后台任务：mock 里先给一个跑完的，进度条与失败清单有得看
 DATA.alljob = {
@@ -585,7 +608,8 @@ window.__TAURI__ = {
           ok: true, items, fetched_at: Date.now() / 1000,
           state: { done: { workbuddy: today },
             pending: DATA.checkin.state.pending, arrived: DATA.checkin.state.arrived,
-            log: [{ at: today, store: 'workbuddy', claimed: true, credit: 100, message: '已领到' }] },
+            // 用同一份多天日志，别在这里再造一条——两处不一致的话筛出来的条数对不上
+            log: DATA.checkin.state.log },
         });
       }
       if (cmd === 'action' && (args.payload || {}).action === 'checkin_claim') {
