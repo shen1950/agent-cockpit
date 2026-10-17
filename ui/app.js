@@ -74,7 +74,7 @@ function sideRatio(a = {}) {
   if (Number.isFinite(r) && r > 0) return clamp(r);
   const legacy = Number(a.mgmt_h);
   if (Number.isFinite(legacy) && legacy > 0) return clamp(legacy / Math.max(320, window.innerHeight));
-  return 0;   // 0 = 自动：正好装下内容（CSS 里还给了个 22vh 的上限）
+  return 0;   // 0 = 自动：正好装下内容（CSS 里还给了个 60vh 的保险丝）
 }
 function ratioPx(r) { return r ? Math.round(r * window.innerHeight) : 0; }
 /* 「管理」那一截的几何：标题多高、一条菜单多高、全部显示多高。
@@ -98,9 +98,10 @@ function mgmtParts() {
   for (const li of lis) sum += li.getBoundingClientRect().height / zoom;
   const listFull = sum + listGap * Math.max(0, lis.length - 1);
   const ih = (listFull + listGap) / lis.length;        // 一条 + 一个行距
-  // 列表自己那条 `max-height: min(22vh, 208px)`，再**向下取整到整条**——
-  // 否则窗口一矮，"全部显示"本身就只有 4.8 条，最底下永远挂着半条
-  const cap0 = Math.min(window.innerHeight * 0.22, 208);
+  // 列表的上限跟 CSS 同步放到 60vh / 420px：管理区"恰好全部显示"= 5 个菜单项
+  // 一条不少。以前 22vh 在正常窗口会切掉第 5 项「设置」（她 2026-10-17 实测）。
+  // 留一个很高的保险丝：菜单真多到装不下时仍可滚动，不会把侧栏撑爆。
+  const cap0 = Math.min(window.innerHeight * 0.6, 420);
   const listH = ih ? Math.min(listFull, Math.floor(cap0 / ih) * ih) : Math.min(listFull, cap0);
   const head = pad + headH + gap;
   return { ih, head, listFull, listH, natural: head + listH };
@@ -218,6 +219,23 @@ const ACT_ICONS = {
   plug: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.7 9.3l2.6-2.6"/><path d="M7.7 4.2l1.1-1.1a2.55 2.55 0 0 1 3.6 3.6l-1.1 1.1"/><path d="M8.3 11.8l-1.1 1.1a2.55 2.55 0 0 1-3.6-3.6l1.1-1.1"/></svg>',
   trash: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4.3h11"/><path d="M6.3 4.3V3.2a1.1 1.1 0 0 1 1.1-1.1h1.2a1.1 1.1 0 0 1 1.1 1.1v1.1"/><path d="M4.2 4.3l.6 8.3a1.2 1.2 0 0 0 1.2 1.1h4a1.2 1.2 0 0 0 1.2-1.1l.6-8.3"/></svg>',
 };
+/* key 测试在途表：站点不通时一次要等 10 秒，连点几下就排一队，
+   界面像卡死（B.ai 那次就是这么"不断返回失败"的）。在途期间按钮自锁，
+   并明说"正在测"，不让请求叠起来。 */
+const KEY_TESTING = new Set();
+function keyTestBusy(site, id) { return KEY_TESTING.has(`${site}|${id}`); }
+async function keyTest(site, id) {
+  const sig = `${site}|${id}`;
+  if (KEY_TESTING.has(sig)) { toast('上一条还没测完（站点不通时要等满 10 秒），稍等', false); return; }
+  KEY_TESTING.add(sig);
+  renderKeyList(S.data);
+  try {
+    await run('key_test', { site, id });
+  } finally {
+    KEY_TESTING.delete(sig);
+    renderKeyList(S.data);
+  }
+}
 function iconBtn(act, handler, title) {
   const b = el('button', {
     class: `iconbtn${act === 'trash' ? ' danger' : ''}`,
@@ -548,14 +566,14 @@ async function warnExpiring(alerts) {
   await ask({
     title: `⏳ ${urgent.length} 笔积分 7 天内到期`,
     msg: `${expiringText(urgent)}\n\n过期作废，记得尽快用掉。`,
-    okText: '知道了',
+    okText: '好的',
   });
 }
 
 async function showAlerts() {
   const alerts = (S.data && S.data.alerts) || [];
   if (!alerts.length) { toast('暂无临期积分'); return; }
-  await ask({ title: `⏳ ${alerts.length} 笔积分临期`, msg: expiringText(alerts), okText: '知道了' });
+  await ask({ title: `⏳ ${alerts.length} 笔积分临期`, msg: expiringText(alerts), okText: '好的' });
 }
 
 function renderNav(d) {
@@ -1614,7 +1632,9 @@ function renderToolbar(d) {
 // 服务端读不成、只剩客户端旧缓存时（典型：Qoder 登录令牌过期，本地只剩 8 月的快照）：
 // 把"这不是实时余额"直接写在卡片里，别让用户拿旧数做判断
 function staleNote(q) {
-  if (!q.stale) return null;
+  // account_only 的 live_error 是"厂商没有余额接口"的解释，不是"服务端没读成"的警告：
+  // 对它弹"下面是旧缓存"等于对着一个没有数字的画面说缓存
+  if (!q.stale || q.account_only) return null;
   const expired = /TOKEN_EXPIRE|UNAUTHORIZED|401/i.test(q.live_error || '');
   return el('div', { class: 'stale-note', title: q.live_error || '' },
     el('b', {}, expired ? '⚠ 登录令牌已过期 · 下面是旧缓存' : '⚠ 读不到服务端 · 下面是旧缓存'),
@@ -1684,6 +1704,13 @@ function quotaMiss(q) {
   // 还没读过（fetched_at 都没有）不能说成"厂商没这一项"——那是没读，不是读不到
   if (!q.fetched_at && !q.stale && !reason) {
     return '还没读到额度　点卡片上的「↻ 刷新额度」，或「账号设置 → 额度与用量 → 贴官网积分页截图识别」';
+  }
+  // 只读得到登录的是谁、压根没有余额接口的店（MiMo/Antigravity/Coze）：
+  // 登录读到了，只是没有余额这一项——话术要跟在读，不是在读不到
+  if (q.account_only && !q.stale) {
+    return ['这个程序只读得到登录的是谁，没有可查的余额',
+      reason ? `原因：${reason}` : '',
+      '余额以厂商官网/客户端里显示的为准'].filter(Boolean).join('　');
   }
   const head = q.stale
     ? '这个产品的额度读不到：服务端没读成，缓存里也没有可用额度记录'
@@ -1984,7 +2011,8 @@ function stampTime(sec) {
 }
 
 /* 按天消耗的两张图：波形图（近期走势）+ 热力图（近一年分布）。
-   数据源只有 WorkBuddy 系给得出——它的本地库逐会话记了各资源包扣掉多少 credits。
+   数据源两路：① WorkBuddy 系的本地库逐会话记了各资源包扣掉多少 credits；
+   ② Codex / Claude Code 的本机会话日志逐条带了时间戳与 token 用量（usage.rs 聚合）。
    别的产品官方只给余额和逐笔到账时刻，没有逐笔消耗时刻，所以读不到就整块不出现：
    摆一张空图占位等于骗人（同"官方没给总额不许当 0"那是一条判据）。 */
 const TREND_RANGES = [30, 90, 365];
@@ -3103,7 +3131,7 @@ function siteQuotaTxt(p) {
 
    所以这里不是又开一个弹窗，而是直接在站点表格上加勾选列：
    表头一个全选框（只管这个站点），勾上之后页面顶部浮一条操作条，
-   单个 key 能做的（改用途 / 改过期 / 测活 / 复制 / 删除）在这里都能对一批做，
+   单个 key 能做的（修改用途 / 改截止日 / 批量测试 / 复制 / 删除）在这里都能对一批做，
    另外多一个「移到其他站点」——那是单个 key 做不到的。 */
 function keySel() {
   if (!S.keySel) S.keySel = new Set();
@@ -3134,36 +3162,42 @@ function keySelBar(sites) {
   bar.appendChild(el('span', { class: 'ksel-n' }, `已选 ${ids.length} 条`));
   bar.appendChild(el('span', { class: 'sp' }));
 
-  bar.appendChild(btn('改用途', 'sm', async () => {
+  bar.appendChild(btn('修改用途', 'sm', async () => {
     const v = await askText('给勾选的这些 key 统一设一个用途名（列表里就按这个名字认人）。留空则清掉用途。',
-      '', { title: `批量改用途 · ${ids.length} 条`, okText: '应用' });
+      '', { title: `批量修改用途 · ${ids.length} 条`, okText: '应用' });
     if (v === null) return;
     const r = await invoke('action', { payload: { action: 'key_batch_update', ids, patch: { label: v } } });
     toast(r.msg, r.ok);
     if (r.ok) { keySelClear(); await load(); }
   }, '统一改「用途」这一列（单个 key 的编辑框里那一项）'));
 
-  bar.appendChild(btn('改过期日', 'sm', async () => {
-    const v = await askText('统一设过期日，格式 2026-12-31。留空表示未填。',
-      '', { title: `批量改过期日 · ${ids.length} 条`, okText: '应用' });
+  bar.appendChild(btn('改截止日', 'sm', async () => {
+    const v = await askText('统一设截止日期，格式 2026-12-31。留空表示未填。',
+      '', { title: `批量改截止日 · ${ids.length} 条`, okText: '应用' });
     if (v === null) return;
     if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v.trim())) { toast('格式不对，要 2026-12-31 这样', false); return; }
     const r = await invoke('action', { payload: { action: 'key_batch_update', ids, patch: { expires_on: v.trim() } } });
     toast(r.msg, r.ok);
     if (r.ok) { keySelClear(); await load(); }
-  }, '统一改过期日（临期提醒按它算）'));
+  }, '统一改截止日期（临期提醒按它算）'));
 
-  bar.appendChild(btn('测活', 'sm', async () => {
+  const testBtn = btn('批量测试', 'sm', async () => {
+    // 站点不通时一条要等 10 秒：期间把按钮变成进度条，别让人以为又卡死了
+    testBtn.disabled = true;
     let okN = 0, badN = 0;
-    for (const x of ids) {
-      const r = await invoke('action', { payload: { action: 'key_test', site: x.site, id: x.id } })
+    for (let i = 0; i < ids.length; i++) {
+      testBtn.textContent = `测试 ${i + 1}/${ids.length}`;
+      const r = await invoke('action', { payload: { action: 'key_test', site: ids[i].site, id: ids[i].id } })
         .catch(() => ({ ok: false }));
       if (r && r.ok) okN += 1; else badN += 1;
     }
-    toast(`测活完成：${okN} 条可用${badN ? `，${badN} 条失败` : ''}`, badN === 0);
+    testBtn.textContent = '批量测试';
+    testBtn.disabled = false;
+    toast(`测试完成：${okN} 条可用${badN ? `，${badN} 条失败` : ''}`, badN === 0);
     keySelClear();
     await load();
-  }, '逐条向站点的接入点发一次 GET /models，验证还能不能用'));
+  }, '逐条向站点的接入点发一次 GET /models，验证还能不能用');
+  bar.appendChild(testBtn);
 
   bar.appendChild(btn('复制', 'sm', async () => {
     const lines = [];
@@ -3182,7 +3216,7 @@ function keySelBar(sites) {
   // 跨站混选时目标站本身就没意义，不如先让她在站内挪。
   if (inOneSite && others.length) {
     const sel = el('select', { class: 'ksel-target', title: '要挪到哪个站点' });
-    sel.appendChild(el('option', { value: '' }, '移到…'));
+    sel.appendChild(el('option', { value: '' }, '选择站点'));
     for (const p of others) sel.appendChild(el('option', { value: p.id }, p.name || '未命名站点'));
     bar.appendChild(sel);
     bar.appendChild(btn('移动', 'sm', async () => {
@@ -3268,14 +3302,14 @@ function renderKeyList(d) {
         kindChip(p.kind),
         el('span', { class: 'sitecount', title: '该站点下登记的 key 数量' }, `${keys.length} 个 key`),
         (p.left != null || p.total != null)
-          ? el('span', { class: 'sitecount', title: '站点额度（剩余 / 总额），在「改站点」里填' }, siteQuotaTxt(p))
+          ? el('span', { class: 'sitecount', title: '站点额度（剩余 / 总额），在「修改站点」里填' }, siteQuotaTxt(p))
           : null,
         p.homepage ? el('a', { class: 'sitehome', href: p.homepage, target: '_blank', rel: 'noreferrer', title: p.homepage }, '主页') : null),
       el('span', { class: 'sp' }),
       btn('＋ 加 key', 'sm', () => openKeyModal(p, null),
-        '在这个站点下再加一个 key：用途标签、余额与过期日各自一份；接入点用站点上填好的'),
-      btn('改站点', 'sm', () => openSiteModal(p), '改站点名、类型、接入点（Base URL）与可用模型'),
-      btn('删站点', 'danger sm', async () => {
+        '在这个站点下再加一个 key：用途标签、余额与截止日期各自一份；接入点用站点上填好的'),
+      btn('修改站点', 'sm', () => openSiteModal(p), '修改站点名、类型、接入点（Base URL）与可用模型'),
+      btn('删除', 'danger sm', async () => {
         if (await askConfirm(
           `删除站点「${p.name}」连同它下面 ${keys.length} 个 key。\n删除后无法再查看或修改，正在用这些 key 的程序会失败。`,
           { danger: true, okText: '删除站点', title: '删除站点' })) {
@@ -3310,7 +3344,7 @@ function renderKeyList(d) {
             })()),
             el('th', { class: 'k-label' }, '用途'),
             el('th', { class: 'k-key' }, 'Key'),
-            el('th', { class: 'k-exp' }, '过期'),
+            el('th', { class: 'k-exp' }, '截止日期'),
             el('th', { class: 'k-st' }, '测试'),
             el('th', { class: 'k-act' }, '操作'))),
           keys.length ? tb : null)));
@@ -3345,7 +3379,7 @@ function siteInfo(p) {
       chip(label, 'fmt'),
       el('span', { class: 'url', title: b.url }, b.url),
       btn('复制', 'plain sm', () => copyText(b.url), '复制这个接入点'),
-      btn('拉模型', 'plain sm', () => pullSiteModels(p, b),
+      btn('获取模型', 'plain sm', () => pullSiteModels(p, b),
         `向 ${b.url}/models 发一次请求，把拉到的模型并进站点的「可用模型」`)));
   }
 
@@ -3431,10 +3465,12 @@ function keyRow(site, k) {
     el('td', {}, expChip(k)),
     el('td', {}, k.last_status ? chip(k.last_status === 'ok' ? '可用' : '失败', k.last_status) : chip('未测', '')),
     el('td', { class: 'acts' },
-      iconBtn('test', () => run('key_test', { site: site.id, id: k.id }),
-        '测试：向站点的接入点发一次 GET /models，验证这把 Key 还能不能用'),
+      keyTestBusy(site.id, k.id)
+        ? el('span', { class: 'muted', title: '正在向站点发请求，等它回来' }, '测试中…')
+        : iconBtn('test', () => keyTest(site.id, k.id),
+          '测试：向站点的接入点发一次 GET /models，验证这把 Key 还能不能用'),
       iconBtn('edit', () => openKeyModal(site, k),
-        '编辑：改用途、Key 原文、接入点覆盖与过期日'),
+        '编辑：用途、Key 原文、接入点覆盖与截止日期'),
       iconBtn('copy', () => copyKey(site.id, k.id, k.label || site.name),
         '复制：把完整 Key 复制到剪贴板（列表里始终打码）'),
       iconBtn('plug', () => openInjectModal(site, k),
@@ -3815,9 +3851,10 @@ function renderDetail() {
         ? btn('还原默认', 'danger sm', () => run('swap_clear', { app }), '换回你原来的账号目录')
         : btn('设为当前', 'primary sm', () => swapSet(app, name), '切换到这个账号')));
   }
-  // 本地会话用量是"用了多少"，归到额度那一组去
+  // 本地会话用量是"用了多少"，归到额度那一组去。按天序列（波形图/热力图）
+  // 也在这里一起刷：Codex / Claude Code 的本机日志带了时间戳，聚得出"哪天用了多少"
   const usageRow = i.kind === 'cli'
-    ? row('本地会话用量', '从该账号的本地会话日志汇总真实 Token 用量（目前支持 Codex），不依赖官方配额接口；后台每轮也会自动刷新',
+    ? row('本地会话用量', '从该账号的本地会话日志汇总真实 Token 用量（目前支持 Codex / Claude Code），不依赖官方配额接口；后台每轮也会自动刷新，「刷新用量」会同时更新波形图与热力图',
       el('div', { class: 'ctlrow' },
         el('span', { class: 'kv' }, i.usage
           ? `入 ${fmtTok(i.usage.input)} / 出 ${fmtTok(i.usage.output)} / 共 ${fmtTok(i.usage.total)}`
@@ -4073,9 +4110,9 @@ function openKeyModal(site, k) {
   $('k-base').value = k?.base_url || '';
   $('k-base').placeholder = siteHomeBase(site)
     ? `留空＝用站点的 ${siteHomeBase(site)}`
-    : '留空＝用站点的接入点（这个站还没填，去「改站点」补）';
+    : '留空＝用站点的接入点（这个站还没填，去「修改站点」补）';
   $('k-key').value = '';
-  // 过期日是普通文本框：原生 type=date 在中文系统上顶着 "yyyy/mm/日" 的中英杂糅示例，
+  // 截止日期是普通文本框：原生 type=date 在中文系统上顶着 "yyyy/mm/日" 的中英杂糅示例，
   // 全站都按 2026-10-20 这种写法走（留空直接填），存的时候统一归一化
   $('k-exp').value = k?.expires_on || '';
   $('k-note').value = k?.note || '';
@@ -4097,7 +4134,140 @@ function siteHomeBase(site) {
     || (list[0] || {}).url
     || (site?.keys || []).find((k) => k.base_url)?.base_url || '');
 }
-function closeKeyModal() { $('kmodal').hidden = true; keyEditing = null; }
+/* ---------------- 添加 key 弹窗里的快速识别（2026-10-17） ----------------
+   她原话："每一个站点在新增 key 的窗口，也应该保留快速识别的功能（可以识别多个 key）"。
+   和页顶「快速登记」共用 parseApiText 本机规则 + 同一个 AI 兜底，区别只在这回
+   站点已经定了：认出来的每条 key 直接进当前站点，用途名允许就地改，
+   先列出来给看，点"全部保存"才落盘——不搞贴进去就莫名多出几条 key。 */
+let kmCands = null;   // [{label, key, base_url, expires_on}]
+function kmMask(k) {
+  const s = String(k || '');
+  return s.length <= 10 ? s.slice(0, 3) + '…' : s.slice(0, 6) + '…' + s.slice(-4);
+}
+async function kmQuickRecognize(imageDataUrl) {
+  const box = $('km-quick-text');
+  const info = $('km-quick-info');
+  const raw = box ? box.value : '';
+  if (!imageDataUrl && !raw.trim()) { toast('先把 API 信息贴进来', false); return; }
+  if (AI_BUSY.on) { aiBusyRefuse(); return; }
+  const go = $('km-quick-go');
+  go.disabled = true;
+  let j = null;
+  let who = '本机规则';
+  const p = imageDataUrl ? null : parseApiText(raw);
+  if (p && (p.keys || []).length) {
+    j = { keys: p.keys, ...quotaFromText(raw) };
+  } else {
+    who = 'AI';
+    info.textContent = '本机规则没认出 key，交给模型读…（进度看右下角）';
+    aiProgressShow(imageDataUrl ? 'AI 读截图' : 'AI 读文本');
+    let r = null;
+    try {
+      r = await invoke('action', {
+        payload: {
+          action: 'ai_ask',
+          prompt: imageDataUrl ? AI_PROMPT_KEYS : `${AI_PROMPT_KEYS}\n\n${raw}`,
+          image: imageDataUrl || '',
+        },
+      });
+    } finally {
+      aiProgressHide();
+      go.disabled = false;
+    }
+    if (!r.ok) { info.textContent = `模型没读成：${r.msg}`; toast(r.msg, false); return; }
+    if (!r.json) { info.textContent = '模型没给出可解析的 JSON'; return; }
+    j = r.json;
+  }
+  go.disabled = false;
+  info.textContent = who;
+  const site = keyEditing && keyEditing.site;
+  const siteBase = site ? siteHomeBase(site) : '';
+  kmCands = (j.keys || [])
+    .filter((k) => k && String(k.key || '').trim())
+    .map((k) => {
+      const own = String(k.base_url || '').trim();
+      return {
+        label: String(k.label || '').trim(),
+        key: String(k.key).trim(),
+        base_url: own && own !== siteBase ? own : '',
+        expires_on: String(j.expires_on || '').trim(),
+      };
+    });
+  kmRenderCands();
+}
+function kmRenderCands() {
+  const host = $('km-quick-list');
+  clear(host);
+  if (!kmCands || !kmCands.length) {
+    host.appendChild(el('div', { class: 'hintline bad' }, '这段里没认出 key——换个排版再试，或者退回手工填。'));
+    return;
+  }
+  host.appendChild(el('div', { class: 'hintline' },
+    `认出 ${kmCands.length} 条 key。用途名可以就地改，截止日期统一用文本里那个；确认无误点「全部保存」。`));
+  kmCands.forEach((c, i) => {
+    const inp = el('input', { value: c.label, placeholder: '这条 key 用在哪（Pot / WorkBuddy…）', autocomplete: 'off' });
+    inp.addEventListener('input', () => { kmCands[i].label = inp.value.trim(); });
+    host.appendChild(el('div', { class: 'kmcand' },
+      el('span', { class: 'kmcand-i' }, String(i + 1)),
+      inp,
+      el('span', { class: 'kmcand-k mono', title: c.key }, kmMask(c.key)),
+      c.base_url ? el('span', { class: 'kmcand-b', title: c.base_url }, '自带接入点') : null,
+      c.expires_on ? el('span', { class: 'kmcand-e' }, `截止 ${c.expires_on}`) : null,
+      el('button', {
+        class: 'iconbtn danger', type: 'button', title: '去掉这条，不保存', 'aria-label': '去掉',
+      }, '✕')));
+  });
+  // 去掉按钮按索引绑：第 i 条的 ✕ 只删第 i 条
+  [...host.querySelectorAll('.kmcand')].forEach((row, i) => {
+    row.querySelector('.iconbtn').addEventListener('click', () => {
+      kmCands.splice(i, 1);
+      kmRenderCands();
+    });
+  });
+  const foot = el('div', { class: 'ctlrow', style: 'margin-top:8px' },
+    el('span', { class: 'sp' }),
+    el('button', { class: 'btn primary sm', type: 'button', onclick: kmSaveCands }, `全部保存（${kmCands.length}）`),
+    el('button', { class: 'btn sm', type: 'button', onclick: () => { kmCands = null; kmRenderCands(); } }, '取消'));
+  host.appendChild(foot);
+}
+async function kmSaveCands() {
+  if (!kmCands || !kmCands.length || !keyEditing) return;
+  const site = keyEditing.site;
+  let done = 0;
+  let firstFail = '';
+  for (const c of kmCands) {
+    const item = {
+      id: '',
+      label: c.label,
+      base_url: c.base_url,
+      key: c.key,
+      models_list: '',
+      expires_on: normExpDate(c.expires_on),
+      note: '粘贴识别',
+    };
+    const r = await invoke('action', { payload: { action: 'key_upsert_key', site: site.id, item } });
+    if (r.ok) done += 1; else if (!firstFail) firstFail = r.msg;
+  }
+  kmCands = null;
+  await load();
+  renderKeys(S.data);
+  $('km-quick-list') && clear($('km-quick-list'));
+  $('km-quick-box').hidden = true;
+  closeKeyModal();
+  toast(done
+    ? `已存进「${site.name}」${done} 条 key${firstFail ? `；有失败：${firstFail}` : ''}`
+    : `一条都没存进去：${firstFail || '原因未知'}`,
+    done > 0);
+}
+function closeKeyModal() {
+  $('kmodal').hidden = true;
+  keyEditing = null;
+  kmCands = null;
+  const qb = $('km-quick-box');
+  if (qb) qb.hidden = true;
+  const ql = $('km-quick-list');
+  if (ql) clear(ql);
+}
 /* 过期日只认一套写法：2026-10-20（带时间也收，2026-10-20 21:00）。
    斜杠、点、年月日中文分隔一律收进来转成同一种，存盘前统一 */
 function normExpDate(s) {
@@ -4138,7 +4308,7 @@ async function saveKeyModal(again) {
   // 编辑已有 key 但没改 Key 文本时，后端必须保留原 Key，不能被空串覆盖
   if (!item.id && !item.key) { toast('新 key 至少要填 Key 原文', false); return; }
   if (item.expires_on && !/^\d{4}-\d{2}-\d{2}/.test(item.expires_on)) {
-    toast('过期日没认出来：留空，或按 2026-10-20 填', false);
+    toast('截止日期没认出来：留空，或按 2026-10-20 填', false);
     return;
   }
   const siteId = keyEditing.site.id;
@@ -4375,7 +4545,7 @@ function parseApiText(raw) {
   return out;
 }
 
-/// 从整段文本里捞余额 / 总额 / 过期日——「粘贴识别」和「快速登记」共用一套取数口径
+/// 从整段文本里捞余额 / 总额 / 截止日期——「粘贴识别」和「快速登记」共用一套取数口径
 function quotaFromText(raw) {
   const t = String(raw || '');
   const num = (re) => {
@@ -4670,6 +4840,13 @@ async function loadSeedSources() {
   renderWizard();
 }
 // 第 2 步：读"这台机器现在登的是谁"。认出来了就顺手把基本信息填上、自动进下一步。
+/// 卡名直接当 Windows 文件名用：`< > : " | ? * / \` 和控制字符一律拿掉，
+/// 尾点的空格也去不掉就整体不用。向导最初用打码账号名预填（`rl1******741@163.com`
+/// 这种），里面的 `*` 会让账号文件写不进去（DSH 2026-10-17 实测建卡到一半失败）。
+function safeCardName(s) {
+  const t = String(s || '').replace(/[<>:"|?*\\/\x00-\x1f]/g, '').replace(/[. ]+$/, '').trim();
+  return t;
+}
 async function wzReadLogin(auto) {
   const w = S.wizard;
   if (!w) return null;
@@ -4683,7 +4860,7 @@ async function wzReadLogin(auto) {
     L.card = dup ? dup.name : '';
     // 名字跟着"最新读到的那个号"走：她在客户端里来回切号时，第一次读到的号不算数。
     // 只有她自己动过名称输入框才不再覆盖（nameTouched）。
-    if (!w.nameTouched) w.name = L.account;
+    if (!w.nameTouched) w.name = safeCardName(L.account) || w.name;
     if (auto && w.step === 1 && !dup) { w.step = 2; renderWizard(); return L; }
   }
   renderWizard();
@@ -4699,8 +4876,18 @@ async function wzOpenClient() {
   const r = await run('launch_app', { app: w.app.id });
   if (!r || !r.ok) { toast(r && r.msg ? r.msg : '打不开客户端', false); return; }
   w.opened = true;
-  toast(r.msg || '已打开客户端，请在窗口里登录', true);
+  // 读不到登录态的程序（Marvis 这类没有登记本机直读通道的）：说清楚"不会自动进
+  // 下一步"，别让人对着一个不动的干等——以前她点完"打开客户端"就是这么卡住的
+  const a = (S.data.apps || []).find((x) => x.id === w.app.id);
+  const blind = a && !a.local_quota && !a.web_quota;
+  toast(
+    blind
+      ? `${r.msg || '已打开客户端'}。这个程序的登录态驾驶舱读不到，不会自动进下一步——`
+        + '在里面登录完，点「跳过此步」继续建卡。'
+      : r.msg || '已打开客户端，请在窗口里登录',
+    true);
   stopWzPoll();
+  if (blind) { renderWizard(); return; }
   w.poll = setInterval(async () => {
     if (!S.wizard || S.wizard !== w) { stopWzPoll(); return; }
     const L = await wzReadLogin(true);
@@ -4727,8 +4914,8 @@ function renderWizard() {
   next.append(
     sid === 'done' ? '确认无误，建这张卡'
       : (sid === 'login' && w.m !== 'apikey'
-        ? (w.login && w.login.ok && w.login.account ? '下一步' : '读取登录状态')
-        : '下一步'));
+        ? (w.login && w.login.ok && w.login.account ? '继续' : '读取登录状态')
+        : '继续'));
 
   /* ---- ① 登录方式 ---- */
   if (sid === 'method') {
@@ -4797,7 +4984,9 @@ function renderWizard() {
         const acct = (w.login && w.login.account) || w.name.trim();
         const claimer = (prof && prof.facts && prof.facts.claimed_by) || '';
         w.origin = 'adopt';
-        w.mode = 'swap';
+        // plain（Marvis 这类原生桌面端）连"换号挂 junction"都不适用：
+        // 打开就是 launch_app 直接开主程序，磁盘上一个字节都不动
+        w.mode = w.app.kind === 'plain' ? 'app' : 'swap';
         w.claimer = claimer;
         body.append(
           el('p', {}, '这个程序在这台机器上只有一份档案，账号是在客户端里切换的。'),
@@ -4827,8 +5016,11 @@ function renderWizard() {
             '一份档案挂一张卡。卡片名字跟着现在登录的号变，额度按当前读数重写。', true));
         }
         body.appendChild(el('div', { class: 'hintline' },
-          '管理方式：这个程序会把第二次启动转交给已开窗口，不能同时多开，所以账号靠客户端里切换'
-          + '（退出登录 → 登另一个号），一次一个。驾驶舱不会为了换号去关你的程序。'));
+          w.app.kind === 'plain'
+            ? '管理方式：这个程序是原生桌面端，不支持独立数据目录（多开无效），所以账号靠客户端里切换'
+              + '（退出登录 → 登另一个号），一次一个。驾驶舱不会为了换号去关你的程序，也不会动它的文件。'
+            : '管理方式：这个程序会把第二次启动转交给已开窗口，不能同时多开，所以账号靠客户端里切换'
+              + '（退出登录 → 登另一个号），一次一个。驾驶舱不会为了换号去关你的程序。'));
       } else {
         const prof = srcs.find((s) => s.kind === 'profile');
         const insts = srcs.filter((s) => s.kind === 'instance' && s.has_data);
@@ -4946,9 +5138,13 @@ function renderWizard() {
       } else {
         body.append(
           el('ol', { class: 'wl' },
-            el('li', { class: 'ok' }, `登录到了「${L.account}」${L.user_type ? `（套餐 ${L.user_type}）` : ''}`),
-            el('li', { class: 'ok' }, `服务端读数：剩 ${nfmt(L.left || 0)} / 共 ${nfmt(L.total || 0)}`
-              + `${L.expires_on ? ` · 到期 ${dtxt(L.expires_on)}` : ''} · 来源 ${L.source || '未知'}`),
+            el('li', { class: 'ok' }, `登录到了「${L.account}」${L.user_type ? `（${L.user_type}）` : ''}`),
+            // 只有登录身份、没有余额接口的店（MiMo/Antigravity/Coze）：不能说"剩 0 / 共 0"——
+            // 那不是没读到，是厂商根本没有这一项。live_error 里那句为什么照原样带上。
+            L.account_only
+              ? el('li', { class: 'ok' }, `没有可查的余额：${L.live_error || '厂商没有可调的余额接口'}`)
+              : el('li', { class: 'ok' }, `服务端读数：剩 ${nfmt(L.left ?? null)} / 共 ${nfmt(L.total ?? null)}`
+                + `${L.expires_on ? ` · 到期 ${dtxt(L.expires_on)}` : ''} · 来源 ${L.source || '未知'}`),
             el('li', {}, L.auth_from ? `登录档案 ${L.auth_from}` : `ID ${String(L.user_id || '').slice(0, 8)}…`),
             L.card ? el('li', { class: 'ok' }, `这个号已经有卡片「${L.card}」了`) : null),
           el('div', { class: 'hintline' }, L.card
@@ -5101,8 +5297,9 @@ async function wzRebind(oldName, newName) {
 async function wzCreate() {
   const w = S.wizard;
   if (!w) return;
-  const nm = w.name.trim();
-  if (!nm) { toast('名称不能为空', false); return; }
+  const nm = safeCardName(w.name);
+  if (!nm) { toast('名称不能为空（也不能只留文件名不认的字符）', false); return; }
+  if (nm !== w.name.trim()) w.name = nm;
   const chosen = w.origin === 'auto' ? (w.recommend || 'fresh') : w.origin;
   const payload = {
     app: w.app.id, name: nm, workdir: w.workdir,
@@ -5143,10 +5340,29 @@ async function wzCreate() {
   }
   if (!r.ok) return;
   stopWzPoll();
-  if (w.mode === 'isolate') await run('launch', { app: w.app.id, name: nm });
-  else await swapSetAndLaunch(w.app.id, nm);
+  // 建卡之后的"打开"按模式分流，且每一步都看返回值：以前不管启动成不成都弹
+  // "已建好"，客户端明明没起来也照样报喜（Marvis 打开无反应就是这么来的）。
+  let opened = true;
+  let why = '';
+  if (w.mode === 'isolate') {
+    const rl = await run('launch', { app: w.app.id, name: nm });
+    opened = !!rl.ok;
+    if (!opened) why = rl.msg || '';
+  } else if (w.mode === 'app') {
+    // plain（Marvis 这类）：簿记卡，打开＝直接开主程序
+    const rl = await run('launch_app', { app: w.app.id, name: nm });
+    opened = !!rl.ok;
+    if (!opened) why = rl.msg || '';
+  } else {
+    opened = await swapSetAndLaunch(w.app.id, nm);
+    if (!opened) why = '换号或启动没成功';
+  }
   closeWizard();
-  toast(`已建好「${nm}」。${cr.length ? `额度记了 ${cr.length} 笔。` : '额度还没填，可在账号设置里补。'}`, true);
+  toast(
+    opened
+      ? `已建好「${nm}」。${cr.length ? `额度记了 ${cr.length} 笔。` : '额度还没填，可在账号设置里补。'}`
+      : `卡「${nm}」建好了，但客户端没打开：${why || '原因没说出来'}。在卡片上点「▶ 打开」再试。`,
+    opened);
 }
 async function wizardNext() {
   const w = S.wizard;
@@ -5234,7 +5450,7 @@ const HELP = [
   },
   {
     t: 'API 与额度页 / 本地反代',
-    h: `<p>「API 与额度」用来管各家官网 API 与中转站的 Key：Base URL、Key（列表里打码，点复制取全文）、额度与过期日，一键 <code>GET /v1/models</code> 测试。</p>
+    h: `<p>「API 与额度」用来管各家官网 API 与中转站的 Key：Base URL、Key（列表里打码，点复制取全文）、额度与截止日期，一键 <code>GET /v1/models</code> 测试。</p>
       <p>登记不必一条条填表：页顶「快速登记」把官方或中转站发你的那段信息原样贴进来（截图也行，Ctrl+V 直接粘），程序先按本机规则读，认不出 key 或地址才交给多模态模型，站点、端点、每条 key 与用途名当场建好；再点 key 行的「模型」向上游要清单，勾多少登记多少，「测试」通了就能用。</p>
       <p>本地反代在 <code>127.0.0.1:8788</code> 做 OpenAI 兼容转发：替换 Authorization 头、保留流式输出，并记录每次请求用了哪个上游。编制在账号库下方「本地反代」面板里，是三段式——</p>
       <ul>
@@ -5730,7 +5946,7 @@ function securitySection(body, panel, row, actBtn) {
       row('改主密码', '先解锁，再设新的（会用新随机盐重新派生并整包重加密）',
         el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' },
           p1, p2, hint,
-          btn('改密码', 'sm', async () => {
+          btn('修改密码', 'sm', async () => {
             const r = await run('vault_set_password', { pwd: p1.value, again: p2.value, hint: hint.value });
             if (r && r.ok) { p1.value = ''; p2.value = ''; loadVault(); }
           }))),
@@ -6019,7 +6235,7 @@ function renderSettings() {
       row('Key 保护', S.data.vault && S.data.vault.has_password
         ? `加密保管箱 ${S.data.vault.count} 条 · Windows 账户 + 主密码${S.data.vault.locked ? ' · 当前锁定' : ''}`
         : `加密保管箱 ${S.data.vault ? S.data.vault.count : 0} 条 · Windows 账户绑定（DPAPI），可在 设置→凭据安全 加一层主密码`,
-        actBtn('去设置', () => { setSection = 'security'; renderSettings(); })),
+        actBtn('前往设置', () => { setSection = 'security'; renderSettings(); })),
       row('仓库', '私有仓库 github.com/shen1950/agent-cockpit',
         actBtn('复制地址', () => copyText('https://github.com/shen1950/agent-cockpit'))),
       row('监听地址', '反代与界面只绑回环，不对外网开放',
@@ -6277,8 +6493,9 @@ function bindAiPaste() {
     try {
       const url = await fileToDataUrl(file);
       if (kind === 'api') {
-        // key 弹窗里已经没有粘贴区了：贴截图一律走页顶「快速登记」，别越过弹窗直接建站点
-        if (!$('kmodal').hidden) { toast('要登记新站先关掉这个弹窗，贴到页顶的「快速登记」', false); return; }
+        // 添加 key 弹窗开着＝往这个站点里加 key：截图直接进弹窗的快速识别，
+        // 认出来的 key 全部落在这个站，不越级建新站
+        if (!$('kmodal').hidden) { $('km-quick-box').hidden = false; kmQuickRecognize(url); return; }
         intakeRegister(url);
       } else {
         aiRecognize(kind, url);
@@ -6642,7 +6859,8 @@ async function swapSetAndLaunch(app, name) {
   const a = S.data.apps.find((x) => x.id === app);
   if (a && a.shared_profile) return openClient(app, name);
   if (!await swapSet(app, name)) return false;
-  await run('launch_app', { app, name });
+  const r = await run('launch_app', { app, name });
+  if (!r || !r.ok) { toast((r && r.msg) || '打开失败', false); return false; }
   return true;
 }
 // 共用一份档案的产品（Qoder 系 / WorkBuddy / ZCode / TRAE 这类单窗口产品）：
@@ -6672,7 +6890,7 @@ async function authSwitch(app, name) {
       ? `当前登着的「${cur.name}」会在写之前先收好，随时切得回来。\n`
       : '还没读出当前登的是谁时后端不会动手（否则切过去就回不来了）。\n')
     + `会重启一次 ${a.name || '客户端'}：窗口里没保存的东西会丢。`,
-    { title: '一键换号', okText: '切过去' })) return false;
+    { title: '一键换号', okText: '切换' })) return false;
   const r = await run('auth_switch', { app, name });
   return !!r.ok;
 }
@@ -6824,6 +7042,22 @@ function bind() {
   ['s-name', 's-home'].forEach((id) => $(id).addEventListener('keydown',
     (e) => { if (e.key === 'Enter') saveSiteModal(); }));
   $('km-cancel').addEventListener('click', closeKeyModal);
+  // 弹窗里的快速识别：展开 / 识别 / 截图 / 收起
+  $('km-quick').addEventListener('click', () => {
+    const box = $('km-quick-box');
+    box.hidden = !box.hidden;
+    if (!box.hidden) $('km-quick-text').focus();
+  });
+  $('km-quick-go').addEventListener('click', () => kmQuickRecognize());
+  $('km-quick-cancel').addEventListener('click', () => { $('km-quick-box').hidden = true; });
+  $('km-quick-img').addEventListener('click', () => $('km-quick-file').click());
+  $('km-quick-file').addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    $('km-quick-box').hidden = false;
+    fileToDataUrl(f).then((u) => kmQuickRecognize(u)).catch((err) => toast(err.message, false));
+    e.target.value = '';
+  });
   // 别直接把函数当 handler：click 事件会被当成 saveKeyModal 的 again 参数
   $('km-save').addEventListener('click', () => saveKeyModal());
   $('km-next').addEventListener('click', () => saveKeyModal(true));
@@ -6831,12 +7065,20 @@ function bind() {
   $('km-test').addEventListener('click', async () => {
     const item = collectKeyItem();
     if (!item.key && !keyEditing.key.id) { toast('先填 Key 原文', false); return; }
+    if (keyTestBusy(keyEditing.site.id, item.id)) { toast('这条正在测，等它回来', false); return; }
     // 测试前先落盘（新建时用刚填的 key；编辑时后端会保留原 key）
     const s = await invoke('action', { payload: { action: 'key_upsert_key', site: keyEditing.site.id, item } });
     if (!s.ok) { toast(s.msg, false); return; }
     keyEditing.key.id = item.id;
-    const r = await invoke('action', { payload: { action: 'key_test', site: keyEditing.site.id, id: item.id } });
-    toast(r.msg, r.ok);
+    const btnTest = $('km-test');
+    btnTest.disabled = true;
+    btnTest.textContent = '测试中…';
+    try {
+      await keyTest(keyEditing.site.id, item.id);
+    } finally {
+      btnTest.disabled = false;
+      btnTest.textContent = '测试';
+    }
     load();
   });
   $('k-intake-go').addEventListener('click', () => intakeRegister());

@@ -356,6 +356,20 @@ pub async fn action(
     }
     let app_id = payload["app"].as_str().unwrap_or("").to_string();
     let name = payload["name"].as_str().unwrap_or("").to_string();
+    // 网络型动作：等响应的那几秒**不持全局锁**。以前整个 action 都持锁跑，
+    // 站点不通时一次 key_test 能把加载、建卡、保存全部挡在门外——
+    // 她测完 B.ai（连接超时）想录云知声，站点就是存不进去（2026-10-17 实测）。
+    // 这三个分支内部自己按「锁内快照 → 锁外探测 → 锁内重读落账」分段拿锁。
+    if matches!(act.as_str(), "key_test" | "key_probe_models" | "key_models") {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_action(&act, &app_id, &name, &payload, &state_ref)
+        }));
+        return Ok(match result {
+            Ok(v) => v,
+            Err(_) => err("内部错误：动作执行失败，详情见控制台"),
+        });
+    }
+    let _g = cmd_guard();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_action(&act, &app_id, &name, &payload, &state_ref)
     }));
@@ -445,25 +459,16 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             if reg::resolve_exe(&app).is_none() {
                 return err(format!("未找到 {} 可执行文件", app.name));
             }
-            if app.kind == "plain" {
-                return err(format!(
-                    "{} 不是 Chromium/Electron 程序，无法用独立数据目录多开；点「启动」可直接打开主程序",
-                    app.name
-                ));
-            }
             let existing: Vec<String> = reg::load_instances(app_id)
                 .iter()
                 .map(|m| m["name"].as_str().unwrap_or("").to_string())
                 .collect();
             // 向导会指定名字；没指定就自动取 账号N
             let wanted = payload["name"].as_str().unwrap_or("").trim().to_string();
-            if !wanted.is_empty()
-                && (wanted.contains("..")
-                    || wanted.contains('/')
-                    || wanted.contains('\\')
-                    || wanted.contains(':'))
-            {
-                return err("账号名不能含路径分隔符（/ \\ : ..）");
+            if !wanted.is_empty() {
+                if let Some(why) = reg::bad_account_name(&wanted) {
+                    return err(format!("账号名{why}，换个名字（比如只留汉字和字母）"));
+                }
             }
             let nm = if !wanted.is_empty() {
                 if existing.contains(&wanted) {
@@ -481,11 +486,22 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                 }
                 n
             };
-            // 数据来源：默认档案里那份"我一直在用的" > 已有账号里最近活跃的 > 空档。
-            // 以前一律建空目录，于是登进去是个没有对话也没有记忆的新号。
-            let origin_want = payload["origin"].as_str().unwrap_or("auto").trim().to_string();
-            let from_arg = payload["from"].as_str().map(PathBuf::from);
-            let (origin, src) = resolve_seed(app_id, &app.kind, &origin_want, from_arg);
+            // Marvis 这类原生桌面端（plain）：不支持独立数据目录，"多开一个账号窗口"
+            // 这件事本身就不存在。簿记卡＝把本机那份档案原位登记下来：数据就在程序
+            // 自己用的位置，驾驶舱不搬、不复制、不建镜像目录，打开一律走 launch_app。
+            // 以前这里一律拒建，她在向导最后一步点"确认无误，建这张卡"直接报错。
+            let plain_card = app.kind == "plain";
+            let (origin, src) = if plain_card {
+                // 卡就挂在程序自己那份档案上（~/.marvis 即使是个 junction 也照挂——
+                // 那就是程序的真实入口，换号系统从不对 plain 产品动手）
+                let prof = reg::profile_dir(app_id).or_else(|| {
+                    reg::resolve_exe(&app)
+                        .and_then(|e| e.parent().map(PathBuf::from))
+                });
+                ("adopt".to_string(), prof)
+            } else {
+                resolve_seed(app_id, &app.kind, &payload["origin"].as_str().unwrap_or("auto").trim().to_string(), payload["from"].as_str().map(PathBuf::from))
+            };
             // 接管＝原地登记：账号目录就是这个默认档案目录本身，不搬进 instances/。
             // 用户天天用的档案留在它本来的位置，驾驶舱只是给它起了个账号名。
             let data_dir = instance_data_dir(
@@ -496,7 +512,13 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             );
             // 认错目录（比如把别的程序的档案认成自己的）会让这张卡"认领"一个不属于它的目录，
             // 之后换号就是拿那个目录开刀。动手前把绝对路径摊出来问一句。
-            if adopt_needs_confirm(&origin, src.as_ref(), payload["confirm_adopt"].as_bool()) {
+            // plain 簿记卡不搬任何数据（目录就是程序自己那个），没有可认领错的东西，不问。
+            let adopt_confirm = if plain_card {
+                false
+            } else {
+                adopt_needs_confirm(&origin, src.as_ref(), payload["confirm_adopt"].as_bool())
+            };
+            if adopt_confirm {
                 let s = src.as_ref().cloned().unwrap_or_default();
                 return json!({
                     "ok": false,
@@ -507,9 +529,18 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                     "msg": "接管原有档案：这个账号直接用默认档案目录本身，不搬也不复制",
                 });
             }
-            let (used, note) = match space::seed_instance(&app_id, &data_dir, &origin, src.as_deref()) {
-                Ok(v) => v,
-                Err(e) => return err(e),
+            let (used, note) = if plain_card {
+                // 簿记卡一个字节都不碰：登录态、对话全在程序自己那份档案里，
+                // 驾驶舱只是把这个位置记在卡上
+                ("adopt".to_string(), format!(
+                    "已登记本机档案：{}（这个程序不能多开，这份档案所有账号共用，账号在客户端里切换）",
+                    data_dir.display()
+                ))
+            } else {
+                match space::seed_instance(&app_id, &data_dir, &origin, src.as_deref()) {
+                    Ok(v) => v,
+                    Err(e) => return err(e),
+                }
             };
             let mut meta = json!({
                 "name": nm, "app": app_id,
@@ -576,10 +607,22 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                     }
                 }
             }
-            reg::save_instance(app_id, &meta);
+            // 写盘失败必须当场说清楚：以前这里被 let _ = 吞掉，前端照到"已新建"，
+            // 磁盘上却没有文件，下一步换号才报"实例不存在"（DSH 2026-10-17 实测）
+            if let Err(e) = reg::save_instance_checked(app_id, &meta) {
+                return err(format!(
+                    "建卡失败：{}。账号名字里可能有这个系统不允许的字符，换个名字再试",
+                    e
+                ));
+            }
+            let extra = if plain_card {
+                "这个程序不支持独立数据目录，卡只作登记用；打开它会连本机这份档案".to_string()
+            } else {
+                note.clone()
+            };
             return json!({
                 "ok": true, "origin": used,
-                "msg": format!("已新建 {}「{}」。{}。", app.name, nm, note),
+                "msg": format!("已新建 {}「{}」。{}。", app.name, nm, extra),
             });
         }
 
@@ -1051,10 +1094,23 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             let store = match crate::local_quota::store_for(app_id) {
                 Some(s) => s,
                 // 清单从 LOCAL_STORES 现拼：写死名字表是第二份真值，加一家忘一家（这次就过期了）
-                None => return err(format!(
-                    "这个程序还没有本机直读通道（目前只支持：{}）",
-                    crate::local_quota::locally_readable_names()
-                )),
+                None => {
+                    // OpenCode 是例外中的例外：不是"没登记通道"，是这台机器上压根没有
+                    // 账号可读——~/.local/share/opencode/opencode.db 的 account 三表实测 0 行
+                    // （从未登录过官方账号），厂商也没有任何余额接口。 generic 的"没登记通道"
+                    // 会把这话说成"以后再支持"，那是空头支票，照实说。
+                    if app_id == "opencode" {
+                        return err(
+                            "OpenCode 在这台机器上没有账号可读：它的账号表实测 0 行（没登录过），\
+                             厂商也没有余额接口。登录态读不到不是你操作错了——先用它在官网/客户端\
+                             登录一次，再回来读。",
+                        );
+                    }
+                    return err(format!(
+                        "这个程序还没有本机直读通道（目前只支持：{}）",
+                        crate::local_quota::locally_readable_names()
+                    ));
+                }
             };
             // 读这个账号自己的档案目录（换号产品每个账号的数据就在自己的 data_dir 里）。
             // Qoder 系例外：登录态存在 %APPDATA%\QoderCN，实例目录空着时按目录读只会报"没登录过"，
@@ -1084,12 +1140,19 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             let bound_name = meta["quota_account"].as_str().unwrap_or("").to_string();
             let force = payload.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
             if !bound.is_empty() && bound != q.user_id && !force {
+                // 产品名从 registry 现取（照 locally_readable_names 的规矩，不写第二份真值）：
+                // 早先这句写死"本机 Qoder"，MiMo/Antigravity/Coze 这些同样整机一份的产品
+                // 中招时会指着别家的名字说话
+                let app_name = reg::app_def(app_id)
+                    .map(|a| a.name.to_string())
+                    .unwrap_or_else(|| "这个程序".to_string());
                 return json!({
                     "ok": false, "mismatch": true,
                     "msg": format!(
-                        "本机 Qoder 现在登的是「{}」，而这个档案绑的是「{}」。\n\
+                        "本机{}现在登的是「{}」，而这个档案绑的是「{}」。\n\
                          换号模式下这说明当前挂着的不是这个账号——要么先去驾驶舱把它换成号，\
                          要么确认这台机器上这个号就是这个档案。",
+                        app_name,
                         q.account, if bound_name.is_empty() { &q.user_id } else { &bound_name }),
                     "found": {
                         "account": q.account, "user_id": q.user_id,
@@ -1108,8 +1171,8 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                     return json!({
                         "ok": false, "already_bound": true,
                         "msg": format!(
-                            "本机当前登录的「{}」已经绑在「{}」上了。
-再绑到「{}」会让两个账号显示同一份余额。
+                            "本机当前登录的「{}」已经绑在「{}」上了。\n\
+                             再绑到「{}」会让两个账号显示同一份余额。\n\
                              要么先在驾驶舱把这个档案换成号再回来读，要么确认它们本来就是同一个号。",
                             q.account, other["name"].as_str().unwrap_or("?"), name),
                         "found": {
@@ -1157,15 +1220,31 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             } else if placeholder && !acct.is_empty() && !usable {
                 rename_note = "\n（用户名含不适合当目录名的字符，没自动改名）".to_string();
             }
-            let mut msg = format!(
-                "读到「{}」{}：剩 {} / {} {}，到期 {}",
-                q.account,
-                if q.user_type.is_empty() { String::new() } else { format!("（{}）", q.user_type) },
-                gfmt_opt(q.left),
-                gfmt_opt(q.total),
-                q.unit(),
-                if q.expires_on.is_empty() { "未给出" } else { &q.expires_on }
-            );
+            let mut msg = if q.is_account_only() {
+                // 只认到账号、没有余额数字的店（MiMo/Antigravity/Coze）：别说"剩 未给出 / 未给出"，
+                // 那是把"厂商根本没有余额"演示成"没读到"。agenthub 给的那句为什么照原样带上。
+                let why = if q.live_error.trim().is_empty() {
+                    "厂商没有可调的余额接口".to_string()
+                } else {
+                    q.live_error.clone()
+                };
+                format!(
+                    "读到「{}」{}：只认到了登录身份，额度读不到——{}",
+                    q.account,
+                    if q.user_type.is_empty() { String::new() } else { format!("（{}）", q.user_type) },
+                    why
+                )
+            } else {
+                format!(
+                    "读到「{}」{}：剩 {} / {} {}，到期 {}",
+                    q.account,
+                    if q.user_type.is_empty() { String::new() } else { format!("（{}）", q.user_type) },
+                    gfmt_opt(q.left),
+                    gfmt_opt(q.total),
+                    q.unit(),
+                    if q.expires_on.is_empty() { "未给出" } else { &q.expires_on }
+                )
+            };
             if q.exceeded {
                 msg.push_str(" · 已标记超额");
             }
@@ -1261,25 +1340,42 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                 Some(m) => m,
                 None => return err("实例不存在"),
             };
+            // 逐笔按天的序列单独算：Codex / Claude Code 的本机会话日志带时间戳，
+            // 聚得出"哪天用了多少"——热力图与波形图就靠它。读不到就不写这个字段，
+            // 前端整块不画，不摆空图。
+            let mut m = meta.clone();
+            let mut what;
             match crate::usage::compute(app_id, meta["data_dir"].as_str().unwrap_or("")) {
                 Some(u) => {
-                    let mut m = meta.clone();
                     m["usage"] = u.clone();
                     m["usage_fetched_at"] = json!(std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or(0.0));
-                    reg::save_instance(app_id, &m);
-                    ok(format!(
+                    what = format!(
                         "已汇总本地用量：入 {} / 出 {} / 共 {} tokens（{} 个会话）",
                         gfmt(u["input"].as_f64().unwrap_or(0.0)),
                         gfmt(u["output"].as_f64().unwrap_or(0.0)),
                         gfmt(u["total"].as_f64().unwrap_or(0.0)),
                         u["files"].as_i64().unwrap_or(0),
-                    ))
+                    );
                 }
-                None => err("没有可统计的本地会话日志（目前支持 Codex）"),
+                None => what = "没有可统计的本地会话总量".to_string(),
             }
+            match crate::usage::compute_trend(app_id, meta["data_dir"].as_str().unwrap_or("")) {
+                Some(t) => {
+                    m["quota_trend"] = t.clone();
+                    let n = t["days"].as_array().map(|a| a.len()).unwrap_or(0);
+                    what += &format!("；按天序列 {} 天（波形图 / 热力图已更新）", n);
+                }
+                // 读不到就不动这个字段：上一轮的序列继续有效，别用 null 把历史抹了
+                None => what += "；按天序列读不到（这个产品的日志没记逐笔时间）",
+            }
+            reg::save_instance(app_id, &m);
+            if what.starts_with("没有可统计") && !what.contains("已更新") {
+                return err(format!("{}。目前支持 Codex / Claude Code", what));
+            }
+            ok(what)
         }
 
         "swap_set" => {
@@ -1970,21 +2066,34 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         "key_test" => {
             let site = payload["site"].as_str().unwrap_or("");
             let id = payload["id"].as_str().unwrap_or("");
-            let (sobj, item) = match find_pair(site, id) {
-                Some(p) => p,
-                None => return Some(err("记录不存在")),
+            // ① 锁内快照：把 base 与 key 拿出来就撤，探测不持锁
+            let (base, key) = {
+                let _g = cmd_guard();
+                match find_pair(site, id) {
+                    Some((sobj, item)) => (
+                        keys::base_for(&sobj, &item),
+                        item["key"].as_str().unwrap_or("").to_string(),
+                    ),
+                    None => return Some(err("记录不存在")),
+                }
             };
-            let base = keys::base_for(&sobj, &item);
             if base.is_empty() {
                 return Some(err("这个站点还没有接入点——点「改站点」把 Base URL 填上（一个站可以有 OpenAI / Anthropic / DashScope 好几种口）"));
             }
-            let (good, msg, n) = keys::probe(&base, item["key"].as_str().unwrap_or(""));
-            let mut updated = item.clone();
-            updated["last_status"] = json!(if good { "ok" } else { "fail" });
-            updated["last_msg"] = json!(msg.clone());
-            updated["models"] = json!(n);
-            updated["last_check"] = json!(chrono::Local::now().format("%m-%d %H:%M").to_string());
-            keys::upsert_key(site, &updated);
+            // ② 锁外探测：站点不通时要等满超时，这几秒绝不许挡住别人加载、建卡、保存
+            let (good, msg, n) = keys::probe(&base, &key);
+            // ③ 锁内重读落账：这几十秒里记录可能被改过甚至删掉，只往最新那份上贴结果，
+            //    不整份覆盖——否则会把别人这期间的编辑冲掉
+            {
+                let _g = cmd_guard();
+                if let Some((_, mut item)) = find_pair(site, id) {
+                    item["last_status"] = json!(if good { "ok" } else { "fail" });
+                    item["last_msg"] = json!(msg.clone());
+                    item["models"] = json!(n);
+                    item["last_check"] = json!(chrono::Local::now().format("%m-%d %H:%M").to_string());
+                    keys::upsert_key(site, &item);
+                }
+            }
             if good { ok(msg) } else { err(msg) }
         }
 
@@ -2016,7 +2125,7 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
                     Err(e) => return Some(err(format!("响应不是合法 JSON：{}", e))),
                 },
                 Err(ureq::Error::Status(c, _)) => return Some(err(format!("HTTP {}", c))),
-                Err(e) => return Some(err(format!("抓取失败：{}", e))),
+                Err(e) => return Some(err(keys::friendly_net_err(&e, 20))),
             };
             // OpenAI 风格 data[].id / Anthropic 风格 data[].id，都兼容
             let models: Vec<String> = body["data"]

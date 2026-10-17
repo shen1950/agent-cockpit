@@ -781,7 +781,9 @@ pub fn probe(base_url: &str, key: &str) -> (bool, String, usize) {
     } else {
         format!("{}/v1/models", base)
     };
-    let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(20));
+    // 测活是随手点的动作，超时压到 10 秒：站点不通时干等 20 秒太磨人
+    // （B.ai 连不上那次，光一次测试就把整个后端锁了 20 秒）
+    let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(10));
     if !key.is_empty() {
         req = req.set("Authorization", &format!("Bearer {}", key));
     }
@@ -795,7 +797,20 @@ pub fn probe(base_url: &str, key: &str) -> (bool, String, usize) {
             (true, format!("可用（列出 {} 个模型）", n), n)
         }
         Err(ureq::Error::Status(code, _)) => (false, format!("HTTP {}", code), 0),
-        Err(e) => (false, e.to_string(), 0),
+        Err(e) => (false, friendly_net_err(&e, 10), 0),
+    }
+}
+
+/// 网络错误翻译成人话：超时（Windows 上表现为 os error 10060）要说清
+/// "等久了没连上"，别把系统错误号原样怼到脸上
+pub fn friendly_net_err(e: &ureq::Error, secs: u64) -> String {
+    let s = e.to_string();
+    if s.contains("timed out") || s.contains("timeout") || s.contains("10060") || s.contains("10061") {
+        format!("连接超时（{} 秒没连上）——站点可能暂时不可达，稍后再试", secs)
+    } else if s.contains("Connection refused") || s.contains("10061") {
+        format!("连接被拒——站点没在监听这个端口：{}", s)
+    } else {
+        s
     }
 }
 
@@ -835,7 +850,7 @@ pub fn probe_models(base_url: &str, key: &str) -> (bool, String, Vec<String>) {
             )
         }
         Err(ureq::Error::Status(code, _)) => (false, format!("HTTP {code}"), Vec::new()),
-        Err(e) => (false, e.to_string(), Vec::new()),
+        Err(e) => (false, friendly_net_err(&e, 20), Vec::new()),
     }
 }
 

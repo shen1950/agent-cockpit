@@ -164,6 +164,15 @@ pub fn apps() -> Vec<AppDef> {
               "{LOCALAPPDATA}/Programs/Antigravity/Antigravity.exe",
               "{PROGRAMFILES}/Antigravity/Antigravity.exe"], "",
             Some("{APPDATA}/Antigravity"), true),
+        // Coze（扣子，字节）：Electron（LICENSE.electron.txt + chrome_*.pak + locales 实测在），
+        // 但它是 app_shell 多版本架构（顶层 Coze.exe 是启动器，实体在 versions\<版本>\），
+        // 且 userData 在 {APPDATA}\Coze。登录态读得到（分区 localStorage 里的 userId），
+        // 没有余额接口——照 MiMo 的规矩只出账号，见 local_quota::LOCAL_STORES 注释。
+        // isolatable=false：没实测 --user-data-dir 对这个壳生不生效，按规矩先收 false。
+        curated("coze", "Coze", "electron",
+            &["{LOCALAPPDATA}/Programs/Coze/Coze.exe",
+              "D:/Artificial_Intelligence/Coze/Coze.exe"], "",
+            Some("{APPDATA}/Coze"), false),
         curated("cursor", "Cursor", "electron",
             &["{LOCALAPPDATA}/Programs/cursor/Cursor.exe",
               "{LOCALAPPDATA}/Programs/Cursor/Cursor.exe",
@@ -660,6 +669,7 @@ pub fn short_name(app_id: &str) -> &'static str {
         "opencode" => "OC",
         // 2026-10-16 补齐的那批：首字母会撞（T/C/Q 各三家），所以都留两三个字母
         "antigravity" => "AG",
+        "coze" => "CZ",
         "cursor" => "CU",
         "kiro" => "KI",
         "windsurf" => "WS",
@@ -1350,42 +1360,83 @@ pub fn find_instance(app_id: &str, name: &str) -> Option<Value> {
         .find(|m| m["name"].as_str() == Some(name))
 }
 
-pub fn save_instance(app_id: &str, meta: &Value) {
-    let dir = instances_dir(app_id);
-    let _ = fs::create_dir_all(&dir);
-    if let Some(name) = meta["name"].as_str() {
-        // 账号名直接拼进文件名，必须挡住路径分隔符，防止越界写盘
-        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-            return;
+/// 账号名直接当文件名用（`instances/<产品>/<名字>.json`），Windows 文件名禁用的
+/// 字符必须一票否决：`< > : " | ? *` 加控制字符，尾部的点和空格也不行。
+/// 以前只挡了 `/ \ : ..`——向导拿打码账号名（`rl1******741@163.com` 这种带 `*` 的）
+/// 预填卡名时直接漏过去，写盘那步又被 `let _ =` 吞掉，卡"建好了"、磁盘上没有，
+/// 下一步换号才报"实例不存在"（DSH 2026-10-17 实测）。返回 None＝名字可以用。
+pub fn bad_account_name(name: &str) -> Option<String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Some("不能为空".to_string());
+    }
+    for ch in n.chars() {
+        if matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\') {
+            return Some(format!("不能含 {}（这个系统的文件名不认）", ch));
         }
-        let mut clean = meta.as_object().cloned().unwrap_or_default();
-        clean.remove("_file");
-        // token 落盘前先收进保管箱。保管箱锁着（有主密码还没解锁）时不能删字段，
-        // 也不能把"补不出来的空值"当成用户清空——那会把真凭据抹掉。
-        let token = clean
-            .get("token")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let held = crate::secrets::available();
-        if !token.is_empty() {
-            if held && crate::secrets::put(&token_id(app_id, name), &token) {
-                clean.remove("token");
-                clean.insert("token_held".into(), json!(true));
-                let _ = crate::secrets::flush();
-            }
-        } else if held {
-            clean.remove("token_held");
-            crate::secrets::remove(&token_id(app_id, name));
+        if (ch as u32) < 0x20 {
+            return Some("不能含控制字符（看起来像空格的怪字符）".to_string());
+        }
+    }
+    if n.contains("..") {
+        return Some("不能含 ..".to_string());
+    }
+    if n.ends_with('.') || n.ends_with(' ') {
+        return Some("结尾不能是点或空格".to_string());
+    }
+    if n.chars().count() > 40 {
+        return Some("太长了（最多 40 个字）".to_string());
+    }
+    None
+}
+
+pub fn save_instance(app_id: &str, meta: &Value) {
+    if let Err(e) = save_instance_checked(app_id, meta) {
+        // 后台刷新路径不该为一次写失败中断，但必须留下痕迹——静默吞掉
+        // 就是当年 DSH"建卡成功却找不到卡"的成因
+        eprintln!("[registry] 账号文件没写成：{e}");
+    }
+}
+
+/// 和 save_instance 同一套落盘逻辑，但把失败原因交回调用方。
+/// 建卡（new_instance）这条路必须用这个：以前写盘失败被 `let _ =` 吞掉，
+/// 前端照到"已新建"，磁盘上却没有文件，下一步换号才报"实例不存在"。
+pub fn save_instance_checked(app_id: &str, meta: &Value) -> Result<(), String> {
+    let dir = instances_dir(app_id);
+    fs::create_dir_all(&dir).map_err(|e| format!("建账号目录失败：{e}"))?;
+    let Some(name) = meta["name"].as_str() else {
+        return Err("账号记录里没有名字".to_string());
+    };
+    if let Some(why) = bad_account_name(name) {
+        return Err(format!("账号名{why}（当前：{name}）"));
+    }
+    let mut clean = meta.as_object().cloned().unwrap_or_default();
+    clean.remove("_file");
+    // token 落盘前先收进保管箱。保管箱锁着（有主密码还没解锁）时不能删字段，
+    // 也不能把"补不出来的空值"当成用户清空——那会把真凭据抹掉。
+    let token = clean
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let held = crate::secrets::available();
+    if !token.is_empty() {
+        if held && crate::secrets::put(&token_id(app_id, name), &token) {
+            clean.remove("token");
+            clean.insert("token_held".into(), json!(true));
             let _ = crate::secrets::flush();
         }
-        let v = Value::Object(clean);
-        let _ = fs::write(
-            dir.join(format!("{}.json", name)),
-            serde_json::to_string_pretty(&v).unwrap_or_default(),
-        );
+    } else if held {
+        clean.remove("token_held");
+        crate::secrets::remove(&token_id(app_id, name));
+        let _ = crate::secrets::flush();
     }
+    let v = Value::Object(clean);
+    let path = dir.join(format!("{}.json", name));
+    let body = serde_json::to_string_pretty(&v).map_err(|e| format!("账号记录序列化失败：{e}"))?;
+    fs::write(&path, body).map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
+    Ok(())
 }
 
 /// 一个账号可能出现在进程命令行里的所有路径写法：

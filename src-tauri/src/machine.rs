@@ -42,6 +42,17 @@ pub fn read(app_id: &str) -> Value {
         None => {
             // 把原因说明白：不是"没登录成功"，是这个产品根本没登记直读通道——
             // 早先只回 unsupported 没有话术，向导里落成一句没头没尾的"读不到登录状态"
+            // OpenCode 例外（2026-10-18）：不是没登记通道，是这台机器上压根没有账号——
+            // ~/.local/share/opencode/opencode.db 的 account 三表实测 0 行，厂商也没有
+            // 余额接口。generic 那句"没登记通道"会暗示"以后会支持"，那是空头支票，照实说。
+            if app_id == "opencode" {
+                return json!({
+                    "ok": false, "unsupported": true, "app": app_id,
+                    "msg": "OpenCode 在这台机器上没有账号可读：它的账号表实测 0 行（没登录过），\
+                           厂商也没有余额接口。登录态读不到不是你操作错了——先用它在官网/客户端\
+                           登录一次，再回来读。",
+                });
+            }
             return json!({
                 "ok": false, "unsupported": true, "app": app_id,
                 "msg": "这个程序没有登记本机直读通道，登录态读不了（不是你没登录成功）",
@@ -72,6 +83,9 @@ pub fn read(app_id: &str) -> Value {
                 "left": q.left, "total": q.total, "expires_on": q.expires_on,
                 "source": q.source, "stale": q.is_stale(), "live_error": q.live_error,
                 "auth_from": q.auth_from,
+                // 只有登录身份、没有余额接口的店（MiMo/Antigravity/Coze）：
+                // 向导据此说"只认到了登录身份"，而不是"剩 0 / 共 0"
+                "account_only": q.is_account_only(),
                 // 逐笔积分也带上：向导在建卡之前就要把额度摊给人看，那时还没有卡片可写
                 "portions": q.portions,
                 "profile_dir": dir.to_string_lossy(),
