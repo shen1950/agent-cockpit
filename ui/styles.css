@@ -1680,3 +1680,27 @@ svg.wave { display: block; width: 100%; height: 150px }
 .cl-r.ok { color: var(--ok) }
 .cl-r.bad { color: var(--danger) }
 .cl-r.mid { color: var(--text-muted) }
+
+/* ------------------------------------------------------------
+   侧栏「管理」那一截：压缩时只留一个滚动条（2026-10-17）
+   以前外层 .side-fixed 和里层 #viewlist 各有一个 overflow-y，
+   滚一下"管理"两个字就被分割线切掉半截、底下也切一条——
+   她说的"上下总是被遮盖"就是这个。
+   现在：外层不滚、标题钉住，只有列表自己滚；高度又吸附到整条菜单，
+   所以看到的永远是 N 条完整的菜单，不会出现半条。
+   ------------------------------------------------------------ */
+.sidebar.split .side-fixed { overflow: hidden }
+.sidebar.split .side-fixed > .sidehead { flex: 0 0 auto }
+.sidebar.split #viewlist {
+  flex: 1 1 auto; min-height: 0; max-height: none;
+  overflow-y: auto; scrollbar-gutter: stable;
+}
+
+/* 列表项不许被压扁（2026-10-17）
+   `.applist` 是 flex column，项默认 `flex-shrink: 1`——容器一变矮，
+   菜单就被等比压扁（不是滚动），于是看到的是"每条都变矮、上下都被切掉一点"。
+   她说的"上下总是被遮盖"有一半是这个。定死 `flex: none`，让它老老实实滚动。 */
+.applist > li { flex: 0 0 auto }
+/* 压缩状态下滚动要落在整条上，不能停在半条 */
+.sidebar.split #viewlist { scroll-snap-type: y mandatory }
+.sidebar.split #viewlist > li { scroll-snap-align: start }
