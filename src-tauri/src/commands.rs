@@ -1502,6 +1502,23 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
 /// 用不到的放这边，在守卫之前就走完。别图省事往 run_action 里加新动作：那边第一道
 /// 门就要求"选中某个 Agent"，台账和设置页里的动作不带 app，一点就弹「未选择 Agent」
 /// （这个坑踩过三次：存储页、AI 拉模型、API 台账）。
+/// `ids: [{site, id}]` → Vec<(site, id)>。批量那几个动作共用。
+fn ids_of(payload: &Value) -> Vec<(String, String)> {
+    payload["ids"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    Some((
+                        x["site"].as_str()?.to_string(),
+                        x["id"].as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
     let v = match act {
         // ===== 数据根与空间治理 =====
@@ -1630,6 +1647,66 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         // view 用缓存（界面 4 秒一轮不能每次都打六家接口），refresh 才真去查
         "checkin_view" => crate::checkin::view(),
         "checkin_refresh" => crate::checkin::refresh(),
+        // 只重查一家（或一个账号）：她把这一行的 ↻ 点一下，不要为了一行去问六家
+        "checkin_refresh_one" => {
+            let store = payload["store"].as_str().unwrap_or("");
+            let acct = payload["account"].as_str().unwrap_or("");
+            let app = payload["app"].as_str().unwrap_or("");
+            let pair = if acct.is_empty() || app.is_empty() {
+                None
+            } else {
+                Some((app, acct))
+            };
+            crate::checkin::refresh_one(store, pair)
+        }
+
+        // 登录并领取：拉起客户端 + 登记一条待办，之后由后台每 5 秒回来看一眼、
+        // 一能领就替她领掉。这里**不等**——等她登录是几十秒到几分钟的事，
+        // 同步等会把整条命令锁占住，界面上别的按钮全得排队。
+        "checkin_login_claim" => {
+            let store = payload["store"].as_str().unwrap_or("");
+            let acct = payload["account"].as_str().unwrap_or("");
+            // 这一组动作不挂某个"当前选中产品"（app_free 里没有 app_id），
+            // 所以 app id 必须由界面显式带上：store 名与 app id 不是一回事
+            // （Trae 两边分别叫 trae-cn / traework-cn）。
+            let id = payload["app"].as_str().unwrap_or("");
+            let app = match reg::app_def(id) {
+                Some(a) => a,
+                None => return Some(err("未知 Agent，没法拉起客户端")),
+            };
+            let exe = match reg::resolve_exe(&app) {
+                Some(e) => e,
+                None => {
+                    return Some(err(format!(
+                        "没找到 {} 的可执行文件（{}），先装它再登录",
+                        app.name,
+                        app.exes.first().cloned().unwrap_or_default()
+                    )))
+                }
+            };
+            // 已经在跑就不重复起（重复起会把已有窗口抢到前台，看着像"点了好几次才开"）
+            let snap = crate::procs::snapshot_fresh();
+            let live = crate::procs::program_pids(&reg::exe_name(&app).to_lowercase(), &snap);
+            let launched = if live.is_empty() {
+                let r = if app.kind == "cli" {
+                    crate::procs::launch_terminal(&exe).map(|_| ())
+                } else {
+                    crate::procs::launch_plain(&exe).map(|_| ())
+                };
+                match r {
+                    Ok(_) => true,
+                    Err(e) => return Some(err(format!("启动 {} 失败：{}", app.name, e))),
+                }
+            } else {
+                false
+            };
+            let mut v = crate::checkin::want_claim(id, store, acct);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("launched".into(), json!(launched));
+            }
+            v
+        }
+
         "checkin_claim" => {
             // account 给了就是"领这个号那一份"：签到页按账号展开之后，两个号各有各的
             // 当日名额，不能都落到"当前登着的那个号"头上
@@ -1809,6 +1886,46 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         "key_dedup_scan" => {
             let (locked, groups) = keys::dedup_scan();
             json!({ "ok": true, "locked": locked, "groups": groups })
+        }
+
+        // 批量改属性：ids = [{site, id}]，patch 里出现哪些字段就改哪些。
+        // 站点内勾一批 → 改用途 / 改过期日 / 改模型清单 / 开关进反代，一次落盘。
+        "key_batch_update" => {
+            let pairs = ids_of(&payload);
+            let patch = payload.get("patch").cloned().unwrap_or_else(|| json!({}));
+            if pairs.is_empty() {
+                return Some(err("没勾任何要改的 key"));
+            }
+            if patch.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                return Some(err("没说要改什么"));
+            }
+            let (n, misses) = keys::update_keys_batch(&pairs, &patch);
+            let mut m = format!("已改 {n} 条");
+            if !misses.is_empty() {
+                m.push_str(&format!("，{} 条没找到（可能已被删）", misses.len()));
+            }
+            if n > 0 { ok(m) } else { err("一条都没改到") }
+        }
+
+        // 批量移到另一个站点：原站点删、目标站点按原 id 追加，已有同一条原文的跳过
+        "key_batch_move" => {
+            let pairs = ids_of(&payload);
+            let target = payload["target"].as_str().unwrap_or("");
+            if pairs.is_empty() {
+                return Some(err("没勾任何要挪的 key"));
+            }
+            if target.is_empty() {
+                return Some(err("没选要挪到哪个站点"));
+            }
+            let (moved, dupes, dupe_names, misses) = keys::move_keys_batch(&pairs, target);
+            if moved == 0 && dupe_names.is_empty() && !misses.is_empty() {
+                return Some(err(misses.join("；")));
+            }
+            let mut m = format!("已挪过去 {moved} 条");
+            if dupes > 0 {
+                m.push_str(&format!("；{} 条目标站里已经有了，跳过（{}）", dupes, dupe_names.join("、")));
+            }
+            ok(m)
         }
 
         // 批量删除：ids = [{site, id}]，一次读盘写盘

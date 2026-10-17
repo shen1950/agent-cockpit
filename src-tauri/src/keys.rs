@@ -668,6 +668,105 @@ pub fn remove_keys_batch(pairs: &[(String, String)]) -> (usize, Vec<String>) {
     (dead.len(), misses)
 }
 
+/// 批量改同几个字段：`patch` 里出现哪些键就改哪些。
+///
+/// 只认"可以批量改"的字段——**id / key 原文 / masked 一律不许批量动**：
+/// 把一批 key 原文改成同一个不是功能，是把一堆号改成同一个的事故。
+/// 她 2026-10-17 要的是"像管理购物车那样，批量勾选之后能做单个 key 能做的一切"，
+/// 所以这里把单个 key 表单里那几个可改字段全放开了：用途、过期日、备注、模型清单、
+/// 是否进反代、接入点覆盖。
+pub fn update_keys_batch(pairs: &[(String, String)], patch: &Value) -> (usize, Vec<String>) {
+    const ALLOW: &[&str] = &[
+        "label", "expires_on", "note", "models_list", "use_in_proxy", "base_url",
+    ];
+    let mut items = sites();
+    let mut n = 0usize;
+    let mut misses: Vec<String> = Vec::new();
+    for (sid, kid) in pairs {
+        let mut hit = false;
+        if let Some(p) = find_site_mut(&mut items, sid) {
+            let mut ks = p["keys"].as_array().cloned().unwrap_or_default();
+            if let Some(k) = ks.iter_mut().find(|k| k["id"].as_str() == Some(kid.as_str())) {
+                if let Some(o) = k.as_object_mut() {
+                    for f in ALLOW {
+                        if let Some(v) = patch.get(*f) {
+                            o.insert((*f).to_string(), v.clone());
+                        }
+                    }
+                    hit = true;
+                    n += 1;
+                }
+            }
+            let len = ks.len();
+            p["keys"] = json!(ks);
+            p["key_count"] = json!(len);
+        }
+        if !hit {
+            misses.push(kid.clone());
+        }
+    }
+    if n > 0 {
+        save(&items);
+    }
+    (n, misses)
+}
+
+/// 把一批 key 挪到另一个站点：原站点删掉、目标站点按**原 id** 追加。
+/// 原 id 不变，反代与"接入到程序"那边记的账就不会断。
+/// 目标站里已经有同一条 key 原文的，跳过并记进 `dupes`——否则台账里又长一条重复。
+pub fn move_keys_batch(
+    pairs: &[(String, String)],
+    target: &str,
+) -> (usize, usize, Vec<String>, Vec<String>) {
+    let mut items = sites();
+    if !items.iter().any(|p| p["id"].as_str() == Some(target)) {
+        return (0, 0, Vec::new(), vec!["目标站点不存在".into()]);
+    }
+    let mut picked: Vec<Value> = Vec::new();
+    let mut misses: Vec<String> = Vec::new();
+    for (sid, kid) in pairs {
+        let mut taken: Option<Value> = None;
+        if let Some(p) = find_site_mut(&mut items, sid) {
+            let mut ks = p["keys"].as_array().cloned().unwrap_or_default();
+            if let Some(pos) = ks.iter().position(|k| k["id"].as_str() == Some(kid.as_str())) {
+                taken = Some(ks.remove(pos));
+            }
+            let len = ks.len();
+            p["keys"] = json!(ks);
+            p["key_count"] = json!(len);
+        }
+        match taken {
+            Some(k) => picked.push(k),
+            None => misses.push(kid.clone()),
+        }
+    }
+    let mut moved = 0usize;
+    let mut dupes: Vec<String> = Vec::new();
+    if let Some(t) = find_site_mut(&mut items, target) {
+        let mut ks = t["keys"].as_array().cloned().unwrap_or_default();
+        for k in picked {
+            let kt = k["key"].as_str().unwrap_or("").trim().to_string();
+            let dup = !kt.is_empty()
+                && ks
+                    .iter()
+                    .any(|x| x["key"].as_str().unwrap_or("").trim() == kt);
+            if dup {
+                dupes.push(k["label"].as_str().unwrap_or("未命名").to_string());
+                continue;
+            }
+            ks.push(k);
+            moved += 1;
+        }
+        let len = ks.len();
+        t["keys"] = json!(ks);
+        t["key_count"] = json!(len);
+    }
+    if moved > 0 || !misses.is_empty() {
+        save(&items);
+    }
+    (moved, dupes.len(), dupes, misses)
+}
+
 /// 用 GET {base}/v1/models 测活；返回 (可用?, 说明, 模型数)
 pub fn probe(base_url: &str, key: &str) -> (bool, String, usize) {
     let base = base_url.trim().trim_end_matches('/');

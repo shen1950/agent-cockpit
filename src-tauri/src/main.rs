@@ -282,12 +282,20 @@ fn quota_watch_loop(app: tauri::AppHandle) {
 /// （它自己看总开关、时间窗、"今天跑过没有"），所以这里只是让它有机会被更及时地调到。
 fn checkin_loop(app: tauri::AppHandle) {
     std::thread::sleep(Duration::from_secs(6));
+    // 两种节奏：全量查（六家接口，5 分钟一轮）与「登录并领取」的待办（5 秒一轮）。
+    // 待办不能等到下一轮全量——她点了「登录并领取」就在盯着那一行，等 5 分钟等于没做
+    // （2026-10-17 她说的"我打开之后还要点一次领取，那我要你干什么"）。
+    let mut slot = 0u32;
     loop {
-        let _ = checkin::refresh();
-        checkin::tick(&app);
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_secs(15));
+        if checkin::want_count() > 0 {
+            checkin::poll_wants();
         }
+        if slot % 60 == 0 {
+            let _ = checkin::refresh();
+            checkin::tick(&app);
+        }
+        slot = slot.wrapping_add(1);
+        std::thread::sleep(Duration::from_secs(5));
     }
 }
 

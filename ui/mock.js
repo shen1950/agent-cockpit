@@ -424,6 +424,16 @@ const CI_ITEMS = [
     signed_today: true, claimable: false, reward: 100, extra: 100, unit: '积分' },
   { product: 'minimax', supported: true, auto: true, activity_on: true, signed_today: true,
     claimable: false, streak: 6, reward: 400, unit: '积分' },
+  // MiniMax 在这台机器上有两个号，但登录态整机一份——账号行只能是占位行（shared），
+  // 这正是 2026-10-17 要求的"通用管理"：不是只有 Qoder CN 才展开
+  { product: 'minimax', scope: 'account', parent: 'minimax', account: 'acct-A',
+    supported: true, auto: false, activity_on: true, signed_today: null, claimable: false,
+    shared: true, unit: '积分',
+    note: '这个产品的登录态是整机一份，换号会覆盖前一个；签到状态要在切到该号之后才读得到' },
+  { product: 'minimax', scope: 'account', parent: 'minimax', account: 'acct-B',
+    supported: true, auto: false, activity_on: true, signed_today: null, claimable: false,
+    shared: true, unit: '积分',
+    note: '这个产品的登录态是整机一份，换号会覆盖前一个；签到状态要在切到该号之后才读得到' },
   { product: 'qoder-cn', supported: true, auto: false, activity_on: false, signed_today: false,
     claimable: false, streak: 0, reward: 100, unit: '积分', campaign: 'cn_daily_check_in_legacy' },
   // 账号级子行（`scope:"account"` + `parent`）：只有"每个号都留着自己那份登录态"的
@@ -445,8 +455,16 @@ const CI_LABEL = {
   minimax: 'MiniMax Code', 'qoder-cn': 'Qoder CN', qoder: 'Qoder', astudio: 'AStudio',
   'workbuddy-activity': 'WorkBuddy 活跃地图', 'workbuddy-travel': 'WorkBuddy 旅行猫',
 };
+// store 名 → app id（真机上 Trae 两边叫 trae-cn / traework-cn，这里照同一张表写）
+const CI_APP = {
+  workbuddy: 'workbuddy', 'workbuddy-intl': 'workbuddy-intl',
+  'workbuddy-activity': 'workbuddy', 'workbuddy-travel': 'workbuddy',
+  'trae-cn': 'traework-cn', minimax: 'minimax', astudio: 'astudio',
+  'qoder-cn': 'qoder-cn', qoder: 'qoder',
+};
 CI_ITEMS.forEach((x) => {
   // 账号行的标题是账号名（后端 refresh 里就是这么改的），别被产品名盖掉
+  x.app = CI_APP[x.product] || x.product;
   x.name = x.scope === 'account' ? x.account : (CI_LABEL[x.product] || x.product);
   x.today = new Date().toISOString().slice(0, 10);
   x.hour = new Date().getHours();
@@ -625,6 +643,36 @@ window.__TAURI__ = {
         return Promise.resolve({ ok: true, msg: '拉到 7 个模型（演示数据）',
           models: ['gpt-5.5', 'gpt-5.5-mini', 'claude-opus-4-6', 'claude-sonnet-4-6',
             'deepseek-v4', 'glm-5', 'kimi-k3'] });
+      }
+      // 站点内批量管理（勾选 / 全选 / 改属性 / 移动 / 删除）——演示数据下也要能点通，
+      // 否则前端那条路一改就没人验证得到（2026-10-17 加的）
+      if (cmd === 'action' && args.payload?.action === 'key_dedup_scan') {
+        const site = (DATA.keys || [])[0] || { id: 'p-longcat', name: 'LongCat' };
+        const ks = (site.keys || []).slice(0, 4);
+        const groups = ks.length >= 3 ? [{
+          masked: ks[0].masked || 'sk-ws••••nBzS',
+          site_name: site.name, count: ks.length,
+          entries: ks.map((k, i) => ({
+            site: site.id, site_name: site.name, id: k.id, label: k.label || `用途${i + 1}`,
+            masked: k.masked, days_left: k.days_left, last_status: k.last_status,
+            use_in_proxy: k.use_in_proxy,
+          })),
+        }] : [];
+        return Promise.resolve({ ok: true, locked: false, groups });
+      }
+      if (cmd === 'action' && (args.payload?.action === 'key_batch_update'
+        || args.payload?.action === 'key_batch_move'
+        || args.payload?.action === 'key_delete_batch'
+        || args.payload?.action === 'key_test')) {
+        const p = args.payload || {};
+        const n = (p.ids || []).length || 1;
+        return Promise.resolve({
+          ok: true,
+          msg: p.action === 'key_batch_move' ? `已挪过去 ${n} 条（演示数据）`
+            : p.action === 'key_batch_update' ? `已改 ${n} 条（演示数据）`
+              : p.action === 'key_delete_batch' ? `已删除 ${n} 条（演示数据）`
+                : '可用（演示数据）',
+        });
       }
       if (cmd === 'action' && args.payload?.action === 'key_upsert') {
         // 真后端会回最终站点 id（同名/同站族会并站），界面靠它接着往下走

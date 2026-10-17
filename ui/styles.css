@@ -1442,7 +1442,8 @@ svg.wave { display: block; width: 100%; height: 150px }
    说明行与开关条也在同一列宽里，不再上宽下窄 */
 .cipad { max-width: 900px; margin: 0 auto; padding: 4px 2px 26px }
 .citab { display: grid; column-gap: 0; row-gap: 0;
-  grid-template-columns: minmax(126px, 1.4fr) 82px 74px 96px 74px 128px 96px 52px 46px; }
+  /* 2026-10-17 加第 10 列「刷新」：每行一个 ↻，只重查这一家 */
+  grid-template-columns: minmax(126px, 1.4fr) 82px 74px 96px 74px 128px 96px 52px 46px 52px; }
 .citab > * { padding: 11px 8px; min-width: 0 }
 /* 一行一条分隔线，跨满九列。以前是每格各画一条，而 .ci-badge/.ci-act/.cick 带
    align-self:center（盒子只有内容高），线就落在各自文字底下，
@@ -1463,11 +1464,12 @@ svg.wave { display: block; width: 100%; height: 150px }
 .ci-err { grid-column: 3 / -1; font-size: 11px; color: var(--danger);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 /* 表头跟着所在列的对齐方式走：状态/操作/两个勾选列居中，四个数字列右对齐。
-   每行固定九格（读不到那行也补齐九格），所以 9n+k 能稳定命中列 */
-.citab > .ci-h:nth-child(9n+2), .citab > .ci-h:nth-child(9n+7),
-.citab > .ci-h:nth-child(9n+8), .citab > .ci-h:nth-child(9n+9) { text-align: center }
-.citab > .ci-h:nth-child(9n+3), .citab > .ci-h:nth-child(9n+4),
-.citab > .ci-h:nth-child(9n+5), .citab > .ci-h:nth-child(9n+6) { text-align: right }
+   每行固定十格（读不到那行也补齐十格），所以 10n+k 能稳定命中列 */
+.citab > .ci-h:nth-child(10n+2), .citab > .ci-h:nth-child(10n+7),
+.citab > .ci-h:nth-child(10n+8), .citab > .ci-h:nth-child(10n+9),
+.citab > .ci-h:nth-child(10n+10) { text-align: center }
+.citab > .ci-h:nth-child(10n+3), .citab > .ci-h:nth-child(10n+4),
+.citab > .ci-h:nth-child(10n+5), .citab > .ci-h:nth-child(10n+6) { text-align: right }
 
 /* ============================================================
    首页（落地页）
@@ -1580,3 +1582,71 @@ svg.wave { display: block; width: 100%; height: 150px }
   width: 7px; height: 1px; background: var(--line);
 }
 .ci-name.acc .ci-note { display: none }
+
+/* ------------------------------------------------------------
+   侧栏管理区的拖拽手柄（2026-10-17 重做）
+   以前只有一条 1px 的线，看不出能拖、也看不出往哪拖。
+   现在：常驻三颗小点（抓手），hover 变宽变亮，拖动中在右侧浮一个像素读数。
+   ------------------------------------------------------------ */
+.side-resize { height: 13px; margin-top: 2px }
+.side-resize::before { inset: 6px 0 auto }
+/* 抓手：三颗 2px 的点，告诉人"这里能上下拉" */
+.side-resize::after {
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: 22px; height: 7px; transform: translate(-50%, -50%);
+  background-image: radial-gradient(circle, var(--text-faint) 1px, transparent 1.2px);
+  background-size: 6px 7px; background-position: 1px 0;
+  border-radius: 4px; opacity: .5; transition: opacity .14s ease;
+  pointer-events: none;
+}
+.side-resize:hover::after, .side-resize.dragging::after { opacity: 1 }
+/* 拖动中的像素读数：贴在横线右上，跟着手走，不用等松手才知道拖了多少 */
+.side-resize[data-readout]:not([data-readout=""])::after {
+  content: attr(data-readout);
+  width: auto; height: auto; background-image: none;
+  left: auto; right: 8px; top: -20px; transform: none;
+  padding: 1px 6px; border-radius: 5px;
+  background: var(--accent); color: #fff; font-size: 11px;
+  font-variant-numeric: tabular-nums; opacity: 1;
+}
+
+/* 每行末尾那颗 ↻：只重查这一行，不动别的行（2026-10-17） */
+.ci-ref { justify-self: center; align-self: center }
+.ci-refresh {
+  width: 26px; height: 26px; padding: 0; border-radius: 50%;
+  border: 1px solid var(--line); background: var(--bg-raised);
+  color: var(--text-muted); font: inherit; font-size: 14px; line-height: 1;
+  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+}
+.ci-refresh:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft) }
+.ci-refresh.spin { animation: ci-spin .8s linear infinite; color: var(--accent) }
+@keyframes ci-spin { to { transform: rotate(360deg) } }
+/* 共用登录态那一行：整行淡一点，别跟读到了数的行一样显眼 */
+.ci-badge.off { color: var(--text-muted); background: var(--bg-sunken) }
+
+/* ------------------------------------------------------------
+   API 站点内批量管理（2026-10-17）
+   勾选列 + 顶部操作条。操作条 sticky 在内容区顶部，滚动时不会跑丢。
+   ------------------------------------------------------------ */
+.tbl.keys th.k-sel, .tbl.keys td.k-sel { width: 34px; padding-left: 4px; padding-right: 0; text-align: center }
+.ksel-cb { width: 14px; height: 14px; accent-color: var(--accent); cursor: pointer }
+.tbl.keys tbody tr.sel { background: var(--accent-soft) }
+.kselbar {
+  position: sticky; top: 0; z-index: 6;
+  display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+  margin: 0 0 var(--sp-3); padding: 9px var(--sp-3);
+  background: var(--bg-raised); border: 1px solid var(--accent);
+  border-radius: var(--r-md); box-shadow: 0 6px 20px rgba(0, 0, 0, .12);
+}
+.kselbar .ksel-n { font-size: 12.5px; font-weight: 650; color: var(--accent) }
+.kselbar .sp { flex: 1 1 auto }
+.ksel-target {
+  height: 26px; padding: 0 6px; font: inherit; font-size: 12px;
+  color: var(--text); background: var(--bg-sunken);
+  border: 1px solid var(--line); border-radius: var(--r-sm); cursor: pointer;
+}
+/* 查重 / 批量删弹窗顶部那条工具条 */
+.bdtools { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: 10px;
+  padding-bottom: 8px; border-bottom: 1px dashed var(--line) }
+.bdgroup .bdghead { display: flex; align-items: center; gap: 8px }
+.bdgroup .bdghead .sp { flex: 1 1 auto }
