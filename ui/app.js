@@ -15,6 +15,11 @@ const S = {
   checkinSeen: {},    // 已经弹过提示的"积分到账"通知 id（本会话内不重复弹）
   // 签到页「产品 → 账号」两级的折叠状态：product → true 表示这家收起来了（默认全展开）
   ciFold: {},
+  // 已经点过「登录并领取」、正在等客户端登录的行（键 = 产品|账号）→ 点下去的时间戳。
+  // 界面上这一行会变成「等待登录…」，后台每 5 秒回来看一眼、能领就领掉。
+  ciWait: {},
+  // API 页勾选中的 key（键 = 站点id|keyid）。站点内批量操作全靠它。
+  keySel: null,
 };
 
 /* ---------------- 外观：主题/密度/字号都来自设置页，不再占顶栏 ---------------- */
@@ -872,6 +877,8 @@ async function loadCheckin(force) {
 function ciState(it) {
   const w = it.words || {};
   if (it.pending) return { cls: 'pending', word: '查询中…' };
+  // 共用一份登录态的行：这个号自己读不到状态，别写"状态未知"（那像出错）
+  if (it.shared) return { cls: 'off', word: '共用登录态' };
   if (it.error) return { cls: 'bad', word: '读不到' };
   // 旅行猫是状态机不是签到：在路上要说"猫猫在路上"，写成"状态未知"等于什么都没说
   if (it.mode === 'travel' && it.next_action === 'wait') return { cls: 'wait', word: w.wait_badge || '猫猫在路上' };
@@ -889,6 +896,7 @@ function ciState(it) {
 function ciActionWord(it) {
   const w = it.words || {};
   if (it.error) return '';
+  if (it.shared) return '切到该号';
   if (it.mode === 'travel') {
     if (it.next_action === 'depart') return w.depart || '派出';
     if (it.next_action === 'wait') return w.wait || '等待中';
@@ -906,17 +914,56 @@ function ciBadge(it) {
 }
 
 /* 一行一个按钮，写的是"这一步到底要做什么"。写操作（领取 / 发对话 / 派出）都要先确认。 */
+/* 一行一个按钮，写的是"这一步到底要做什么"。写操作（领取 / 发对话 / 派出）都要先确认。
+   2026-10-17 改：登录那一步不再叫"打开客户端登一次"（她原话"太难听了，一点也不书面化"），
+   也不再要求她登完回来点第二次——按钮自己会等、会领。 */
 function ciAction(it, name) {
   if (it.pending) {
     return btn('查询中…', 'sm', () => {}, '状态正在读，马上就有');
   }
+  const key = ciKey(it);
+  // 共用一份登录态的行（Trae CN / MiniMax / AStudio 这类）：这一行读不到它自己的状态，
+  // 能做的是"切到该号"——切过去之后整机登录态就是它，产品级那一行会跟着变。
+  if (it.shared) {
+    const has = !!it.app && !!it.account;
+    const b = btn('切到该号', 'sm', async () => {
+      const yes = await askConfirm(
+        `把「${name}」切成这台机器当前使用的账号？\n\n`
+        + `「${it.name || it.product}」的登录态是整机一份，切过去会把现在这个号换下来；`
+        + '驾驶舱存过它的话随时能切回来。',
+        { title: '切换账号' });
+      if (!yes) return;
+      const r = await invoke('action', { payload: { action: 'auth_switch', app: it.app, name: it.account } })
+        .catch((e) => ({ ok: false, msg: String(e) }));
+      toast((r && (r.msg || r.error)) || '已切换', !!(r && r.ok));
+      setTimeout(() => loadCheckin(true), 2000);
+    }, has ? (it.note || '这个号自己读不到签到状态，切过去再看') : '这个号还没存过登录态，先在客户端登它一次');
+    if (!has) b.disabled = true;
+    return b;
+  }
   if (it.need_login) {
-    // 这一家今天还没登录过，光把按钮摆成"不用领"等于什么都没做——直接帮她把客户端拉起来
-    return btn('打开客户端登一次', 'sm primary', async () => {
-      const r = await invoke('action', { payload: { action: 'launch_app', app: it.product, name: '' } });
-      toast(r && r.ok ? '已打开客户端，登进去之后回这页点一次刷新' : (r && r.msg) || '打开失败', !!(r && r.ok));
-      if (r && r.ok) setTimeout(() => loadCheckin(true), 25000);
-    }, '每日积分要今天登录过一次才发；点这个把客户端打开，登录后我自动回来补状态');
+    // 已经点过、正在等它登录：不再让她点第二下
+    if ((S.ciWait || {})[key]) {
+      return btn('等待登录…', 'sm', () => {}, '客户端已经拉起来了：登进去之后我会自动把今天这份领掉');
+    }
+    const b = btn('登录并领取', 'sm primary', async () => {
+      if (b.disabled) return;
+      b.disabled = true;
+      // app 必须显式带上：store 名与 app id 不是一回事（Trae 两边叫 trae-cn / traework-cn）
+      const r = await invoke('action', {
+        payload: { action: 'checkin_login_claim', app: it.app || '', store: it.product, account: it.account || '' },
+      }).catch((e) => ({ ok: false, msg: String(e) }));
+      b.disabled = false;
+      if (!r || !r.ok) {
+        toast((r && (r.msg || r.error)) || '拉不起来客户端', false);
+        return;
+      }
+      S.ciWait = S.ciWait || {};
+      S.ciWait[key] = Date.now();
+      toast(r.msg || '已开始等登录', true);
+      renderCheckin();
+    }, '一条龙：拉起客户端 → 你登进去 → 自动把今天这份领掉，不用回来点第二次');
+    return b;
   }
   const w = it.words || {};
   const travel = it.mode === 'travel';
@@ -949,10 +996,13 @@ function ciAction(it, name) {
           : `要给「${name}」领今天的签到积分吗？\n\n领完这一家的当日名额就用掉了，撤回不了。`,
       { title: travel ? (step === 'depart' ? '确认派出' : '确认领取') : (act ? '确认发对话' : '确认领取') });
     if (!yes) return;
-    // 账号级那行要把账号名一起发过去：两个号各有各的当日名额，
-    // 不带账号就会全落到"当前登着的那个号"头上（2026-10-16 加）
+    // 只有账号级那行才带 account：产品行的 account 是"本机现在登着的那个号"，
+    // 顺手带过去会让后端去铺一个根本不存在的登录包（AStudio 那次就是这么失败的）
     const r = await invoke('action', {
-      payload: { action: 'checkin_claim', app: '', store: it.product, account: it.account || '' },
+      payload: {
+        action: 'checkin_claim', app: '', store: it.product,
+        account: it.scope === 'account' ? (it.account || '') : '',
+      },
     });
     const x = (r && r.result) || {};
     // claimed 只在 agenthub 回读状态确认过之后才为真——厂商回一句 200 不算领到。
@@ -964,6 +1014,48 @@ function ciAction(it, name) {
     loadCheckin(true);
   }, title);
   if (!doable) b.disabled = true;
+  return b;
+}
+
+/* 一行的唯一键：产品 + 账号（产品行没有账号） */
+function ciKey(it) {
+  return `${it.product}|${it.account || ''}`;
+}
+
+/* 只重查这一行：她 2026-10-17 要的"只签到了一个的时候自己点一次刷新，
+   不会影响其他 Agent，不会询问太长时间"。
+   后端 refresh_one 只跑这一家（账号级只跑这一个号），并把它并进缓存。 */
+function ciRefreshBtn(it) {
+  const b = el('button', {
+    class: 'ci-refresh', type: 'button',
+    title: `只重查「${it.name || it.product}」这一行，不动其它行`,
+    'aria-label': '刷新这一行',
+  }, '↻');
+  b.addEventListener('click', async () => {
+    if (b.dataset.busy) return;
+    b.dataset.busy = '1';
+    b.classList.add('spin');
+    const r = await invoke('action', {
+      payload: {
+        action: 'checkin_refresh_one', store: it.product,
+        account: it.scope === 'account' ? (it.account || '') : '',
+        app: it.app || '',
+      },
+    }).catch((e) => ({ ok: false, msg: String(e) }));
+    delete b.dataset.busy;
+    b.classList.remove('spin');
+    if (!r || !r.ok) { toast(`刷新失败：${(r && (r.msg || r.error)) || '未知原因'}`, false); return; }
+    // 把这一条并进手上的那份，别的行一个像素都不动
+    const items = ((S.checkin && S.checkin.items) || []).slice();
+    const i = items.findIndex((x) => ciKey(x) === ciKey(it)
+      && (x.scope || 'product') === (it.scope || 'product'));
+    if (i >= 0) items[i] = r.item; else items.push(r.item);
+    S.checkin = { ...(S.checkin || {}), items };
+    if (S.ciWait) delete S.ciWait[ciKey(it)];
+    renderCheckin();
+    const st = ciState(r.item);
+    toast(`「${it.name || it.product}」已刷新 · ${st.word}`, st.cls !== 'bad');
+  });
   return b;
 }
 
@@ -994,7 +1086,7 @@ async function saveCheckinMute(store, muted) {
 /* 一行九格，全部塞进同一个 grid 容器（父级 display:grid、这里 display:contents），
    列宽只在 .citab 里定义一次，所以"每日多少积分""今天不用领"这些同类内容必然落在同一列。
    以前每行自己 flex 排，一家少个字段整行就错位——你圈出来的就是这个。 */
-const CI_COLS = ['产品', '状态', '连签', '每日', '累计', '活动截止', '操作', '自动领', '提醒'];
+const CI_COLS = ['产品', '状态', '连签', '每日', '累计', '活动截止', '操作', '自动领', '提醒', '刷新'];
 
 function ciRule(grid) { grid.appendChild(el('div', { class: 'ci-rule' })); }
 
@@ -1053,6 +1145,7 @@ function ciCells(grid, it, autoOn, opts) {
     const tip = '自动领 / 提醒是**按产品**设的开关，在上面那一行（' + (CI_NAMES[it.product] || it.product) + '）上勾';
     grid.appendChild(el('span', { class: 'cick no', title: tip }, '同上'));
     grid.appendChild(el('span', { class: 'cick no', title: tip }, '同上'));
+    grid.appendChild(el('div', { class: 'ci-ref' }, ciRefreshBtn(it)));
     return;
   }
   // 只有厂商给了独立状态接口、领取又不需要验证码的，才允许交给程序自动跑
@@ -1073,6 +1166,8 @@ function ciCells(grid, it, autoOn, opts) {
   rb.title = '到点提醒我今天去领（只读提醒，不会替我领）';
   rb.addEventListener('change', () => saveCheckinMute(it.product, !rb.checked));
   grid.appendChild(el('label', { class: 'cick' }, rb));
+  // 每行一个单独的 ↻：只重查这一家，不动别的行（2026-10-17 她要的）
+  grid.appendChild(el('div', { class: 'ci-ref' }, ciRefreshBtn(it)));
 }
 
 async function saveCheckinAuto(store, on) {
@@ -1150,6 +1245,14 @@ function renderCheckin() {
     return;
   }
   const items = d.items || [];
+  // 等登录的那些行：状态一不再是"还没登录"就清掉——后台已经替她领掉了
+  if (S.ciWait && Object.keys(S.ciWait).length) {
+    for (const it of items) {
+      const k = ciKey(it);
+      if (!S.ciWait[k]) continue;
+      if (!it.need_login || Date.now() - S.ciWait[k] > 1800000) delete S.ciWait[k];
+    }
+  }
   // 两级：产品行 + 它名下的账号行（`scope:"account"`，`parent` 指着产品）。
   // 账号行只有"这台机器上每个号都留着自己那份登录态"的产品才有（现在 Qoder 系与 WorkBuddy 系）——
   // 其余几家整机一份登录态，硬拆只会给出串号的假答案，所以只有产品行。
@@ -2806,6 +2909,124 @@ function siteQuotaTxt(p) {
 /* 整张列表每次都是推倒重建：clear() 一执行，滚动容器的 scrollHeight 当场塌掉，
    scrollTop 被浏览器夹回 0——点开下面那张卡就跳回页顶，轮询一次也跳一次。
    所以重建前记住位置，重建后原样放回去（侧栏 renderNav 同一套做法）。 */
+/* ---------------- 站点内批量管理（2026-10-17） ----------------
+   她原话："我不仅要批量删除，我更需要的是在每一个站点内部的批量修改，
+   这个批量修改包括批量删除和其他操作，类似于淘宝管理购物车……
+   可以批量勾选，可以一键全选，可以删除，可以移动，可以进行单个 key 可以进行的一切操作。"
+
+   所以这里不是又开一个弹窗，而是直接在站点表格上加勾选列：
+   表头一个全选框（只管这个站点），勾上之后页面顶部浮一条操作条，
+   单个 key 能做的（改用途 / 改过期 / 测活 / 复制 / 删除）在这里都能对一批做，
+   另外多一个「移到其他站点」——那是单个 key 做不到的。 */
+function keySel() {
+  if (!S.keySel) S.keySel = new Set();
+  return S.keySel;
+}
+function keySelSig(siteId, keyId) { return `${siteId}|${keyId}`; }
+function keySelIds() {
+  return [...keySel()].map((x) => {
+    const i = x.indexOf('|');
+    return { site: x.slice(0, i), id: x.slice(i + 1) };
+  });
+}
+function keySelToggle(sig, on) {
+  const sel = keySel();
+  if (on) sel.add(sig); else sel.delete(sig);
+  renderKeyList(S.data);
+}
+function keySelClear() { keySel().clear(); renderKeyList(S.data); }
+
+/* 站点内批量操作条：勾了东西才出现，钉在内容区顶部（滚动时也看得见） */
+function keySelBar(sites) {
+  const ids = keySelIds();
+  if (!ids.length) return null;
+  const inOneSite = new Set(ids.map((x) => x.site)).size === 1;
+  const selSite = inOneSite ? ids[0].site : '';
+  const others = (sites || []).filter((p) => p.id !== selSite);
+  const bar = el('div', { class: 'kselbar' });
+  bar.appendChild(el('span', { class: 'ksel-n' }, `已选 ${ids.length} 条`));
+  bar.appendChild(el('span', { class: 'sp' }));
+
+  bar.appendChild(btn('改用途', 'sm', async () => {
+    const v = await askText('给勾选的这些 key 统一设一个用途名（列表里就按这个名字认人）。留空则清掉用途。',
+      '', { title: `批量改用途 · ${ids.length} 条`, okText: '应用' });
+    if (v === null) return;
+    const r = await invoke('action', { payload: { action: 'key_batch_update', ids, patch: { label: v } } });
+    toast(r.msg, r.ok);
+    if (r.ok) { keySelClear(); await load(); }
+  }, '统一改「用途」这一列（单个 key 的编辑框里那一项）'));
+
+  bar.appendChild(btn('改过期日', 'sm', async () => {
+    const v = await askText('统一设过期日，格式 2026-12-31。留空表示未填。',
+      '', { title: `批量改过期日 · ${ids.length} 条`, okText: '应用' });
+    if (v === null) return;
+    if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v.trim())) { toast('格式不对，要 2026-12-31 这样', false); return; }
+    const r = await invoke('action', { payload: { action: 'key_batch_update', ids, patch: { expires_on: v.trim() } } });
+    toast(r.msg, r.ok);
+    if (r.ok) { keySelClear(); await load(); }
+  }, '统一改过期日（临期提醒按它算）'));
+
+  bar.appendChild(btn('测活', 'sm', async () => {
+    let okN = 0, badN = 0;
+    for (const x of ids) {
+      const r = await invoke('action', { payload: { action: 'key_test', site: x.site, id: x.id } })
+        .catch(() => ({ ok: false }));
+      if (r && r.ok) okN += 1; else badN += 1;
+    }
+    toast(`测活完成：${okN} 条可用${badN ? `，${badN} 条失败` : ''}`, badN === 0);
+    keySelClear();
+    await load();
+  }, '逐条向站点的接入点发一次 GET /models，验证还能不能用'));
+
+  bar.appendChild(btn('复制', 'sm', async () => {
+    const lines = [];
+    for (const x of ids) {
+      const full = await invoke('get_key_plain', { site: x.site, id: x.id }).catch(() => '');
+      if (full) lines.push(full);
+    }
+    if (!lines.length) { toast('一条原文都没读到', false); return; }
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      toast(`已复制 ${lines.length} 条 Key 原文（一行一条）`);
+    } catch (e) { toast(`复制失败：${e}`, false); }
+  }, '把勾选的 Key 原文按行复制到剪贴板'));
+
+  // 移动：目标站下拉。只对"同一个站点里的勾选"给这个入口——
+  // 跨站混选时目标站本身就没意义，不如先让她在站内挪。
+  if (inOneSite && others.length) {
+    const sel = el('select', { class: 'ksel-target', title: '要挪到哪个站点' });
+    sel.appendChild(el('option', { value: '' }, '移到…'));
+    for (const p of others) sel.appendChild(el('option', { value: p.id }, p.name || '未命名站点'));
+    bar.appendChild(sel);
+    bar.appendChild(btn('移动', 'sm', async () => {
+      if (!sel.value) { toast('先在下拉里选目标站点', false); return; }
+      const target = others.find((p) => p.id === sel.value);
+      const yes = await askConfirm(
+        `把勾选的 ${ids.length} 条 key 从「${sites.find((p) => p.id === selSite)?.name || '当前站点'}」`
+        + `挪到「${target?.name || '目标站点'}」？\n\n`
+        + '原站点里会删掉这几条，目标站点里按原 id 追加（反代与接入记的账不断）。',
+        { title: '批量移动 key' });
+      if (!yes) return;
+      const r = await invoke('action', { payload: { action: 'key_batch_move', ids, target: sel.value } });
+      toast(r.msg, r.ok);
+      if (r.ok) { keySelClear(); await load(); }
+    }, '挪到另一个站点（单个 key 做不到的那件事）'));
+  }
+
+  bar.appendChild(btn('删除', 'danger sm', async () => {
+    const yes = await askConfirm(
+      `删除勾选的 ${ids.length} 条 key。\n正在用这些 key 的程序会立刻失败，删除后无法恢复。`,
+      { danger: true, okText: '删除', title: `批量删除 · ${ids.length} 条` });
+    if (!yes) return;
+    const r = await invoke('action', { payload: { action: 'key_delete_batch', ids } });
+    toast(r.msg, r.ok);
+    if (r.ok) { keySelClear(); await load(); }
+  }, '删掉勾选的这几条'));
+
+  bar.appendChild(btn('取消', 'sm', () => keySelClear(), '取消勾选'));
+  return bar;
+}
+
 function renderKeys(d) {
   const box = $('keysites').closest('.pagebody');
   const keep = box ? box.scrollTop : 0;
@@ -2887,6 +3108,19 @@ function renderKeyList(d) {
       box.appendChild(el('div', { class: 'tablewrap' },
         el('table', { class: 'tbl keys' },
           el('thead', {}, el('tr', {},
+            el('th', { class: 'k-sel' }, (() => {
+              // 表头全选：只管**这个站点**。混选跨站没有意义，也会让「移动」不知道往哪挪
+              const all = keys.length > 0 && keys.every((k) => keySel().has(keySelSig(p.id, k.id)));
+              const some = keys.some((k) => keySel().has(keySelSig(p.id, k.id)));
+              const cb = el('input', { type: 'checkbox', class: 'ksel-cb' });
+              cb.checked = all;
+              cb.indeterminate = !all && some;
+              cb.title = all ? '取消全选这个站点' : `全选这个站点的 ${keys.length} 条`;
+              cb.addEventListener('change', () => {
+                for (const k of keys) keySelToggle(keySelSig(p.id, k.id), cb.checked);
+              });
+              return cb;
+            })()),
             el('th', { class: 'k-label' }, '用途'),
             el('th', { class: 'k-key' }, 'Key'),
             el('th', { class: 'k-exp' }, '过期'),
@@ -2900,6 +3134,10 @@ function renderKeyList(d) {
     }
     host.appendChild(box);
   }
+  // 勾了 key 就把操作条钉在最上面（滚动时也看得见）。它必须在站点列表之后插，
+  // 否则每次重绘都会把它挤到列表下面去。
+  const bar = keySelBar(sites);
+  if (bar) host.insertBefore(bar, host.firstChild);
   renderKeyNav(d);   // 左菜单的站点计数跟着列表一起更新
 }
 
@@ -2991,7 +3229,13 @@ function renderKeyNav(d) {
    操作列照 LongCat 的 API Keys 那样用图标，悬停 tooltip 说明；顺序按她点名的：
    测试 / 编辑 / 复制 / 接入 / 删除 */
 function keyRow(site, k) {
-  return el('tr', {},
+  const sig = keySelSig(site.id, k.id);
+  const cb = el('input', { type: 'checkbox', class: 'ksel-cb' });
+  cb.checked = keySel().has(sig);
+  cb.title = '勾上之后到页面顶部那条操作条里批量处理';
+  cb.addEventListener('change', () => keySelToggle(sig, cb.checked));
+  return el('tr', { class: keySel().has(sig) ? 'sel' : '' },
+    el('td', { class: 'k-sel' }, cb),
     el('td', { class: 't', title: k.note || k.label || '' }, k.label || el('span', { class: 'muted' }, '未命名')),
     el('td', { class: 'k-key', title: '点「复制」取全文' },
       el('span', { class: 'mono' }, k.masked || '—'),
@@ -3146,14 +3390,51 @@ async function openKeyBatch(mode) {
   renderBd();
 }
 
+/* 勾选数 → 底部按钮与计数一起同步。抽出来是因为"全选"也要走同一套，
+   以前这段写在 change 里，一加全选就会出现"计数对了按钮还灰着" */
+function syncBd() {
+  $('bd-go').disabled = !bd.sel.size;
+  $('bd-count').textContent = bd.sel.size ? `已勾选 ${bd.sel.size} 条，删除后无法恢复` : '';
+}
+
 function renderBd() {
   const box = $('bd-list');
   clear(box);
+  // 一键全选：查重那 12 条重复、或者一个站 40 多条 key，一条条点太折磨
+  // （她 2026-10-17："你应该加一个一键选中的功能，现在这样我还得一个一个选"）。
+  // 查重模式下"每组保留第一条"不许勾，全选也跳过它们。
+  const pickable = [];
   for (const g of bd.groups) {
+    g.entries.forEach((k, i) => {
+      if (bd.mode === 'dedup' && i === 0) return;
+      pickable.push(`${k.site}|${k.id}`);
+    });
+  }
+  const tools = el('div', { class: 'bdtools' },
+    btn(`全选可删的（${pickable.length}）`, 'sm', () => {
+      bd.sel = new Set(pickable);
+      renderBd();
+    }, bd.mode === 'dedup' ? '每组保留的那一条不会勾上' : '把这个列表里的全部勾上'),
+    btn('清空', 'sm', () => { bd.sel = new Set(); renderBd(); }, '一条都不勾'),
+    el('span', { class: 'kv' }, bd.sel.size ? `当前已勾 ${bd.sel.size} 条` : ''));
+  box.appendChild(tools);
+  for (const g of bd.groups) {
+    const gSigs = g.entries
+      .map((k, i) => (bd.mode === 'dedup' && i === 0 ? '' : `${k.site}|${k.id}`))
+      .filter(Boolean);
+    const allOn = gSigs.length > 0 && gSigs.every((x) => bd.sel.has(x));
     box.appendChild(el('div', { class: 'bdgroup' },
       el('div', { class: 'bdghead' },
         g.masked ? el('span', { class: 'mono' }, g.masked) : el('b', {}, g.site_name),
-        el('span', { class: 'kv' }, g.masked ? `${g.count} 条重复` : `${g.count} 个 key`))));
+        el('span', { class: 'kv' }, g.masked ? `${g.count} 条重复` : `${g.count} 个 key`),
+        el('span', { class: 'sp' }),
+        gSigs.length
+          ? btn(allOn ? '取消本组' : `全选本组（${gSigs.length}）`, 'sm', () => {
+            if (allOn) gSigs.forEach((x) => bd.sel.delete(x));
+            else gSigs.forEach((x) => bd.sel.add(x));
+            renderBd();
+          }, '只勾这一组')
+          : null)));
     g.entries.forEach((k, i) => {
       const sig = `${k.site}|${k.id}`;
       const keepHere = bd.mode === 'dedup' && i === 0;
@@ -3162,8 +3443,7 @@ function renderBd() {
       cb.disabled = keepHere;
       cb.addEventListener('change', () => {
         if (cb.checked) bd.sel.add(sig); else bd.sel.delete(sig);
-        $('bd-go').disabled = !bd.sel.size;
-        $('bd-count').textContent = bd.sel.size ? `已勾选 ${bd.sel.size} 条，删除后无法恢复` : '';
+        syncBd();
       });
       box.appendChild(el('label', { class: 'bdrow' }, cb,
         keepHere ? chip('保留', 'ok') : null,
@@ -3181,6 +3461,7 @@ function renderBd() {
     box.appendChild(el('div', { class: 'empty' },
       bd.mode === 'dedup' ? '台账里没有重复的 key。' : '台账里还没有 key。'));
   }
+  syncBd();
 }
 
 async function bdDelete() {
@@ -5000,7 +5281,9 @@ function shellSection(body, panel, row, actBtn, btn) {
       actBtn('重新读取', () => loadShell())));
     return;
   }
-  const d = W.desktop, s = W.start;
+  // W 里可能缺 desktop / start（后端某个版本没给、或 mock 数据没铺全）：
+  // 不兜底的话整个设置页会抛异常整块白掉，比少两行字严重得多
+  const d = W.desktop || {}, s = W.start || {};
   const state = (it) => it.exists
     ? (it.ours ? '已创建，指向本程序' : `已有同名项，但指向：${it.target || '读不出来'}`)
     : '尚未创建';
@@ -6043,6 +6326,15 @@ function bindNavResize() {
 }
 
 /* ---------------- 侧栏管理区的高度：拖那条横线 / 双击复位 / 方向键微调 ---------------- */
+/* ---------------- 侧栏管理区的高度：拖那条横线 / 双击复位 / 方向键微调 ----------------
+   2026-10-17 重写：原来是"指针越靠下管理区越矮，上限取管理区内容高"——
+   于是往上拖到内容高就再也拖不动，用户看到的是"往哪边移动也不确定"；
+   而单击一下会走 pointerdown+pointerup 把当前高度原样提交一次，弹一个看不懂的
+   "管理区高度 13% 窗口高"，看着就像"只能点、不能拖"。
+
+   现在改成**按位移算**：按下时记住起点 y 与当前高度，之后每移动 1px 就加减 1px。
+   方向恒定（往上＝变高、往下＝变矮），上限是"给列表至少留 SIDE_MIN"，不再卡内容高；
+   没真移动过就不提交、不弹提示。 */
 function bindSideResize() {
   const h = $('side-resize');
   const sb = h.closest('.sidebar');
@@ -6050,13 +6342,7 @@ function bindSideResize() {
   const fx = sb.querySelector('.side-fixed');
   const zoom = () => (Number(S.data?.settings?.appearance?.font_scale) || 100) / 100;
   const store = () => ratioPx(sideRatio(S.data?.settings?.appearance || {}));
-  const contentH = (node) => {
-    const last = node.lastElementChild;
-    if (!last) return 0;
-    return Math.ceil((last.getBoundingClientRect().bottom
-      - node.getBoundingClientRect().top + node.scrollTop) / zoom());
-  };
-  // 只有列表区和管理区参与分配，其余兄弟（顶栏 + 这条手柄）连外边距一起扣掉
+  // 两截一共能分多少（扣掉顶栏与这条手柄本身）
   const avail = () => {
     let chrome = 0;
     for (const kid of sb.children) {
@@ -6067,36 +6353,63 @@ function bindSideResize() {
     }
     return sb.getBoundingClientRect().height / zoom() - chrome / zoom();
   };
-  // 指针越靠下 = 管理区越矮；以列表区的顶边为原点（它不随拖动移动）
-  const at = (y) => Math.round(avail() - (y - top.getBoundingClientRect().top) / zoom());
-  // 上限就是管理区的内容高——再往上拖多出来的空间没人接，就是左下角那片空白
+  const shown = () => store() || Math.round(fx.getBoundingClientRect().height / zoom());
+  // 下限 SIDE_MIN，上限"给列表至少留 SIDE_MIN"——不再被内容高卡住。
+  // 管理区比内容高的时候多出来的是它自己的空白，那正是用户拖出来的结果，不该被吃掉。
   const clamp = (px) => {
-    const hi = Math.max(SIDE_MIN, Math.min(contentH(fx), avail() - SIDE_MIN));
+    const hi = Math.max(SIDE_MIN, avail() - SIDE_MIN);
     return Math.round(Math.min(Math.max(px, SIDE_MIN), hi));
   };
-  const shown = () => store() || Math.round(fx.getBoundingClientRect().height / zoom());
+  let from = 0;      // pointerdown 时的 clientY
+  let base = 0;      // pointerdown 时的管理区高度
+  let moved = false;
+  const label = () => {
+    const px = Math.round(parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue('--mgmt-h')) || 0);
+    h.dataset.readout = px ? `${px}px` : '';
+  };
+  const stop = (e) => {
+    if (!sideDrag.active) return;
+    sideDrag.active = false;
+    h.classList.remove('dragging');
+    h.dataset.readout = '';
+    if (e && h.hasPointerCapture?.(e.pointerId)) h.releasePointerCapture(e.pointerId);
+  };
 
   h.addEventListener('pointerdown', (e) => {
     if (document.documentElement.classList.contains('rail')) return;   // 图标条模式下这两截没得分配
+    if (e.button != null && e.button !== 0) return;
     e.preventDefault();
     sideDrag.active = true;
+    moved = false;
+    from = e.clientY;
+    base = clamp(shown());
     h.classList.add('dragging');
-    applySideHeight(clamp(at(e.clientY)));   // 先给反馈，再要指针捕获
+    // 一按下就把管理区锁成定高：不锁的话它还是"内容高"，
+    // 往下拖会先吃掉那几像素的弹性，手感是"拖了没反应"
+    applySideHeight(base);
     h.setPointerCapture(e.pointerId);
   });
   h.addEventListener('pointermove', (e) => {
-    if (sideDrag.active) applySideHeight(clamp(at(e.clientY)));
+    if (!sideDrag.active) return;
+    const dy = from - e.clientY;        // 往上为正
+    if (Math.abs(dy) > 2) moved = true;
+    applySideHeight(clamp(base + dy / zoom()));
+    label();
   });
   h.addEventListener('pointerup', (e) => {
     if (!sideDrag.active) return;
-    sideDrag.active = false;
-    h.classList.remove('dragging');
-    commitSideHeight(clamp(at(e.clientY)));
+    const px = clamp(base + (from - e.clientY) / zoom());
+    stop(e);
+    if (!moved) {                       // 只是点了一下：什么都不改，也不弹提示
+      applySideHeight(store());
+      return;
+    }
+    commitSideHeight(px);
   });
-  h.addEventListener('pointercancel', () => {
+  h.addEventListener('pointercancel', (e) => {
     if (!sideDrag.active) return;
-    sideDrag.active = false;
-    h.classList.remove('dragging');
+    stop(e);
     applySideHeight(store());
   });
   h.addEventListener('dblclick', () => commitSideHeight(0));

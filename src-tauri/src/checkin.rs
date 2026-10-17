@@ -187,6 +187,10 @@ fn expand_accounts(items: Value) -> Value {
         let mut prod = it.clone();
         if let Some(o) = prod.as_object_mut() {
             o.insert("scope".into(), json!("product"));
+            // 界面要 app id 才能拉起客户端（store 名跟 app id 不是一回事）
+            if let Some(app_id) = crate::local_quota::app_for_store(&store) {
+                o.insert("app".into(), json!(app_id));
+            }
         }
         out.push(prod);
         if store.is_empty() {
@@ -234,6 +238,8 @@ fn catalog_items() -> Vec<Value> {
             json!({
                 "product": p, "name": n, "pending": true, "supported": true,
                 "scope": "product",
+                // 占位行也要带 app id：这一行的「登录并领取」全靠它拉客户端
+                "app": crate::local_quota::app_for_store(p).unwrap_or(p),
                 "auto": false, "activity_on": true, "signed_today": false, "claimable": false,
             })
         })
@@ -275,28 +281,46 @@ fn stage_arg(app_id: &str, store: &str, dir: &std::path::Path) -> (String, Strin
     }
 }
 
-/// 一个产品的每个账号各查一次。只对"登录态按账号各存一份"的产品做，
-/// 且**至少两个号都存过登录包**才展开——一个号的产品，产品级那一行就是它，
-/// 再挂一条同名子行只是重复。
+/// 一个产品名下的账号行。**通用**：只要这个产品在驾驶舱里有 ≥2 张账号卡就展开，
+/// 跟"读不读得到它自己的登录态"无关——
+///   · 读得到（登录态按账号各存一份，见 PER_ACCOUNT）：这一行就是那个号自己的签到状态；
+///   · 读不到（整机一份登录态，如 Trae CN / MiniMax / AStudio）：这一行只摆账号名，
+///     标 `shared`，动作给「切到该号」——仍然是"通用管理"，只是不假装读到了数。
 ///
-/// 每个号各起一次 agenthub（一次 python 启动两三秒），所以这条只在后台刷新里跑。
+/// 她 2026-10-17 原话："这个下拉菜单不是只有 QoderCN 需要，如果有其他 Agent 有了其他账号
+/// 也是需要的，我要的是通用管理。" 所以展开的判据从"这家能不能按账号读"改成"这家有没有多账号"。
+///
+/// 读得到的那几行，每个号各起一次 agenthub（一次 python 启动两三秒），所以只在后台刷新里跑。
 pub fn account_items(app_id: &str, store: &str) -> Vec<Value> {
-    if !per_account(store) {
-        return Vec::new();
-    }
     let insts = crate::registry::load_instances(app_id);
     let names: Vec<String> = insts
         .iter()
         .filter_map(|m| m["name"].as_str().map(String::from))
         .filter(|n| !n.is_empty())
-        // 没存过登录包的账号不硬查：查出来的是"当前登着的那个号"的状态，那就是串号
-        .filter(|n| crate::authpack::stored(app_id, n).is_some())
         .collect();
+    // 一个号的产品不展开：产品级那一行就是它，再挂一条同名子行只是重复
     if names.len() < 2 {
         return Vec::new();
     }
+    let readable = per_account(store);
     let mut out = Vec::new();
     for name in names {
+        // 读不到独立登录态 / 这个号还没存过登录包：摆一行占位，不再逐个起 agenthub
+        if !readable || crate::authpack::stored(app_id, &name).is_none() {
+            out.push(json!({
+                "scope": "account", "account": name, "name": name,
+                "product": store, "parent": store, "app": app_id,
+                "shared": true, "pending": false,
+                "supported": true, "auto": false, "activity_on": true,
+                "signed_today": Value::Null, "claimable": false,
+                "note": if readable {
+                    "这个号还没存过登录态：先在客户端登它一次，之后就能按账号查"
+                } else {
+                    "这个产品的登录态是整机一份，换号会覆盖前一个；签到状态要在切到该号之后才读得到"
+                },
+            }));
+            continue;
+        }
         let dir = match stage(app_id, store, &name) {
             Ok(d) => d,
             Err(_) => continue,
@@ -317,10 +341,79 @@ pub fn account_items(app_id: &str, store: &str) -> Vec<Value> {
             // 账号行的标题就是账号名（agenthub 报的 name 是产品名，那一层已经由父行说过了）
             o.insert("name".into(), json!(name));
             o.insert("parent".into(), json!(store));
+            // 界面要 app id 才能拉起客户端：store 名跟 app id 不是一回事（Trae 两边叫 trae-cn / traework-cn）
+            o.insert("app".into(), json!(app_id));
         }
         out.push(it);
     }
     out
+}
+
+/// 只重查一家（或一个账号），把结果并进缓存，**不动其它行**。
+/// 她 2026-10-17 要的：只签到了一个的时候自己点一次刷新，不要为了一行去问六家、等半天。
+pub fn refresh_one(store: &str, acct: Option<(&str, &str)>) -> Value {
+    if store.is_empty() {
+        return json!({ "ok": false, "msg": "没说要刷哪一家" });
+    }
+    let mut extra: Vec<String> = vec![store.to_string()];
+    let mut staged: Option<std::path::PathBuf> = None;
+    // 账号级要按它自己的登录包读；产品不支持按账号读时忽略 acct（否则会拿别人的号冒充）
+    if let Some((app_id, name)) = acct {
+        if per_account(store) {
+            match stage(app_id, store, name) {
+                Ok(d) => {
+                    let (f, v) = stage_arg(app_id, store, &d);
+                    extra.push(f);
+                    extra.push(v);
+                    staged = Some(d);
+                }
+                Err(e) => return json!({ "ok": false, "msg": e }),
+            }
+        }
+    }
+    let refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+    let r = run(&refs);
+    if let Some(d) = staged {
+        crate::authpack::drop_profile(&d);
+    }
+    let mut item = match r {
+        Ok(v) => match v.as_array().and_then(|a| a.first().cloned()) {
+            Some(i) => i,
+            None => return json!({ "ok": false, "msg": "agenthub 没返回结果" }),
+        },
+        Err(e) => return json!({ "ok": false, "msg": e }),
+    };
+    let acct_key = acct.map(|(_, n)| n).unwrap_or("");
+    let scope = if acct_key.is_empty() { "product" } else { "account" };
+    if let Some(o) = item.as_object_mut() {
+        o.insert("scope".into(), json!(scope));
+        o.insert("product".into(), json!(store));
+        if let Some((app_id, name)) = acct {
+            o.insert("account".into(), json!(name));
+            o.insert("name".into(), json!(name));
+            o.insert("parent".into(), json!(store));
+            o.insert("app".into(), json!(app_id));
+        }
+    }
+    // 并进缓存：只换掉同一条，别的行原样留着。**不动 fetched_at**——
+    // 那是"整张表最后一次查于"，动它会让别的行看起来也刚查过。
+    {
+        let mut g = CACHE.lock().unwrap();
+        if let Some(v) = g.as_mut() {
+            if let Some(arr) = v["items"].as_array_mut() {
+                let hit = arr.iter().position(|x| {
+                    x["product"].as_str() == Some(store)
+                        && x["scope"].as_str().unwrap_or("product") == scope
+                        && x["account"].as_str().unwrap_or("") == acct_key
+                });
+                match hit {
+                    Some(i) => arr[i] = item.clone(),
+                    None => arr.push(item.clone()),
+                }
+            }
+        }
+    }
+    json!({ "ok": true, "item": item })
 }
 
 /// 领一家。返回 agenthub 那一条结果，并把缓存作废（领完状态必然变了）。
@@ -329,6 +422,10 @@ pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
     if store.is_empty() {
         return json!({ "ok": false, "msg": "没说要给哪家签到" });
     }
+    // 只有"登录态按账号各存一份"的产品才按账号领。其余几家的 acct 是界面顺手带上的
+    // （产品行的 account 字段是"本机现在登着的那个号"），照着它去铺登录包会直接报
+    // "还没存过登录态"——AStudio 那次点「确认领取」就是这么失败的（2026-10-17）。
+    let acct = acct.filter(|_| per_account(store));
     let mut staged: Option<std::path::PathBuf> = None;
     let mut extra: Vec<String> = vec!["--claim".into(), store.to_string()];
     if let Some((app_id, name)) = acct {
@@ -572,6 +669,146 @@ pub fn should_run(
         && hour < to
 }
 
+/// 「登录并领取」的待办队列。
+///
+/// 为什么要有它：她点「登录并领取」之后，客户端要她自己登进去——那是几十秒到几分钟的事，
+/// 一个同步动作等不起（`action` 全程拿着全局命令锁，等两分钟整个界面别的按钮全得排队）。
+/// 所以点按钮只做两件事：拉起客户端、在这里登记一条待办；后台每 5 秒回来看一眼，
+/// 那个号一能领就替她领掉，领完走 `arrived` 在操作提示区说一声。
+///
+/// 她 2026-10-17 原话："为什么我打开之后还要点一次领取，那我要你干什么"。
+static WANT: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+/// 登记一条待办。同一个号重复点不叠加。
+pub fn want_claim(app_id: &str, store: &str, account: &str) -> Value {
+    if store.is_empty() {
+        return json!({ "ok": false, "msg": "没说要给哪一家领" });
+    }
+    let mut w = WANT.lock().unwrap();
+    if w.iter().any(|x| {
+        x["store"].as_str() == Some(store) && x["account"].as_str().unwrap_or("") == account
+    }) {
+        return json!({ "ok": true, "msg": "这个号已经在等着了：登进去之后我会自动把今天这份领掉" });
+    }
+    w.push(json!({
+        "app": app_id, "store": store, "account": account,
+        "since": now_secs(),
+        // 半小时还没登进来就算了：再等下去她多半是压根不想登了
+        "until": now_secs() + 1800.0,
+    }));
+    json!({ "ok": true, "msg": "已开始等这个号登录：登进去之后我会自动把今天这份领掉，不用再点" })
+}
+
+/// 现在有几条在等
+pub fn want_count() -> usize {
+    WANT.lock().map(|w| w.len()).unwrap_or(0)
+}
+
+/// 把一条提示塞进 `arrived`——界面已经有"认新 id 就 toast"的通道，不用另开一条。
+fn push_notice(text: &str) {
+    let now = now_secs();
+    let mut st = load_state();
+    let mut arr = st["arrived"].as_array().cloned().unwrap_or_default();
+    arr.push(json!({
+        "id": format!("want-{}-{}", now as i64, arr.len()),
+        "at": now, "store": "", "label": "", "text": text,
+    }));
+    if arr.len() > 20 {
+        arr.drain(0..arr.len() - 20);
+    }
+    st["arrived"] = json!(arr);
+    save_state(&st);
+}
+
+/// 后台每 5 秒调一次：把等着的那几个号挨个看一眼，能领就领掉。
+/// 只读状态用 `refresh_one` 那条路（同一套按账号读的逻辑），领走才发写请求。
+pub fn poll_wants() -> Vec<String> {
+    let pending: Vec<Value> = match WANT.lock() {
+        Ok(w) => w.clone(),
+        Err(_) => return Vec::new(),
+    };
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let now = now_secs();
+    let mut msgs: Vec<String> = Vec::new();
+    for want in &pending {
+        let store = want["store"].as_str().unwrap_or("");
+        let account = want["account"].as_str().unwrap_or("");
+        let app_id = want["app"].as_str().unwrap_or("");
+        let label = match account {
+            "" => store.to_string(),
+            n => format!("{store} · {n}"),
+        };
+        if want["until"].as_f64().unwrap_or(0.0) < now {
+            remove_want(store, account);
+            let m = format!("「{label}」等了半小时还没登录上，先不等了：登进去之后点这一行的 ↻ 就行");
+            push_notice(&m);
+            msgs.push(m);
+            continue;
+        }
+        let pair = if account.is_empty() || app_id.is_empty() {
+            None
+        } else {
+            Some((app_id, account))
+        };
+        // 只看状态：refresh_one 不动别的行，也不发写请求
+        let st = refresh_one(store, pair);
+        if st["ok"].as_bool() != Some(true) {
+            continue; // 这一次没读到就下一轮再说
+        }
+        let item = &st["item"];
+        if item["signed_today"].as_bool() == Some(true) {
+            remove_want(store, account);
+            let m = format!("「{label}」今天这份已经在账上了");
+            push_notice(&m);
+            msgs.push(m);
+            continue;
+        }
+        if item["claimable"].as_bool() != Some(true) {
+            continue; // 还没到能领的时候，继续等
+        }
+        let r = claim(store, pair);
+        let x = &r["result"];
+        let ok = x["claimed"].as_bool().unwrap_or(false);
+        let credit = x["credit"].as_f64();
+        let m = if ok {
+            format!(
+                "「{label}」已自动领到{}",
+                match credit {
+                    Some(c) => format!(" {} 积分", num_text(c)),
+                    None => "今天这份".to_string(),
+                }
+            )
+        } else if x["already"].as_bool() == Some(true) {
+            format!("「{label}」今天这份已经领过了")
+        } else if x["settling"].as_bool() == Some(true) {
+            format!("「{label}」已发出，等服务端结算")
+        } else {
+            format!(
+                "「{label}」自动领取没成：{}",
+                x["message"]
+                    .as_str()
+                    .or(x["error"].as_str())
+                    .unwrap_or("厂商没回原因")
+            )
+        };
+        remove_want(store, account);
+        push_notice(&m);
+        msgs.push(m);
+    }
+    msgs
+}
+
+fn remove_want(store: &str, account: &str) {
+    if let Ok(mut w) = WANT.lock() {
+        w.retain(|x| {
+            !(x["store"].as_str() == Some(store)
+                && x["account"].as_str().unwrap_or("") == account)
+        });
+    }
+}
+
 /// 给 4 秒一轮的状态快照用：**绝不发网络请求**。
 /// 缓存还没有（刚开机、后台第一轮没跑完）就把**上次查到的那份**交出去，一张表先画出来；
 /// 一次都没查过才退回静态目录占位（界面把状态列写成"查询中"）。
@@ -600,6 +837,8 @@ pub fn snapshot() -> Value {
         .unwrap_or_else(catalog_items);
     let v = json!({
         "ok": true, "items": items,
+        // 有几条「登录并领取」正在等（界面据此在那一行显示"等待登录"）
+        "want": want_count(),
         "fetched_at": last["fetched_at"].as_f64().unwrap_or(0.0),
         "state": public_state(&st),
         "stale": true, "refreshing": true,
