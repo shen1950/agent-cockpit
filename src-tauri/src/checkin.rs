@@ -884,6 +884,9 @@ pub fn for_app(app_id: &str) -> Value {
     json!({
         "state": if it["signed_today"].as_bool() == Some(true) { "done" }
             else if it["claimable"].as_bool() == Some(true) { "claimable" }
+            // 这次没读到（空列表 / 没拿到设备令牌）：卡片角标要写"没读到"，
+            // 不能落到下面的 unknown——那是"厂商没给"，跟"我们没问出来"是两件事
+            else if it["unreadable"].as_bool() == Some(true) { "unreadable" }
             else if it["activity_on"].as_bool() == Some(false) { "off" }
             else { "unknown" },
         "reward": it["reward"], "streak": it["streak"],
