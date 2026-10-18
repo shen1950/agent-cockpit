@@ -1447,6 +1447,7 @@ svg.wave { display: block; width: 100%; height: 150px }
 .cimark.claimable { color: var(--accent-ink); background: var(--accent); border-color: var(--accent) }
 .cimark.done { color: var(--ok); background: var(--ok-soft) }
 .cimark.error { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line) }
+.cimark.unreadable { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line) }
 .cinum.wide { width: 70px }
 .ciwarn { accent-color: var(--accent) }
 

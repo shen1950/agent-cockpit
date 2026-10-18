@@ -998,6 +998,9 @@ async function loadCheckin(force) {
 function ciState(it) {
   const w = it.words || {};
   if (it.pending) return { cls: 'pending', word: '查询中…' };
+  // 这次没读到（服务端回空列表，或者没拿到客户端设备令牌）：要写成"没读到"，
+  // 不能落到最底下那句"状态未知"——那句等于把"我们没问出来"和"厂商没给"混成一件事
+  if (it.unreadable) return { cls: 'bad', word: '这次没读到' };
   // 共用一份登录态的行：这个号自己读不到状态，别写"状态未知"（那像出错）
   if (it.shared) return { cls: 'off', word: '共用登录态' };
   if (it.error) return { cls: 'bad', word: '读不到' };
@@ -1007,6 +1010,8 @@ function ciState(it) {
   if (it.claimable === true) return { cls: 'go', word: w.go || '今天可领' };
   // 接口两条都正常返回、只是今天还没到账：那是"还没登录过"，不许画成红色"读不到"
   if (it.need_login) return { cls: 'wait', word: w.wait || '今天还没登录' };
+  // 活动是开着的、今天也确实没有可领项：这是一个**确定**的答案，不是"未知"
+  if (it.activity_on === true) return { cls: 'off', word: '没有可领活动' };
   if (it.activity_on === false) return { cls: 'off', word: '活动未开' };
   return { cls: 'off', word: '状态未知' };
 }
@@ -1017,6 +1022,7 @@ function ciState(it) {
 function ciActionWord(it) {
   const w = it.words || {};
   if (it.error) return '';
+  if (it.unreadable) return '没读到';
   if (it.shared) return '切到该号';
   if (it.mode === 'travel') {
     if (it.next_action === 'depart') return w.depart || '派出';
@@ -1095,7 +1101,9 @@ function ciAction(it, name) {
     ? (step === 'depart' || step === 'claim')
     : (it.claimable === true);
   const label = ciActionWord(it);
-  const title = !doable
+  const title = it.unreadable
+    ? '这次没读到这一家的活动列表——点这一行最右边的 ↻ 重试，或者到客户端里点「领取」'
+    : !doable
     ? (travel
       ? (step === 'wait'
         ? `猫猫还在路上${it.arrive_at ? `，约 ${it.arrive_at} 到` : ''}，到点了这一格会变成「领取」`
@@ -1185,7 +1193,7 @@ function ciRefreshBtn(it) {
 function checkinMark(i) {
   const c = i.checkin;
   if (!c || !c.state) return null;
-  const txt = { done: '已签', claimable: '可领', off: '签到未开', unknown: '状态未知', error: '读不到' }[c.state];
+  const txt = { done: '已签', claimable: '可领', off: '签到未开', unreadable: '没读到', unknown: '状态未知', error: '读不到' }[c.state];
   if (!txt) return null;
   const tip = `${c.name || '每日签到'} · ${txt}`
     + (c.streak != null ? ` · 连签 ${c.streak} 天` : '')
