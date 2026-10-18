@@ -19,7 +19,6 @@
 
   --nav-w-user: 248px;
   --nav-w: var(--nav-w-user);
-  --mgmt-h: 184px;  /* 左下角「管理」那一截的定高，只有拖过那条横线才生效（.sidebar.split） */
   --topbar-h: 48px;
 }
 
@@ -271,19 +270,20 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
   display: flex; flex-direction: column; gap: var(--sp-2);
   padding-right: var(--sp-1); scrollbar-gutter: stable;
 }
+/* 左下角「管理」这一截：**固定高度**，正好装下它那 5 个菜单项，跟窗口多大无关，
+   也不再有可拖的横线（她 2026-10-18："不要可以上下滑动了，不管窗口多大都固定这个大小"）。
+   flex: 0 0 auto = 高度完全由内容决定；上面那块 .side-scroll 是 flex:1 1 0，
+   窗口变高变矮只会改变列表区，这一截纹丝不动。 */
 .side-fixed {
   flex: 0 0 auto; padding-top: var(--sp-1);
+  border-top: 1px solid var(--line); margin-top: var(--sp-1);
   display: flex; flex-direction: column; gap: var(--sp-1);
 }
-/* 左下角「管理」这一截：项目加多之后不能跟着一路长高——字号、行距、图标列都压到最小，
-   再给一个占窗口高度的上限，窗口矮的时候它自己滚，窗口大起来也不会去抢上面列表的地方。
-   （2026-10-15 她指出"项目多了显得非常高"） */
+/* 左下角「管理」这一截：项目加多之后不能跟着一路长高——字号、行距、图标列都压到最小。 */
 .side-fixed .navtitle { margin: 0 var(--sp-3) 1px; font-size: 10px; letter-spacing: 1.6px }
-/* 管理区列表：正常窗口与最大化窗口都必须把 5 个菜单项**恰好全部显示**。
-   以前这里压着 min(22vh, 208px)，800px 高的正常窗口只能显示 4 条多，
-   「设置」直接被切掉（她 2026-10-17 实测截图）。现在上限放到 60vh / 420px：
-   5 条菜单在任何窗口尺寸下都装得下，真到了菜单多到装不下时才滚动。 */
-#viewlist { gap: 1px; max-height: min(60vh, 420px); overflow-y: auto; scrollbar-gutter: stable }
+/* 管理区列表：不再限高（以前 min(60vh,420px)，窗口一矮它就自己滚，菜单被切掉）。
+   5 条菜单在任何窗口尺寸下都完整显示，这是"固定"的一半；另一半在上面那条 flex。 */
+#viewlist { gap: 1px; overflow: visible }
 #viewlist button { padding: 4px 9px; font-size: 12px; border-radius: 7px; gap: 2px 6px }
 #viewlist .ico { width: 14px; font-size: 11.5px }
 /* 危险项（删除账号这类）在菜单里自成一档：分隔线 + 红字，标准菜单的做法 */
@@ -293,21 +293,6 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
 .setnav button.danger[aria-current="true"] {
   background: var(--danger-soft); color: var(--danger); box-shadow: inset 2px 0 0 var(--danger);
 }
-/* 两段之间这条横线自己就是拖拽手柄（.side-fixed 的 border-top 移到了这里） */
-.side-resize {
-  flex: 0 0 auto; height: 11px; margin-top: var(--sp-1);
-  position: relative; cursor: row-resize; touch-action: none;
-}
-.side-resize::before {
-  content: ""; position: absolute; inset: 5px 0 auto; height: 1px;
-  background: var(--line); border-radius: var(--r-pill);
-  transition: background .14s ease;
-}
-.side-resize:hover::before, .side-resize.dragging::before { background: var(--accent); height: 3px; top: 4px }
-.side-resize:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px }
-/* 列表区永远吃掉剩余高度（flex:1 1 0），拖线只改「管理」那一截的定高。
-   这样窗口无论变大变小，多出来的空间都只会落到列表区，左下角不可能长出空白 */
-.sidebar.split .side-fixed { flex: 0 0 var(--mgmt-h); min-height: 0; overflow-y: auto; scrollbar-gutter: stable }
 .sidehead { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2) }
 .sidehead .navtitle { margin: 0 }
 /* 侧栏最上面那行：Agents 标题 + 收起按钮。不参与两段高度的分配，所以 flex 定死不许缩 */
@@ -1262,10 +1247,7 @@ html.rail { --nav-w: 68px }
 html.rail .navtitle, html.rail .navfoot, html.rail .legend,
 html.rail .applist .label, html.rail .applist .badge, html.rail .applist .cap,
 html.rail .applist .nav-badges, html.rail .nav-resize { display: none }
-/* 图标条模式下这两截没什么可分配的，线留着当分隔、不许拖 */
-html.rail .side-resize { cursor: default; height: 9px }
-html.rail .side-resize:hover::before { background: var(--line); height: 1px; top: 5px }
-html.rail .sidebar.split .side-fixed { flex: 0 0 auto; overflow-y: visible }
+/* 图标条模式下这一截照样固定高度，只是把名字藏起来 */
 html.rail .applist button { justify-content: center; padding: 8px 0; gap: 0 }
 html.rail .applist .dot { display: none }
 html.rail .applist .fav { width: 24px; height: 24px }
@@ -1284,7 +1266,6 @@ html.rail .layout { grid-template-columns: var(--nav-w) minmax(0, 1fr) }
   #btn-nav-toggle { display: none }
   .layout { grid-template-columns: minmax(0, 1fr) }
   .sidebar, .side-scroll { overflow: visible }
-  .side-resize { display: none }
   .content { padding-left: 0 }
   .applist { flex-direction: row; overflow-x: auto }
   .cards { grid-template-columns: minmax(0, 1fr) }
@@ -1601,33 +1582,6 @@ svg.wave { display: block; width: 100%; height: 150px }
 }
 .ci-name.acc .ci-note { display: none }
 
-/* ------------------------------------------------------------
-   侧栏管理区的拖拽手柄（2026-10-17 重做）
-   以前只有一条 1px 的线，看不出能拖、也看不出往哪拖。
-   现在：常驻三颗小点（抓手），hover 变宽变亮，拖动中在右侧浮一个像素读数。
-   ------------------------------------------------------------ */
-.side-resize { height: 13px; margin-top: 2px }
-.side-resize::before { inset: 6px 0 auto }
-/* 抓手：三颗 2px 的点，告诉人"这里能上下拉" */
-.side-resize::after {
-  content: ""; position: absolute; left: 50%; top: 50%;
-  width: 22px; height: 7px; transform: translate(-50%, -50%);
-  background-image: radial-gradient(circle, var(--text-faint) 1px, transparent 1.2px);
-  background-size: 6px 7px; background-position: 1px 0;
-  border-radius: 4px; opacity: .5; transition: opacity .14s ease;
-  pointer-events: none;
-}
-.side-resize:hover::after, .side-resize.dragging::after { opacity: 1 }
-/* 拖动中的像素读数：贴在横线右上，跟着手走，不用等松手才知道拖了多少 */
-.side-resize[data-readout]:not([data-readout=""])::after {
-  content: attr(data-readout);
-  width: auto; height: auto; background-image: none;
-  left: auto; right: 8px; top: -20px; transform: none;
-  padding: 1px 6px; border-radius: 5px;
-  background: var(--accent); color: #fff; font-size: 11px;
-  font-variant-numeric: tabular-nums; opacity: 1;
-}
-
 /* 每行末尾那颗 ↻：只重查这一行，不动别的行（2026-10-17） */
 .ci-ref { justify-self: center; align-self: center }
 .ci-refresh {
@@ -1700,25 +1654,13 @@ svg.wave { display: block; width: 100%; height: 150px }
 .cl-r.mid { color: var(--text-muted) }
 
 /* ------------------------------------------------------------
-   侧栏「管理」那一截：压缩时只留一个滚动条（2026-10-17）
-   以前外层 .side-fixed 和里层 #viewlist 各有一个 overflow-y，
-   滚一下"管理"两个字就被分割线切掉半截、底下也切一条——
-   她说的"上下总是被遮盖"就是这个。
-   现在：外层不滚、标题钉住，只有列表自己滚；高度又吸附到整条菜单，
-   所以看到的永远是 N 条完整的菜单，不会出现半条。
+   侧栏「管理」那一截：固定高度、不滚（2026-10-18）
+   以前这里有一整套"压缩态"的规则（外层不滚、标题钉住、列表自己滚、滚动吸附整条）。
+   现在这一截的高度恒等于内容（5 条菜单全显示），.sidebar.split 这个状态整个不存在了，
+   那几条规则一起删掉，只留下面这条"列表项不许被压扁"。
    ------------------------------------------------------------ */
-.sidebar.split .side-fixed { overflow: hidden }
-.sidebar.split .side-fixed > .sidehead { flex: 0 0 auto }
-.sidebar.split #viewlist {
-  flex: 1 1 auto; min-height: 0; max-height: none;
-  overflow-y: auto; scrollbar-gutter: stable;
-}
-
 /* 列表项不许被压扁（2026-10-17）
    `.applist` 是 flex column，项默认 `flex-shrink: 1`——容器一变矮，
    菜单就被等比压扁（不是滚动），于是看到的是"每条都变矮、上下都被切掉一点"。
    她说的"上下总是被遮盖"有一半是这个。定死 `flex: none`，让它老老实实滚动。 */
 .applist > li { flex: 0 0 auto }
-/* 压缩状态下滚动要落在整条上，不能停在半条 */
-.sidebar.split #viewlist { scroll-snap-type: y mandatory }
-.sidebar.split #viewlist > li { scroll-snap-align: start }
