@@ -343,7 +343,6 @@ pub async fn action(
     payload: Value,
     state_ref: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
-    let _g = cmd_guard();
     let act = payload["action"].as_str().unwrap_or("").to_string();
     // 「一键刷新全部额度」不在这里同步跑：十几个账号挨个读，官网那条还要建隐藏窗口，
     // 一路同步下去窗口要冻好几分钟。起个后台任务，界面靠 4 秒一轮的进度自己看。
@@ -360,6 +359,12 @@ pub async fn action(
     // 站点不通时一次 key_test 能把加载、建卡、保存全部挡在门外——
     // 她测完 B.ai（连接超时）想录云知声，站点就是存不进去（2026-10-17 实测）。
     // 这三个分支内部自己按「锁内快照 → 锁外探测 → 锁内重读落账」分段拿锁。
+    // ⚠ 这里**不许**再拿一次 CMD_LOCK（2026-10-18 修的死锁）：
+    // v2.1.5 把网络动作改成"锁外探测"时，函数开头那一句 `let _g = cmd_guard();` 忘了删，
+    // 于是下面第 371 行又锁一次——std::sync::Mutex 不可重入，同一个线程第二次 lock
+    // 直接卡死。表现是**所有** action 都永远不返回：向导里「打开客户端登录」「读取登录状态」
+    // 点了没反应、建卡/换号/领取全部无声失败，而 4 秒一轮的状态刷新（另一条命令）照常，
+    // 所以界面看着是活的。锁只在真正落账的那一段拿。
     if matches!(act.as_str(), "key_test" | "key_probe_models" | "key_models") {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_action(&act, &app_id, &name, &payload, &state_ref)
