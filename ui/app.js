@@ -320,8 +320,19 @@ const askConfirm = (msg, opts = {}) => ask({ msg, ...opts }).then((v) => v !== n
 const askText = (msg, def = '', opts = {}) => ask({ msg, input: def, ...opts });
 
 /* ---------------- 后端调用 ---------------- */
+/* invoke 被拒绝（命令抛错 / 卡死超时后 IPC 断掉）时**必须出声**。
+   以前这里直接 `await invoke(...)`，一旦后端返回 Err，异常就冒到按钮的 async 回调里没人接，
+   按钮看起来就是"点了没反应"——2026-10-18 向导那两个按钮正是这么静默失败的
+   （真因是 commands.rs 里 CMD_LOCK 重入死锁，已修）。现在统一兜成一条失败提示。 */
 async function run(action, extra = {}) {
-  const r = await invoke('action', { payload: { action, ...extra } });
+  let r;
+  try {
+    r = await invoke('action', { payload: { action, ...extra } });
+  } catch (e) {
+    const msg = String((e && (e.message || e)) || e).slice(0, 200);
+    toast(`这一步没跑通：${msg}`, false);
+    return { ok: false, msg };
+  }
   toast(r.msg, r.ok);
   load();
   return r;
@@ -431,9 +442,18 @@ function renderAlerts(d) {
   warnExpiring(d.alerts);
 }
 
+/* 一条临期要说两件事：这一档还剩多少、最早那一刻会作废多少。
+   以前只写总量（"剩余 4,397.36 积分"），读起来像"22:18 要作废 4,397.36"，
+   实际到点作废的只是 62.36 那一笔——两件事必须分开写，否则提醒就是误导。 */
 function expiringText(alerts) {
-  return alerts.map((a) => `「${a.app}/${a.name}」${a.label ? ` · ${a.label}` : ''}`
-    + ` 剩余 ${nfmt(a.left)}${a.unit ? ` ${utxt(a.unit)}` : ''} · ${expText(a.days)}`).join('\n');
+  return alerts.map((a) => {
+    const unit = a.unit ? ` ${utxt(a.unit)}` : '';
+    const at = a.exp_left != null
+      ? ` 作废 ${nfmt(a.exp_left)}${unit}`
+      : (a.exp_left_unknown ? '（该笔没给逐笔剩余）' : '');
+    const tot = a.left != null ? `（这一档共剩 ${nfmt(a.left)}${unit}）` : '';
+    return `「${a.app}/${a.name}」${a.label ? ` · ${a.label}` : ''}${at}${tot} · ${expText(a.days)}`;
+  }).join('\n');
 }
 
 let expWarnedOn = null;   // 本次会话已弹过就不重复弹
