@@ -628,9 +628,7 @@ function renderNav(d) {
     bindNavSort(b, a.id);
     ul.appendChild(el('li', {}, b));
   }
-  document.querySelectorAll('#viewlist [data-view]').forEach((x) => {
-    x.setAttribute('aria-current', String(S.view === x.dataset.view));
-  });
+  renderViewlist();   // 下半截 首页/更多/设置 也跟着 settings 每轮重画
   if (box) box.scrollTop = keep;
 }
 
@@ -7549,9 +7547,8 @@ function securitySection(body, panel, row, actBtn) {
     note('登录态在各 Agent 自己的加密存储里，驾驶舱只搬目录；账号目录不加密，要防翻盘就把数据根放 BitLocker 盘。')));
 }
 
-/* 设置 → 外观：侧导菜单编辑器（「更多」「设置」两个弹层各一份）。
-   全量候选 = 已勾的（按保存顺序）+ 没勾的（按固定顺序），上下按钮在整张清单里
-   挪位置，勾选即时保存；存盘只存勾中的 id。 */
+/* 设置 → 外观：「设置」弹层的编辑器（勾选 + 上下排序；侧导菜单那栏用上面的拖拽编辑器）。
+   全量候选 = 已勾的（按保存顺序）+ 没勾的（按固定顺序），存盘只存勾中的 id。 */
 function menuEditor(key, pool, inLabel) {
   const canonical = Object.keys(pool);
   const saved = Array.isArray(S.data?.settings?.appearance?.[key])
@@ -7561,7 +7558,7 @@ function menuEditor(key, pool, inLabel) {
   const commit = () => setSetting('appearance', key, order.filter((id) => saved.includes(id)));
   const wrap = el('div', { class: 'mm-editor' });
   order.forEach((id, i) => {
-    const [glyph, label, , mdl] = pool[id];
+    const [label] = pool[id];
     const up = el('button', { class: 'btn plain sm mm-move', type: 'button', title: '上移', aria: { label: `上移${label}` } }, '↑');
     up.disabled = i === 0;
     up.addEventListener('click', () => { [order[i - 1], order[i]] = [order[i], order[i - 1]]; commit(); });
@@ -7575,13 +7572,110 @@ function menuEditor(key, pool, inLabel) {
       else saved.splice(saved.indexOf(id), 1);
       commit();
     });
+    const ic = menuIcon(id);
+    ic.classList.add('mm-ico');
     wrap.appendChild(el('div', { class: 'mm-row' },
-      up, down, chk,
-      el('span', { class: mdl ? 'mm-ico ico-gear' : 'mm-ico' }, glyph),
+      up, down, chk, ic,
       el('span', { class: 'mm-name' }, label),
       saved.includes(id) ? el('span', { class: 'mm-state' }, inLabel) : el('span', { class: 'mm-state off' }, '不显示')));
   });
   return wrap;
+}
+
+/* 设置 → 外观：「侧导菜单」编辑器，照 Qoder 的「编辑侧导菜单」做——
+   左栏「侧栏布局预览」是侧栏上真实的样子（首页 / 更多 / 设置三行固定带锁），
+   右栏「收进更多」是收进「··· 更多」弹层的项；按住行尾六个点拖动，可以面板内排序、
+   也可以跨栏（拖进左栏 = 出现在侧栏上，拖回右栏 = 收进弹层）。落盘：
+   side_visible（侧栏上的项，按序）+ side_menu（收进「更多」的项，按序）。 */
+function sideMenuEditor() {
+  const { vis, more } = sideMenuSplit();
+  const wrap = el('div', { class: 'se-wrap' });
+  const mkPanel = (cap, panelKey) => {
+    const list = el('div', { class: 'se-list' });
+    const panel = el('div', { class: 'se-panel', data: { panel: panelKey } }, el('div', { class: 'se-cap' }, cap), list);
+    return { panel, list };
+  };
+  const A = mkPanel('侧栏布局预览', 'side');
+  const B = mkPanel('收进「更多」', 'more');
+  const lockedRow = (iconId, label) => {
+    const lk = menuIcon('lock');
+    lk.classList.add('se-lockico');
+    return el('div', { class: 'se-row locked' },
+      menuIcon(iconId), el('span', { class: 'se-name' }, label),
+      el('span', { class: 'se-lock', title: '固定项' }, lk));
+  };
+  const dragRow = (id, panelKey) => {
+    const row = el('div', { class: 'se-row', data: { id } },
+      menuIcon(id), el('span', { class: 'se-name' }, SIDE_MENU_ITEMS[id][0]));
+    const handle = el('span', { class: 'se-handle', title: '拖动排序或跨栏' });
+    handle.innerHTML = MENU_ICONS.dots;
+    row.appendChild(handle);
+    handle.addEventListener('pointerdown', (e) => startRowDrag(e, id, panelKey, row, A, B));
+    return row;
+  };
+  A.list.appendChild(lockedRow('home', '首页'));
+  for (const id of vis) A.list.appendChild(dragRow(id, 'side'));
+  A.list.appendChild(lockedRow('more', '更多'));
+  A.list.appendChild(lockedRow('gear', '设置'));
+  if (!more.length) B.list.appendChild(el('div', { class: 'se-empty' }, '把右边的行拖回这里，就收进「更多」'));
+  for (const id of more) B.list.appendChild(dragRow(id, 'more'));
+  wrap.appendChild(A.panel);
+  wrap.appendChild(B.panel);
+  return wrap;
+}
+
+/* 一次跨栏拖拽：pointerdown 抓住六个点 → move 时按指针找目标面板与插入位（亮线提示）
+   → up 落盘。数据源是两个数组（side_visible / side_menu），并集恒等于全部候选项。 */
+function startRowDrag(e, id, fromPanel, rowEl, A, B) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  seDrag = id;
+  rowEl.classList.add('dragging');
+  let target = null;
+  const mark = (row, above) => {
+    document.querySelectorAll('.se-row').forEach((r) => r.classList.remove('drop-above', 'drop-below'));
+    if (!row) return;
+    row.classList.add(above ? 'drop-above' : 'drop-below');
+  };
+  const move = (ev) => {
+    const under = document.elementFromPoint(ev.clientX, ev.clientY);
+    const panel = under && under.closest('.se-panel');
+    target = null;
+    if (!panel) { mark(null); return; }
+    const rows = [...panel.querySelectorAll('.se-row:not(.locked):not(.dragging)')];
+    let before = null;
+    for (const r of rows) {
+      const rc = r.getBoundingClientRect();
+      if (ev.clientY < rc.top + rc.height / 2) { before = r; break; }
+    }
+    target = { panel: panel.dataset.panel, before: before ? before.dataset.id : null };
+    const ref = before || rows[rows.length - 1];
+    mark(ref, !!before);
+  };
+  const up = () => {
+    document.removeEventListener('pointermove', move, true);
+    document.removeEventListener('pointerup', up, true);
+    document.removeEventListener('pointercancel', up, true);
+    mark(null);
+    rowEl.classList.remove('dragging');
+    seDrag = null;
+    if (!target || (target.panel === fromPanel && target.before === rowEl.dataset.id)) { renderSettings(); return; }
+    const vis = sideMenuSplit().vis.slice();
+    const more = sideMenuSplit().more.slice();
+    const src = fromPanel === 'side' ? vis : more;
+    const i = src.indexOf(id);
+    if (i >= 0) src.splice(i, 1);
+    const dst = target.panel === 'side' ? vis : more;
+    const j = target.before ? dst.indexOf(target.before) : dst.length;
+    dst.splice(j < 0 ? dst.length : j, 0, id);
+    setSetting('appearance', 'side_visible', vis);
+    setSetting('appearance', 'side_menu', more);
+    renderNav(S.data);   // 侧栏立刻跟上（seDrag 已清，允许重建）
+    renderSettings();    // 面板按新划分重排
+  };
+  document.addEventListener('pointermove', move, true);
+  document.addEventListener('pointerup', up, true);
+  document.addEventListener('pointercancel', up, true);
 }
 
 function renderSettings() {
@@ -7662,9 +7756,10 @@ function renderSettings() {
         segCtrl([['auto', '自动'], ['expand', '总是展开'], ['collapse', '总是收起']],
           a.nav_collapsed === true ? 'collapse' : (a.nav_collapsed === false ? 'expand' : 'auto'),
           (v) => setSetting('appearance', 'nav_collapsed', v === 'auto' ? null : v === 'collapse'))),
-      row('「更多」菜单', '侧栏「··· 更多」弹层里放哪些项、按什么顺序；末尾的「编辑侧导菜单」固定在最后。',
-        menuEditor('side_menu', SIDE_MENU_ITEMS, '在「更多」里')),
-      row('「设置」菜单', '侧栏「⚙ 设置」弹层里放哪些项、按什么顺序。',
+      row('侧导菜单', '左边是侧栏上实际的样子（首页 / 更多 / 设置固定不动），右边是收进「更多」的；'
+        + '按住行尾六个点拖动，可以排序、也可以跨栏。',
+        sideMenuEditor()),
+      row('「设置」菜单', '侧栏「设置」弹层里放哪些项、按什么顺序。',
         menuEditor('gear_menu', GEAR_MENU_ITEMS, '在「设置」里'))));
   }
 
@@ -8500,23 +8595,42 @@ function pxRunBtn(d, onlyStop) {
   return btn('启动反代', 'primary sm', proxyToggle, '启动本机反代端口，客户端才连得上 8788');
 }
 
-/* 侧栏底部「··· 更多」「⚙ 设置」两个弹层（她 10-25 定的设计，学 Qoder 侧导菜单）：
-   - 更多 = 多余的管理项（默认 协作/密钥管理/模型反代/每日签到）+ 分界线 + 「编辑侧导菜单」
-     （跳 设置 → 外观，那里可以自定义两个弹层里各放什么、按什么顺序）；
-   - 设置 = 设置页分组（默认 设置/外观/运行日志/帮助）。
-   两个弹层都**只往右侧伸出**（像浏览器收藏夹子菜单往右套娃），绝不从左边或下边冒出来。
-   弹层挂 body 上——这一截会自己滚，绝对定位的子元素放进去会被 overflow 裁掉。 */
+/* 侧栏菜单 / 弹层 / 编辑器共用的图标：内联 SVG（照 ACT_ICONS 的规矩，不赌字体字形）。
+   她点名"所有这几个选项的小图标都重新设计，尤其是那三个点"——文本的 ···/◎/⇢ 在
+   等宽字体里又小又偏，全部换成线性稿（gear 用 24 网格的 Lucide 齿轮缩过来）。 */
+const MENU_ICONS = {
+  home: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 7.3 8 3.2l5.2 4.1"/><path d="M4.4 6.6V13h7.2V6.6"/><path d="M6.7 13V9.4h2.6V13"/></svg>',
+  more: '<svg viewBox="0 0 16 16" fill="currentColor" stroke="none"><circle cx="3.4" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="12.6" cy="8" r="1.5"/></svg>',
+  gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
+  collab: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.2h9.4M10.2 3l2.2 2.2-2.2 2.2"/><path d="M13 10.8H3.6M5.8 8.6 3.6 10.8l2.2 2.2"/></svg>',
+  keys: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="11" r="2.7"/><path d="M6.9 9.1 13 3M10.2 5.8l2 2M12 4l2 2"/></svg>',
+  proxy: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 8h10M9.8 5.2 12.9 8l-3.1 2.8"/></svg>',
+  checkin: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M5.3 8.3l1.9 1.9 3.5-4"/></svg>',
+  appearance: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 2a6 6 0 0 1 0 12Z" fill="currentColor" stroke="none"/></svg>',
+  logs: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5.6 4h7.8M5.6 8h7.8M5.6 12h7.8"/><circle cx="2.7" cy="4" r=".5" fill="currentColor" stroke="none"/><circle cx="2.7" cy="8" r=".5" fill="currentColor" stroke="none"/><circle cx="2.7" cy="12" r=".5" fill="currentColor" stroke="none"/></svg>',
+  help: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M6.3 6.3a1.8 1.8 0 1 1 2.7 1.9c-.6.4-1 .7-1 1.5"/><circle cx="8" cy="11.6" r=".5" fill="currentColor" stroke="none"/></svg>',
+  lock: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7.2" width="8" height="6" rx="1.5"/><path d="M5.5 7.2V5.6a2.5 2.5 0 0 1 5 0v1.6"/></svg>',
+  dots: '<svg viewBox="0 0 8 14" width="8" height="14" fill="currentColor" stroke="none"><circle cx="2" cy="2" r="1.2"/><circle cx="6" cy="2" r="1.2"/><circle cx="2" cy="7" r="1.2"/><circle cx="6" cy="7" r="1.2"/><circle cx="2" cy="12" r="1.2"/><circle cx="6" cy="12" r="1.2"/></svg>',
+};
+function menuIcon(id) {
+  const s = el('span', { class: 'ico', 'aria-hidden': 'true' });
+  s.innerHTML = MENU_ICONS[id] || '';
+  return s;
+}
+/* 侧栏底部三个入口：首页 + 「更多」（收多余的管理项，弹层只往右伸出）+ 「设置」
+   （设置页分组入口）。哪些项出现在侧栏上、哪些收进「更多」、按什么顺序，
+   在 设置 → 外观 的「侧导菜单」里按住行尾六个点拖（Qoder 的「编辑侧导菜单」那套）。 */
 const SIDE_MENU_ITEMS = {
-  collab: ['⇄', '协作', () => { S.view = 'collab'; ensureCollab(false); }],
-  keys: ['#', '密钥管理', () => { S.view = 'keys'; }],
-  proxy: ['⇢', '模型反代', () => { S.view = 'proxy'; }],
-  checkin: ['✓', '每日签到', () => { S.view = 'checkin'; }],
+  collab: ['协作', () => { S.view = 'collab'; ensureCollab(false); }],
+  keys: ['密钥管理', () => { S.view = 'keys'; }],
+  proxy: ['模型反代', () => { S.view = 'proxy'; }],
+  checkin: ['每日签到', () => { S.view = 'checkin'; }],
 };
 const GEAR_MENU_ITEMS = {
-  settings: ['\uE713', '设置', () => { setSection = 'general'; S.view = 'settings'; }, true],
-  appearance: ['◐', '外观', () => { setSection = 'appearance'; S.view = 'settings'; }],
-  logs: ['▤', '运行日志', () => { setSection = 'logs'; S.view = 'settings'; }],
-  help: ['?', '帮助', () => { setSection = 'help'; S.view = 'settings'; }],
+  settings: ['设置', () => { setSection = 'general'; S.view = 'settings'; }],
+  appearance: ['外观', () => { setSection = 'appearance'; S.view = 'settings'; }],
+  logs: ['运行日志', () => { setSection = 'logs'; S.view = 'settings'; }],
+  help: ['帮助', () => { setSection = 'help'; S.view = 'settings'; }],
 };
 /* 当前生效的清单：settings.appearance[key]（缺键=老配置，全放；数组里的未知 id 过滤掉） */
 function menuIds(key, pool) {
@@ -8524,7 +8638,21 @@ function menuIds(key, pool) {
   if (!Array.isArray(arr)) return Object.keys(pool);
   return arr.filter((id) => pool[id]);
 }
+/* 侧栏上的项（side_visible，按序插在「首页」和「更多」之间）与收进「更多」的项
+   （side_menu）的划分；两边都没有的候选项收进「更多」，保证并集完整、互不重复。 */
+function sideMenuSplit() {
+  const ok = (id) => !!SIDE_MENU_ITEMS[id];
+  const a = S.data?.settings?.appearance || {};
+  const vis = (Array.isArray(a.side_visible) ? a.side_visible : []).filter(ok);
+  const more = (Array.isArray(a.side_menu) ? a.side_menu : Object.keys(SIDE_MENU_ITEMS))
+    .filter(ok).filter((id) => !vis.includes(id));
+  for (const id of Object.keys(SIDE_MENU_ITEMS)) {
+    if (!vis.includes(id) && !more.includes(id)) more.push(id);
+  }
+  return { vis, more };
+}
 let sidePop = null;
+let seDrag = null;   // 编辑器正在拖拽时别重建面板/侧栏（4 秒轮询会掐断拖拽）
 
 function closeSideMenu() {
   if (!sidePop) return;
@@ -8540,9 +8668,8 @@ function openSidePopup(anchor, items) {
   sidePop = el('div', { class: 'sidepop' });
   for (const it of items) {
     if (it && it.sep) { sidePop.appendChild(el('div', { class: 'sep' })); continue; }
-    const [glyph, label, act, mdl] = it;
-    const b = el('button', { type: 'button' },
-      el('span', { class: mdl ? 'ico ico-gear' : 'ico' }, glyph), label);
+    const [id, label, act] = it;
+    const b = el('button', { type: 'button' }, menuIcon(id), label);
     b.addEventListener('click', (ev) => {
       ev.stopPropagation();
       closeSideMenu();
@@ -8552,8 +8679,8 @@ function openSidePopup(anchor, items) {
     sidePop.appendChild(b);
   }
   document.body.appendChild(sidePop);
-  // 只在右侧伸出：左缘贴锚点右缘，顶缘对齐锚点行（超出窗口就往上收）；
-  // 贴着窗口右缘放不下时只允许夹回窗口内，这是"只在右边"的极限，不做别的方向
+  // 只在右侧伸出：左缘贴锚点行右缘，顶缘对齐锚点行（超出窗口就往上收）；
+  // 贴着窗口右缘放不下时只允许夹回窗口内，这是"只在右边"的极限
   const r = anchor.getBoundingClientRect();
   const pw = sidePop.offsetWidth, ph = sidePop.offsetHeight;
   const top = Math.max(8, Math.min(r.top - 4, window.innerHeight - ph - 8));
@@ -8563,23 +8690,48 @@ function openSidePopup(anchor, items) {
   anchor.setAttribute('aria-expanded', 'true');
 }
 
-function bindSideMenus() {
-  const more = $('btn-more-menu');
-  const gear = $('btn-gear-menu');
-  if (!more || !gear) return;
-  more.addEventListener('click', (e) => {
-    e.stopPropagation();
-    if (sidePop) { closeSideMenu(); return; }
-    const items = menuIds('side_menu', SIDE_MENU_ITEMS).map((id) => SIDE_MENU_ITEMS[id]);
+/* 侧栏下半截：首页 + (side_visible 各行) + 更多 + 设置，4 秒一轮跟着 settings 重画。
+   弹层开着或编辑器拖拽中时跳过重建——锚点被换掉的话弹层/拖拽就悬空了。 */
+function renderViewlist() {
+  const ul = $('viewlist');
+  if (!ul || sidePop || seDrag) return;
+  clear(ul);
+  const { vis } = sideMenuSplit();
+  const viewRow = (view, iconId, label) => {
+    const b = el('button', { data: { view }, aria: { current: String(S.view === view) } },
+      menuIcon(iconId), label);
+    b.addEventListener('click', () => {
+      S.view = view;
+      render();
+      if (view === 'collab') ensureCollab(false);
+    });
+    return el('li', {}, b);
+  };
+  const popRow = (btnId, iconId, label, getItems) => {
+    const b = el('button', { type: 'button', id: btnId, 'aria-haspopup': 'true',
+      'aria-expanded': 'false', title: `${label}菜单（在 设置 → 外观 里自定义）` },
+      menuIcon(iconId), label);
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (sidePop) { closeSideMenu(); return; }
+      openSidePopup(b, getItems());
+    });
+    return el('li', {}, b);
+  };
+  ul.appendChild(viewRow('home', 'home', '首页'));
+  for (const id of vis) ul.appendChild(viewRow(id, id, SIDE_MENU_ITEMS[id][0]));
+  ul.appendChild(popRow('btn-more-menu', 'more', '更多', () => {
+    const items = sideMenuSplit().more.map((id) => [id, SIDE_MENU_ITEMS[id][0], SIDE_MENU_ITEMS[id][1]]);
     items.push({ sep: true });
-    items.push(['✎', '编辑侧导菜单', () => { setSection = 'appearance'; S.view = 'settings'; }]);
-    openSidePopup(more, items);
-  });
-  gear.addEventListener('click', (e) => {
-    e.stopPropagation();
-    if (sidePop) { closeSideMenu(); return; }
-    openSidePopup(gear, menuIds('gear_menu', GEAR_MENU_ITEMS).map((id) => GEAR_MENU_ITEMS[id]));
-  });
+    items.push(['appearance', '编辑侧导菜单', () => { setSection = 'appearance'; S.view = 'settings'; }]);
+    return items;
+  }));
+  ul.appendChild(popRow('btn-gear-menu', 'gear', '设置', () => {
+    return menuIds('gear_menu', GEAR_MENU_ITEMS).map((id) => [id, GEAR_MENU_ITEMS[id][0], GEAR_MENU_ITEMS[id][1]]);
+  }));
+}
+
+function bindSideMenuClosers() {
   document.addEventListener('click', closeSideMenu);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSideMenu(); });
 }
@@ -8612,7 +8764,7 @@ function bind() {
   /* 左上角 logo = 回首页。整块还是拖拽区，但拖走要位移、单击照样跳。
      「首页」这一条在管理菜单里仍然保留——logo 是捷径，不是唯一入口。 */
   $('btn-home').addEventListener('click', () => { S.view = 'home'; render(); });
-  bindSideMenus();
+
   bindProxyNums();
   $('c-alerts').addEventListener('click', showAlerts);
   bindCtx();
@@ -8796,13 +8948,7 @@ function bind() {
   document.querySelectorAll('.back-agents').forEach((b) => {
     b.addEventListener('click', () => { S.view = 'agents'; render(); });
   });
-  document.querySelectorAll('#viewlist [data-view]').forEach((b) => {
-    b.addEventListener('click', () => {
-      S.view = b.dataset.view;
-      render();
-      if (S.view === 'collab') ensureCollab(false);
-    });
-  });
+  bindSideMenuClosers();   // 弹层的行级绑定在 renderViewlist 里（每轮重建），这里只挂全局关闭
   $('btn-home-reload').addEventListener('click', () => load());
   $('btn-collab-retry').addEventListener('click', () => ensureCollab(true));
   $('btn-collab-retry2').addEventListener('click', () => ensureCollab(true));

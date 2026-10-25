@@ -252,7 +252,8 @@ input:focus, select:focus { border-color: var(--accent) }
   flex: 1; min-height: 0; position: relative;
   display: grid;
   grid-template-columns: var(--nav-w) 9px minmax(0, 1fr);
-  padding: var(--sp-5);
+  /* 卡片放大（她圈的规格）：上下只留 12px、右侧 14px；左侧 24px 是侧栏自己的檐口不动 */
+  padding: 12px 14px 12px 24px;
   overflow: hidden;
 }
 
@@ -297,19 +298,17 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
   border-top: 1px solid var(--line); margin-top: var(--sp-1);
   display: flex; flex-direction: column; gap: var(--sp-1);
 }
-/* 侧栏最下面这一截只有三行（首页 / 更多 / 设置）。悬停/选中的底色不铺满整条侧栏，
-   收成固定宽（她量的蓝框 ≈178px）；侧栏拖得比这还窄时 min 兜底铺满。 */
+/* 侧栏最下面这一截：首页 / 更多 / 设置 打底，外观里拖进来的行也出现在这里。
+   悬停/选中的底色不铺满整条侧栏，收成固定宽（她量的蓝框 ≈178px）；
+   侧栏拖得比这还窄时 min 兜底铺满。 */
 #viewlist li { position: relative }
 #viewlist button { width: min(100%, 178px) }
 /* 「更多」「设置」弹层开着时入口行保持高亮，跟 hover 一致 */
 #btn-more-menu[aria-expanded="true"], #btn-gear-menu[aria-expanded="true"] {
   background: var(--bg-hover); color: var(--text);
 }
-/* 设置行的齿轮用 MDL2 字形（和删掉的齿轮按钮长得一样）；.ico 默认等宽字体，得换过去 */
-#viewlist .ico-gear, .sidepop .ico-gear, .mm-editor .ico-gear { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif; font-size: 13px }
-/* 图标条里菜单行收成 54px（跟 Agent 按钮同宽同列）；内边距沿用展开态的 3px 9px，
-   图标才钉在原地。宽度规则本体在文件末尾的 rail 块里。 */
-/* 齿轮弹层：挂在 body 上的独立 fixed 层，理由和 .tipbox 一样——
+/* 图标条里菜单行收成 54px（跟 Agent 按钮同宽同列）。宽度规则本体在文件末尾的 rail 块里。 */
+/* 弹层：挂在 body 上的独立 fixed 层，理由和 .tipbox 一样——
    .side-fixed 现在会滚，绝对定位的子元素放进去会被 overflow 裁掉 */
 .sidepop {
   position: fixed; z-index: 9998; min-width: 168px; padding: 4px;
@@ -319,32 +318,66 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
 }
 .sidepop[hidden] { display: none }
 .sidepop button {
-  display: flex; align-items: center; gap: 8px; width: 100%;
+  display: flex; align-items: center; gap: 10px; width: 100%;
   padding: 7px 9px; border-radius: var(--r-sm); text-align: left;
   color: var(--text-muted); font-size: 13px;
 }
 .sidepop button:hover { background: var(--bg-hover); color: var(--text) }
-.sidepop button .ico { width: 16px; text-align: center; color: var(--text-faint); font-family: var(--font-mono) }
+.sidepop button .ico { width: 16px; color: var(--text-faint) }
 .sidepop .sep { height: 1px; margin: 4px 6px; background: var(--line) }
-/* 「更多」里一个菜单项都没勾时给一句指路 */
-/* 设置 → 外观：「更多」菜单编辑器 */
+/* 设置 → 外观：「设置」菜单编辑器 */
 .mm-editor { display: flex; flex-direction: column; gap: 2px; min-width: 240px }
-.mm-row { display: flex; align-items: center; gap: 7px; padding: 3px 4px; border-radius: 7px }
+.mm-row { display: flex; align-items: center; gap: 8px; padding: 3px 4px; border-radius: 7px }
 .mm-row:hover { background: var(--bg-hover) }
 .mm-move { padding: 0 6px; font-size: 12px; line-height: 20px; min-height: 0 }
 .mm-move:disabled { opacity: .35; cursor: default }
-.mm-ico { width: 16px; text-align: center; color: var(--text-faint); font-family: var(--font-mono); font-size: 12px }
+.mm-ico { width: 16px; color: var(--text-faint) }
 .mm-name { font-size: 13px; color: var(--text) }
 .mm-state { margin-left: auto; font-size: 11.5px; color: var(--text-faint) }
 .mm-state.off { opacity: .6 }
-/* 「管理」小标题已按她 10-25 的意思删掉（.navtitle 不再出现在这一截）。
-   管理区列表：不再限高（以前 min(60vh,420px)，窗口一矮它就自己滚，菜单被切掉）。
-   6 行菜单在任何窗口尺寸下都完整显示，这是"固定"的一半；另一半在上面那条 flex。 */
-#viewlist { gap: 1px; overflow: visible }
-/* 字号从 12 提到 13，同时把上下内边距各减 1px、行高写死 18px：
-   3 + 18 + 3 = 24px，和原来 4 + 16 + 4 完全一样，字大了但行高没变。 */
-#viewlist button { padding: 3px 9px; font-size: 13px; line-height: 18px; border-radius: 7px; gap: 2px 6px }
-#viewlist .ico { width: 15px; font-size: 12.5px }
+/* 设置 → 外观：侧导菜单拖拽编辑器（照 Qoder 的「编辑侧导菜单」）：
+   左栏是侧栏布局预览（首页/更多/设置带锁固定），右栏是收进「更多」的；
+   行尾六个点是拖把手，可排序可跨栏，落点亮线提示。 */
+.se-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3) }
+.se-panel { border: 1px solid var(--line); border-radius: var(--r-md); padding: 8px; background: var(--bg) }
+.se-cap { font-size: 12px; color: var(--text-muted); padding: 2px 4px 8px }
+.se-list { display: flex; flex-direction: column; gap: 3px; min-height: 150px }
+.se-row {
+  position: relative; display: flex; align-items: center; gap: 10px;
+  padding: 7px 9px; border-radius: 8px; background: var(--bg-raised);
+  border: 1px solid var(--line); font-size: 13px;
+}
+.se-row.locked { color: var(--text-muted) }
+.se-row .ico { color: var(--text-faint) }
+.se-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.se-lock { margin-left: auto; color: var(--text-faint); display: inline-flex }
+.se-handle {
+  margin-left: auto; display: inline-flex; padding: 5px 4px; border-radius: 5px;
+  color: var(--text-faint); cursor: grab; touch-action: none;
+}
+.se-handle:hover { color: var(--text); background: var(--bg-hover) }
+.se-row.dragging { opacity: .45 }
+.se-row.drop-above::before, .se-row.drop-below::after {
+  content: ''; position: absolute; left: 5px; right: 5px; height: 2px;
+  background: var(--accent); border-radius: 1px; pointer-events: none;
+}
+.se-row.drop-above::before { top: -3px }
+.se-row.drop-below::after { bottom: -3px }
+.se-empty {
+  padding: 14px 10px; font-size: 12.5px; color: var(--text-faint);
+  border: 1px dashed var(--line-strong); border-radius: 8px; text-align: center;
+}
+/* 菜单行的图标全部换内联 SVG（MENU_ICONS）：等宽字体的 ◎/···/⇢ 又小又偏 */
+#viewlist .ico, .sidepop .ico, .mm-ico, .se-row .ico, .se-lockico {
+  display: inline-flex; align-items: center; justify-content: center;
+}
+#viewlist .ico svg, .sidepop .ico svg, .mm-ico svg, .se-row .ico svg { width: 15px; height: 15px; display: block }
+.se-lockico svg { width: 13px; height: 13px; display: block }
+/* 她 10-25（第三轮）：后面还有那么大空间，为什么挤在一起——
+   菜单行加高、图标和文字拉开、行距放宽，整截的呼吸感跟上来。 */
+#viewlist { gap: 4px; overflow: visible }
+#viewlist button { padding: 8px 10px; font-size: 13px; line-height: 18px; border-radius: 8px; gap: 2px 12px }
+#viewlist .ico { width: 15px; color: var(--text-muted) }
 /* 危险项（删除账号这类）在菜单里自成一档：分隔线 + 红字，标准菜单的做法 */
 .setnav .sep { height: 1px; margin: 6px 4px; background: var(--line) }
 .setnav button.danger { color: var(--danger) }
@@ -370,7 +403,7 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
 .nav-resize:focus-visible { outline: 2px solid var(--accent); outline-offset: 0 }
 /* 整窗视图（设置 / 密钥管理 / 协作）：盖掉侧栏，页面自己的左菜单就是二级导航，
    不然侧栏 + 页内菜单 + 内容三栏并排，右边的字就被挤到看不全 */
-.layout.full { grid-template-columns: minmax(0, 1fr) }
+.layout.full { grid-template-columns: minmax(0, 1fr); padding: 12px 14px }
 .layout.full .sidebar, .layout.full .nav-resize { display: none }
 .layout.full .view { max-width: 1280px; margin: 0 auto; width: 100% }
 /* 图标条（rail）模式把 .layout 改成 68px + 1fr 两列；整窗页藏了侧栏后只剩 .content
