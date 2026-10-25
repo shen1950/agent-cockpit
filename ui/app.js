@@ -805,8 +805,14 @@ function renderHome(d) {
       btn(running ? '↻ 正在刷新…' : '↻ 一键刷新全部额度', 'primary lg', () => refreshAllQuota(),
         '把每个账号的额度读一遍：能走官网读逐包明细，读不到退本机/服务端汇总。'
         + '这一轮在后台跑，进度就在按钮下面。'),
-      btn('✓ 一键签到', 'primary lg', () => claimAllCheckin(),
-        '把今天能领的一次领掉：先摊清单给你确认，领走的当日名额退不回来。')));
+      // 都领完了就别再摆"一键签到"：点了只会摊出一张空清单。状态还没读到（placeholder）、
+      // 一家都没读到（items 空）或还有可领的，才给签到按钮；确认领完换成进签到页看明细——
+      // 这两个按钮的位置要的是"现在能干什么"（2026-10-25 她圈的：都领完了还挂着一键签到）
+      ...(chk.placeholder || claimable.length || !items.length
+        ? [btn('✓ 一键签到', 'primary lg', () => claimAllCheckin(),
+            '把今天能领的一次领掉：先摊清单给你确认，领走的当日名额退不回来。')]
+        : [btn('✓ 今日已领完 · 看明细', 'lg', () => { S.view = 'checkin'; render(); },
+            `${signed.length}/${items.length} 家今天都领完了；去每日签到页看明细和领取记录。`)])));
   if (job) {
     const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
     hero.appendChild(el('div', { class: 'hjob' },
@@ -1044,7 +1050,13 @@ function ciState(it) {
   if (it.shared) return { cls: 'off', word: '共用登录态' };
   if (it.error) return { cls: 'bad', word: '读不到' };
   // 旅行猫是状态机不是签到：在路上要说"猫猫在路上"，写成"状态未知"等于什么都没说
-  if (it.mode === 'travel' && it.next_action === 'wait') return { cls: 'wait', word: w.wait_badge || '猫猫在路上' };
+  if (it.mode === 'travel') {
+    if (it.next_action === 'wait') return { cls: 'wait', word: w.wait_badge || '猫猫在路上' };
+    // 到达未领必须先于"今天已领取"判：跨天领（昨晚那趟今天领）时 signed_today 也是 true，
+    // 先判 done 会把眼前这趟没领的盖成"今天已领取"（2026-10-25 漏领 5 积分那次）
+    if (it.next_action === 'claim') return { cls: 'go', word: w.arrive_badge || '猫猫到了' };
+    if (it.next_action === 'depart') return { cls: 'go', word: w.home_badge || '猫猫在家' };
+  }
   if (it.signed_today === true) return { cls: 'done', word: w.done || '今天已签' };
   if (it.claimable === true) return { cls: 'go', word: w.go || '今天可领' };
   // 接口两条都正常返回、只是今天还没到账：那是"还没登录过"，不许画成红色"读不到"
