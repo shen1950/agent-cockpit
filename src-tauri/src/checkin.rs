@@ -291,6 +291,21 @@ fn stage_arg(app_id: &str, store: &str, dir: &std::path::Path) -> (String, Strin
 /// 也是需要的，我要的是通用管理。" 所以展开的判据从"这家能不能按账号读"改成"这家有没有多账号"。
 ///
 /// 读得到的那几行，每个号各起一次 agenthub（一次 python 启动两三秒），所以只在后台刷新里跑。
+/// 按账号查失败时摆的那一行。查询失败不许让整行消失——
+/// 她看到的是"二号不见了"，真相只是这一次没读到（2026-10-20 agenthub 少参数时踩过）。
+fn account_row_unreadable(app_id: &str, store: &str, name: &str, why: &str) -> Value {
+    json!({
+        "scope": "account", "account": name, "name": name,
+        "product": store, "parent": store, "app": app_id,
+        "pending": false, "unreadable": true,
+        "supported": true, "auto": false, "activity_on": true,
+        "signed_today": Value::Null, "claimable": false,
+        "note": format!(
+            "这个号自己的状态这次没读到：{why}。点这一行最右边的 ↻ 重试；一直失败就先去客户端登它一次"
+        ),
+    })
+}
+
 pub fn account_items(app_id: &str, store: &str) -> Vec<Value> {
     let insts = crate::registry::load_instances(app_id);
     let names: Vec<String> = insts
@@ -323,16 +338,29 @@ pub fn account_items(app_id: &str, store: &str) -> Vec<Value> {
         }
         let dir = match stage(app_id, store, &name) {
             Ok(d) => d,
-            Err(_) => continue,
+            Err(e) => {
+                out.push(account_row_unreadable(app_id, store, &name, &e));
+                continue;
+            }
         };
         let (flag, val) = stage_arg(app_id, store, &dir);
-        let item = run(&[store, flag.as_str(), val.as_str()])
-            .ok()
-            .and_then(|v| v.as_array().and_then(|a| a.first().cloned()));
+        let r = run(&[store, flag.as_str(), val.as_str()]);
         crate::authpack::drop_profile(&dir);
+        let item = match r {
+            Ok(v) => v.as_array().and_then(|a| a.first().cloned()),
+            Err(e) => {
+                out.push(account_row_unreadable(app_id, store, &name, &e));
+                continue;
+            }
+        };
         let mut it = match item {
             Some(i) => i,
-            None => continue,
+            None => {
+                out.push(account_row_unreadable(
+                    app_id, store, &name, "agenthub 没返回这个号的结果",
+                ));
+                continue;
+            }
         };
         if let Some(o) = it.as_object_mut() {
             o.insert("scope".into(), json!("account"));
@@ -486,6 +514,9 @@ pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
         "account": acct.map(|(_, n)| n).unwrap_or(""),
         "claimed": item["claimed"].as_bool().unwrap_or(false),
         "already": item["already"].as_bool().unwrap_or(false),
+        // 旅行猫那种"这一步做成了、奖励要等"的，日志得跟即时提示一样按中性画——
+        // 只认 claimed 的话，派猫出门会被染成红色"没领成"（2026-10-23 她圈的这条）
+        "settling": item["settling"].as_bool().unwrap_or(false),
         "verified": item["verified"],
         "message": item["message"], "credit": item["credit"], "error": item["error"],
         // 活跃地图那种"发一句对话"的，把用的模型也记下来——
@@ -1049,6 +1080,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 按账号查失败也要留一行：「这次没读到」不是一个消失的账号
+    #[test]
+    fn failed_account_query_still_yields_a_row() {
+        let row = account_row_unreadable("qoder-cn", "qoder-cn", "账号2", "unrecognized arguments");
+        assert_eq!(row["scope"], "account");
+        assert_eq!(row["account"], "账号2");
+        assert_eq!(row["unreadable"], true);
+        assert!(row["note"].as_str().unwrap().contains("unrecognized arguments"));
     }
 
     /// 提醒时间解析：填错要退回默认，不能把提醒整个关掉

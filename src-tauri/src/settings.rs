@@ -58,6 +58,28 @@ fn merge(base: &mut Value, patch: &Value) {
     }
 }
 
+/// 这两张表的键是产品名，值只有「开」这一种写法。深合并只覆盖补丁里出现的键、
+/// 从不删键（那是给 general / appearance 这种分区字段留的），所以界面想关掉某一家
+/// 只能提交显式 false，落盘前在这里统一抹掉——否则「auto 里没写到的就是关」这条
+/// 约定根本做不到，取消勾选的下一家重启就又被磁盘上那条 true 复活（Trae CN，2026-10-21）。
+const FLAG_MAPS: &[&[&str]] = &[&["checkin", "auto"], &["checkin", "remind_mute"]];
+
+fn prune_flags(s: &mut Value) {
+    for path in FLAG_MAPS {
+        if let Some(obj) = flag_map(s, path).and_then(|n| n.as_object_mut()) {
+            obj.retain(|_, v| v.as_bool().unwrap_or(false));
+        }
+    }
+}
+
+fn flag_map<'a>(root: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
+    let mut node = root;
+    for key in path {
+        node = node.get_mut(*key)?;
+    }
+    Some(node)
+}
+
 pub fn get() -> Value {
     let mut s = defaults();
     let cfg = load_config();
@@ -117,6 +139,7 @@ pub fn update(patch: &Value) -> Value {
     let mut s = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
     let clearing = key_submitted(patch);
     merge(&mut s, patch);
+    prune_flags(&mut s);
     // 内存里那份带原文，回给界面继续显示；写进 config.json 的那份收进保管箱
     let key = s["ai"]["key"].as_str().unwrap_or("").trim().to_string();
     let mut disk = s.clone();
@@ -180,5 +203,36 @@ mod tests {
         );
         assert!(!key_submitted(&json!({ "general": { "autostart": true } })));
         assert!(!key_submitted(&json!({})));
+    }
+
+    /// 取消勾选一家：界面发的是显式 false，落盘后这家必须真的没了，
+    /// 同时不能牵连别家（重启后 auto 表里剩下的就是还开着的）
+    #[test]
+    fn unchecking_one_product_really_clears_it() {
+        let mut s = json!({ "checkin": { "enabled": true, "auto": { "trae-cn": true, "workbuddy": true } } });
+        merge(
+            &mut s,
+            &json!({ "checkin": { "auto": { "trae-cn": false, "workbuddy": true } } }),
+        );
+        prune_flags(&mut s);
+        assert_eq!(s["checkin"]["auto"], json!({ "workbuddy": true }));
+    }
+
+    /// 只改总开关时补丁里根本没有 auto：那一张表要原样留着，不能被这次保存清空
+    #[test]
+    fn a_patch_without_the_map_leaves_it_untouched() {
+        let mut s = json!({ "checkin": { "enabled": true, "auto": { "minimax": true, "trae-cn": false } } });
+        merge(&mut s, &json!({ "checkin": { "enabled": false } }));
+        prune_flags(&mut s);
+        assert_eq!(s["checkin"]["enabled"], json!(false));
+        assert_eq!(s["checkin"]["auto"], json!({ "minimax": true }));
+    }
+
+    #[test]
+    fn remind_mute_clears_the_same_way() {
+        let mut s = json!({ "checkin": { "remind_mute": { "trae-cn": true } } });
+        merge(&mut s, &json!({ "checkin": { "remind_mute": { "trae-cn": false } } }));
+        prune_flags(&mut s);
+        assert_eq!(s["checkin"]["remind_mute"], json!({}));
     }
 }

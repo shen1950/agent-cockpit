@@ -22,6 +22,15 @@ fn fmt_date(ts: f64) -> String {
         .unwrap_or_default()
 }
 
+fn fmt_min(ts: f64) -> String {
+    if ts <= 0.0 {
+        return String::new();
+    }
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
 /// 取"更早到期"的那一条：天数相同时先到先得，不做二次排序。
 fn sooner(cur: &mut Option<i64>, exp: &mut String, d: i64, e: &str) {
     if cur.map(|p| d < p).unwrap_or(true) {
@@ -30,9 +39,31 @@ fn sooner(cur: &mut Option<i64>, exp: &mut String, d: i64, e: &str) {
     }
 }
 
+/// 排序用的到期时刻。临期列表只按"几天后"排是不够的：同一天里
+/// 千问的每日积分 00:00 就刷新、WorkBuddy 的裂变包要到 22:18 才作废，
+/// 两者都是"1 天后"，按 app 顺序排会把先作废的压在后面。
+/// 这里把同一套写法（"YYYY-MM-DD HH:MM"）的字典序当时间序用；
+/// 只给到日的补 23:59（与 quota::expiry 同一口径：那一天整天还能用）。
+fn exp_sort_key(s: &str) -> String {
+    let s = s.trim();
+    let head_ok = s.len() >= 10
+        && s.is_char_boundary(10)
+        && s[..10].bytes().all(|b| b.is_ascii_digit() || b == b'-');
+    if !head_ok {
+        return "9999-12-31 23:59".to_string(); // "未给出"/"无限期" 排最后，不许冒充最近到期
+    }
+    if s.len() >= 16 && s.is_char_boundary(16) && s.as_bytes().get(10) == Some(&b' ') {
+        s[..16].to_string()
+    } else {
+        format!("{} 23:59", &s[..10])
+    }
+}
+
 /// 该 Agent 能否真正多开：先看静态判定，再看实测结论（启动后校验失败会写进 app_caps）
 fn isolate_ok(cfg: &Value, app: &crate::registry::AppDef) -> bool {
-    if app.kind == "cli" {
+    // CLI（CODEX_HOME 环境变量）与 Chromium PWA（--user-data-dir）都是目录隔离，
+    // 实测都真能并存，不需要靠 app_caps 记录"试过没有"
+    if app.kind == "cli" || app.kind == "pwa" {
         return true;
     }
     if app.kind == "plain" {
@@ -69,6 +100,7 @@ pub fn reset_caps() {
 }
 
 pub fn build_state(proxy: &Proxy) -> Value {
+    crate::gateway::migrate_legacy_names();
     let snap = snapshot();
     let vis = windowed_pids();
     let cfg = load_config();
@@ -107,8 +139,9 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 .unwrap_or("")
                 .to_string(),
         };
-        // 程序级：这个 exe 到底有没有在跑。不能多开的产品只能按这个粒度判定运行状态
-        let prog_pids = if app.kind == "electron" || app.kind == "plain" {
+        // 程序级：这个 exe 到底有没有在跑。不能多开的产品只能按这个粒度判定运行状态；
+        // PWA 也按 exe 名看——它的子进程全叫 ChatGPT.exe，账号级要靠命令行里的目录区分
+        let prog_pids = if app.kind == "electron" || app.kind == "plain" || app.kind == "pwa" {
             program_pids(&exe_name(&app).to_lowercase(), &snap)
         } else {
             Vec::new()
@@ -202,9 +235,16 @@ pub fn build_state(proxy: &Proxy) -> Value {
             // source 会一直写着 server，之后连着几天读不到也永远判不出旧（TRAE 实测踩过：
             // 程序没开时弹窗还顶着"1 天后过期"，而那笔积分几天前就用光了）。
             let live_error = m["quota_live_error"].as_str().unwrap_or("").trim().to_string();
-            let snap_at = m["quota_detail_at"]
+            // "这份数有多新"只认**最近一次成功取数**的时刻，即汇总数的 quota_fetched_at
+            // （本机接口/服务端每半小时一刷）。quota_detail_at 是逐笔明细的抓取时刻，
+            // 两者天然不同步——国内版 WorkBuddy 的明细走官网窗口、汇总数走本机接口。
+            // 拿明细时刻当读数时刻，会把"汇总 23:30 刚到、明细停在 12:01"误判成整份作废：
+            // 临期提醒整份消失（14 笔而不是 16 笔），卡片还顶着"读不到服务端"的假警告
+            // ——实测 23:30 服务端 source=server、liveError 为空，只是明细 11 小时没刷新。
+            // 明细旧不旧是另一件事，由 quota_detail_stale 单独标注，不掺进这里的判据。
+            let snap_at = m["quota_fetched_at"]
                 .as_f64()
-                .or_else(|| m["quota_fetched_at"].as_f64())
+                .or_else(|| m["quota_detail_at"].as_f64())
                 .unwrap_or(0.0);
             // 只认到账号、压根没有额度数字的店（MiMo / Antigravity / Coze）：
             // agenthub 那句 live_error 是"厂商没有余额接口"的**解释**，不是"服务端没读成"的
@@ -264,6 +304,11 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 let (mut live_left, mut live_n, mut dead_n, mut usable_n) =
                     (0.0f64, 0usize, 0usize, 0usize);
                 let mut nearest = String::new();
+                // 「最早那一刻会作废多少」——和这一档的总剩余是两件事。
+                // 只写总量会被读成"这个时间点要作废 4,397 积分"，而真正到点作废的
+                // 可能只有那 62.36 积分的一笔。同一时刻到期的几笔要合起来算。
+                let mut nearest_left: Option<f64> = None;
+                let mut nearest_unknown = false;
                 for it in g["items"].as_array().cloned().unwrap_or_default() {
                     let e = it["expires_on"].as_str().unwrap_or("").trim().to_string();
                     let (dead, d) = crate::quota::expiry(&e);
@@ -279,8 +324,19 @@ pub fn build_state(proxy: &Proxy) -> Value {
                         // left 没给（厂商不做逐笔剩余，如 AStudio 的获得明细）时按"还没用完"算。
                         let usable = l.is_none() || l.unwrap_or(0.0) > 0.0;
                         // 同一套写法（"YYYY-MM-DD HH:MM"）字典序就是时间序，取最早那笔
-                        if usable && d.is_some() && (nearest.is_empty() || e < nearest) {
-                            nearest = e.clone();
+                        if usable && d.is_some() {
+                            if nearest.is_empty() || e < nearest {
+                                nearest = e.clone();
+                                nearest_left = l;
+                                nearest_unknown = l.is_none();
+                            } else if e == nearest {
+                                match (nearest_left, l) {
+                                    (Some(x), Some(y)) => nearest_left = Some(x + y),
+                                    // 有一笔没给逐笔剩余，这一档的到期金额就不能报确数
+                                    (_, None) => nearest_unknown = true,
+                                    (None, Some(_)) => {}
+                                }
+                            }
                         }
                         if usable {
                             usable_n += 1;
@@ -313,18 +369,54 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     "usable_count": usable_n,
                     "live_left": live_left,
                     "expires": nearest.clone(),
+                    "expires_left": nearest_left,
+                    "expires_left_unknown": nearest_unknown,
                     "days_left": days_left(&nearest),
                     "items": items,
                 }));
             }
-            // 「最近到期」与顶栏「临期 N」只在这一处算。
-            // 逐档明细（quota_groups.items）精确到分钟，而且上面现算过"还没作废 + 还没用光"；
-            // 扁平的 credits 桶是厂商侧汇总，expires_on 常常只到日，还把刚作废的那笔当成最早到期。
-            // 以前卡片大字与临期徽章读桶、额度面板读逐档，同一次刷新会给出两个答案：
-            // TRAE 实测面板已经改口「1 天后过期」，卡片上还顶着「今天到期」，这句要挂到半夜才动。
+            // 明细与汇总数可能来自两次不同的读数：本机那条接口只有汇总数、逐笔到期只有官网有。
+            // 「临期」和「最早到期」都长在明细那层，所以明细旧不旧必须先于它们算出来：
+            // 明细停在两天前时还拿它逐笔报"今天 07:29 作废"，刷新只会改汇总数，
+            // 这几句话一个字都不会动（WorkBuddy 实测）。
+            let detail_stale = m["quota_detail_stale"].as_bool().unwrap_or(false);
+            let top_left = m["credits_left"].as_f64();
             let mut earliest_dl: Option<i64> = None;
             let mut earliest_exp = String::new();
-            if !groups_out.is_empty() {
+            if detail_stale {
+                // 明细是旧读数：逐笔的"还剩多少 / 哪天作废"都不能当今天报。
+                // 只按这一轮刚读到的汇总数报一条，到期日取汇总读数自己带的那个，没给就不报。
+                let e = m["expires_on"].as_str().unwrap_or("").trim().to_string();
+                let (dead, d) = crate::quota::expiry(&e);
+                if !dead {
+                    if let (Some(dd), Some(l)) = (d, top_left) {
+                        earliest_dl = Some(dd);
+                        earliest_exp = e.clone();
+                        if !quota_stale && dd <= warn_days && l > 0.0 {
+                            let at = fmt_min(m["quota_detail_at"].as_f64().unwrap_or(0.0));
+                            alerts.push(json!({
+                                "app": app.name, "app_id": app.id,
+                                "name": m["name"], "days": dd, "left": l,
+                                "unit": groups_out
+                                    .first()
+                                    .and_then(|g| g["unit"].as_str())
+                                    .unwrap_or("credits"),
+                                "expires": e.clone(),
+                                "exp_left": Value::Null,
+                                "exp_left_unknown": false,
+                                "detail_stale": true,
+                                "detail_at": m["quota_detail_at"],
+                                "label": if at.is_empty() {
+                                    "汇总读数（逐笔明细比汇总旧）".to_string()
+                                } else {
+                                    format!("汇总读数 · 逐笔明细停在 {}", at)
+                                },
+                                "level": if dd <= danger_days { "danger" } else { "warn" },
+                            }));
+                        }
+                    }
+                }
+            } else if !groups_out.is_empty() {
                 for g in &groups_out {
                     let e = g["expires"].as_str().unwrap_or("").trim().to_string();
                     // 这一档没有"还没用完又还没作废"的笔 → expires 是空，不出到期也不出提醒
@@ -347,6 +439,9 @@ pub fn build_state(proxy: &Proxy) -> Value {
                         "app": app.name, "app_id": app.id,
                         "name": m["name"], "days": d, "left": left,
                         "unit": g["unit"],
+                        "expires": e.clone(),
+                        "exp_left": g["expires_left"].as_f64(),
+                        "exp_left_unknown": g["expires_left_unknown"].as_bool().unwrap_or(false),
                         "label": format!(
                             "{} {} 笔在效期 · 最早 {}",
                             g["name"].as_str().unwrap_or("积分"),
@@ -388,6 +483,10 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     alerts.push(json!({
                         "app": app.name, "app_id": app.id,
                         "name": m["name"], "days": dd, "left": left,
+                        // 这一档没有逐笔明细，按"到期日"合并出来的那几包本身就是当天会作废的量
+                        "expires": exp.clone(),
+                        "exp_left": left,
+                        "exp_left_unknown": left.is_none(),
                         "label": format!("{} 笔到期 {}", n, exp),
                         "level": if dd <= danger_days { "danger" } else { "warn" },
                     }));
@@ -396,9 +495,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
             // 明细与汇总数可能来自两次不同的读数：本机那条接口只有汇总数、逐笔到期只有官网有。
             // 这种时候大字跟最新的汇总数走，明细单独标"截至几点"——拿旧明细逐笔求和冒充
             // 现在的余额，就是把几小时前的数当今天报出去。
-            let detail_stale = m["quota_detail_stale"].as_bool().unwrap_or(false);
-            let top_left = m["credits_left"].as_f64();
-            let use_top = detail_stale && has_portions && top_left.is_some();
+            let use_top = detail_stale && top_left.is_some();
             let (left, total, expires_on, dl) = if use_top {
                 (top_left, m["credits_total"].as_f64(), earliest_exp, earliest_dl)
             } else if has_portions {
@@ -514,12 +611,27 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     // 按天消耗序列（波形图/热力图）：`{unit,days[],total,peak...}` 或 `{error}`；
                     // Null = 这个产品压根没有逐笔时刻可聚，界面就不许出现图占位
                     "trend": m["quota_trend"],
+                    // CLI 类产品（Codex）的登录态：只读 auth.json（不跑子进程——
+                    // build_state 每 4 秒一次，跑 `codex login status` 太频）。
+                    // 官方那句话（"Logged in using …"）由前端按需调 codex_status 拿。
+                    "cli_auth": cli_auth_info(app.id.as_str(), &m),
                 },
             }));
         }
     }
 
-    alerts.sort_by(|a, b| a["days"].as_i64().unwrap_or(0).cmp(&b["days"].as_i64().unwrap_or(0)));
+    // 先按"几天后"排，同一天再按具体时刻排——同是 1 天后到期，0 点刷新的那笔要先看到
+    alerts.sort_by(|a, b| {
+        let ka = (
+            a["days"].as_i64().unwrap_or(i64::MAX),
+            exp_sort_key(a["expires"].as_str().unwrap_or("")),
+        );
+        let kb = (
+            b["days"].as_i64().unwrap_or(i64::MAX),
+            exp_sort_key(b["expires"].as_str().unwrap_or("")),
+        );
+        ka.cmp(&kb)
+    });
     let procs = procs_rows(&snap);
 
     // 各家 Agent 的限时 / 每日福利（"Qoder 每天免费用 Qwen3.8-Max"这类）。
@@ -596,12 +708,25 @@ pub fn build_state(proxy: &Proxy) -> Value {
         "proxy": {
             "running": proxy.is_running(),
             "port": if proxy.is_running() { proxy.port() } else { PROXY_PORT },
+            "base_url": format!(
+                "http://127.0.0.1:{}/v1",
+                if proxy.is_running() { proxy.port() } else { PROXY_PORT }
+            ),
             "upstream": upstream, "strategy": strategy,
             "pool": pool_labels(),
-            // 反代编制：池子（谁进哪个池）+ 分发出去的 Key（谁能用哪些池）
+            // 模型反代：上游组（谁进哪个组）+ 接入密钥（谁能用哪些组）
             "pools": crate::gateway::pools_view(&upstream),
             "dist": crate::gateway::list_dist_masked(),
             "members": crate::gateway::member_options(),
+            // Qoder / Qoder CN 模型反代：账号状态、能不能进组、一键反代的结果
+            "qproxy": crate::qproxy::view(),
+            // Trae CN：这里**只读缓存**（4 秒轮询不起 python）；刷新走 trae_refresh 动作
+            "traeproxy": crate::traeproxy::view(),
+            // WorkBuddy 国内版 / 国际版：账号状态、全量模型清单、护栏、最近日志
+            "wbproxy": crate::wbproxy::view(),
+            // AStudio：模型令牌读 astron-session.json 的 modelBearerToken，
+            // 直连讯飞云端 model-gateway（OpenAI 兼容，不需要协议翻译）
+            "astudio": crate::asproxy::view(),
             "logs": proxy.recent_logs(30),
         },
         "now": chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -619,6 +744,43 @@ pub fn build_state(proxy: &Proxy) -> Value {
     })
 }
 
+/// `exp_sort_key()` 同一段后面。CLI 产品（Codex）的登录态摘要：
+/// 只解 auth.json，不跑子进程——4 秒一轮的 build_state 经不起每条都 spawn。
+/// 返回 `{"mode","key","account","has_auth"}`，非 CLI 产品或没有文件时给 Null。
+fn cli_auth_info(app_id: &str, m: &Value) -> Value {
+    if app_id != "codex" {
+        return Value::Null;
+    }
+    let dir = m["data_dir"].as_str().unwrap_or("").trim();
+    if dir.is_empty() {
+        return Value::Null;
+    }
+    let f = std::path::Path::new(dir).join("auth.json");
+    let txt = match std::fs::read_to_string(&f) {
+        Ok(t) => t,
+        Err(_) => return json!({ "has_auth": false }),
+    };
+    let v: Value = match serde_json::from_str(&txt) {
+        Ok(v) => v,
+        Err(_) => return json!({ "has_auth": false }),
+    };
+    let mode = v["auth_mode"].as_str().unwrap_or("").to_string();
+    let key = v["OPENAI_API_KEY"]
+        .as_str()
+        .map(|k| {
+            let n = k.chars().count();
+            if n <= 12 {
+                "***".to_string()
+            } else {
+                let head: String = k.chars().take(7).collect();
+                let tail: String = k.chars().skip(n - 4).collect();
+                format!("{head}***{tail}")
+            }
+        })
+        .unwrap_or_default();
+    json!({ "has_auth": true, "mode": mode, "key": key })
+}
+
 fn pool_labels() -> Vec<String> {
     let cfg = crate::registry::load_config();
     let upstream = cfg["proxy"]["upstream"]
@@ -626,4 +788,30 @@ fn pool_labels() -> Vec<String> {
         .unwrap_or("https://api.openai.com")
         .to_string();
     crate::proxy::pool_labels(&upstream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exp_sort_key;
+
+    /// 同一天里"0 点刷新"的那笔必须排在 22:18 那笔前面：千问每日积分 00:00 就作废，
+    /// WorkBuddy 的裂变包要到 22:18——两者都是"1 天后到期"，只按天数排会把先作废的压后。
+    #[test]
+    fn exp_sort_key_orders_same_day_by_time() {
+        assert!(exp_sort_key("2026-10-19 00:00") < exp_sort_key("2026-10-19 22:18"));
+    }
+
+    /// 只给到日的按"那天整天还能用"处理（23:59），与 quota::expiry 同一口径
+    #[test]
+    fn exp_sort_key_pads_date_only() {
+        assert_eq!(exp_sort_key("2026-10-19"), "2026-10-19 23:59");
+        assert!(exp_sort_key("2026-10-19 22:18") < exp_sort_key("2026-10-19"));
+    }
+
+    /// 没给到期日的排最后，不许冒充"最近到期"
+    #[test]
+    fn exp_sort_key_puts_unknown_last() {
+        assert!(exp_sort_key("2026-12-31") < exp_sort_key("未给出"));
+        assert!(exp_sort_key("2026-12-31") < exp_sort_key(""));
+    }
 }

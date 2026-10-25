@@ -2,7 +2,7 @@
 use crate::registry::{app_def, exe_name, load_instances, AppDef};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(windows)]
@@ -195,6 +195,11 @@ fn scrub_env(c: &mut Command) {
     }
 }
 
+/// 给 cliauth 起终端登录用的：内部那份 scrub 不外放，但子进程不能少这一步
+pub fn scrub_env_pub(c: &mut Command) {
+    scrub_env(c);
+}
+
 pub fn alive(snap: &HashMap<u32, ProcInfo>, pid: u32) -> bool {
     snap.contains_key(&pid)
 }
@@ -253,14 +258,49 @@ pub fn launch_electron(exe: &Path, data_dir: &Path, workdir: &str) -> Result<(),
 }
 
 /// CLI 系：新开控制台窗口，用环境变量隔离账号，返回 cmd 的 PID（可结束整棵子树）
+/// Windows Terminal 的 wt.exe：有它就用它起窗口（可多标签、字体/颜色正常），
+/// 没有就退回 conhost(cmd /K)。Windows 11 默认装在 WindowsApps 下。
+fn wt_exe() -> Option<PathBuf> {
+    // 不引 dirs crate：USERPROFILE 就够，避免为一个路径多一根依赖
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        if !up.is_empty() {
+            cands.push(
+                PathBuf::from(up)
+                    .join("AppData")
+                    .join("Local")
+                    .join("Microsoft")
+                    .join("WindowsApps")
+                    .join("wt.exe"),
+            );
+        }
+    }
+    cands.push(PathBuf::from(r"C:\Program Files\WindowsApps\wt.exe"));
+    cands.into_iter().find(|p| p.is_file())
+}
+
 pub fn launch_cli(app: &AppDef, exe: &Path, data_dir: &Path, workdir: &str) -> Result<u32, String> {
-    let inner = format!(
-        "cd /d \"{}\" && set \"{}={}\" && \"{}\"",
-        workdir,
-        app.env,
-        data_dir.display(),
-        exe.display()
-    );
+    // CODEX_HOME 这类隔离变量就是这个账号的目录：多开的每个号一个，互不覆盖
+    let setenv = format!("set \"{}={}\" && \"{}\"", app.env, data_dir.display(), exe.display());
+    if let Some(wt) = wt_exe() {
+        // 标签标题用账号名（data_dir 最后一段），多开时看得出哪个窗口是哪个号
+        let acct = data_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| app.name.clone());
+        let mut c = Command::new(&wt);
+        scrub_env(&mut c);
+        c.args(["--title", &format!("{} · {}", app.name, acct), "-d", workdir, "cmd", "/K", &setenv]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        if let Ok(ch) = c.spawn() {
+            return Ok(ch.id());
+        }
+    }
+    let inner = format!("cd /d \"{}\" && {}", workdir, setenv);
     let mut c = Command::new("cmd");
     scrub_env(&mut c);
     c.args(["/K", &inner]).current_dir(workdir);
@@ -270,6 +310,22 @@ pub fn launch_cli(app: &AppDef, exe: &Path, data_dir: &Path, workdir: &str) -> R
         c.creation_flags(CREATE_NEW_CONSOLE);
     }
     c.spawn().map(|ch| ch.id()).map_err(|e| e.to_string())
+}
+
+/// Chromium PWA 壳（ChatGPT 桌面版）：只传 --user-data-dir，**不带位置参数**——
+/// 它把第一个位置参数当 URL/PWA 入口，传工作目录会开成网页。
+/// 不同目录＝不同浏览器实例，实测能与已在跑的实例共存（各自一份登录态）。
+pub fn launch_pwa(exe: &Path, data_dir: &Path) -> Result<(), String> {
+    let mut c = Command::new(exe);
+    scrub_env(&mut c);
+    c.arg(format!("--user-data-dir={}", data_dir.display()))
+        .current_dir(exe.parent().unwrap_or(Path::new(".")));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    c.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// 直接打开主程序（用默认档案，不隔离）：用于无法多开的程序与 CLI
@@ -306,7 +362,7 @@ pub fn agent_running(app_id: &str, snap: &HashMap<u32, ProcInfo>) -> bool {
         Some(a) => a,
         None => return false,
     };
-    if app.kind == "electron" || app.kind == "plain" {
+    if app.kind == "electron" || app.kind == "plain" || app.kind == "pwa" {
         !program_pids(&exe_name(&app).to_lowercase(), snap).is_empty()
     } else {
         load_instances(app_id).iter().any(|m| {
@@ -363,7 +419,7 @@ pub fn procs_rows(snap: &HashMap<u32, ProcInfo>) -> Vec<Value> {
         if crate::registry::resolve_exe(&app).is_none() {
             continue;
         }
-        if app.kind == "electron" || app.kind == "plain" {
+        if app.kind == "electron" || app.kind == "plain" || app.kind == "pwa" {
             let pids = program_pids(&exe_name(&app).to_lowercase(), snap);
             if !pids.is_empty() {
                 let wins = windowed_count(&pids, &windowed_pids());

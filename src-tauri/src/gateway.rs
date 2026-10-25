@@ -1,5 +1,5 @@
-// 本地反代的「池子」与「下发 Key」：
-//   来源（某个 Agent 的某个账号 / API 台账里的某个 Key）→ 归到某个池子 → 用一个下发 Key 对外开放
+// 本地反代的「上游组」与「下发 Key」：
+//   来源（某个 Agent 的某个账号 / API 台账里的某个 Key）→ 归到某个上游组 → 用一个下发 Key 对外开放
 // 配置全部存在 config.json 的 proxy 段，纯本机。
 use crate::registry::{all_apps, load_config, load_instances, save_config};
 use serde_json::{json, Value};
@@ -41,6 +41,148 @@ pub fn gen_dist_key() -> String {
 
 fn proxy_cfg(cfg: &Value) -> Value {
     cfg.get("proxy").cloned().unwrap_or_else(|| json!({}))
+}
+
+/// 把早期内置的“免费模型 / 接入密钥”名字迁到书面语。
+/// 只认精确的旧名字，用户自己起的名字（WB-qoder、沉浸式翻译）一律不动。
+/// 迁移后再做同名片去重：历史 bug（Trae 按旧名找池，每轮一键都新建一个）
+/// 会堆出一排同名上游组/密钥；成员完全相同就并成一个，引用被并组的密钥重映射。
+pub fn migrate_legacy_names() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut cfg = load_config();
+        let mut changed = false;
+        if let Some(proxy) = cfg.get_mut("proxy").and_then(|v| v.as_object_mut()) {
+            if let Some(arr) = proxy.get_mut("pools").and_then(|v| v.as_array_mut()) {
+                for item in arr.iter_mut() {
+                    if let Some(new) = rename_pool(item["name"].as_str().unwrap_or("")) {
+                        item["name"] = json!(new);
+                        changed = true;
+                    }
+                }
+            }
+            if let Some(arr) = proxy.get_mut("dist").and_then(|v| v.as_array_mut()) {
+                for item in arr.iter_mut() {
+                    if let Some(new) = rename_dist(item["name"].as_str().unwrap_or("")) {
+                        item["name"] = json!(new);
+                        changed = true;
+                    }
+                }
+            }
+            let remap = match proxy.get_mut("pools").and_then(|v| v.as_array_mut()) {
+                Some(arr) => dedupe_pools(arr),
+                None => Vec::new(),
+            };
+            if !remap.is_empty() {
+                changed = true;
+                if let Some(arr) = proxy.get_mut("dist").and_then(|v| v.as_array_mut()) {
+                    remap_dist_pools(arr, &remap);
+                }
+            }
+            if let Some(arr) = proxy.get_mut("dist").and_then(|v| v.as_array_mut()) {
+                let before = arr.len();
+                dedupe_dists(arr);
+                if arr.len() != before {
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            save_config(&cfg);
+        }
+    });
+}
+
+/// 同名且成员 src 集合相同的上游组只留第一条，返回 (被并掉的组id, 保留组id) 映射。
+/// 成员不同的同名组保留——可能是用户有意拆的，不去猜。
+fn dedupe_pools(arr: &mut Vec<Value>) -> Vec<(String, String)> {
+    fn srcs_of(p: &Value) -> Vec<String> {
+        p["members"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| m["src"].as_str().map(|s| s.to_string()))
+            .collect()
+    }
+    let mut kept: Vec<Value> = Vec::new();
+    let mut remap: Vec<(String, String)> = Vec::new();
+    for item in arr.iter() {
+        let id = item["id"].as_str().unwrap_or("").to_string();
+        let name = item["name"].as_str().unwrap_or("").to_string();
+        let srcs = srcs_of(item);
+        match kept
+            .iter()
+            .position(|k| k["name"].as_str().unwrap_or("") == name && srcs_of(k) == srcs)
+        {
+            Some(i) => {
+                let kept_id = kept[i]["id"].as_str().unwrap_or("").to_string();
+                if !id.is_empty() && !kept_id.is_empty() && id != kept_id {
+                    remap.push((id, kept_id));
+                }
+            }
+            None => kept.push(item.clone()),
+        }
+    }
+    let dropped = remap.len();
+    *arr = kept;
+    let _ = dropped;
+    remap
+}
+
+/// 把接入密钥授权里的组 id 按映射改写（被并掉的组 → 保留的组）
+fn remap_dist_pools(arr: &mut Vec<Value>, remap: &[(String, String)]) {
+    for d in arr.iter_mut() {
+        if let Some(ps) = d["pools"].as_array_mut() {
+            for v in ps.iter_mut() {
+                let cur = v.as_str().unwrap_or("");
+                if let Some((_, kept_id)) = remap.iter().find(|(dd, _)| dd == cur) {
+                    *v = json!(kept_id);
+                }
+            }
+        }
+    }
+}
+
+/// 同名接入密钥只留调用次数最多的那把（被删过又被一键重建会堆出同名 key）
+fn dedupe_dists(arr: &mut Vec<Value>) {
+    let mut best: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, d) in arr.iter().enumerate() {
+        let name = d["name"].as_str().unwrap_or("").to_string();
+        let calls = d["calls"].as_u64().unwrap_or(0);
+        let e = best.entry(name).or_insert(i);
+        if arr[*e]["calls"].as_u64().unwrap_or(0) < calls {
+            *e = i;
+        }
+    }
+    let mut out = Vec::new();
+    for (i, d) in arr.iter().enumerate() {
+        let name = d["name"].as_str().unwrap_or("").to_string();
+        if best.get(&name) == Some(&i) {
+            out.push(d.clone());
+        }
+    }
+    *arr = out;
+}
+
+fn rename_pool(name: &str) -> Option<&'static str> {
+    match name {
+        "Qoder 免费模型" => Some("Qoder 上游组"),
+        "WorkBuddy 免费模型" => Some("WorkBuddy 上游组"),
+        "OpenCode 免费模型" => Some("OpenCode 上游组"),
+        "Trae 模型" => Some("Trae 上游组"),
+        _ => None,
+    }
+}
+
+fn rename_dist(name: &str) -> Option<&'static str> {
+    match name {
+        "Qoder 免费（自用）" => Some("Qoder 接入"),
+        "WorkBuddy 免费（自用）" => Some("WorkBuddy 接入"),
+        "OpenCode 免费（自用）" => Some("OpenCode 接入"),
+        "Trae 自用" => Some("Trae 接入"),
+        _ => None,
+    }
 }
 
 pub fn pools() -> Vec<Value> {
@@ -85,7 +227,7 @@ pub struct Upstream {
     pub pool: String,
 }
 
-// ───────────────────────── 池子增删改 ─────────────────────────
+// ───────────────────────── 上游组增删改 ─────────────────────────
 
 /// 把界面传来的成员数组规整成存储格式：去空、去重（同 src 只留一条）、补默认字段
 fn norm_members(v: &Value) -> Vec<Value> {
@@ -107,11 +249,11 @@ fn norm_members(v: &Value) -> Vec<Value> {
     out
 }
 
-/// 建/改池子。members 里同一 src 去重；成员只保留存在性由 pool_upstreams 实时算。
+/// 建/改上游组。members 里同一 src 去重；成员只保留存在性由 pool_upstreams 实时算。
 pub fn upsert_pool(item: &Value) -> (bool, String) {
     let name = item["name"].as_str().unwrap_or("").trim().to_string();
     if name.is_empty() {
-        return (false, "池子名不能为空".into());
+        return (false, "上游组名不能为空".into());
     }
     let members = norm_members(&item["members"]);
     let id = item["id"].as_str().unwrap_or("").trim().to_string();
@@ -137,13 +279,13 @@ pub fn upsert_pool(item: &Value) -> (bool, String) {
     save_proxy_field("pools", json!(list));
     let n = obj["members"].as_array().map(|a| a.len()).unwrap_or(0);
     if is_new {
-        (true, format!("已建池子「{}」，{} 个成员", name, n))
+        (true, format!("已建上游组「{}」，{} 个成员", name, n))
     } else {
-        (true, format!("已保存池子「{}」，{} 个成员", name, n))
+        (true, format!("已保存上游组「{}」，{} 个成员", name, n))
     }
 }
 
-/// 删池子，同时把引用它的分发 key 里的悬空 id 摘掉
+/// 删上游组，同时把引用它的分发 key 里的悬空 id 摘掉
 pub fn remove_pool(id: &str) -> (bool, String) {
     let mut list = pools();
     let before = list.len();
@@ -154,7 +296,7 @@ pub fn remove_pool(id: &str) -> (bool, String) {
         .unwrap_or_default();
     list.retain(|p| p["id"].as_str().unwrap_or("") != id);
     if list.len() == before {
-        return (false, "没找到这个池子".into());
+        return (false, "没找到这个上游组".into());
     }
     save_proxy_field("pools", json!(list));
 
@@ -174,11 +316,11 @@ pub fn remove_pool(id: &str) -> (bool, String) {
     }
     (
         true,
-        format!("已删除池子「{}」，并同步更新了 {} 个分发 Key 的授权", name, touched),
+        format!("已删除上游组「{}」，并同步更新了 {} 个接入密钥 的授权", name, touched),
     )
 }
 
-/// 池子视图：带上「实际可用成员数」与成员标签，界面直接显示
+/// 上游组视图：带上「实际可用成员数」与成员标签，界面直接显示
 pub fn pools_view(global_upstream: &str) -> Vec<Value> {
     pools()
         .into_iter()
@@ -191,9 +333,9 @@ pub fn pools_view(global_upstream: &str) -> Vec<Value> {
         .collect()
 }
 
-// ───────────────────────── 分发 Key 增删改 ─────────────────────────
+// ───────────────────────── 接入密钥 增删改 ─────────────────────────
 
-/// 分发 Key 列表（打码）。完整 key 用 reveal_dist 单取。
+/// 接入密钥 列表（打码）。完整 key 用 reveal_dist 单取。
 pub fn list_dist_masked() -> Vec<Value> {
     dist_keys()
         .into_iter()
@@ -210,7 +352,7 @@ pub fn list_dist_masked() -> Vec<Value> {
         .collect()
 }
 
-/// 单个分发 Key 的明文（本地工具，点了才取）
+/// 单个接入密钥 的明文（本地工具，点了才取）
 pub fn reveal_dist(id: &str) -> Option<String> {
     dist_keys()
         .into_iter()
@@ -218,7 +360,7 @@ pub fn reveal_dist(id: &str) -> Option<String> {
         .and_then(|d| d["key"].as_str().map(|s| s.to_string()))
 }
 
-/// 建/改分发 Key。新建时返回明文 key 一并提示（只在这里出现一次也够用）。
+/// 建/改接入密钥。新建时返回明文 key 一并提示（只在这里出现一次也够用）。
 pub fn upsert_dist(item: &Value) -> (bool, String) {
     let name = item["name"].as_str().unwrap_or("").trim().to_string();
     if name.is_empty() {
@@ -232,9 +374,9 @@ pub fn upsert_dist(item: &Value) -> (bool, String) {
         .filter_map(|v| v.as_str().map(|s| s.to_string()))
         .collect();
     let scope = if sel.is_empty() {
-        "全部池子".to_string()
+        "全部上游组".to_string()
     } else {
-        format!("{} 个池子", sel.len())
+        format!("{} 个上游组", sel.len())
     };
     let id = item["id"].as_str().unwrap_or("").trim().to_string();
     let mut list = dist_keys();
@@ -255,7 +397,7 @@ pub fn upsert_dist(item: &Value) -> (bool, String) {
         save_proxy_field("dist", json!(list));
         return (
             true,
-            format!("已生成分发 Key（{}）：{} —— 填到客户端当 API Key", scope, key),
+            format!("已生成接入密钥（{}）：{} —— 填到客户端当 API Key", scope, key),
         );
     }
 
@@ -274,7 +416,7 @@ pub fn upsert_dist(item: &Value) -> (bool, String) {
         return (false, "没找到这条分发记录".into());
     }
     save_proxy_field("dist", json!(list));
-    (true, format!("已保存分发 Key「{}」（授权 {}）", name, scope))
+    (true, format!("已保存接入密钥「{}」（授权 {}）", name, scope))
 }
 
 pub fn remove_dist(id: &str) -> (bool, String) {
@@ -290,7 +432,7 @@ pub fn remove_dist(id: &str) -> (bool, String) {
         return (false, "没找到这条分发记录".into());
     }
     save_proxy_field("dist", json!(list));
-    (true, format!("已删除分发 Key「{}」，正在用它的人会立刻被拒", name))
+    (true, format!("已删除接入密钥「{}」，正在用它的人会立刻被拒", name))
 }
 
 /// 一键停用/启用（不改名字和授权范围）
@@ -325,20 +467,80 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
         let meta = load_instances(app_id).into_iter().find(|m| {
             m["name"].as_str().unwrap_or("") == name
         })?;
-        let tok = meta["token"].as_str().unwrap_or("").trim().to_string();
+        let mut tok = meta["token"].as_str().unwrap_or("").trim().to_string();
+        // Qoder 系的令牌不在账号记录里，而在产品自己的 auth.v1.dat（见 qproxy）。
+        // Trae 的在 storage.json（见 traeproxy）。
+        // AStudio 的模型令牌在 astron-session.json 的 modelBearerToken（见 asproxy），
+        // 账号记录里那个 token 是 SSO 会话令牌，不是模型 Bearer，不能顶替。
+        // 这里读不到就说明这个号没登录 / 档案身份不符 —— 如实返回 None，不拿别人的号顶替。
+        if crate::asproxy::APPS.contains(&app_id) {
+            tok = crate::asproxy::token();
+        } else if tok.is_empty() {
+            tok = if crate::traeproxy::APPS.contains(&app_id) {
+                crate::traeproxy::token_for(app_id, name).unwrap_or_default()
+            } else if crate::wbproxy::APPS.contains(&app_id) {
+                crate::wbproxy::token_for(app_id, name).unwrap_or_default()
+            } else {
+                crate::qproxy::token_for(app_id, name).unwrap_or_default()
+            };
+        }
         if tok.is_empty() {
             return None;
         }
-        // 实例自带的上游优先，其次全局上游
+        // 实例自带的上游优先，其次各家自己的网关，最后才是全局上游
         let own = meta["proxy_base_url"].as_str().unwrap_or("").trim().to_string();
+        let tbase = if crate::traeproxy::APPS.contains(&app_id) {
+            crate::traeproxy::BASE_MARK
+        } else {
+            ""
+        };
+        let wbase = if crate::wbproxy::APPS.contains(&app_id) {
+            crate::wbproxy::base_mark(crate::wbproxy::region_of(app_id).unwrap_or("cn"))
+        } else {
+            String::new()
+        };
+        let qbase = crate::qproxy::region_of(app_id)
+            .map(crate::qproxy::model_base)
+            .unwrap_or("");
+        // AStudio 的模型网关（不带 /v1，客户端发的 /v1/chat/completions 原样接上）
+        let abase = if crate::asproxy::APPS.contains(&app_id) {
+            crate::asproxy::GATEWAY_BASE.to_string()
+        } else {
+            String::new()
+        };
         let base = if !member_base.trim().is_empty() {
             member_base.trim().to_string()
         } else if !own.is_empty() {
             own
+        } else if !abase.is_empty() {
+            abase
+        } else if !tbase.is_empty() {
+            tbase.to_string()
+        } else if !wbase.is_empty() {
+            wbase.to_string()
+        } else if !qbase.is_empty() {
+            qbase.to_string()
         } else {
             global_upstream.to_string()
         };
         Some((format!("{}/{}", app_name, name), tok, base))
+    } else if let Some(rest) = src.strip_prefix("bridge:") {
+        // bridge:qoder-cn/<账号> —— Qoder CN 的本地桥（官方运行时 + OpenAI 兼容外壳）。
+        // 桥没在跑就没有上游，如实返回 None，别让上游组拿一个连不上的地址。
+        let (app_id, name) = rest.split_once('/')?;
+        if app_id != "qoder-cn" || !crate::qproxy::cn_bridge_running() {
+            return None;
+        }
+        let app_name = all_apps()
+            .into_iter()
+            .find(|a| a.id == app_id)
+            .map(|a| a.name)
+            .unwrap_or_else(|| app_id.to_string());
+        Some((
+            format!("本地桥/{}/{}", app_name, name),
+            crate::qproxy::CN_KEY.to_string(),
+            format!("http://127.0.0.1:{}/v1", crate::qproxy::CN_PORT),
+        ))
     } else if let Some(rest) = src.strip_prefix("key:") {
         let (site_id, key_id) = rest.split_once('/')?;
         for site in crate::keys::sites() {
@@ -378,7 +580,7 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
     }
 }
 
-/// 把一个池子展开成可用上游列表
+/// 把一个上游组展开成可用上游列表
 pub fn pool_upstreams(pool: &Value, global_upstream: &str) -> Vec<Upstream> {
     let pool_name = pool["name"].as_str().unwrap_or("未命名池").to_string();
     let mut out = Vec::new();
@@ -400,7 +602,7 @@ pub fn pool_upstreams(pool: &Value, global_upstream: &str) -> Vec<Upstream> {
     out
 }
 
-/// 指定池子（按 id）里的可用上游；ids 为空 = 全部启用的池子
+/// 指定上游组（按 id）里的可用上游；ids 为空 = 全部启用的上游组
 pub fn upstreams_for(ids: &[String], global_upstream: &str) -> Vec<Upstream> {
     let all = pools();
     let mut out = Vec::new();
@@ -455,14 +657,41 @@ pub fn member_options() -> Value {
         for m in load_instances(&app.id) {
             let name = m["name"].as_str().unwrap_or("").to_string();
             let tok = m["token"].as_str().unwrap_or("").trim().to_string();
+            // Qoder 系的令牌在产品自己的档案里（qproxy 读），这里按"反代真的能不能用"报
+            let usable = !tok.is_empty()
+                || (crate::qproxy::region_of(&app.id).is_some()
+                    && crate::qproxy::token_for(&app.id, &name).is_some())
+                || (crate::traeproxy::APPS.contains(&app.id.as_str())
+                    && crate::traeproxy::token_for(&app.id, &name).is_some())
+                || (crate::asproxy::APPS.contains(&app.id.as_str())
+                    && !crate::asproxy::token().is_empty());
             instances.push(json!({
                 "src": member_src_instance(&app.id, &name),
                 "app": app.id,
                 "app_name": app.name,
                 "instance": name,
-                "has_token": !tok.is_empty(),
+                "has_token": usable,
                 "proxy_base_url": m["proxy_base_url"].as_str().unwrap_or(""),
+                "qregion": crate::qproxy::region_of(&app.id).unwrap_or(""),
+                "qstate": crate::qproxy::stored_state(&app.id, &name).unwrap_or_default(),
+                "trae": crate::traeproxy::APPS.contains(&app.id.as_str()),
+                "astudio": crate::asproxy::APPS.contains(&app.id.as_str()),
             }));
+            // Qoder CN：CLI 登录过就能挂本地桥（国内版唯一通路，见 qproxy.rs）
+            if app.id == "qoder-cn" && crate::qproxy::cn_logged_in(&name) {
+                let up = crate::qproxy::cn_bridge_running();
+                instances.push(json!({
+                    "src": format!("bridge:{}/{}", app.id, name),
+                    "app": app.id,
+                    "app_name": app.name,
+                    "instance": name,
+                    "has_token": up,
+                    "proxy_base_url": format!("http://127.0.0.1:{}/v1", crate::qproxy::CN_PORT),
+                    "qregion": "cn",
+                    "qstate": if up { "bridge" } else { "bridge_idle" },
+                    "bridge": true,
+                }));
+            }
         }
     }
     let mut keys = Vec::new();
@@ -554,7 +783,7 @@ mod tests {
         assert!(pool_upstreams(&all_off, "https://x").is_empty());
     }
 
-    /// 真机往返：池子 + 分发 Key 的增删改串到一起跑一遍，并验证它真的能改变反代的路由。
+    /// 真机往返：上游组 + 接入密钥 的增删改串到一起跑一遍，并验证它真的能改变反代的路由。
     /// 会临时改写 ~/.agent-cockpit/config.json，结束时（含 panic/断言失败）原样还原。
     /// 默认不跑：`cargo test -- --include-ignored`
     #[test]
@@ -577,7 +806,7 @@ mod tests {
         let path = crate::registry::config_file();
         let _guard = CfgGuard(std::fs::read_to_string(&path).ok(), path);
 
-        // 建池子：成员指向不存在的账号，保证不会真把请求发出去
+        // 建上游组：成员指向不存在的账号，保证不会真把请求发出去
         let (ok, msg) = upsert_pool(&json!({
             "name": "__gw_test_pool",
             "members": [
@@ -590,7 +819,7 @@ mod tests {
         let p = pools()
             .into_iter()
             .find(|p| p["name"] == "__gw_test_pool")
-            .expect("池子没落盘");
+            .expect("上游组没落盘");
         let pid = p["id"].as_str().unwrap().to_string();
         assert_eq!(p["members"].as_array().unwrap().len(), 1, "成员应已去重去空");
 
@@ -600,7 +829,7 @@ mod tests {
         assert_eq!(pv["live"], 0);
         assert_eq!(pv["members"].as_array().unwrap().len(), 1);
 
-        // 生成分发 Key：明文只该在这次返回值里出现
+        // 生成接入密钥：明文只该在这次返回值里出现
         let (ok, msg) = upsert_dist(&json!({ "name": "__gw_test_dist", "pools": [pid] }));
         assert!(ok, "{}", msg);
         let key = msg
@@ -622,7 +851,7 @@ mod tests {
         assert!(md.get("key").is_none(), "列表必须打码，不能带明文");
         assert_eq!(reveal_dist(&did).as_deref(), Some(key.as_str()));
 
-        // 路由：带这个 key → 只走它授权的池子（并把命中的 key 名带回日志）
+        // 路由：带这个 key → 只走它授权的上游组（并把命中的 key 名带回日志）
         let r = crate::proxy::pick_upstreams(&key, "https://upstream.invalid");
         assert_eq!(r.dist_id, did);
         assert!(!r.disabled);
@@ -634,16 +863,16 @@ mod tests {
         assert!(r.disabled, "停用后应被标记为拒绝");
         assert!(toggle_dist(&did).0, "再次切换应恢复启用");
 
-        // 删池子 → 授权里的悬空 id 要同步摘掉，且分发 Key 本身还在
+        // 删上游组 → 授权里的悬空 id 要同步摘掉，且接入密钥 本身还在
         assert!(remove_pool(&pid).0);
         let d2 = find_dist(&key).expect("分发记录不该被一起删掉");
         assert!(d2["pools"].as_array().unwrap().is_empty(), "悬空池 id 应被摘掉");
 
-        // 删分发 Key → 这个 key 立刻不认识
+        // 删接入密钥 → 这个 key 立刻不认识
         assert!(remove_dist(&did).0);
         assert!(find_dist(&key).is_none());
 
-        // 收尾：池子里不该还有测试残留
+        // 收尾：上游组里不该还有测试残留
         assert!(!pools().iter().any(|x| x["name"] == "__gw_test_pool"));
         assert!(!dist_keys().iter().any(|x| x["name"] == "__gw_test_dist"));
     }

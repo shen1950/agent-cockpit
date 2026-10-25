@@ -28,3 +28,7 @@ _noserve.py
 
 # 界面预览图（本地留存，发布时作为 Release 附件）
 docs/*.png
+.agent-sync/
+
+# 一次性改库备份
+*.proxyfix-bak

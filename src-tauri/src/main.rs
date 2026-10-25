@@ -4,8 +4,10 @@
 #![recursion_limit = "256"]
 
 mod ai;
+mod asproxy;
 mod authpack;
 mod checkin;
+mod cliauth;
 mod commands;
 mod discover;
 mod gateway;
@@ -15,9 +17,12 @@ mod inject;
 mod inventory;
 mod keys;
 mod local_quota;
+mod lifecycle;
 mod machine;
+mod opencode;
 mod procs;
 mod proxy;
+mod qproxy;
 mod quota;
 mod registry;
 mod secrets;
@@ -27,7 +32,9 @@ mod space;
 mod state;
 mod storage;
 mod swap;
+mod traeproxy;
 mod usage;
+mod wbproxy;
 mod webquota;
 
 use std::time::Duration;
@@ -72,10 +79,17 @@ fn report(line: String) {
 }
 
 fn main() {
+    // 两件事必须排在最前面：panic 钩子（release 是 GUI 程序，没有控制台，
+    // 不接钩子的话 panic 只印到没人看得见的 stderr）和这次启动的记录。
+    // 放在 --rehome 分支之前，命令行那条路同样要留痕。
+    lifecycle::install_panic_hook();
+    lifecycle::start();
     if let Some(code) = cli_rehome() {
+        lifecycle::why(&format!("命令行 --rehome 跑完，退出码 {}", code));
+        lifecycle::exit();
         std::process::exit(code);
     }
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -129,6 +143,10 @@ fn main() {
             // 便携 exe 不进开始菜单就搜不到，而搜不到就没人能进设置去点那个按钮——
             // 启动后自己在后台补一条（要起 PowerShell，不放启动路径上）
             std::thread::spawn(shelllink::ensure_start_menu);
+            // 反代**不在启动时自动恢复**：8788 起来就是在把各家账号的模型往外放行，
+            // 开机静默监听不是她想要的默认（2026-10-21 她明确要求改成用时自己点）。
+            // 要恢复这条得先想清楚：她客户端填的地址连不上时会明说「模型连不上」，
+            // 比一个悄悄开着的端口好查。
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -144,8 +162,16 @@ fn main() {
             commands::set_settings,
             commands::set_autostart
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("Agent 驾驶舱启动失败");
+    // RunEvent::Exit 只在正常走完退出流程时触发。所以日志里「有 start、没有配对的 exit」
+    // 就说明是被外部结束的——换 exe 的 Stop-Process、任务管理器、系统关机。
+    // 这正是 10-20 那次查不出的东西，当时只能靠 bin/ 里回滚件的时间戳反推。
+    app.run(|_app, event| {
+        if let tauri::RunEvent::Exit = event {
+            lifecycle::exit();
+        }
+    });
 }
 
 fn show_main(app: &tauri::AppHandle) {
@@ -245,8 +271,14 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             }
             // 重启＝把当前 exe 原样再拉一遍：换过新版 exe、或者后台线程卡住时，
             // 这一下比"去任务管理器结束进程再双击"清楚得多
-            "restart" => app.restart(),
-            "quit" => app.exit(0),
+            "restart" => {
+                lifecycle::why("托盘「重启应用」");
+                app.restart()
+            }
+            "quit" => {
+                lifecycle::why("托盘「退出」");
+                app.exit(0)
+            }
             _ => {}
         }
     });

@@ -27,6 +27,19 @@ fn cmd_guard() -> std::sync::MutexGuard<'static, ()> {
     CMD_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// 登录用的账号目录。有实例档案就用它自己的 data_dir（多开的每个号各一个 CODEX_HOME）；
+/// 原地账号没有独立目录，退回产品默认档案（~/.codex）——不新建目录，
+/// 免得为一个从未建卡的号在 instances/ 下留空壳。
+fn login_slot_dir(app_id: &str, name: &str) -> Option<PathBuf> {
+    if let Some(m) = reg::find_instance(app_id, name) {
+        let d = m["data_dir"].as_str().unwrap_or("").trim().to_string();
+        if !d.is_empty() {
+            return Some(PathBuf::from(d));
+        }
+    }
+    reg::profile_dir(app_id)
+}
+
 static SCAN_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn scan_stamp() -> String {
     let t = SCAN_AT.load(std::sync::atomic::Ordering::Relaxed);
@@ -233,9 +246,12 @@ pub fn get_key_plain(site: String, id: String) -> String {
     keys::get_key_plain(&site, &id)
 }
 
+/// async：Tauri 把它丢给工作线程。build_state 每轮要做进程快照（冷启 300ms+）、
+/// 逐账号数档案文件（identity::inspect，实测 250-300ms）、EnumWindows——以前是同步命令，
+/// 全部跑在主线程上，前端每 4 秒 invoke 一次，滚动/缩放正好撞上就被卡住几百毫秒。
 #[tauri::command]
-pub fn get_state(state_ref: tauri::State<AppState>) -> Value {
-    state::build_state(&state_ref.proxy)
+pub async fn get_state(state_ref: tauri::State<'_, AppState>) -> Result<Value, String> {
+    Ok(state::build_state(&state_ref.proxy))
 }
 
 /* ---------------- 一键刷新全部额度 ----------------
@@ -365,7 +381,16 @@ pub async fn action(
     // 直接卡死。表现是**所有** action 都永远不返回：向导里「打开客户端登录」「读取登录状态」
     // 点了没反应、建卡/换号/领取全部无声失败，而 4 秒一轮的状态刷新（另一条命令）照常，
     // 所以界面看着是活的。锁只在真正落账的那一段拿。
-    if matches!(act.as_str(), "key_test" | "key_probe_models" | "key_models") {
+    // Qoder 的探测/一键也走这条"锁外探测"的路：它们要等上游响应（国内版那条探测最坏 25 秒），
+    // 持锁跑就是"点了没反应、别的动作全被挡"——2026-10-20 实测复现过。
+    if matches!(
+        act.as_str(),
+        "key_test" | "key_probe_models" | "key_models"
+            | "qproxy_probe" | "qproxy_oneclick"
+            | "qproxy_cn_login" | "qproxy_cn_bridge"
+            | "wproxy_probe" | "wproxy_oneclick"
+            | "astudio_probe" | "astudio_oneclick" | "astudio_test" | "astudio_refresh"
+    ) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_action(&act, &app_id, &name, &payload, &state_ref)
         }));
@@ -472,7 +497,9 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             let wanted = payload["name"].as_str().unwrap_or("").trim().to_string();
             if !wanted.is_empty() {
                 if let Some(why) = reg::bad_account_name(&wanted) {
-                    return err(format!("账号名{why}，换个名字（比如只留汉字和字母）"));
+                    // why 自己已经是整句（"太长了（最多 60 个字）——括号里的邮箱可以删掉"），
+                    // 后面再缀一句"换个名字"会读成两截话
+                    return err(format!("账号名{why}"));
                 }
             }
             let nm = if !wanted.is_empty() {
@@ -662,6 +689,29 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                      要打开「{}」这个账号，先点「设为当前」换号（零额外空间、随时还原），再启动。",
                     app.name, name
                 ));
+            }
+
+            // Chromium PWA 壳（ChatGPT 桌面版）：不同 --user-data-dir ＝ 不同实例，
+            // 实测能与已在跑的实例并存。子进程命令行里都带这个目录，所以照样能按目录认领。
+            if app.kind == "pwa" {
+                if let Err(e) = procs::launch_pwa(&exe, data_dir) {
+                    return err(format!("启动失败：{e}"));
+                }
+                let cands =
+                    reg::account_candidates(app_id, &meta, &reg::swaps_of(&reg::load_config()));
+                let mut verified = false;
+                for _ in 0..6 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if !procs::instance_pids(&app, &cands, &procs::snapshot_fresh()).is_empty() {
+                        verified = true;
+                        break;
+                    }
+                }
+                return if verified {
+                    ok(format!("已启动 {}「{}」", app.name, name))
+                } else {
+                    ok(format!("已启动 {}「{}」，窗口还在起", app.name, name))
+                };
             }
 
             if app.kind == "electron" {
@@ -1254,7 +1304,10 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                 msg.push_str(" · 已标记超额");
             }
             if from_default {
-                msg.push_str("\n来源：本机当前登录的档案（这个账号目录里还没有它自己的登录数据）");
+                // 这句容易被读成"登录数据丢了"。事实是：这类程序（WorkBuddy 等共用档案型）
+                // 本来就只有整机一份登录态，实例目录里不会有第二份——读整机当前登着的号就是
+                // 设计如此。说清"这是正常的"，别让用户以为自己号掉了。
+                msg.push_str("\n来源：整机当前登录的档案（这个程序的几个账号共用一份档案，读的是当前登着的号，就是设计如此）");
             }
             // 服务端没读成、只剩旧缓存：必须说清"这不是实时数"，否则用户会拿 8 月的余额做判断
             let stale_hint = q.stale_hint();
@@ -1879,7 +1932,7 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
                 payload["strategy"].as_str(),
             );
             let (upstream, strategy) = st.proxy.config();
-            // 只覆盖 upstream / strategy，pools 与 dist 必须原地保留（否则一开反代池子就没了）
+            // 只覆盖 upstream / strategy，pools 与 dist 必须原地保留（否则一开反代上游组就没了）
             let mut cfg = reg::load_config();
             if !cfg["proxy"].is_object() {
                 cfg["proxy"] = json!({});
@@ -1907,7 +1960,7 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             }
         }
 
-        // ── 反代：池子（成员的归属） ──
+        // ── 反代：上游组（成员的归属） ──
         "proxy_pool_upsert" => {
             let (o, m) = crate::gateway::upsert_pool(&payload["item"]);
             if o { ok(m) } else { err(m) }
@@ -1949,6 +2002,289 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
 
         // 可勾选的成员清单：按 Agent 分组列账号 + API 台账里的 Key
         "proxy_members" => ok(json!({ "members": crate::gateway::member_options() }).to_string()),
+
+        // 「可用模型」面板：把所有上游组当前真能调的模型按厂商分组列出
+        "proxy_models_list" => ok(crate::proxy::models_payload().to_string()),
+
+        // ── OpenCode 本地桥（见 opencode.rs）──
+        "opencode_models" => {
+            let r = crate::opencode::models();
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": if r["ok"].as_bool().unwrap_or(false) {
+                    format!("读到 {} 个模型", r["count"].as_u64().unwrap_or(0))
+                } else {
+                    r["error"].as_str().unwrap_or("桥没起来").to_string()
+                },
+                "result": r,
+            })
+        }
+        "opencode_test" => {
+            let r = crate::opencode::test(payload["model"].as_str().unwrap_or(""));
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["error"].as_str()
+                    .or_else(|| r["content"].as_str())
+                    .unwrap_or("测完了"),
+                "result": r,
+            })
+        }
+
+        // ── Qoder / Qoder CN 模型反代（见 qproxy.rs） ──
+        "qproxy_status" => ok(crate::qproxy::view().to_string()),
+
+        // 探一个账号：默认连推理一起试（花几个 token），infer=false 只验令牌；deep=false 走快档
+        "qproxy_probe" => {
+            let r = crate::qproxy::probe(
+                payload["app"].as_str().unwrap_or(""),
+                payload["name"].as_str().unwrap_or(""),
+                payload["infer"].as_bool().unwrap_or(true),
+                payload["deep"].as_bool().unwrap_or(true),
+                payload["model"].as_str().unwrap_or("auto"),
+            );
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["text"].as_str().unwrap_or("探完了"),
+                "result": r,
+            })
+        }
+
+        // 一键：探测 → 建/复用池 → 生成/复用接入密钥 → 起反代
+        "qproxy_oneclick" => {
+            let r = crate::qproxy::one_click(
+                &st.proxy,
+                payload["infer"].as_bool().unwrap_or(true),
+            );
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["msg"].as_str().unwrap_or("跑完了"),
+                "result": r,
+            })
+        }
+
+        // 接入密钥 的明文：界面点「显示」才取
+        "qproxy_reveal" => {
+            let k = crate::qproxy::dist_reveal();
+            if k.is_empty() {
+                err("还没有 Qoder 的接入密钥：到「接入密钥」表里生成一把，勾上要用它的上游组")
+            } else {
+                ok(k)
+            }
+        }
+
+        // Qoder CN：让官方 CLI 登录这个账号（设备码，点一次浏览器就完事）
+        "qproxy_cn_login" => {
+            let r = crate::qproxy::cn_login(payload["name"].as_str().unwrap_or(""));
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["msg"].as_str().unwrap_or(""),
+                "result": r,
+            })
+        }
+
+        // Qoder CN 本地桥：开 / 关 / 看状态
+        "qproxy_cn_bridge" => {
+            let name = payload["name"].as_str().unwrap_or("");
+            if payload["on"].as_bool().unwrap_or(false) {
+                let (o, m) = crate::qproxy::cn_bridge_start(name);
+                json!({ "ok": o, "msg": m })
+            } else {
+                let (o, m) = crate::qproxy::cn_bridge_stop();
+                json!({ "ok": o, "msg": m })
+            }
+        }
+
+        // ── WorkBuddy 国内版 / 国际版（见 wbproxy.rs）──
+        "wproxy_status" => ok(crate::wbproxy::view().to_string()),
+
+        // 首次：从本机 agenthub 读一次解密密钥，存进保管箱（DPAPI）
+        "wproxy_import_secret" => match crate::wbproxy::import_secret_from_agenthub() {
+            Ok(m) => ok(m),
+            Err(e) => err(e),
+        },
+
+        // 手动粘贴那把 base64（读不到 agenthub 时的退路）
+        "wproxy_set_secret" => match crate::wbproxy::set_secret(
+            payload["value"].as_str().unwrap_or(""),
+        ) {
+            Ok(m) => ok(m),
+            Err(e) => err(e),
+        },
+
+        // 探一个账号：只打额度接口，不花积分
+        "wproxy_probe" => {
+            let r = crate::wbproxy::probe(
+                payload["app"].as_str().unwrap_or(""),
+                payload["name"].as_str().unwrap_or(""),
+            );
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["msg"].as_str().unwrap_or("探完了"),
+                "result": r,
+            })
+        }
+
+        // 用指定模型发一次极小补全：验证账号、模型名和整条上游链路
+        "wproxy_test" => {
+            let r = crate::wbproxy::test(
+                payload["app"].as_str().unwrap_or(""),
+                payload["name"].as_str().unwrap_or(""),
+                payload["model"].as_str().unwrap_or(""),
+            );
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["error"].as_str()
+                    .or_else(|| r["content"].as_str())
+                    .unwrap_or("测完了"),
+                "result": r,
+            })
+        }
+
+        // 一键：探活 → 建/复用池 → 生成/复用接入密钥 → 起反代
+        "wproxy_oneclick" => {
+            let r = crate::wbproxy::one_click(
+                &st.proxy,
+                payload["infer"].as_bool().unwrap_or(true),
+            );
+            let mut out = json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["msg"].as_str().unwrap_or("跑完了"),
+                "result": r,
+            });
+            // 密钥还没导入时要说清「缺什么」，界面据此弹导入入口
+            if r["need"].as_str() == Some("secret") {
+                out["need"] = json!("secret");
+            }
+            out
+        }
+
+        "wproxy_reveal" => {
+            let k = crate::wbproxy::dist_reveal();
+            if k.is_empty() {
+                err("还没有 WorkBuddy 的接入密钥：到「接入密钥」表里生成一把，勾上要用它的上游组")
+            } else {
+                ok(k)
+            }
+        }
+
+        // ── Trae CN（见 traeproxy.rs）──
+        // 读缓存（界面轮询用这个）
+        "trae_status" => ok(crate::traeproxy::view().to_string()),
+
+        // 显式刷新：起 agenthub 读令牌与模型目录、重算出口 IP
+        "trae_refresh" => {
+            crate::traeproxy::refresh();
+            let v = crate::traeproxy::view();
+            let models = v["models"].as_array().map(|a| a.len()).unwrap_or(0);
+            ok(format!("Trae 令牌、模型目录（{} 个模型）、出口 IP 已重读", models))
+        }
+
+        // 单发探针：花几个积分，验证「翻译 + 出口 IP + 真模型」整条链
+        "trae_probe" => {
+            let r = crate::traeproxy::probe(
+                payload["app"].as_str().unwrap_or("traework-cn"),
+                payload["name"].as_str().unwrap_or(""),
+                payload["model"].as_str().unwrap_or("glm-5.3-flash"),
+            );
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["error"].as_str()
+                    .or_else(|| r["message"].as_str())
+                    .unwrap_or("探完了"),
+                "result": r,
+            })
+        }
+
+        // 一键：刷新 → 探一发 → 建/复用池 → 生成/复用 Key → 起反代
+        "trae_oneclick" => {
+            let r = crate::traeproxy::one_click(
+                &st.proxy,
+                payload["model"].as_str().unwrap_or("glm-5.3-flash"),
+                payload["skip_probe"].as_bool().unwrap_or(false),
+            );
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["msg"].as_str().unwrap_or("跑完了"),
+                "result": r,
+            })
+        }
+
+        // 运行日志（启动 / 退出 / panic）：设置 → 运行日志 和齿轮菜单都读这一条。
+        // 只回尾部若干行加文件位置——这文件会一直长，不能整份灌进界面。
+        "log_tail" => {
+            let n = payload["lines"].as_u64().unwrap_or(120).clamp(10, 800) as usize;
+            json!({
+                "ok": true,
+                "path": crate::lifecycle::path().display().to_string(),
+                "lines": crate::lifecycle::tail(n),
+            })
+        }
+
+        "trae_reveal" => {
+            let k = crate::traeproxy::dist_reveal();
+            if k.is_empty() {
+                err("还没有 Trae 的接入密钥：到「接入密钥」表里生成一把，勾上要用它的上游组")
+            } else {
+                ok(k)
+            }
+        }
+
+        // ── AStudio（见 asproxy.rs）──
+        // 模型令牌在 astron-session.json 的 modelBearerToken，直连讯飞云端
+        // model-gateway（OpenAI 兼容，不需要协议翻译）。
+        "astudio_status" => ok(crate::asproxy::view().to_string()),
+
+        // 只验令牌：不发模型请求（不花积分）
+        "astudio_probe" => {
+            let r = crate::asproxy::probe();
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["text"].as_str().unwrap_or("探完了"),
+                "result": r,
+            })
+        }
+
+        // 用指定模型发一次极小补全：验证「令牌 + 网关 + 模型名」整条链
+        "astudio_test" => {
+            let r = crate::asproxy::test(
+                payload["model"].as_str().unwrap_or("spark-x2.6-4b"),
+            );
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["error"].as_str().unwrap_or("测完了"),
+                "result": r,
+            })
+        }
+
+        // 清令牌缓存 + 拉一次账号级实时模型清单（Cookie 打 /bot/models/configs）
+        "astudio_refresh" => {
+            crate::asproxy::invalidate();
+            let r = crate::asproxy::models_live();
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["error"].as_str().unwrap_or("模型清单已刷新"),
+                "result": r,
+            })
+        }
+
+        // 一键：建/复用池 → 生成/复用接入密钥 → 起反代
+        "astudio_oneclick" => {
+            let r = crate::asproxy::one_click(&st.proxy);
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["msg"].as_str().unwrap_or("跑完了"),
+                "result": r,
+            })
+        }
+
+        "astudio_reveal" => {
+            let k = crate::asproxy::dist_reveal();
+            if k.is_empty() {
+                err("还没有 AStudio 的接入密钥：到「接入密钥」表里生成一把，勾上要用它的上游组")
+            } else {
+                ok(k)
+            }
+        }
 
         "key_upsert" => {
             let (o, m, sid) = keys::upsert_site(&payload["item"]);
@@ -2397,6 +2733,59 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             }
         }
 
+        // CLI 类产品（Codex）的账号登录：API Key / ChatGPT OAuth / 设备码。
+        // 登录态落在**这个账号自己的**目录里（data_dir），所以换号＝换目录，多开各登各的。
+        "codex_login" => {
+            let aid = payload["app"].as_str().unwrap_or("").to_string();
+            let nm = payload["name"].as_str().unwrap_or("").trim().to_string();
+            let data_dir = match login_slot_dir(&aid, &nm) {
+                Some(d) => d,
+                None => return Some(err(format!("账号「{nm}」不存在"))),
+            };
+            let _ = std::fs::create_dir_all(&data_dir);
+            let mode = payload["mode"].as_str().unwrap_or("chatgpt");
+            let r = match mode {
+                "apikey" => crate::cliauth::login_apikey(&data_dir, payload["key"].as_str().unwrap_or(""))
+                    .map(|m| ok(m)),
+                "device" => crate::cliauth::login_browser(&data_dir, true)
+                    .map(|_| ok("已开登录窗口：在终端里按提示完成设备码授权"))
+                    .map_err(|e| e),
+                _ => crate::cliauth::login_browser(&data_dir, false)
+                    .map(|_| ok("已开登录窗口：在终端里按提示完成浏览器授权"))
+                    .map_err(|e| e),
+            };
+            match r {
+                Ok(v) => v,
+                Err(e) => err(format!("登录失败：{e}")),
+            }
+        }
+
+        "codex_logout" => {
+            let aid = payload["app"].as_str().unwrap_or("").to_string();
+            let nm = payload["name"].as_str().unwrap_or("").trim().to_string();
+            let data_dir = match login_slot_dir(&aid, &nm) {
+                Some(d) => d,
+                None => return Some(err(format!("账号「{nm}」不存在"))),
+            };
+            match crate::cliauth::logout(&data_dir) {
+                Ok(m) => ok(m),
+                Err(e) => err(e),
+            }
+        }
+
+        "codex_status" => {
+            let aid = payload["app"].as_str().unwrap_or("").to_string();
+            let nm = payload["name"].as_str().unwrap_or("").trim().to_string();
+            let data_dir = match login_slot_dir(&aid, &nm) {
+                Some(d) => d,
+                None => return Some(err(format!("账号「{nm}」不存在"))),
+            };
+            json!({
+                "ok": true,
+                "status": crate::cliauth::status(&data_dir),
+            })
+        }
+
         // 「她在官网窗口里登录上了没有」——只翻 cookie 罐、不发请求，给前端那条轮询用。
         // 没有这一条，登录完还得再点一次读数才出明细，而她的预期是"我登录了，
         // 积分/用量/时间就该都在"。
@@ -2564,6 +2953,11 @@ fn resolve_seed(
         "adopt" => ("adopt".into(), profile),
         "copy" => ("copy".into(), from_arg.or(profile).or(prev)),
         _ => match profile {
+            // CLI 产品（Codex / Claude Code）：登录态就是目录里的一个 JSON 文件。
+            // 默认"复制本机档案"会把上一个号的 API Key / ChatGPT 令牌原样带进新号——
+            // 新号登进去还是旧号。一律从空目录起，在里面登一次才是这个号的；
+            // 要接管本机那个号可以显式选 adopt。
+            Some(_) if kind == "cli" => ("fresh".into(), None),
             Some(p) if kind != "cli" && !crate::state::isolatable(app_id) => {
                 ("adopt".into(), Some(p))
             }
@@ -2715,6 +3109,7 @@ mod tests {
             "storage_report", "vault_state", "storage_rollback", "ai_list_models",
             "key_upsert", "key_delete", "key_test", "key_models", "key_fetch_quota",
             "key_probe_models", "key_dedup_scan", "perk_save", "proxy_members",
+            "proxy_models_list",
             "delete_backup", "kill_pids",
             // 快捷方式三连：空入参下 create/remove 都在起 PowerShell 之前就报错回绝，
             // 只验它们被 app_free 接住；status 会真起子进程，不放这儿
