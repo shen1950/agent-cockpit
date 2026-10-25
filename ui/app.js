@@ -2848,6 +2848,7 @@ function proxyKind(appId) {
   if (appId === 'traework-cn') return 't';
   if (appId === 'workbuddy' || appId === 'workbuddy-intl') return 'w';
   if (appId === 'opencode') return 'oc';
+  if (appId === 'astudio') return 'a';
   return '';
 }
 function pxState(appId) {
@@ -2894,7 +2895,7 @@ async function loadAgentModelIds(appId) {
   const st = pxState(appId);
   if (st.idsLoading) return;
   st.idsLoading = true;
-  rerenderProxy();
+  replacePxIds(appId);
   try {
     const r = await invoke('action', { payload: { action: 'proxy_models_list' } });
     const v = typeof r.msg === 'string' ? JSON.parse(r.msg) : (r || {});
@@ -2909,12 +2910,13 @@ async function loadAgentModelIds(appId) {
     st.ids = { models: [], count: 0, error: String(e) };
   }
   st.idsLoading = false;
-  rerenderProxy();
+  replacePxIds(appId);
 }
 
 function pxIdsRow(appId) {
   const st = pxState(appId);
-  const box = el('div', { class: 'px-ids' });
+  // data-pxids 给 replacePxIds 定点换节点用（只换这一块、不重建整个面板）
+  const box = el('div', { class: 'px-ids', data: { pxids: appId } });
   const head = el('div', { class: 'px-ids-head' },
     el('span', { class: 'px-k' }, '模型 ID'),
     btn(st.idsLoading ? '读取中…' : (st.ids ? '刷新' : '获取模型ID'), 'sm',
@@ -2926,7 +2928,7 @@ function pxIdsRow(appId) {
       const open = !!st.idsOpen;
       head.appendChild(btn(open ? '收起' : `展开全部 ${st.ids.count} 个`, 'sm', () => {
         st.idsOpen = !open;
-        rerenderProxy();
+        replacePxIds(appId);
       }, open ? '只留当前选中的那一行' : `展开全部 ${st.ids.count} 个 Model ID`));
     }
   }
@@ -2983,6 +2985,7 @@ function pxTestLine(st) {
 function pxKeyAction(kind) {
   if (kind === 'q') return { get: () => S.qkey, set: (v) => { S.qkey = v; }, reveal: 'qproxy_reveal' };
   if (kind === 'w') return { get: () => S.wkey, set: (v) => { S.wkey = v; }, reveal: 'wproxy_reveal' };
+  if (kind === 'a') return { get: () => S.akey, set: (v) => { S.akey = v; }, reveal: 'astudio_reveal' };
   return { get: () => S.tkey, set: (v) => { S.tkey = v; }, reveal: 'trae_reveal' };
 }
 function pxAccess(d, kind, dist, modelId, modelName) {
@@ -3005,7 +3008,7 @@ function pxAccess(d, kind, dist, modelId, modelName) {
   }, '显示完整接入密钥并复制') : null;
   // 给客户端的 Model 一律带 Agent 前缀（qoder/xxx、workbuddy/xxx、trae/xxx）：
   // 同名模型不会漂到别家，指向固定在这一家的上游。
-  const nsOwner = kind === 't' ? 'trae' : ((kind === 'q' || kind === 'w') ? S.cur : '');
+  const nsOwner = kind === 't' ? 'trae' : (kind === 'a' ? 'astudio' : ((kind === 'q' || kind === 'w') ? S.cur : ''));
   const clientModel = modelId && nsOwner ? `${nsOwner}/${modelId}` : (modelId || '');
   const copyCfg = btn('复制接入配置', 'primary sm', async () => {
     const key = await ensureKey();
@@ -3018,6 +3021,114 @@ function pxAccess(d, kind, dist, modelId, modelName) {
     pxRow('推荐模型', modelLabel, clientModel ? [btn('复制', 'sm', () => copyText(clientModel), '复制模型 ID（带 Agent 前缀，指向固定）')] : []),
     pxRow('接入密钥', keyNode, reveal ? [reveal] : []),
     el('div', { class: 'px-actions' }, copyCfg));
+}
+
+/* ---------------- AStudio（讯飞星火）反代面板 ----------------
+   上游是讯飞云端 model-gateway（OpenAI 兼容，不需要协议翻译），
+   令牌读 astron-session.json 的 modelBearerToken。面板结构和 Qoder/WorkBuddy 一致：
+   头部（配置态 + 刷新模型 + 一键反代 + 启停）→ 接入信息 → 模型下拉 + 测试 → 模型ID → 账号表。 */
+function astudioModelLabel(m) {
+  const tag = m.free ? '（限免）' : (m.multiplier ? `（${m.multiplier}）` : '');
+  return `${m.name && m.name !== m.id ? `${m.name} · ` : ''}${m.id}${tag}`;
+}
+async function astudioRefreshModels() {
+  const st = pxState('astudio');
+  if (st.refreshing) return;
+  st.refreshing = true;
+  rerenderProxy();
+  try {
+    const r = await invoke('action', { payload: { action: 'astudio_refresh' } });
+    const res = r.result || {};
+    st.live = (res.models || []).map((m) => ({
+      id: m.id, name: m.name, free: m.free, multiplier: m.multiplier,
+    }));
+    st.liveError = res.ok ? '' : (res.error || r.msg || '');
+  } catch (e) {
+    st.liveError = String(e);
+  }
+  st.refreshing = false;
+  rerenderProxy();
+}
+async function astudioOneClick() {
+  const st = pxState('astudio');
+  if (st.busy) return;
+  st.busy = true;
+  rerenderProxy();
+  try {
+    const r = await invoke('action', { payload: { action: 'astudio_oneclick' } });
+    st.test = r.ok ? { ok: true, msg: r.msg } : { ok: false, error: r.msg };
+    await load();
+  } catch (e) {
+    st.test = { ok: false, error: String(e) };
+  }
+  st.busy = false;
+  rerenderProxy();
+}
+async function pxTestAstudio(st) {
+  st.testing = true;
+  rerenderProxy();
+  try {
+    const r = await invoke('action', { payload: { action: 'astudio_test', model: st.model } });
+    st.test = r.result || { ok: false, error: r.msg };
+  } catch (e) {
+    st.test = { ok: false, error: String(e) };
+  }
+  st.testing = false;
+  rerenderProxy();
+}
+function renderAstudioPanel(a, host, appId) {
+  if (!a) return;
+  const st = pxState(appId);
+  const accts = a.accounts || [];
+  let models = (st.live && st.live.length) ? st.live : (a.models || []);
+  if (!models.length) models = [{ id: 'spark-x2.6-4b', name: 'Spark-X2.6-Lite', free: true }];
+  if (!models.some((m) => m.id === st.model)) {
+    st.model = (models.find((m) => m.free) || models[0]).id;
+  }
+  const modelName = pxModelOf(models, st.model)?.name || st.model;
+  const inPool = accts.some((x) => inEnabledPool(x.app, x.name));
+  host.appendChild(pxHead('AStudio 模型', '读 astron-session.json 的 modelBearerToken，直连讯飞云端模型网关（OpenAI 兼容，无需翻译）', [
+    el('span', {
+      class: `tag ${inPool ? 'swap' : ''}`.trim(),
+      title: inPool
+        ? '账号在启用的上游组里：反代一开，带授权的 key 就能调它'
+        : '账号还没进任何上游组：点「一键反代」，或到「上游组」把它勾进去',
+    }, inPool ? '已配置' : '未配置'),
+    btn(st.refreshing ? '读取中…' : '刷新模型', 'sm', astudioRefreshModels,
+      '用登录 Cookie 拉这个账号实时可用的模型清单'),
+    btn(st.busy ? '正在配置…' : (inPool ? '重新配置' : '一键反代'), 'primary sm', astudioOneClick,
+      '账号进上游组 → 生成接入密钥 → 启动反代'),
+    pxRunBtn(S.data, true),
+  ].filter(Boolean)));
+  if (st.busy) { const b = host.querySelector('button.primary'); if (b) b.disabled = true; }
+
+  host.appendChild(pxAccess(S.data, 'a', a.dist, st.model, modelName));
+
+  const sel = el('select', { class: 'px-select' });
+  for (const m of models) sel.appendChild(el('option', { value: m.id }, astudioModelLabel(m)));
+  sel.value = st.model;
+  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
+  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm',
+    () => pxTestAstudio(st), '用选中的模型发一次极小请求');
+  if (st.testing) testBtn.disabled = true;
+  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
+  host.appendChild(pxTestLine(st));
+  host.appendChild(pxIdsRow(appId));
+  host.appendChild(pxNote('下拉里默认是内置清单；点「刷新模型」换成账号实时清单。限免的 spark-x2.6-4b 不扣积分，其余按倍率扣星火积分。'));
+  if (st.liveError) host.appendChild(pxNote(`模型清单：${st.liveError}`, true));
+
+  let acctTable;
+  if (!accts.length) {
+    acctTable = pxEmpty('还没有 AStudio 账号。先在账号页建一个，或把现在登录的那份收进来。');
+  } else {
+    const rows = accts.map((x) => el('tr', {},
+      el('td', {}, el('b', {}, x.name)),
+      el('td', {}, chip(x.text || x.state || '—', x.usable ? 'swap' : 'expired')),
+      el('td', { class: 'mono muted' }, `${x.masked || '—'}${x.from ? `（${x.from}）` : ''}`),
+      el('td', {}, x.in_pool ? '已进上游组' : '未进上游组')));
+    acctTable = pxAccountTable(['账号', '令牌状态', '模型令牌', '上游组'], rows);
+  }
+  host.appendChild(acctTable);
 }
 
 function renderAgentProxy(d) {
@@ -3037,6 +3148,7 @@ function renderAgentProxy(d) {
     renderOpenCodeBridge(host, d, true);
     if (!S.proxyPage.bridge && !S.proxyPage.bridgeLoading) loadOpenCodeModels(false);
   }
+  if (kind === 'a') renderAstudioPanel(d.proxy.astudio, host, S.cur);
 }
 
 async function pxTestQoder(appId, accts, st) {
@@ -3279,8 +3391,26 @@ function renderTraePanel(t, host) {
 }
 
 function rerenderProxy() {
+  // 她的老毛病（二·续十三在 renderKeys 修过一轮）：面板整体重建会改页面总长度，
+  // 清空的一瞬间 scrollHeight 塌掉、scrollTop 被浏览器夹回去，内容回来后没人放回原位——
+  // 表现就是点「获取模型ID / 展开全部」之后页面莫名往上错，得重新滚回来。
+  // 面板里滚动的是外层 .pagebody，重建前后把它拿住。
+  const pb = document.querySelector(S.view === 'proxy' ? '#view-proxy .pagebody' : '#view-agents .pagebody');
+  const keep = pb ? pb.scrollTop : 0;
   if (S.view === 'proxy') renderProxyPage(S.data);
   else if (S.view === 'agents') renderAgentProxy(S.data);
+  if (pb) pb.scrollTop = keep;
+}
+
+/* 「获取模型ID / 展开全部」这类只动「模型 ID」一块的状态，走定点替换：
+   整板 clear+重建会把浏览器滚动锚定的锚点节点一起销毁——她视口上方加了内容时
+   锚定失效、页面往上错一截（2.10 的 二·续十三 同类）。只换 .px-ids 一个节点，
+   面板里下面的账号表活下来，锚定自动补偿，她的位置一动不动。 */
+function replacePxIds(appId) {
+  const scope = S.view === 'agents' ? '#agent-proxy' : '#view-proxy';
+  const old = document.querySelector(`${scope} .px-ids[data-pxids="${appId}"]`);
+  if (!old) { rerenderProxy(); return; }
+  old.replaceWith(pxIdsRow(appId));
 }
 
 function pxTestOpenCode(st) {
@@ -9004,6 +9134,11 @@ async function init() {
   if (!window.__TAURI__) await import('./mock.js');
   invoke = window.__TAURI__.core.invoke;
   win = window.__TAURI__.window.getCurrentWindow();
+  // 版本号钉在标题右下（她 10-25 点名要的）；拿不到就空着，不留半个 "v"
+  try {
+    const v = await window.__TAURI__.app.getVersion();
+    $('brand-ver').textContent = v ? `v${v}` : '';
+  } catch { /* 旧桥没有 app 模块：留着空 */ }
   bind();
   await load();
   // 主题搬进设置后，把旧版存在 localStorage 里的偏好迁移过来，别让默认值盖掉用户的选择
