@@ -136,7 +136,13 @@ input:focus, select:focus { border-color: var(--accent) }
   -webkit-user-select: none;
 }
 .dragfill { flex: 1; align-self: stretch }
-.brand { display: flex; align-items: center; gap: var(--sp-2); flex: none }
+.brand { display: flex; align-items: center; gap: var(--sp-2); flex: none; position: relative }
+/* 版本号钉在标题右下（她 10-25 点名要的），init 里从 tauri 拿真实版本填进来 */
+.brand .ver {
+  align-self: flex-end; transform: translateY(4px); margin-left: -2px;
+  font: 600 10px/1 var(--font-mono); letter-spacing: .4px;
+  color: var(--text-faint);
+}
 .brand .mark {
   width: 18px; height: 18px; border-radius: 5px;
   background: var(--bg); border: 1.5px solid var(--accent);
@@ -169,6 +175,10 @@ input:focus, select:focus { border-color: var(--accent) }
   display: flex; align-items: center; gap: var(--sp-2); flex-wrap: nowrap;
   justify-content: flex-end; min-width: 0; overflow: hidden;
 }
+/* 她 10-25：225% 缩放下窗口只有 ~890 CSS px，顶栏装不下——徽章行之前被
+   overflow:hidden 齐腰切掉半个字（"Agent 18" 变 "gent 18"，看着像标题的
+   透明层压住了它）。改成让徽章自己收缩，内层出省略号，不再切半个字。 */
+.stats .chip { flex: 0 1 auto; min-width: 0 }
 
 .chip {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1406,6 +1416,7 @@ html[data-density="compact"] .btn.sm { padding: 4px 9px }
 @media (max-width: 1300px) {
   :root { --nav-w: min(var(--nav-w-user), 46vw) }
   .tagline { display: none }
+  .topbar { gap: var(--sp-2); padding-left: var(--sp-3) }
 }
 /* 图标条（rail）模式：窗口太窄时由 JS 挂上 html.rail，用户手动收起也是同一个类，
    样式只写一份。断点按 CSS 像素取值并留足余量，否则默认窗口就会退化成图标条。 */

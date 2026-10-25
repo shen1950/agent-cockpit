@@ -507,6 +507,9 @@ pub struct ModelInfo {
     pub name: String,
     pub credits: String,
     pub free: bool,
+    /// 是否在客户端 `agents[cli].models` 白名单里。
+    /// **只用来排序/标注，不作过滤依据**（见 catalog 的注释）。
+    pub in_cli: bool,
     pub supports_images: bool,
     pub supports_reasoning: bool,
     pub supports_tools: bool,
@@ -537,9 +540,16 @@ pub fn is_free(credits: &str) -> bool {
     s.parse::<f64>().map(|v| v == 0.0).unwrap_or(false)
 }
 
-/// 读 `/v3/config` 的本机缓存。模型必须**同时**满足两条才算可用：
-/// ① 在顶层 `models[]` 里（有倍率信息）；② 在 `agents[cli].models` 白名单里。
-/// 实测 `hy3-b`/`hy3-c` 是 0 倍率但不在 cli 白名单里 —— 那两条调不动，别写进清单。
+/// 读 `/v3/config` 的本机缓存，**列出全部可当聊天用的模型（免费 + 付费）**。
+///
+/// ⚠️ `agents[cli].models` **不是鉴权闸门**，只是客户端模型选择器的展示清单。
+/// 2026-10-20 我把它当成了「不在名单里就调不动」，于是拿它做硬过滤 —— 2026-10-25 实测推翻：
+/// 服务端把 cli 名单缩到 9 个旧模型（auto/glm-5.1/glm-5.0/glm-4.7/kimi-k2.5/minimax-m2.7/
+/// deepseek-v3-2-volc…），而 `hy3` 已经不在名单里，直接 POST 仍然 **200**。
+/// 用名单过滤的后果就是界面上只剩那 9 个「被遗弃的旧模型」，新模型和免费模型全看不见。
+///
+/// 所以取舍只剩一条：挡掉走不了 `/v2/chat/completions` 的非聊天模型（补全/图片/视频…）。
+/// 白名单只保留 `in_cli` 标记用于排序，不参与过滤；免费/付费都列出来，单价由 `credits` 注明。
 pub fn catalog(app_id: &str) -> Result<Catalog, String> {
     let p = catalog_path(app_id).ok_or_else(|| format!("{app_id} 没有档案目录"))?;
     if !p.is_file() {
@@ -568,18 +578,18 @@ pub fn catalog(app_id: &str) -> Result<Catalog, String> {
     if let Some(arr) = v["models"].as_array() {
         for m in arr {
             let id = m["id"].as_str().unwrap_or("").trim().to_string();
-            if id.is_empty() {
-                continue;
-            }
-            if !cli_ids.is_empty() && !cli_ids.iter().any(|x| x == &id) {
+            if id.is_empty() || is_non_chat(&id) {
                 continue;
             }
             let credits = m["credits"].as_str().unwrap_or("").to_string();
+            let free = is_free(&credits);
+            let in_cli = cli_ids.iter().any(|x| x == &id);
             models.push(ModelInfo {
                 id: id.clone(),
                 name: m["name"].as_str().unwrap_or(&id).to_string(),
-                free: is_free(&credits),
                 credits,
+                free,
+                in_cli,
                 supports_images: m["supportsImages"].as_bool().unwrap_or(false),
                 supports_reasoning: m["supportsReasoning"].as_bool().unwrap_or(false),
                 supports_tools: m["supportsToolCall"].as_bool().unwrap_or(false),
@@ -589,13 +599,31 @@ pub fn catalog(app_id: &str) -> Result<Catalog, String> {
         }
     }
     if models.is_empty() {
-        return Err(format!("{} 里没有可用的 cli 模型", p.display()));
+        return Err(format!("{} 里没有可用的聊天模型", p.display()));
     }
+    // 免费的排前面，同一档里白名单内的排前面，再按 id 稳定排序
+    models.sort_by(|a, b| {
+        b.free
+            .cmp(&a.free)
+            .then(b.in_cli.cmp(&a.in_cli))
+            .then(a.id.cmp(&b.id))
+    });
     Ok(Catalog {
         models,
         fetched_at,
         source: p.to_string_lossy().into_owned(),
     })
+}
+
+/// `/v3/config` 的 `models[]` 里混着一堆非对话模型：补全、改写、内联建议、图片、视频。
+/// 它们走不了 `/v2/chat/completions`，列出来只会让人点一次错一次。
+fn is_non_chat(id: &str) -> bool {
+    const JUNK: [&str; 13] = [
+        "image", "video", "t2v", "i2v", "completion", "rewrite", "-nes", "jump",
+        "codewise", "embed", "rerank", "kling", "tts",
+    ];
+    let l = id.to_ascii_lowercase();
+    JUNK.iter().any(|k| l.contains(k))
 }
 
 pub fn free_models(app_id: &str) -> Vec<ModelInfo> {
@@ -757,7 +785,7 @@ impl PrepError {
             PrepError::NoCredential(s) => s.clone(),
             PrepError::ModelUnknown { asked, available } => {
                 if available.is_empty() {
-                    format!("没有可用模型（要的不是 {asked}，而且本区域目录里没有免费模型）")
+                    format!("没有可用模型（要的是 {asked}，而这个区域的目录里没有聊天模型）")
                 } else {
                     format!("模型「{asked}」不在可用清单里。现在能用：{}", available.join("、"))
                 }
@@ -1562,6 +1590,7 @@ pub fn test(app_id: &str, name: &str, model: &str) -> Value {
 fn model_json(m: &ModelInfo) -> Value {
     json!({
         "id": m.id, "name": m.name, "credits": m.credits, "free": m.free,
+        "in_cli": m.in_cli,
         "context": m.context, "max_output": m.max_output,
         "tools": m.supports_tools, "images": m.supports_images,
         "reasoning": m.supports_reasoning,
@@ -2197,6 +2226,54 @@ mod tests {
         // 只有「重编码必须逐字一致」能拦住
         let round = crate::secrets::b64_encode(&crate::secrets::b64_decode(stripped).unwrap());
         assert_ne!(round, stripped);
+    }
+
+    #[test]
+    fn non_chat_models_are_filtered_out() {
+        for id in [
+            "kling-video-v3",
+            "codewise-completions",
+            "codewise-rewrite",
+            "hunyuan-image-alpha",
+            "hunyuan-image-v3.0",
+            "deepseek-v3-0324-taco-completion",
+            "minimax-embed-x",
+        ] {
+            assert!(is_non_chat(id), "{id} 应该被挡掉");
+        }
+        for id in ["hy3", "hy4-preview", "glm-5.3", "minimax-m2.7", "auto", "deepseek-v3-2-volc"] {
+            assert!(!is_non_chat(id), "{id} 是聊天模型，不该被挡");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_catalog_includes_free_models_outside_the_cli_list() {
+        // 2026-10-25 的真实形状：cli 白名单只剩 9 个旧模型，hy3 不在其中但仍可调用。
+        // 这条钉住「白名单不作过滤」——再有人拿 cli_ids 当 if 条件，这里会红。
+        for app in APPS {
+            let cat = catalog(app).expect("读目录失败");
+            let names: Vec<&str> = cat.models.iter().map(|m| m.id.as_str()).collect();
+            eprintln!("{app}: {} 个模型 · 免费 {:?}", cat.models.len(),
+                cat.models.iter().filter(|m| m.free).map(|m| m.id.as_str()).collect::<Vec<_>>());
+            assert!(!cat.models.is_empty(), "{app} 目录是空的");
+            for m in &cat.models {
+                assert!(!is_non_chat(&m.id), "{app} 把非聊天模型 {} 也列出来了", m.id);
+            }
+            // 付费且不在白名单里的模型也必须列出来——她明确要「所有付费模型也要」
+            let paid_outside = cat
+                .models
+                .iter()
+                .filter(|m| !m.free && !m.in_cli)
+                .count();
+            eprintln!("  {app}: {} 个模型，其中付费且不在白名单 {paid_outside} 个", cat.models.len());
+            assert!(
+                paid_outside > 0,
+                "{app} 一个白名单外的付费模型都没有，说明闸门还在"
+            );
+            let free = cat.models.iter().filter(|m| m.free).count();
+            assert!(free > 0 || names.is_empty(), "{app} 一个免费模型都没有");
+        }
     }
 
     #[test]

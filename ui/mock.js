@@ -943,6 +943,9 @@ window.__TAURI__ = {
       return Promise.resolve({ ok: true, msg });
     },
   },
+  app: {
+    getVersion() { return Promise.resolve('2.1.7'); },
+  },
   window: {
     getCurrentWindow() {
       return {
