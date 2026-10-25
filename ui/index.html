@@ -8,11 +8,13 @@
 </head>
 <body>
 <header class="topbar" data-tauri-drag-region>
-  <!-- 左上角 logo = 回首页。整块仍是拖拽区：拖走需要位移，单击照样触发跳转 -->
+  <!-- 左上角 logo = 回首页。整块不能再带 data-tauri-drag-region：Tauri 会在 mousedown 时
+       进窗口拖拽循环，点击事件整个被吞——她实测"点图标和 Agent 都没用，只有点
+       「驾驶舱」三个字（<b>，没挂拖拽属性）才有用"。拖拽区留给 tagline / dragfill。 -->
   <div class="brand" id="btn-home" role="button" tabindex="-1"
-       title="回驾驶舱首页" data-tauri-drag-region>
-    <span class="mark" aria-hidden="true" data-tauri-drag-region></span>
-    <span class="name" data-tauri-drag-region>Agent <b>驾驶舱</b></span>
+       title="回驾驶舱首页">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="name">Agent <b>驾驶舱</b></span>
   </div>
   <p class="tagline" data-tauri-drag-region>多开 · 换号 · 额度过期提醒 · 模型反代</p>
   <span class="dragfill" data-tauri-drag-region></span>
@@ -54,19 +56,17 @@
       <button class="btn addapp" id="btn-add-app"
               title="登记一个本机程序：只需可执行文件路径。新装软件也可以点「重新扫描」自动收录">＋ 添加程序</button>
     </div>
-    <!-- 下半截：菜单行。她 10-25：「管理」小标题删掉、行尾齿轮删掉，换成「设置」「更多」
-         两个正经菜单行（学 Qoder 的侧导菜单）；「更多」弹层里放什么到 设置 → 外观 自己挑。 -->
+    <!-- 下半截：她 10-25 定的三行——首页 / 更多 / 设置。「更多」收多余的管理项
+         （默认 协作/密钥管理/模型反代/每日签到 + 分界线 + 编辑侧导菜单），
+         「设置」收设置页分组（默认 设置/外观/运行日志/帮助）；
+         两个弹层都只在右侧伸出（像浏览器收藏夹子菜单），内容在 设置 → 外观 自定义。 -->
     <div class="side-fixed">
       <ul id="viewlist" class="applist">
         <li><button data-view="home"><span class="ico">◎</span><span class="label">首页</span></button></li>
-        <li><button data-view="collab"><span class="ico">⇄</span><span class="label">协作</span></button></li>
-        <li><button data-view="keys"><span class="ico">#</span><span class="label">密钥管理</span></button></li>
-        <li><button data-view="proxy"><span class="ico">⇢</span><span class="label">模型反代</span></button></li>
-        <li><button data-view="settings"><span class="ico ico-gear">&#xE713;</span><span class="label">设置</span></button></li>
-        <!-- 「更多」是弹层入口不是视图：.sidepop 挂在 body 上（bindMoreMenu），
-             定位与关闭逻辑跟原来的齿轮菜单同一套 -->
         <li><button type="button" id="btn-more-menu" aria-haspopup="true" aria-expanded="false"
                     title="更多菜单（在 设置 → 外观 里自定义）"><span class="ico">···</span><span class="label">更多</span></button></li>
+        <li><button type="button" id="btn-gear-menu" aria-haspopup="true" aria-expanded="false"
+                    title="设置菜单"><span class="ico ico-gear">&#xE713;</span><span class="label">设置</span></button></li>
       </ul>
     </div>
   </nav>

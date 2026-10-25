@@ -7549,16 +7549,19 @@ function securitySection(body, panel, row, actBtn) {
     note('登录态在各 Agent 自己的加密存储里，驾驶舱只搬目录；账号目录不加密，要防翻盘就把数据根放 BitLocker 盘。')));
 }
 
-/* 设置 → 外观：「更多」菜单编辑器。全量候选 = 已勾的（按保存顺序）+ 没勾的（按固定顺序），
-   上下按钮在整张清单里挪位置，勾选即时保存；存盘的 more_menu 只含勾中的 id。 */
-function moreMenuEditor(a) {
-  const canonical = Object.keys(MORE_ITEMS);
-  const saved = Array.isArray(a.more_menu) ? a.more_menu.filter((id) => MORE_ITEMS[id]) : canonical.slice();
+/* 设置 → 外观：侧导菜单编辑器（「更多」「设置」两个弹层各一份）。
+   全量候选 = 已勾的（按保存顺序）+ 没勾的（按固定顺序），上下按钮在整张清单里
+   挪位置，勾选即时保存；存盘只存勾中的 id。 */
+function menuEditor(key, pool, inLabel) {
+  const canonical = Object.keys(pool);
+  const saved = Array.isArray(S.data?.settings?.appearance?.[key])
+    ? S.data.settings.appearance[key].filter((id) => pool[id])
+    : canonical.slice();
   const order = [...saved, ...canonical.filter((id) => !saved.includes(id))];
-  const commit = () => setSetting('appearance', 'more_menu', order.filter((id) => saved.includes(id)));
+  const commit = () => setSetting('appearance', key, order.filter((id) => saved.includes(id)));
   const wrap = el('div', { class: 'mm-editor' });
   order.forEach((id, i) => {
-    const [glyph, label] = MORE_ITEMS[id];
+    const [glyph, label, , mdl] = pool[id];
     const up = el('button', { class: 'btn plain sm mm-move', type: 'button', title: '上移', aria: { label: `上移${label}` } }, '↑');
     up.disabled = i === 0;
     up.addEventListener('click', () => { [order[i - 1], order[i]] = [order[i], order[i - 1]]; commit(); });
@@ -7574,9 +7577,9 @@ function moreMenuEditor(a) {
     });
     wrap.appendChild(el('div', { class: 'mm-row' },
       up, down, chk,
-      el('span', { class: 'mm-ico' }, glyph),
+      el('span', { class: mdl ? 'mm-ico ico-gear' : 'mm-ico' }, glyph),
       el('span', { class: 'mm-name' }, label),
-      saved.includes(id) ? el('span', { class: 'mm-state' }, '在「更多」里') : el('span', { class: 'mm-state off' }, '不显示')));
+      saved.includes(id) ? el('span', { class: 'mm-state' }, inLabel) : el('span', { class: 'mm-state off' }, '不显示')));
   });
   return wrap;
 }
@@ -7653,14 +7656,16 @@ function renderSettings() {
           numCtrl(navWidth(a.nav_w), NAV_MIN, NAV_MAX, (v) => setSetting('appearance', 'nav_w', v)),
           actBtn('恢复默认', () => setSetting('appearance', 'nav_w', NAV_DEFAULT)))),
       row('侧栏底部菜单区高度',
-        '固定：正好装下 首页 / 协作 / 密钥管理 / 模型反代 / 设置 / 更多 这六行，不随窗口大小变化，也不再能拖动。'
+        '固定：正好装下 首页 / 更多 / 设置 这三行，不随窗口大小变化，也不再能拖动。'
         + '字号调大时它会跟着变高——那是内容变了，不是窗口变了。'),
       row('侧栏形态', '只剩一列程序图标，悬停可看名字；点 « / » 或 Ctrl+B 切换。',
         segCtrl([['auto', '自动'], ['expand', '总是展开'], ['collapse', '总是收起']],
           a.nav_collapsed === true ? 'collapse' : (a.nav_collapsed === false ? 'expand' : 'auto'),
           (v) => setSetting('appearance', 'nav_collapsed', v === 'auto' ? null : v === 'collapse'))),
-      row('「更多」菜单', '侧栏「··· 更多」弹层里放哪些项、按什么顺序；全部取消勾选后弹层里只留一句指路。',
-        moreMenuEditor(a))));
+      row('「更多」菜单', '侧栏「··· 更多」弹层里放哪些项、按什么顺序；末尾的「编辑侧导菜单」固定在最后。',
+        menuEditor('side_menu', SIDE_MENU_ITEMS, '在「更多」里')),
+      row('「设置」菜单', '侧栏「⚙ 设置」弹层里放哪些项、按什么顺序。',
+        menuEditor('gear_menu', GEAR_MENU_ITEMS, '在「设置」里'))));
   }
 
   if (setSection === 'quota') {
@@ -8495,22 +8500,29 @@ function pxRunBtn(d, onlyStop) {
   return btn('启动反代', 'primary sm', proxyToggle, '启动本机反代端口，客户端才连得上 8788');
 }
 
-/* 侧栏「··· 更多」弹层：装设置页之外的散项。放哪些、什么顺序，在 设置 → 外观 里自定义
-   （学 Qoder 的「编辑侧导菜单」）；弹层挂 body 上——这一截现在会自己滚（overflow-y:auto），
-   绝对定位的子元素放进去会被 overflow 裁掉，和 .tipbox 不放进原容器是同一个理由。 */
-const MORE_ITEMS = {
+/* 侧栏底部「··· 更多」「⚙ 设置」两个弹层（她 10-25 定的设计，学 Qoder 侧导菜单）：
+   - 更多 = 多余的管理项（默认 协作/密钥管理/模型反代/每日签到）+ 分界线 + 「编辑侧导菜单」
+     （跳 设置 → 外观，那里可以自定义两个弹层里各放什么、按什么顺序）；
+   - 设置 = 设置页分组（默认 设置/外观/运行日志/帮助）。
+   两个弹层都**只往右侧伸出**（像浏览器收藏夹子菜单往右套娃），绝不从左边或下边冒出来。
+   弹层挂 body 上——这一截会自己滚，绝对定位的子元素放进去会被 overflow 裁掉。 */
+const SIDE_MENU_ITEMS = {
+  collab: ['⇄', '协作', () => { S.view = 'collab'; ensureCollab(false); }],
+  keys: ['#', '密钥管理', () => { S.view = 'keys'; }],
+  proxy: ['⇢', '模型反代', () => { S.view = 'proxy'; }],
   checkin: ['✓', '每日签到', () => { S.view = 'checkin'; }],
+};
+const GEAR_MENU_ITEMS = {
+  settings: ['\uE713', '设置', () => { setSection = 'general'; S.view = 'settings'; }, true],
   appearance: ['◐', '外观', () => { setSection = 'appearance'; S.view = 'settings'; }],
   logs: ['▤', '运行日志', () => { setSection = 'logs'; S.view = 'settings'; }],
   help: ['?', '帮助', () => { setSection = 'help'; S.view = 'settings'; }],
 };
-/* 当前生效的「更多」清单：settings.appearance.more_menu（缺键=老配置，全放；数组里的
-   未知 id 过滤掉，防止手改配置塞进脏值）。编辑器（外观页）用全量清单自己拼顺序。 */
-function moreMenuIds() {
-  const arr = S.data?.settings?.appearance?.more_menu;
-  if (!Array.isArray(arr)) return Object.keys(MORE_ITEMS);
-  const ids = arr.filter((id) => MORE_ITEMS[id]);
-  return ids;
+/* 当前生效的清单：settings.appearance[key]（缺键=老配置，全放；数组里的未知 id 过滤掉） */
+function menuIds(key, pool) {
+  const arr = S.data?.settings?.appearance?.[key];
+  if (!Array.isArray(arr)) return Object.keys(pool);
+  return arr.filter((id) => pool[id]);
 }
 let sidePop = null;
 
@@ -8518,42 +8530,55 @@ function closeSideMenu() {
   if (!sidePop) return;
   sidePop.remove();
   sidePop = null;
-  const g = $('btn-more-menu');
-  if (g) g.setAttribute('aria-expanded', 'false');
+  for (const id of ['btn-more-menu', 'btn-gear-menu']) {
+    $(id)?.setAttribute('aria-expanded', 'false');
+  }
 }
 
-function bindMoreMenu() {
+function openSidePopup(anchor, items) {
+  closeSideMenu();
+  sidePop = el('div', { class: 'sidepop' });
+  for (const it of items) {
+    if (it && it.sep) { sidePop.appendChild(el('div', { class: 'sep' })); continue; }
+    const [glyph, label, act, mdl] = it;
+    const b = el('button', { type: 'button' },
+      el('span', { class: mdl ? 'ico ico-gear' : 'ico' }, glyph), label);
+    b.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      closeSideMenu();
+      act();
+      render();
+    });
+    sidePop.appendChild(b);
+  }
+  document.body.appendChild(sidePop);
+  // 只在右侧伸出：左缘贴锚点右缘，顶缘对齐锚点行（超出窗口就往上收）；
+  // 贴着窗口右缘放不下时只允许夹回窗口内，这是"只在右边"的极限，不做别的方向
+  const r = anchor.getBoundingClientRect();
+  const pw = sidePop.offsetWidth, ph = sidePop.offsetHeight;
+  const top = Math.max(8, Math.min(r.top - 4, window.innerHeight - ph - 8));
+  const left = Math.max(8, Math.min(r.right + 6, window.innerWidth - pw - 8));
+  sidePop.style.left = left + 'px';
+  sidePop.style.top = top + 'px';
+  anchor.setAttribute('aria-expanded', 'true');
+}
+
+function bindSideMenus() {
   const more = $('btn-more-menu');
-  if (!more) return;
+  const gear = $('btn-gear-menu');
+  if (!more || !gear) return;
   more.addEventListener('click', (e) => {
     e.stopPropagation();
     if (sidePop) { closeSideMenu(); return; }
-    sidePop = el('div', { class: 'sidepop' });
-    const ids = moreMenuIds();
-    if (!ids.length) {
-      sidePop.appendChild(el('p', { class: 'sidepop-empty' }, '这里还没有菜单项——到 设置 → 外观 里挑。'));
-    }
-    for (const id of ids) {
-      const [glyph, label, act] = MORE_ITEMS[id];
-      const b = el('button', { type: 'button' }, el('span', { class: 'ico' }, glyph), label);
-      b.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        closeSideMenu();
-        act();
-        render();
-      });
-      sidePop.appendChild(b);
-    }
-    document.body.appendChild(sidePop);
-    // 贴在这行上方、右缘对齐；两条边都夹在窗口里。侧栏收成图标条后这行贴着窗口左缘，
-    // 按 innerWidth-r.right 定位 right 会算出巨大值，把整个弹层推出窗外（实测 x=-97 只露出一条边）
-    const r = more.getBoundingClientRect();
-    const pw = sidePop.offsetWidth, ph = sidePop.offsetHeight;
-    const left = Math.max(8, Math.min(r.right - pw, window.innerWidth - pw - 8));
-    const bottom = Math.max(8, Math.min(window.innerHeight - r.top + 6, window.innerHeight - ph - 8));
-    sidePop.style.left = left + 'px';
-    sidePop.style.bottom = bottom + 'px';
-    more.setAttribute('aria-expanded', 'true');
+    const items = menuIds('side_menu', SIDE_MENU_ITEMS).map((id) => SIDE_MENU_ITEMS[id]);
+    items.push({ sep: true });
+    items.push(['✎', '编辑侧导菜单', () => { setSection = 'appearance'; S.view = 'settings'; }]);
+    openSidePopup(more, items);
+  });
+  gear.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (sidePop) { closeSideMenu(); return; }
+    openSidePopup(gear, menuIds('gear_menu', GEAR_MENU_ITEMS).map((id) => GEAR_MENU_ITEMS[id]));
   });
   document.addEventListener('click', closeSideMenu);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSideMenu(); });
@@ -8587,7 +8612,7 @@ function bind() {
   /* 左上角 logo = 回首页。整块还是拖拽区，但拖走要位移、单击照样跳。
      「首页」这一条在管理菜单里仍然保留——logo 是捷径，不是唯一入口。 */
   $('btn-home').addEventListener('click', () => { S.view = 'home'; render(); });
-  bindMoreMenu();
+  bindSideMenus();
   bindProxyNums();
   $('c-alerts').addEventListener('click', showAlerts);
   bindCtx();
