@@ -495,11 +495,11 @@ pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
     let settled = item["settling"].as_bool().unwrap_or(false)
         && item["settling_final"].as_bool().unwrap_or(false);
     let mut st = load_state();
-    // 只有真领到了（或今天这份本来就已经在手）才记"这家今天跑过"。
+    // 只有真领到了（或今天这份本来就已经在手）、且这家今天没有下一步了，才记"今天跑过"。
     // 以前是无条件记，于是 MiniMax 那种"服务端拒了但被解析成成功"的一次点击，
     // 会把这家钉成今天已完成——当天再怎么重试都不会发第二次，用户看到的就是
     // "点了半天没反应，底下还一直提示领到了"（2026-10-13）。
-    if (got || settled) && !today.is_empty() {
+    if marks_done(got, settled, !today.is_empty(), item["next_action"].as_str()) {
         st["done"].as_object_mut().map(|o| {
             o.insert(key.clone(), json!(today));
         });
@@ -533,6 +533,16 @@ pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
     save_state(&st);
     *CACHE.lock().unwrap() = None;
     json!({ "ok": item["error"].is_null(), "result": item })
+}
+
+/// 领到了（或今天这份本来就在手）要不要把这家记成"今天跑完"。
+/// 一般家领完即结束；旅行猫领完一趟后面可能还欠一步——跨天领（昨晚到、今早领）之后
+/// 往往还欠一次「派出」。agenthub 在旅行猫的领取回包里带 next_action（depart/claim
+/// = 还有下一步），有下一步就不能记 done，否则当天自动领被钉死，今天的派出名额
+/// 白白作废（官方 records 里 10-14 缺的那一趟就是这么丢的）。
+fn marks_done(got: bool, settled: bool, today_ok: bool, next_action: Option<&str>) -> bool {
+    let more = matches!(next_action, Some("depart") | Some("claim"));
+    (got || settled) && today_ok && !more
 }
 
 /// 登记一家「写操作已经做完、服务端还没结算到账」的（现在只有 WorkBuddy 国际版那 30 积分）。
@@ -913,8 +923,12 @@ pub fn for_app(app_id: &str) -> Value {
         return json!({ "state": "error", "msg": it["error"] });
     }
     json!({
-        "state": if it["signed_today"].as_bool() == Some(true) { "done" }
-            else if it["claimable"].as_bool() == Some(true) { "claimable" }
+        // 可领要排在"已领"前面：旅行猫跨天领时两个字段会同时为真——今天领过昨晚那趟
+        // （signed_today=true），眼前这趟又到了（claimable=true）；先判 done 会把
+        // 待领的盖成已完成（2026-10-25 漏领 5 积分那次）。其余各家 claimable 与
+        // signed_today 互斥，这个换序只影响旅行猫。
+        "state": if it["claimable"].as_bool() == Some(true) { "claimable" }
+            else if it["signed_today"].as_bool() == Some(true) { "done" }
             // 这次没读到（空列表 / 没拿到设备令牌）：卡片角标要写"没读到"，
             // 不能落到下面的 unknown——那是"厂商没给"，跟"我们没问出来"是两件事
             else if it["unreadable"].as_bool() == Some(true) { "unreadable" }
@@ -1058,6 +1072,17 @@ mod tests {
         assert!(!should_run(true, true, &ok, 9, 6, 12, true), "今天已经跑过不能再跑");
         assert!(!should_run(true, true, &ok, 5, 6, 12, false), "窗口之前不跑");
         assert!(!should_run(true, true, &ok, 13, 6, 12, false), "窗口之后不跑");
+    }
+
+    /// 旅行猫跨天领：领完昨晚那趟，回包 next_action=depart 说明还欠一次派出，
+    /// 不能记 done（记了当天自动领就被钉死）；领完最后一趟（next_action=done）才记
+    #[test]
+    fn travel_claim_with_more_steps_does_not_mark_done() {
+        assert!(marks_done(true, false, true, Some("done")));
+        assert!(marks_done(true, false, true, None), "其余几家没有 next_action，行为不变");
+        assert!(!marks_done(true, false, true, Some("depart")));
+        assert!(!marks_done(false, false, true, Some("done")), "没领到不记");
+        assert!(!marks_done(true, false, false, Some("done")), "读不到今天日期不记");
     }
 
     /// 真机：整条 refresh() 跑一遍（含按账号展开），把结果打出来。
