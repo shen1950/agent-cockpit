@@ -54,24 +54,19 @@
       <button class="btn addapp" id="btn-add-app"
               title="登记一个本机程序：只需可执行文件路径。新装软件也可以点「重新扫描」自动收录">＋ 添加程序</button>
     </div>
-    <!-- 下半截：与上半截按固定比例分高（styles.css 的 .side-scroll / .side-fixed），
-         菜单项变多时这一截自己滚，不再把上面的 Agent 列表挤掉一行。
-         「每日签到」「设置」「外观」收进右下角齿轮菜单：齿轮弹层挂在 body 上，
-         因为这一截现在会滚，绝对定位的弹层放在里面会被裁掉。 -->
+    <!-- 下半截：菜单行。她 10-25：「管理」小标题删掉、行尾齿轮删掉，换成「设置」「更多」
+         两个正经菜单行（学 Qoder 的侧导菜单）；「更多」弹层里放什么到 设置 → 外观 自己挑。 -->
     <div class="side-fixed">
-      <div class="sidehead">
-        <h2 class="navtitle">管理</h2>
-      </div>
       <ul id="viewlist" class="applist">
         <li><button data-view="home"><span class="ico">◎</span><span class="label">首页</span></button></li>
         <li><button data-view="collab"><span class="ico">⇄</span><span class="label">协作</span></button></li>
         <li><button data-view="keys"><span class="ico">#</span><span class="label">密钥管理</span></button></li>
-        <!-- 齿轮钉在这一行右边：不再独占一行，这一截的总高就是「标题 + 四行」，不出滚动条 -->
-        <li><button data-view="proxy"><span class="ico">⇢</span><span class="label">模型反代</span></button>
-          <!-- 不给 title：原生悬停提示是一条白底方块，她 10-21 说不要。读屏用 aria-label -->
-          <button class="gearbtn" id="btn-side-menu" type="button" aria-haspopup="true" aria-expanded="false"
-                  aria-label="更多：每日签到 · 设置 · 外观 · 运行日志"></button>
-        </li>
+        <li><button data-view="proxy"><span class="ico">⇢</span><span class="label">模型反代</span></button></li>
+        <li><button data-view="settings"><span class="ico ico-gear">&#xE713;</span><span class="label">设置</span></button></li>
+        <!-- 「更多」是弹层入口不是视图：.sidepop 挂在 body 上（bindMoreMenu），
+             定位与关闭逻辑跟原来的齿轮菜单同一套 -->
+        <li><button type="button" id="btn-more-menu" aria-haspopup="true" aria-expanded="false"
+                    title="更多菜单（在 设置 → 外观 里自定义）"><span class="ico">···</span><span class="label">更多</span></button></li>
       </ul>
     </div>
   </nav>
