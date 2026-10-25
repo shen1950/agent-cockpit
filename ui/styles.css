@@ -297,15 +297,16 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
   border-top: 1px solid var(--line); margin-top: var(--sp-1);
   display: flex; flex-direction: column; gap: var(--sp-1);
 }
-/* 侧栏最下面这一截现在只有一列菜单按钮（她 10-25：标题和行尾齿轮都删掉了）。
-   悬停/选中的底色不铺满整条侧栏，收成固定宽（她量的蓝框 ≈178px）；
-   侧栏拖得比这还窄时 min 兜底铺满。 */
+/* 侧栏最下面这一截只有三行（首页 / 更多 / 设置）。悬停/选中的底色不铺满整条侧栏，
+   收成固定宽（她量的蓝框 ≈178px）；侧栏拖得比这还窄时 min 兜底铺满。 */
 #viewlist li { position: relative }
-#viewlist li > button[data-view] { width: min(100%, 178px) }
-/* 「更多」弹层开着时入口行保持高亮，跟 hover 一致 */
-#btn-more-menu[aria-expanded="true"] { background: var(--bg-hover); color: var(--text) }
+#viewlist button { width: min(100%, 178px) }
+/* 「更多」「设置」弹层开着时入口行保持高亮，跟 hover 一致 */
+#btn-more-menu[aria-expanded="true"], #btn-gear-menu[aria-expanded="true"] {
+  background: var(--bg-hover); color: var(--text);
+}
 /* 设置行的齿轮用 MDL2 字形（和删掉的齿轮按钮长得一样）；.ico 默认等宽字体，得换过去 */
-#viewlist .ico-gear { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif; font-size: 13px }
+#viewlist .ico-gear, .sidepop .ico-gear, .mm-editor .ico-gear { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif; font-size: 13px }
 /* 图标条里菜单行收成 54px（跟 Agent 按钮同宽同列）；内边距沿用展开态的 3px 9px，
    图标才钉在原地。宽度规则本体在文件末尾的 rail 块里。 */
 /* 齿轮弹层：挂在 body 上的独立 fixed 层，理由和 .tipbox 一样——
@@ -326,7 +327,6 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
 .sidepop button .ico { width: 16px; text-align: center; color: var(--text-faint); font-family: var(--font-mono) }
 .sidepop .sep { height: 1px; margin: 4px 6px; background: var(--line) }
 /* 「更多」里一个菜单项都没勾时给一句指路 */
-.sidepop-empty { margin: 2px 4px; padding: 6px 8px; font-size: 12.5px; color: var(--text-muted) }
 /* 设置 → 外观：「更多」菜单编辑器 */
 .mm-editor { display: flex; flex-direction: column; gap: 2px; min-width: 240px }
 .mm-row { display: flex; align-items: center; gap: 7px; padding: 3px 4px; border-radius: 7px }
@@ -372,7 +372,6 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
    不然侧栏 + 页内菜单 + 内容三栏并排，右边的字就被挤到看不全 */
 .layout.full { grid-template-columns: minmax(0, 1fr) }
 .layout.full .sidebar, .layout.full .nav-resize { display: none }
-.layout.full .content { padding-left: 0 }
 .layout.full .view { max-width: 1280px; margin: 0 auto; width: 100% }
 /* 图标条（rail）模式把 .layout 改成 68px + 1fr 两列；整窗页藏了侧栏后只剩 .content
    一个格子，会被塞进 68px 那一列（Ctrl+B 之后密钥/设置/签到页全挤成一条）。
@@ -456,7 +455,12 @@ html.rail .layout.full { grid-template-columns: minmax(0, 1fr) }
 .content {
   min-width: 0; min-height: 0; overflow: hidden;
   display: flex; flex-direction: column;
-  padding-left: var(--sp-4);
+  /* 主窗口 = 圆角卡片（学 ZCode / Qoder）：上、下、左、右四处都有边界，
+     内容浮在窗口底色上，不再是"一团铺到边的灰" */
+  padding: var(--sp-3) var(--sp-4) 0;
+  background: var(--bg-raised);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
 }
 .view { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-4) }
 .view[hidden] { display: none }
@@ -1383,7 +1387,7 @@ html.rail .applist .badge, html.rail .applist .cap { visibility: hidden }
 html.rail #viewlist .label { display: none }
 /* 菜单行的图标也钉在展开态的位置（x=33），不用居中——居中会让它横挪 11px，
    而且展开态里它本来就跟 Agent 图标（x=36）差 3px，收起后保持同一差值才叫"没动" */
-html.rail #viewlist li > button[data-view] { width: 54px }html.rail .btn.addapp { font-size: 0; margin: var(--sp-2) var(--sp-1) 0; width: calc(100% - var(--sp-2)) }
+html.rail #viewlist button { width: 54px }html.rail .btn.addapp { font-size: 0; margin: var(--sp-2) var(--sp-1) 0; width: calc(100% - var(--sp-2)) }
 html.rail .btn.addapp::after { content: "＋"; font-size: 15px }
 /* 图标条模式下两个扫描按钮竖排、只留图标 */
 html.rail .sidehead { justify-content: center }
