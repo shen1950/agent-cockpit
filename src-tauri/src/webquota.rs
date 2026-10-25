@@ -472,6 +472,30 @@ fn f(v: &Value, k: &str) -> f64 {
 /// 用的是这张卡自己那份会话，所以读回来的一定是这个号的数。
 /// 返回 {ok, account, user_id, plan, plan_expire, left, total, used, packs:[...], portions:[...]}
 pub fn fetch(app_id: &str, meta: &Value) -> Value {
+    let r = fetch_inner(app_id, meta);
+    // 用完就关。官网 usage 页自带 JS 定时器/动画，隐藏窗口里照样全速跑——
+    // 实测每个窗口的渲染进程持续吃 ~26% CPU、GPU 进程 ~17%，三张 web 卡合起来
+    // 白白烧掉一整个核，整机滚动/缩放跟着卡。登录中的可见窗口（open_login 建的）
+    // 必须留着让人操作，只关"我们为取数临时建的"那一扇：标签固定 webq- 前缀 +
+    // 标题是「官网会话」，用户手动开的登录窗口标题不是这个，不会误伤。
+    if let Ok(app) = app_handle() {
+        let store_ok = store_of(app_id).ok();
+        let slot = slot_of(meta);
+        if let Some(store) = store_ok {
+            let label = label_for(store, &slot);
+            if let Some(w) = app.get_webview_window(&label) {
+                let is_temp = w.title().map(|t| t == "官网会话").unwrap_or(false)
+                    && !w.is_visible().unwrap_or(true);
+                if is_temp {
+                    let _ = w.destroy();
+                }
+            }
+        }
+    }
+    r
+}
+
+fn fetch_inner(app_id: &str, meta: &Value) -> Value {
     let store = match store_of(app_id) {
         Ok(s) => s,
         Err(e) => return json!({ "ok": false, "msg": e }),

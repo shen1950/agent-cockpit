@@ -148,7 +148,24 @@ pub fn apps() -> Vec<AppDef> {
         curated("opencode", "OpenCode", "electron",
             &["{LOCALAPPDATA}/Programs/@opencode-aidesktop/OpenCode.exe"], "",
             Some(".local/share/opencode|{APPDATA}/ai.opencode.desktop"), false),
-        curated("codex", "Codex CLI", "cli", &["D:/npm-global/codex.cmd"], "CODEX_HOME", Some(".codex"), true),
+        // Codex：多开与切换靠 CODEX_HOME 指向各自的数据目录（每个账号一个目录，
+        // launch_cli 注入 env 时就是这个目录），实测第二次启动互不干扰。
+        // 2026-10-19 修好本机安装（@openai/codex-win32-x64 原生二进制曾整包缺失，
+        // npm 壳报 Missing optional dependency）——原生 exe 走 node 壳里嵌的那层查找，
+        // 直连 exe 省一次 node 启动；.cmd 兜底给壳装全但 vendor 目录不同的机器。
+        curated("codex", "Codex CLI", "cli", &[
+            "D:/npm-global/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+            "D:/npm-global/codex.cmd",
+        ], "CODEX_HOME", Some(".codex"), true),
+        // ChatGPT / Codex 桌面版（MSIX 里的 Chromium PWA 壳，主程序叫 ChatGPT.exe）。
+        // 多开靠 Chromium 自己的 --user-data-dir：不同目录＝不同进程组、各自一份登录态
+        // （实测 2026-10-20：带 --user-data-dir 起第二个实例，进程组独立、profile 正常生成）。
+        // 安装目录带版本号，登记只能写通配；profile 是 %APPDATA%\Codex\web\Codex（不是包内 LocalCache）。
+        curated("codex-desktop", "ChatGPT", "pwa", &[
+            "{PROGRAMFILES}/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
+            "D:/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
+            "{LOCALAPPDATA}/Microsoft/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
+        ], "", Some("{APPDATA}/Codex/web/Codex"), true),
         curated("claude", "Claude Code CLI", "cli", &["D:/npm-global/claude.cmd"], "CLAUDE_CONFIG_DIR", Some(".claude"), true),
         // ------------------------------------------------------------------
         // 以下这批是 2026-10-16 照着 jlcodes99/cockpit-tools 的平台清单补的：
@@ -737,10 +754,12 @@ pub fn profile_search_dirs() -> Vec<PathBuf> {
 pub(crate) fn expand(p: &str) -> PathBuf {
     let la = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let ad = std::env::var("APPDATA").unwrap_or_default();
+    let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
     let up = home().to_string_lossy().into_owned();
     let s = p
         .replace("{LOCALAPPDATA}", &la)
         .replace("{APPDATA}", &ad)
+        .replace("{PROGRAMFILES}", &pf)
         .replace("{USERPROFILE}", &up);
     // 模板（和 exes 列表）里惯用正斜杠，这里统一落成 Windows 规范形式：
     // 界面上显示、写进 config.json 的路径才不会一半 `\` 一半 `/`
@@ -749,8 +768,55 @@ pub(crate) fn expand(p: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// MSIX 应用的安装目录带版本号（`OpenAI.Codex_26.1013.4894.0_x64__2p2nqsd0c76g0`），
+/// 每次升级整段换名字——登记路径只能写通配。这里只支持**路径里一个 `*`**：
+/// 命中前缀+后缀的兄弟目录里取修改时间最新的那个（升级后旧的通常还在，会残留）。
+fn glob_best(p: &Path) -> Option<PathBuf> {
+    let comps: Vec<String> = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let idx = comps.iter().position(|c| c.contains('*'))?;
+    let pat = comps[idx].clone();
+    let (head, tail) = pat.split_once('*')?;
+    let prefix = comps[..idx].join("\\");
+    let rest = comps[idx + 1..].join("\\");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in std::fs::read_dir(&prefix).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(head) || !name.ends_with(tail) {
+            continue;
+        }
+        let cand = if rest.is_empty() { e.path() } else { e.path().join(&rest) };
+        if !cand.is_file() {
+            continue;
+        }
+        let t = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().map(|(bt, _)| t > *bt).unwrap_or(true) {
+            best = Some((t, cand));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 pub fn resolve_exe(app: &AppDef) -> Option<PathBuf> {
-    let base = app.exes.iter().map(|p| expand(p)).find(|p| p.exists())?;
+    let base = app
+        .exes
+        .iter()
+        .filter_map(|p| {
+            let e = expand(p);
+            if e.is_file() {
+                Some(e)
+            } else if p.contains('*') {
+                glob_best(&e)
+            } else {
+                None
+            }
+        })
+        .next()?;
     Some(newest_update(&base).unwrap_or(base))
 }
 
@@ -1384,8 +1450,11 @@ pub fn bad_account_name(name: &str) -> Option<String> {
     if n.ends_with('.') || n.ends_with(' ') {
         return Some("结尾不能是点或空格".to_string());
     }
-    if n.chars().count() > 40 {
-        return Some("太长了（最多 40 个字）".to_string());
+    // 60 字：够放下「昵称 + 邮箱」这种向导自动预填的名字（Fabinho Gerald〈geraldafabbinhu492@gmail.com〉
+    // 这类 46 字），又不至于把 instances\<产品>\<名字>.json 顶到 MAX_PATH。
+    // 40 字那会儿连向导自己预填的名字都过不去——建卡弹「名字太长」，而名字根本是它填的。
+    if n.chars().count() > 60 {
+        return Some("太长了（最多 60 个字）——括号里的邮箱可以删掉".to_string());
     }
     None
 }
@@ -2116,6 +2185,31 @@ pub fn set_swap(cfg: &mut Value, app_id: &str, val: Option<Value>) {
         }
         None => {
             o.remove(app_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod msix_tests {
+    use super::*;
+
+    /// MSIX 安装目录带版本号，登记只能写通配：解析到的必须是真文件，
+    /// 且文件名对得上（不能把 app 目录里别的 exe 认成主程序）。
+    #[test]
+    fn resolves_versioned_msix_dir() {
+        let app = match app_def("codex-desktop") {
+            Some(a) => a,
+            None => panic!("codex-desktop 没登记"),
+        };
+        match resolve_exe(&app) {
+            Some(p) => {
+                assert!(p.is_file(), "解析到但不是文件：{}", p.display());
+                let n = p.file_name().unwrap().to_string_lossy().to_lowercase();
+                assert_eq!(n, "chatgpt.exe");
+                assert!(p.to_string_lossy().contains("OpenAI.Codex_"), "{}", p.display());
+            }
+            // 没装这台机器上就是 None，不算失败（测试要能跟着仓库走）
+            None => eprintln!("本机没装 OpenAI.Codex，跳过"),
         }
     }
 }

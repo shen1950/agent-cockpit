@@ -397,6 +397,21 @@ pub fn detail_rank(groups: &[Value], portions: &[Value]) -> (usize, usize) {
     (n, dated)
 }
 
+/// 这份读数是不是"逐笔、而且每一笔都带真到期日"的细读数。
+/// 条数不能拿来比大小：资源包过期后会从列表里消失，正常刷新条数就是会变少。
+fn dated_item_rank(groups: &[Value]) -> (usize, usize) {
+    let (mut n, mut dated) = (0usize, 0usize);
+    for g in groups {
+        for it in arr(g, "items") {
+            n += 1;
+            if is_real_date(it["expires_on"].as_str().unwrap_or("")) {
+                dated += 1;
+            }
+        }
+    }
+    (n, dated)
+}
+
 /// 档案里现在存着的那份明细有多细
 pub fn stored_rank(m: &Value) -> (usize, usize) {
     detail_rank(&arr(m, "quota_groups"), &arr(m, "credits"))
@@ -448,7 +463,13 @@ pub fn apply(meta: &Value, q: &Quota) -> Value {
     // 只有「主额度 + 附加包」两个汇总数，而档案里躺着官网读回来的 21 笔逐包各带到期日。
     // 后台每半小时一轮自动取数，没有这道守卫的话，读一次官网存进去的明细下一轮就没了
     // （她看到的"积分明细又全都蜷到一团了"就是这么来的）。
-    let keep_detail = stored_rank(meta) > detail_rank(&q.groups, &q.portions);
+    // "粗"的判据只认逐笔条数**不够**：资源包过期后会从列表里消失，正常一轮刷新条数就会变少。
+    // 新读数自己把每一笔的到期日都给全了，就说明它也是逐笔读数，条数少只代表包少了
+    // （WorkBuddy 实测 10-18 的 69 笔把之后每轮 65~66 笔全挡在门外，临期提醒一直冻着）。
+    let (in_n, in_dated) = dated_item_rank(&q.groups);
+    let incoming_is_dated_detail = in_n > 0 && in_dated == in_n;
+    let keep_detail =
+        stored_rank(meta) > detail_rank(&q.groups, &q.portions) && !incoming_is_dated_detail;
     if keep_detail {
         obj.insert("quota_detail_stale".into(), json!(true));
     } else {
@@ -602,6 +623,29 @@ mod tests {
         );
         assert_eq!(m["quota_detail_stale"], false);
         assert_eq!(m["quota_detail_source"], "server");
+    }
+
+    /// 条数变少不等于读数变粗：资源包会过期、从列表里消失。
+    /// WorkBuddy 实测 10-18 那份 69 笔把之后每一轮 65~66 笔全挡在门外，
+    /// 于是一刷新汇总数变了、临期那几句（含到期日）一个字不动。
+    #[test]
+    fn fresh_shorter_detail_replaces_the_frozen_one() {
+        let stored = json!({"quota_detail_source": "server", "credits": [],
+            "quota_groups": [{"name": "平台奖励积分", "left": 120.0, "total": 200.0, "items": [
+                {"label": "裂变包", "left": 0.0, "expires_on": "2026-10-18 12:08"},
+                {"label": "裂变包", "left": 100.0, "expires_on": "2026-10-24 19:54"},
+                {"label": "裂变包", "left": 20.0, "expires_on": "2026-10-25 10:00"}]}]});
+        let mut q = mk_quota("server", "");
+        q.groups = vec![json!({"name": "平台奖励积分", "left": 118.0, "total": 200.0, "items": [
+            {"label": "裂变包", "left": 98.0, "expires_on": "2026-10-24 19:54"},
+            {"label": "裂变包", "left": 20.0, "expires_on": "2026-10-25 10:00"}]})];
+        let m = apply(&stored, &q);
+        assert_eq!(
+            m["quota_groups"][0]["items"].as_array().unwrap().len(),
+            2,
+            "新一轮读数也是逐笔带日期的，哪怕只有两笔也该覆盖旧的三笔"
+        );
+        assert_eq!(m["quota_detail_stale"], false);
     }
 
     #[test]

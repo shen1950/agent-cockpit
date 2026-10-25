@@ -673,11 +673,11 @@ pub fn remove_keys_batch(pairs: &[(String, String)]) -> (usize, Vec<String>) {
 /// 只认"可以批量改"的字段——**id / key 原文 / masked 一律不许批量动**：
 /// 把一批 key 原文改成同一个不是功能，是把一堆号改成同一个的事故。
 /// 她 2026-10-17 要的是"像管理购物车那样，批量勾选之后能做单个 key 能做的一切"，
-/// 所以这里把单个 key 表单里那几个可改字段全放开了：用途、过期日、备注、模型清单、
+/// 所以这里把单个 key 表单里那几个可改字段全放开了：名称、来源、过期日、备注、模型清单、
 /// 是否进反代、接入点覆盖。
 pub fn update_keys_batch(pairs: &[(String, String)], patch: &Value) -> (usize, Vec<String>) {
     const ALLOW: &[&str] = &[
-        "label", "expires_on", "note", "models_list", "use_in_proxy", "base_url",
+        "label", "source", "expires_on", "note", "models_list", "use_in_proxy", "base_url",
     ];
     let mut items = sites();
     let mut n = 0usize;

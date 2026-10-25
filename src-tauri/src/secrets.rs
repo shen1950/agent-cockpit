@@ -174,6 +174,15 @@ fn unprotect(blob: &str, entropy: &[u8]) -> Result<Vec<u8>, String> {
     b64_decode(&out)
 }
 
+/// 只解一段 DPAPI 密文（CurrentUser、无附加 entropy）。
+/// Qoder 系的 `Local State` 里那把 os_crypt 主密钥就是这么包的，调用方拿到的是原始 32 字节。
+pub fn dpapi_open(b64: &str) -> Result<Vec<u8>, String> {
+    if !supported() {
+        return Err("这台机器没有 DPAPI".into());
+    }
+    unprotect(b64.trim(), &[])
+}
+
 fn derive(pwd: &str, salt_b64: &str, rounds: i64) -> Result<Vec<u8>, String> {
     let out = run_ps(
         PS_DERIVE,

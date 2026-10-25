@@ -82,15 +82,71 @@ fn carries_own_icon(path: &str) -> bool {
     )
 }
 
+/// MSIX 包的主程序图标常常是壳自带的占位图——ChatGPT.exe 用 ExtractAssociatedIcon
+/// 抽出来是个绿方块，不是 OpenAI 那个花标。厂商自己的 logo 在包根 `assets/` 下，
+/// 有就直接拷这张：比抽壳图标准，也不用起 PowerShell。
+fn msix_logo(exe: &Path) -> Option<PathBuf> {
+    let root = exe.parent()?.parent()?; // <包根>/app/ChatGPT.exe → <包根>
+    let assets = root.join("assets");
+    for name in [
+        // 256 的浅色版：透明底、深色线稿，浅色主题下最好认
+        "Square44x44Logo.targetsize-256_altform-lightunplated.png",
+        "Square44x44Logo.scale-200.png",
+        "Square44x44Logo.png",
+        "Square150x150Logo.png",
+    ] {
+        let p = assets.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 用户自己指定的图标：`icons/custom/<产品id>.png`。放进去就生效，
+/// 优先于包内 logo 和 exe 抽取——有些产品抽出来/自带的都不是想要的那张。
+fn custom_icon(app_id: &str) -> Option<PathBuf> {
+    let p = icon_dir().join("custom").join(format!("{app_id}.png"));
+    p.is_file().then_some(p)
+}
+
 /// 一次性把所有缺失的图标抽出来（单个 PowerShell 进程，避免逐个启动）
 pub fn refresh(items: &[(String, String)]) {
     let _ = fs::create_dir_all(icon_dir());
-    let missing: Vec<&(String, String)> = items
-        .iter()
-        .filter(|(k, exe)| {
-            !file_for(k).exists() && Path::new(exe).exists() && carries_own_icon(exe)
-        })
-        .collect();
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for (k, exe) in items {
+        let dst = file_for(k);
+        // ① 手工指定的图标最优先：只比修改时间，换一张新的不用先删缓存
+        if let Some(ci) = custom_icon(k) {
+            let newer = fs::metadata(&ci)
+                .and_then(|m| m.modified())
+                .ok()
+                .zip(fs::metadata(&dst).and_then(|m| m.modified()).ok())
+                .map(|(a, b)| a > b)
+                .unwrap_or(true);
+            if newer {
+                let _ = fs::copy(&ci, &dst);
+            }
+            continue;
+        }
+        if dst.exists() {
+            continue;
+        }
+        let p = Path::new(exe);
+        if !p.exists() {
+            continue;
+        }
+        // ② MSIX 包自带 logo：直接拷（比抽壳 exe 准）
+        if let Some(logo) = msix_logo(p) {
+            if fs::copy(&logo, &dst).is_ok() {
+                continue;
+            }
+        }
+        // ③ 退回从 exe 抽
+        if carries_own_icon(exe) {
+            missing.push((k.clone(), exe.clone()));
+        }
+    }
     if missing.is_empty() {
         return;
     }
@@ -101,6 +157,54 @@ pub fn refresh(items: &[(String, String)]) {
     let script = format!(
         r#"[Console]::OutputEncoding = [Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Drawing
+# 32×32 的 ExtractAssociatedIcon 放到 28px 格子里勉强够，再大就糊——所以走 shell 的
+# 系统图标列表（SHIL_JUMBO = 256×256），拿 exe 里真正那张大图。
+# 注意：C# 段只返回 HICON，不引用 System.Drawing 类型——这台机器的 PowerShell 里
+# System.Drawing.Icon 被转发到 System.Drawing.Common，Add-Type 引不到，编译直接失败。
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class BigIcon {{
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct SHFILEINFO {{
+    public IntPtr hIcon; public int iIcon; public uint dwAttributes;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szDisplayName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)] public string szTypeName;
+  }}
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+  public static extern IntPtr SHGetFileInfo(string path, uint attr, ref SHFILEINFO sfi, uint cb, uint flags);
+  [DllImport("shell32.dll")]
+  public static extern int SHGetImageList(int iImageList, ref Guid riid,
+    [MarshalAs(UnmanagedType.Interface)] out IImageList ppv);
+  [ComImport, Guid("46EB5926-582E-4017-9FDF-E8998DAA0950"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IImageList {{
+    [PreserveSig] int Add(IntPtr hbm, IntPtr hbmMask, ref int pi);
+    [PreserveSig] int ReplaceIcon(int i, IntPtr hicon, ref int pi);
+    [PreserveSig] int SetOverlayImage(int iImage, int iOverlay);
+    [PreserveSig] int Replace(int i, IntPtr hbm, IntPtr hbmMask);
+    [PreserveSig] int AddMasked(IntPtr hbm, int crMask, ref int pi);
+    [PreserveSig] int Draw(IntPtr pimldp);
+    [PreserveSig] int Remove(int i);
+    [PreserveSig] int GetIcon(int i, int flags, ref IntPtr picon);
+  }}
+  // size: 0=大(32) 1=小(16) 2=超大(48) 4=JUMBO(256)
+  public static IntPtr GetHandle(string path, int size) {{
+    SHFILEINFO sfi = new SHFILEINFO();
+    // SHGFI_SYSICONINDEX = 0x4000（不是 0x1000，那是 SHGFI_ICONLOCATION——
+    // 写错就永远拿到 iIcon=0，即系统列表第 0 项那张空白文档图）
+    IntPtr r = SHGetFileInfo(path, 0, ref sfi, (uint)Marshal.SizeOf(sfi), 0x4000);
+    if (r == IntPtr.Zero) return IntPtr.Zero;
+    Guid iid = new Guid("46EB5926-582E-4017-9FDF-E8998DAA0950");
+    IImageList list;
+    if (SHGetImageList(size, ref iid, out list) != 0 || list == null) return IntPtr.Zero;
+    IntPtr h = IntPtr.Zero;
+    if (list.GetIcon(sfi.iIcon, 1, ref h) != 0) return IntPtr.Zero;
+    return h;
+  }}
+}}
+'@
 $lines = @'
 {}
 '@ -split "`n"
@@ -109,7 +213,9 @@ foreach ($l in $lines) {{
   $i = $l.IndexOf('|')
   $key = $l.Substring(0, $i); $exe = $l.Substring($i + 1)
   try {{
-    $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
+    $h = [BigIcon]::GetHandle($exe, 4)
+    if ($h -ne [IntPtr]::Zero) {{ $ico = [System.Drawing.Icon]::FromHandle($h) }}
+    else {{ $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($exe) }}
     if ($ico -ne $null) {{
       $bmp = $ico.ToBitmap()
       $out = Join-Path '{}' ($key + '.png')

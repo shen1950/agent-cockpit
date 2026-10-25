@@ -233,9 +233,87 @@ const DATA = {
   stats: { instances: 8, running: 4, running_instances: 3, agents: 10, auto: 2 },
   scan: { auto: 2, at: '15:20' },
   proxy: {
-    running: true, port: 8788, upstream: 'https://api.openai.com', strategy: 'round-robin',
+    running: true, port: 8788, base_url: 'http://127.0.0.1:8788/v1',
+    upstream: 'https://api.openai.com', strategy: 'round-robin',
     pool: ['主力池 · Qoder/账号1', '主力池 · Qoder/账号2', '备用池 · Key/Longcat/Pot'],
-    /* 反代编制：来源 → 池子 → 分发 Key */
+    /* Qoder 免费模型：账号状态 + 接入信息 */
+    qproxy: {
+      base_url: 'http://127.0.0.1:8788/v1', port: 8788,
+      pool: { id: 'gp-1', name: 'Qoder 上游组' },
+      dist: { id: 'dk-9', name: 'Qoder 接入', masked: 'ac-71b0••••4e2c', calls: 42 },
+      models: [
+        { app: 'qoder', fetched_at: Math.floor(now) - 3600, error: null, models: [
+          { id: 'auto', name: 'Auto', price_factor: 1, free: false, reasoning: false, context: 180000, default: false },
+          { id: 'qmodel_38max', name: 'Qwen3.8-Max', price_factor: 0.5, free: false, reasoning: true, context: 180000, default: true },
+          { id: 'qfmodel', name: 'Qwen3.8-Flash', price_factor: 0.1, free: false, reasoning: true, context: 180000, default: false },
+          { id: 'dmodel', name: 'DeepSeek-V4-Pro', price_factor: 0.8, free: false, reasoning: true, context: 1000000, default: false },
+        ] },
+        { app: 'qoder-cn', fetched_at: 0, error: '读不到 CN 客户端的模型缓存', models: [] },
+      ],
+      accounts: [
+        {
+          app: 'qoder', app_name: 'Qoder', name: '账号1', region: 'global', region_label: '国际版',
+          state: 'ok', text: '可推理', detail: '', masked: 'dt-qL…3k4v',
+          expires_at: '2026-11-17T03:13:34Z', days_left: 28, latency_ms: 812,
+          checked: Math.floor(now) - 300, calls: 42, ok: 41, fail: 1,
+          last_error: '', in_pool: true, usable: true,
+        },
+        {
+          app: 'qoder-cn', app_name: 'Qoder CN', name: 'nick9994374911', region: 'cn', region_label: '国内版',
+          state: 'signature_required', text: '要官方客户端签名（纯 HTTP 打不通）',
+          detail: '{"code":"101","message":"Signature invalid"}', masked: 'dt-w9…0Acg',
+          expires_at: '2026-11-18T13:35:43Z', days_left: 29, latency_ms: 161,
+          checked: Math.floor(now) - 300, calls: 0, ok: 0, fail: 0,
+          last_error: '', in_pool: false, usable: false,
+        },
+      ],
+    },
+    wbproxy: {
+      base_url: 'http://127.0.0.1:8788/v1', port: 8788,
+      secret: { present: true, fingerprint: 'mock' },
+      pool_name: 'WorkBuddy 上游组', dist_name: 'WorkBuddy 接入',
+      dist: { id: 'dk-wb', name: 'WorkBuddy 接入', masked: 'ac-b523••••4560', calls: 10 },
+      accounts: [
+        { app: 'workbuddy', app_name: 'WorkBuddy', name: 'DuckDeity', region: 'cn', region_label: '国内版', state: 'ok', masked: 'wb-du••••k3', user: 'DuckDeity', expires_days: 27, today_credit: 0, today_tokens: 78, today_calls: 6, calls: 6, ok: 6, fail: 0, in_pool: true },
+        { app: 'workbuddy-intl', app_name: 'WorkBuddy 国际版', name: 'shen1950', region: 'global', region_label: '国际版', state: 'ok', masked: 'wb-sh••••9a', user: 'shen1950', expires_days: 362, today_credit: 0, today_tokens: 0, today_calls: 4, calls: 4, ok: 4, fail: 0, in_pool: true },
+      ],
+      models: [
+        { app: 'workbuddy', region: 'cn', region_label: '国内版', allow_paid: false, fetched_at: Math.floor(now) - 3600, error: null,
+          free: [
+            { id: 'hy3', name: 'hy3', credits: 'x0.00', free: true, context: 128000, tools: true, reasoning: true },
+            { id: 'step-5-preview', name: 'step-5-preview', credits: 'x0.00', free: true, context: 128000, tools: true, reasoning: true },
+          ],
+          all: [
+            { id: 'hy3', name: 'hy3', credits: 'x0.00', free: true, context: 128000, tools: true, reasoning: true },
+            { id: 'step-5-preview', name: 'step-5-preview', credits: 'x0.00', free: true, context: 128000, tools: true, reasoning: true },
+            { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', credits: 'x0.11', free: false, context: 128000, tools: true, reasoning: true },
+          ] },
+        { app: 'workbuddy-intl', region: 'global', region_label: '国际版', allow_paid: false, fetched_at: Math.floor(now) - 3600, error: null,
+          free: [{ id: 'hy3', name: 'hy3', credits: 'x0.00', free: true, context: 128000, tools: true, reasoning: true }],
+          all: [
+            { id: 'hy3', name: 'hy3', credits: 'x0.00', free: true, context: 128000, tools: true, reasoning: true },
+            { id: 'hy4-preview-f', name: 'hy4-preview-f', credits: 'x0.00', free: true, context: 128000, tools: true, reasoning: true },
+            { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', credits: 'x1.20', free: false, context: 200000, tools: true, reasoning: true },
+          ] },
+      ],
+      guardrails: { reserve_credit: 200, daily_credit_cap: 0, daily_token_cap: 0, allow_paid: false },
+      logs: [],
+    },
+    traeproxy: {
+      base_url: 'http://127.0.0.1:8788/v1', port: 8788,
+      dist: { id: 'dk-trae', name: 'Trae 接入', masked: 'ac-8fc2••••1d3e', calls: 3 },
+      accounts: [
+        { app: 'traework-cn', app_name: 'TRAE CN', name: 'shen1950', ok: true, ready: true, token_tail: '…7f2a', user_id: '21498320', hours_left: 120 },
+      ],
+      models: [
+        { id: 'glm-5.3-flash', channel: 'solo_agent' },
+        { id: 'kimi-k3', channel: 'solo_agent' },
+        { id: 'qwen3.8-max', channel: 'solo_agent' },
+        { id: 'DeepSeek-V4-Pro-Official', channel: 'solo_agent' },
+      ],
+      models_ready: true, model_source_mtime: Date.now() - 86400000, egress_ip: '10.100.174.71',
+    },
+    /* 反代编制：来源 → 上游组 → 接入密钥 */
     pools: [
       {
         id: 'gp-1', name: '主力池', enabled: true, live: 2, labels: ['Qoder/账号1', 'Qoder/账号2'],
@@ -323,13 +401,13 @@ DATA.keys = [
         models_list: 'LongCat-2.0, LongCat-2.5-Preview', models: 2,
         left: 68.4, total: 100, expires_on: '2026-12-31', days_left: 86,
         last_status: 'ok', last_msg: '可用（列出 2 个模型）', last_check: '10-06 14:22',
-        use_in_proxy: true, note: '主力' },
+        use_in_proxy: true, note: '主力', source: '官方申请' },
       { id: 'k-lc-2', label: 'WorkBuddy', key: 'sk-lc-bbbbbbbbbbbbbbb2222',
         masked: 'sk-lc-••••2222', base_url: 'https://api.longcat.chat/anthropic',
         models_list: 'LongCat-2.5-Preview', models: 1,
         left: 68.4, total: 100, expires_on: '2026-12-31', days_left: 86,
         last_status: 'ok', last_msg: '可用（列出 1 个模型）', last_check: '10-06 14:22',
-        use_in_proxy: false, note: 'Anthropic 格式接入' },
+        use_in_proxy: false, note: 'Anthropic 格式接入', source: '群里分享' },
       { id: 'k-lc-3', label: 'QoderCN', key: 'sk-lc-cccccccccccccc3333',
         masked: 'sk-lc-••••3333', base_url: 'https://api.longcat.chat/openai/v1',
         models_list: 'LongCat-2.0', models: 1,
@@ -663,6 +741,52 @@ window.__TAURI__ = {
             + '它们没有窗口但在后台驻留（换号、改名都会被挡住）。确认后驾驶舱可以替你结束这些进程再换号。',
         });
       }
+      if (cmd === 'action') {
+        const p = args.payload || {};
+        if (p.action === 'qproxy_oneclick') {
+          return Promise.resolve({ ok: true, msg: '1 个账号加入上游组，反代已启动 127.0.0.1:8788', result: { key: 'ac-6fb2190a555491fa4d88ab2d52908155' } });
+        }
+        if (p.action === 'wproxy_oneclick') {
+          return Promise.resolve({ ok: true, msg: '2 个账号加入上游组，反代已启动 127.0.0.1:8788', result: { key: 'ac-b5231c9a4a9f7fce15a0792926f44560' } });
+        }
+        if (p.action === 'trae_oneclick') {
+          return Promise.resolve({ ok: true, msg: '1 个账号加入上游组，反代已启动 127.0.0.1:8788', result: { key: 'ac-8fc2e2a75fbe491b9ee9d51b6f3a1d3e' } });
+        }
+        if (p.action === 'opencode_models') {
+          return Promise.resolve({ ok: true, msg: '读到 3 个模型', result: {
+            ok: true, base_url: 'http://127.0.0.1:8211/v1', count: 3,
+            models: [{ id: 'glm-5.3-flash-free' }, { id: 'deepseek-v4.1-flash-free' }, { id: 'mimo-v2.6-flash-free' }],
+          } });
+        }
+        if (p.action === 'opencode_test') {
+          return Promise.resolve({ ok: true, msg: 'hi', result: { ok: true, ms: 123, model: p.model, content: 'hi', usage: { total_tokens: 12 } } });
+        }
+        if (p.action === 'qproxy_probe') {
+          return Promise.resolve({ ok: true, msg: '可推理', result: { ok: true, latency_ms: 321, model_used: p.model, detail: '{"choices":[{"message":{"content":"hi"}}]}' } });
+        }
+        if (p.action === 'wproxy_test') {
+          return Promise.resolve({ ok: true, msg: 'hi', result: { ok: true, ms: 456, model_used: p.model, content: 'hi', usage: { credit: 0 } } });
+        }
+        if (p.action === 'trae_probe') {
+          return Promise.resolve({ ok: true, msg: 'ok', result: { ok: true, elapsed_ms: 222, provider: p.model } });
+        }
+        if (p.action === 'wproxy_allow_paid') {
+          DATA.proxy.wbproxy.guardrails.allow_paid = !!p.value;
+          (DATA.proxy.wbproxy.models || []).forEach((m) => { m.allow_paid = !!p.value; });
+          return Promise.resolve({ ok: true, msg: '已保存' });
+        }
+        if (p.action === 'proxy_dist_reveal') {
+          return Promise.resolve({ ok: true, msg: 'ac-3f2a1111222233334444555566669c41' });
+        }
+        if (p.action === 'proxy_dist_create') {
+          const key = 'ac-' + Math.random().toString(16).slice(2).padEnd(32, '0').slice(0, 32);
+          DATA.proxy.dist.push({ id: 'dk-' + Date.now(), name: p.item.name, masked: `${key.slice(0, 6)}••••${key.slice(-4)}`, pools: p.item.pools || [], enabled: true, calls: 0, last_used: 0 });
+          return Promise.resolve({ ok: true, msg: `已生成接入密钥 ${key}` });
+        }
+        if (['proxy_dist_update', 'proxy_dist_toggle', 'proxy_dist_delete', 'proxy_pool_upsert', 'proxy_pool_delete'].includes(p.action)) {
+          return Promise.resolve({ ok: true, msg: '已保存' });
+        }
+      }
       if (cmd === 'action' && args.payload?.action === 'key_probe_models') {
         return Promise.resolve({ ok: true, msg: '拉到 7 个模型（演示数据）',
           models: ['gpt-5.5', 'gpt-5.5-mini', 'claude-opus-4-6', 'claude-sonnet-4-6',
@@ -790,6 +914,29 @@ window.__TAURI__ = {
       if (cmd === 'action' && args.payload?.action === 'new_instance') {
         return Promise.resolve({ ok: true, origin: args.payload.origin || 'auto',
           msg: `已新建 ${args.payload.app}「${args.payload.name}」。演示数据` });
+      }
+      if (cmd === 'action' && args.payload?.action === 'proxy_models_list') {
+        // 形状照 proxy.rs::models_payload：id 一律带 Agent 前缀，逐模型实测挂在 calls/ok/fail 上
+        const g = (owner, ids) => ({
+          owner, count: ids.length,
+          models: ids.map(([id, st]) => ({
+            id: `${owner}/${id}`, object: 'model', owned_by: owner, name: id, context_window: 200000,
+            tools: id.includes('pro') ? true : undefined,
+            reasoning: id.includes('pro') ? true : undefined,
+            credits: owner === 'workbuddy' ? 'x0.00' : undefined,
+            ...(st ? st : {}),
+          })),
+        });
+        const groups = [
+          g('trae', [['glm-5.3-flash'], ['dmodel'], ['deepseek-v4-pro', { calls: 23, ok: 23, fail: 0 }]]),
+          g('workbuddy', [['hy3', { calls: 8, ok: 8, fail: 0 }], ['glm-4.7-flash', { calls: 5, ok: 4, fail: 1 }]]),
+          g('qoder', [['dfmodel'], ['qmodel_38max', { calls: 31, ok: 29, fail: 2 }]]),
+          g('astudio', [['xopglm52', { calls: 4, ok: 4, fail: 0 }], ['spark-x2.6-4b']]),
+        ];
+        return Promise.resolve({
+          ok: true,
+          msg: JSON.stringify({ groups, count: groups.reduce((n, x) => n + x.count, 0) }),
+        });
       }
       const msg = `${args.payload?.action ?? cmd} → ${args.payload?.name ?? args.payload?.app ?? ''}`;
       return Promise.resolve({ ok: true, msg });
