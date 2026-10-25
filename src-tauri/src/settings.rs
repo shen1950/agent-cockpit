@@ -15,10 +15,12 @@ pub fn defaults() -> Value {
         // mgmt_h / mgmt_ratio：左下角「管理」那一截的历史定高键，**已废弃**（2026-10-18）。
         // 那一截现在是固定高度（正好装下 首页/更多/设置 三行，不随窗口变化、也不能拖），没有任何代码读它们。
         // 旧键 nav_h（列表区定高）同理，早废弃了。
-        // 侧栏两个弹层（她 10-25 定的默认与顺序，外观页可自定义）：
-        // side_menu = 「··· 更多」里的管理项（末尾固定接 分界线+「编辑侧导菜单」）；
-        // gear_menu = 「⚙ 设置」里跳的设置页分组。缺键 = 全放，空数组 = 一项都不放。
+        // 侧栏底部与弹层（她 10-25 定的默认与顺序，外观页可自定义）：
+        // side_visible = 直接出现在侧栏上的管理项（插在「首页」和「更多」之间，按序）；
+        // side_menu = 「··· 更多」弹层里的项（末尾固定接 分界线+「编辑侧导菜单」）；
+        // gear_menu = 「设置」弹层里跳的设置页分组。缺键 = 走默认划分，空数组 = 一项都不放。
         "appearance": { "theme": "system", "density": "comfortable", "font_scale": 100, "nav_w": 248, "nav_collapsed": false,
+                        "side_visible": [],
                         "side_menu": ["collab", "keys", "proxy", "checkin"],
                         "gear_menu": ["settings", "appearance", "logs", "help"] },
         "quota": { "warn_days": 30, "danger_days": 7, "auto_fetch_min": 30 },
