@@ -297,37 +297,17 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
   border-top: 1px solid var(--line); margin-top: var(--sp-1);
   display: flex; flex-direction: column; gap: var(--sp-1);
 }
-/* 齿轮不再独占一行，而是钉在最后一项「模型反代」那一行的右边：
-   绝对定位不占高度，所以这一截的总高就是「标题 + 四行」，永远不出滚动条。
-   四行各自让出右侧 30px，标签再长也不会钻到齿轮底下。
-   display 必须显式改成 inline-flex：它是 .applist 里的 button，会继承
-   `.applist button { display:grid; grid-template-columns: 34px ... }`，
-   图标被塞进第一列（34px 左对齐）——悬停框于是看着"歪"在齿轮右边。
-   悬停也不再画边框，只留一层底色。 */
+/* 侧栏最下面这一截现在只有一列菜单按钮（她 10-25：标题和行尾齿轮都删掉了）。
+   悬停/选中的底色不铺满整条侧栏，收成固定宽（她量的蓝框 ≈178px）；
+   侧栏拖得比这还窄时 min 兜底铺满。 */
 #viewlist li { position: relative }
-/* 悬停/选中的底色不铺满整条侧栏，收成固定宽（她量的蓝框 ≈178px）；侧栏拖得比这还窄时 min 兜底铺满 */
-#viewlist li > button[data-view] { padding-right: 30px; width: min(100%, 178px) }
-#viewlist li > .gearbtn {
-  position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 26px; height: 26px; padding: 0; border: 0; border-radius: 7px;
-  background: transparent; color: var(--text-muted);
-  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif;
-  font-size: 14px; line-height: 1; cursor: pointer;
-}
-#viewlist li > .gearbtn::before { content: "\e713" }
-#viewlist li > .gearbtn:hover, #viewlist li > .gearbtn[aria-expanded="true"] {
-  background: var(--bg-hover); color: var(--text);
-}
-/* 图标条模式下四个菜单都只剩一个图标，齿轮要是还绝对定位居中就会跟「模型反代」的 ⇢
-   叠在同一格；改成 static 独占一行。margin-left 14 = (54-26)/2：跟上面图标列（54px 宽，
-   含滚动条槽位偏移）对齐同一竖线，margin auto 会按整条 68px 居中、比图标列偏右 7px */
-html.rail #viewlist li > .gearbtn {
-  position: static; transform: none; display: flex; margin: 1px 0 0 14px;
-}
-/* 四行菜单在图标条里行距、列位都跟上面 Agent 图标对齐（54px = .side-scroll 内容宽，
-   少了滚动条槽位的那 10px，不补这条会比上面的图标整体偏右 7px） */
-html.rail #viewlist li > button[data-view] { padding: 11px 0; width: 54px }
+#viewlist li > button[data-view] { width: min(100%, 178px) }
+/* 「更多」弹层开着时入口行保持高亮，跟 hover 一致 */
+#btn-more-menu[aria-expanded="true"] { background: var(--bg-hover); color: var(--text) }
+/* 设置行的齿轮用 MDL2 字形（和删掉的齿轮按钮长得一样）；.ico 默认等宽字体，得换过去 */
+#viewlist .ico-gear { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif; font-size: 13px }
+/* 图标条里菜单行收成 54px（跟 Agent 按钮同宽同列）；内边距沿用展开态的 3px 9px，
+   图标才钉在原地。宽度规则本体在文件末尾的 rail 块里。 */
 /* 齿轮弹层：挂在 body 上的独立 fixed 层，理由和 .tipbox 一样——
    .side-fixed 现在会滚，绝对定位的子元素放进去会被 overflow 裁掉 */
 .sidepop {
@@ -345,10 +325,21 @@ html.rail #viewlist li > button[data-view] { padding: 11px 0; width: 54px }
 .sidepop button:hover { background: var(--bg-hover); color: var(--text) }
 .sidepop button .ico { width: 16px; text-align: center; color: var(--text-faint); font-family: var(--font-mono) }
 .sidepop .sep { height: 1px; margin: 4px 6px; background: var(--line) }
-/* 左下角「管理」这一截：项目加多之后不能跟着一路长高——字号、行距、图标列都压到最小。 */
-.side-fixed .navtitle { margin: 0 var(--sp-3) 1px; font-size: 10px; letter-spacing: 1.6px }
-/* 管理区列表：不再限高（以前 min(60vh,420px)，窗口一矮它就自己滚，菜单被切掉）。
-   5 条菜单在任何窗口尺寸下都完整显示，这是"固定"的一半；另一半在上面那条 flex。 */
+/* 「更多」里一个菜单项都没勾时给一句指路 */
+.sidepop-empty { margin: 2px 4px; padding: 6px 8px; font-size: 12.5px; color: var(--text-muted) }
+/* 设置 → 外观：「更多」菜单编辑器 */
+.mm-editor { display: flex; flex-direction: column; gap: 2px; min-width: 240px }
+.mm-row { display: flex; align-items: center; gap: 7px; padding: 3px 4px; border-radius: 7px }
+.mm-row:hover { background: var(--bg-hover) }
+.mm-move { padding: 0 6px; font-size: 12px; line-height: 20px; min-height: 0 }
+.mm-move:disabled { opacity: .35; cursor: default }
+.mm-ico { width: 16px; text-align: center; color: var(--text-faint); font-family: var(--font-mono); font-size: 12px }
+.mm-name { font-size: 13px; color: var(--text) }
+.mm-state { margin-left: auto; font-size: 11.5px; color: var(--text-faint) }
+.mm-state.off { opacity: .6 }
+/* 「管理」小标题已按她 10-25 的意思删掉（.navtitle 不再出现在这一截）。
+   管理区列表：不再限高（以前 min(60vh,420px)，窗口一矮它就自己滚，菜单被切掉）。
+   6 行菜单在任何窗口尺寸下都完整显示，这是"固定"的一半；另一半在上面那条 flex。 */
 #viewlist { gap: 1px; overflow: visible }
 /* 字号从 12 提到 13，同时把上下内边距各减 1px、行高写死 18px：
    3 + 18 + 3 = 24px，和原来 4 + 16 + 4 完全一样，字大了但行高没变。 */
@@ -1382,22 +1373,17 @@ html[data-density="compact"] .btn.sm { padding: 4px 9px }
 /* 图标条（rail）模式：窗口太窄时由 JS 挂上 html.rail，用户手动收起也是同一个类，
    样式只写一份。断点按 CSS 像素取值并留足余量，否则默认窗口就会退化成图标条。 */
 html.rail { --nav-w: 68px }
-html.rail .navtitle, html.rail .navfoot, html.rail .legend,
-html.rail .applist .label, html.rail .applist .badge, html.rail .applist .cap,
-html.rail .applist .nav-badges, html.rail .nav-resize { display: none }
-/* 图标条模式下这一截照样固定高度，只是把名字藏起来 */
-html.rail .applist button { justify-content: center; padding: 8px 0; gap: 0 }
-html.rail #applist .nav-btn { padding-left: 0 }
-html.rail #applist .nav-main { justify-content: center; padding-right: 0 }
-/* 展开态给账号数让位的那条（#applist .nav-btn.counted .nav-main，1 id + 3 类）优先级更高，
-   会漏进图标条模式把图标顶得左偏 17px——图标条里账号数整列隐藏，必须按同款选择器归零，
-   否则有账号的行和没账号的行各偏各的，整列参差不齐 */
-html.rail #applist .nav-btn.counted .nav-main { padding-right: 0 }
-html.rail .applist .dot { display: none }
-/* 图标条里要居中排，不能沿用两行布局那套绝对定位 */
-html.rail .applist .fav { position: static; transform: none; width: 24px; height: 24px }
-html.rail .applist .fav.none { font: 600 10px/24px var(--font-mono) }
-html.rail .btn.addapp { font-size: 0; margin: var(--sp-2) var(--sp-1) 0; width: calc(100% - var(--sp-2)) }
+/* 收起＝只把字藏起来，行结构一根头发都不动（她 10-25：收起后图标要还压在展开时
+   自己那一行上）。Agent 行的 名字/圆点/徽章全部 visibility 隐身——display:none 会把
+   行高抽掉、整列图标上移；图标保持展开态的绝对定位与 28px 尺寸，列位也不挪。
+   下面的菜单行是单行结构，行高本来就是 24px，名字 display:none 即可。 */
+html.rail .navtitle, html.rail .navfoot, html.rail .legend, html.rail .nav-resize { display: none }
+html.rail .applist .label, html.rail .applist .dot,
+html.rail .applist .badge, html.rail .applist .cap { visibility: hidden }
+html.rail #viewlist .label { display: none }
+/* 菜单行的图标也钉在展开态的位置（x=33），不用居中——居中会让它横挪 11px，
+   而且展开态里它本来就跟 Agent 图标（x=36）差 3px，收起后保持同一差值才叫"没动" */
+html.rail #viewlist li > button[data-view] { width: 54px }html.rail .btn.addapp { font-size: 0; margin: var(--sp-2) var(--sp-1) 0; width: calc(100% - var(--sp-2)) }
 html.rail .btn.addapp::after { content: "＋"; font-size: 15px }
 /* 图标条模式下两个扫描按钮竖排、只留图标 */
 html.rail .sidehead { justify-content: center }

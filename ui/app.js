@@ -358,11 +358,21 @@ async function run(action, extra = {}) {
   load();
   return r;
 }
+/* 最近一次设置改动的发起时刻（setSetting 入口处打点）。比它早发起的 get_state 读到的
+   settings 可能是写盘前的旧值——4 秒轮询正好在飞的那一趟会把旧值盖回 S.data，
+   表现就是「点收缩→弹回展开，得再点一下」（2026-10-25 她每次都弹）。
+   到达时用内存里那份盖回去：内存永远是"至少一样新"的（写盘前它已经先改了，
+   写盘后它和磁盘一致）。容差 100ms 盖住"fetch 发起晚于点击、但读盘早于落盘"的窄缝。 */
+let lastSettingsWrite = 0;
+
 async function load() {
   if (S.busy) return;
   S.busy = true;
   try {
-    S.data = await invoke('get_state');
+    const t0 = Date.now();
+    const d = await invoke('get_state');
+    if (S.data?.settings && t0 <= lastSettingsWrite + 100) d.settings = S.data.settings;
+    S.data = d;
     if (!S.cur || !S.data.apps.some((a) => a.id === S.cur)) S.cur = S.data.apps[0]?.id;
     render();
   } catch (e) {
@@ -7125,6 +7135,7 @@ let setScroll = 0;
 let setLast = '';
 
 async function setSetting(section, key, value) {
+  lastSettingsWrite = Date.now();
   S.data.settings[section][key] = value;
   applyAppearance(S.data.settings.appearance);
   const r = await invoke('set_settings', { patch: { [section]: { [key]: value } } });
@@ -7538,6 +7549,38 @@ function securitySection(body, panel, row, actBtn) {
     note('登录态在各 Agent 自己的加密存储里，驾驶舱只搬目录；账号目录不加密，要防翻盘就把数据根放 BitLocker 盘。')));
 }
 
+/* 设置 → 外观：「更多」菜单编辑器。全量候选 = 已勾的（按保存顺序）+ 没勾的（按固定顺序），
+   上下按钮在整张清单里挪位置，勾选即时保存；存盘的 more_menu 只含勾中的 id。 */
+function moreMenuEditor(a) {
+  const canonical = Object.keys(MORE_ITEMS);
+  const saved = Array.isArray(a.more_menu) ? a.more_menu.filter((id) => MORE_ITEMS[id]) : canonical.slice();
+  const order = [...saved, ...canonical.filter((id) => !saved.includes(id))];
+  const commit = () => setSetting('appearance', 'more_menu', order.filter((id) => saved.includes(id)));
+  const wrap = el('div', { class: 'mm-editor' });
+  order.forEach((id, i) => {
+    const [glyph, label] = MORE_ITEMS[id];
+    const up = el('button', { class: 'btn plain sm mm-move', type: 'button', title: '上移', aria: { label: `上移${label}` } }, '↑');
+    up.disabled = i === 0;
+    up.addEventListener('click', () => { [order[i - 1], order[i]] = [order[i], order[i - 1]]; commit(); });
+    const down = el('button', { class: 'btn plain sm mm-move', type: 'button', title: '下移', aria: { label: `下移${label}` } }, '↓');
+    down.disabled = i === order.length - 1;
+    down.addEventListener('click', () => { [order[i + 1], order[i]] = [order[i], order[i + 1]]; commit(); });
+    const chk = el('input', { type: 'checkbox' });
+    chk.checked = saved.includes(id);
+    chk.addEventListener('change', () => {
+      if (chk.checked) saved.push(id);
+      else saved.splice(saved.indexOf(id), 1);
+      commit();
+    });
+    wrap.appendChild(el('div', { class: 'mm-row' },
+      up, down, chk,
+      el('span', { class: 'mm-ico' }, glyph),
+      el('span', { class: 'mm-name' }, label),
+      saved.includes(id) ? el('span', { class: 'mm-state' }, '在「更多」里') : el('span', { class: 'mm-state off' }, '不显示')));
+  });
+  return wrap;
+}
+
 function renderSettings() {
   // 右栏自己滚（左菜单另算）
   const host = $('set-body') || document.querySelector('.content');
@@ -7609,13 +7652,15 @@ function renderSettings() {
         el('div', { class: 'ctlrow' },
           numCtrl(navWidth(a.nav_w), NAV_MIN, NAV_MAX, (v) => setSetting('appearance', 'nav_w', v)),
           actBtn('恢复默认', () => setSetting('appearance', 'nav_w', NAV_DEFAULT)))),
-      row('左下角管理区高度',
-        '固定：正好装下「管理」那 5 个菜单项，不随窗口大小变化，也不再能拖动。'
+      row('侧栏底部菜单区高度',
+        '固定：正好装下 首页 / 协作 / 密钥管理 / 模型反代 / 设置 / 更多 这六行，不随窗口大小变化，也不再能拖动。'
         + '字号调大时它会跟着变高——那是内容变了，不是窗口变了。'),
       row('侧栏形态', '只剩一列程序图标，悬停可看名字；点 « / » 或 Ctrl+B 切换。',
         segCtrl([['auto', '自动'], ['expand', '总是展开'], ['collapse', '总是收起']],
           a.nav_collapsed === true ? 'collapse' : (a.nav_collapsed === false ? 'expand' : 'auto'),
-          (v) => setSetting('appearance', 'nav_collapsed', v === 'auto' ? null : v === 'collapse')))));
+          (v) => setSetting('appearance', 'nav_collapsed', v === 'auto' ? null : v === 'collapse'))),
+      row('「更多」菜单', '侧栏「··· 更多」弹层里放哪些项、按什么顺序；全部取消勾选后弹层里只留一句指路。',
+        moreMenuEditor(a))));
   }
 
   if (setSection === 'quota') {
@@ -8450,34 +8495,46 @@ function pxRunBtn(d, onlyStop) {
   return btn('启动反代', 'primary sm', proxyToggle, '启动本机反代端口，客户端才连得上 8788');
 }
 
-/* 侧栏「管理」右下角的齿轮菜单：装下 每日签到 / 设置 / 外观 / 帮助。
-   弹层挂 body 上——这一截现在会自己滚（overflow-y:auto），绝对定位的子元素放进去
-   会被 overflow 裁掉，和 .tipbox 不放进原容器是同一个理由。 */
-const SIDE_MENU = [
-  ['✓', '每日签到', () => { S.view = 'checkin'; }],
-  ['⚙', '设置', () => { setSection = 'general'; S.view = 'settings'; }],
-  ['◐', '外观', () => { setSection = 'appearance'; S.view = 'settings'; }],
-  ['▤', '运行日志', () => { setSection = 'logs'; S.view = 'settings'; }],
-  ['?', '帮助', () => { setSection = 'help'; S.view = 'settings'; }],
-];
+/* 侧栏「··· 更多」弹层：装设置页之外的散项。放哪些、什么顺序，在 设置 → 外观 里自定义
+   （学 Qoder 的「编辑侧导菜单」）；弹层挂 body 上——这一截现在会自己滚（overflow-y:auto），
+   绝对定位的子元素放进去会被 overflow 裁掉，和 .tipbox 不放进原容器是同一个理由。 */
+const MORE_ITEMS = {
+  checkin: ['✓', '每日签到', () => { S.view = 'checkin'; }],
+  appearance: ['◐', '外观', () => { setSection = 'appearance'; S.view = 'settings'; }],
+  logs: ['▤', '运行日志', () => { setSection = 'logs'; S.view = 'settings'; }],
+  help: ['?', '帮助', () => { setSection = 'help'; S.view = 'settings'; }],
+};
+/* 当前生效的「更多」清单：settings.appearance.more_menu（缺键=老配置，全放；数组里的
+   未知 id 过滤掉，防止手改配置塞进脏值）。编辑器（外观页）用全量清单自己拼顺序。 */
+function moreMenuIds() {
+  const arr = S.data?.settings?.appearance?.more_menu;
+  if (!Array.isArray(arr)) return Object.keys(MORE_ITEMS);
+  const ids = arr.filter((id) => MORE_ITEMS[id]);
+  return ids;
+}
 let sidePop = null;
 
 function closeSideMenu() {
   if (!sidePop) return;
   sidePop.remove();
   sidePop = null;
-  const g = $('btn-side-menu');
+  const g = $('btn-more-menu');
   if (g) g.setAttribute('aria-expanded', 'false');
 }
 
-function bindSideMenu() {
-  const gear = $('btn-side-menu');
-  if (!gear) return;
-  gear.addEventListener('click', (e) => {
+function bindMoreMenu() {
+  const more = $('btn-more-menu');
+  if (!more) return;
+  more.addEventListener('click', (e) => {
     e.stopPropagation();
     if (sidePop) { closeSideMenu(); return; }
     sidePop = el('div', { class: 'sidepop' });
-    for (const [glyph, label, act] of SIDE_MENU) {
+    const ids = moreMenuIds();
+    if (!ids.length) {
+      sidePop.appendChild(el('p', { class: 'sidepop-empty' }, '这里还没有菜单项——到 设置 → 外观 里挑。'));
+    }
+    for (const id of ids) {
+      const [glyph, label, act] = MORE_ITEMS[id];
       const b = el('button', { type: 'button' }, el('span', { class: 'ico' }, glyph), label);
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();
@@ -8488,15 +8545,15 @@ function bindSideMenu() {
       sidePop.appendChild(b);
     }
     document.body.appendChild(sidePop);
-    // 贴在齿轮上方、右缘对齐齿轮；两条边都夹在窗口里。侧栏收成图标条后齿轮贴着窗口左缘，
-    // 原 right = innerWidth - gear.right 会算出一千多的巨大值，把整个弹层推出窗外（实测 x=-97 只露出一条边）
-    const r = gear.getBoundingClientRect();
+    // 贴在这行上方、右缘对齐；两条边都夹在窗口里。侧栏收成图标条后这行贴着窗口左缘，
+    // 按 innerWidth-r.right 定位 right 会算出巨大值，把整个弹层推出窗外（实测 x=-97 只露出一条边）
+    const r = more.getBoundingClientRect();
     const pw = sidePop.offsetWidth, ph = sidePop.offsetHeight;
     const left = Math.max(8, Math.min(r.right - pw, window.innerWidth - pw - 8));
     const bottom = Math.max(8, Math.min(window.innerHeight - r.top + 6, window.innerHeight - ph - 8));
     sidePop.style.left = left + 'px';
     sidePop.style.bottom = bottom + 'px';
-    gear.setAttribute('aria-expanded', 'true');
+    more.setAttribute('aria-expanded', 'true');
   });
   document.addEventListener('click', closeSideMenu);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSideMenu(); });
@@ -8530,7 +8587,7 @@ function bind() {
   /* 左上角 logo = 回首页。整块还是拖拽区，但拖走要位移、单击照样跳。
      「首页」这一条在管理菜单里仍然保留——logo 是捷径，不是唯一入口。 */
   $('btn-home').addEventListener('click', () => { S.view = 'home'; render(); });
-  bindSideMenu();
+  bindMoreMenu();
   bindProxyNums();
   $('c-alerts').addEventListener('click', showAlerts);
   bindCtx();

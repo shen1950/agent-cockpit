@@ -472,7 +472,7 @@ DATA.keys = [
 DATA.settings = {
   profile: { nickname: '', note: '' },
   general: { autostart: false, close_action: 'tray', notify_alerts: true, refresh_sec: 4, auto_scan: true },
-  appearance: { theme: 'dark', density: 'comfortable', font_scale: 100, nav_w: 248, nav_h: 0, nav_collapsed: false },
+  appearance: { theme: 'dark', density: 'comfortable', font_scale: 100, nav_w: 248, nav_h: 0, nav_collapsed: false, more_menu: ['checkin', 'appearance', 'logs', 'help'] },
   quota: { warn_days: 30, danger_days: 7, auto_fetch_min: 30 },
   proxy: { port: 8788, upstream: 'https://api.openai.com', log_keep: 100 },
   checkin: { enabled: false, window_start: 6, window_end: 12, auto: { workbuddy: true },

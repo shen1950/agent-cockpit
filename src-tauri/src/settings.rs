@@ -13,9 +13,12 @@ pub fn defaults() -> Value {
             "auto_scan": true
         },
         // mgmt_h / mgmt_ratio：左下角「管理」那一截的历史定高键，**已废弃**（2026-10-18）。
-        // 那一截现在是固定高度（正好装下 5 个菜单项，不随窗口变化、也不能拖），没有任何代码读它们。
+        // 那一截现在是固定高度（正好装下几个菜单项，不随窗口变化、也不能拖），没有任何代码读它们。
         // 旧键 nav_h（列表区定高）同理，早废弃了。
-        "appearance": { "theme": "system", "density": "comfortable", "font_scale": 100, "nav_w": 248, "nav_collapsed": false },
+        // more_menu：侧栏「··· 更多」弹层里放哪些项（顺序即显示顺序），在 设置 → 外观 里自定义；
+        // 缺键 = 全放（老配置升级），空数组 = 一项都不放（弹层里给一句提示）。
+        "appearance": { "theme": "system", "density": "comfortable", "font_scale": 100, "nav_w": 248, "nav_collapsed": false,
+                        "more_menu": ["checkin", "appearance", "logs", "help"] },
         "quota": { "warn_days": 30, "danger_days": 7, "auto_fetch_min": 30 },
         "proxy": { "port": 8788, "upstream": "https://api.openai.com", "log_keep": 100 },
         // 每日签到：领取是写操作，总开关默认关，开了还要逐家勾（auto 里没写到的就是关）。
