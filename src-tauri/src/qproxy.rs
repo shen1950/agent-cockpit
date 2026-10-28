@@ -68,8 +68,26 @@ pub fn is_qoder_base(base: &str) -> bool {
     b.starts_with(model_base("cn")) || b.starts_with(model_base("global"))
 }
 
-/// Qoder 只认它自己清单里的模型名。实测确认可用的就这两个，其余一律归到 auto。
-pub const QODER_MODELS: &[&str] = &["auto", "gpt-5"];
+/// Qoder 只认它自己清单里的模型名。这里收的是 **2026-10-27 实测被 `/model/v1` 接受**的：
+///
+///   接受：auto、gpt-5、gmodel（GLM-5.3）、dmodel（DeepSeek-V4-Pro）、
+///         mmodel（MiniMax-M3）、performance、efficient、ultimate、deepseek-v4-flash
+///   拒绝（200 + `invalid_model_error`）：cmodel、dfmodel、qmodel_38max、kmodel_latest
+///
+/// 客户端缓存里那些 `qmodel_38max` / `dfmodel` 是**显示别名**，API 层不认；以前一律归一成
+/// auto，结果所有客户端全挤在 auto 这一条路上，Qoder 一紧张就整片排不上队。
+/// 现在把实测能用的具体模型放行，用户选 gmodel 就真的走 GLM-5.3，能分散压力。
+pub const QODER_MODELS: &[&str] = &[
+    "auto",
+    "gpt-5",
+    "gmodel",
+    "dmodel",
+    "mmodel",
+    "performance",
+    "efficient",
+    "ultimate",
+    "deepseek-v4-flash",
+];
 
 /// 客户端（WorkBuddy / Cherry Studio / 各家 Agent）习惯发自己的模型名——`DeepSeek-Flash`、
 /// `claude-sonnet-4-5`、`gpt-4o`……Qoder 不认识，但**仍然回 HTTP 200**，正文是一帧 SSE
@@ -99,10 +117,22 @@ pub fn sse_error_message(head: &[u8]) -> Option<String> {
     };
     let line = body.lines().next().unwrap_or("").trim();
     if let Ok(v) = serde_json::from_str::<Value>(line) {
-        let code = v["code"].as_str().unwrap_or("").trim();
-        let msg = v["message"].as_str().unwrap_or("").trim();
+        // 两种帧都见过：`{"code":..,"message":..}` 和 OpenAI 风格的
+        // `{"error":{"code":"invalid_parameter_error","type":..,"message":..}}`。
+        // 只认前一种的话，后一种会被当成"认不出的行"整段截断丢给界面。
+        let e = if v["error"].is_object() { &v["error"] } else { &v };
+        let code = e["code"].as_str().unwrap_or("").trim();
+        let msg = e["message"].as_str().unwrap_or("").trim();
+        let typ = e["type"].as_str().unwrap_or("").trim();
         if !code.is_empty() || !msg.is_empty() {
-            return Some(format!("{} {}", code, msg).trim().to_string());
+            let head = if typ.is_empty() {
+                code.to_string()
+            } else if code.is_empty() {
+                typ.to_string()
+            } else {
+                format!("{}（{}）", code, typ)
+            };
+            return Some(format!("{} {}", head, msg).trim().to_string());
         }
     }
     if line.is_empty() {
@@ -397,7 +427,11 @@ fn http_status(url: &str, token: &str, body: Option<(&str, &str)>) -> (i32, Stri
 }
 
 /// 把一次探测的结果翻成状态码。**三维分开**：令牌 / 网关 / 内容，别混成一个"失败"。
-pub fn classify(auth: i32, infer: i32, body: &str) -> &'static str {
+///
+/// `region` 只影响 5xx 的说法：国内版 `gateway.qoder.com.cn` 的 `/model` 路由确实没开
+/// （稳定 503），那是"网关没开这条路由"；国际版同一段 5xx 是上游推理自己挂了，
+/// 拿国内版的结论去描述它，界面就会出现「国际版 + 网关没开这条路由」这种自相矛盾。
+pub fn classify(auth: i32, infer: i32, body: &str, region: &str) -> &'static str {
     if auth == 401 || auth == 403 {
         return "token_invalid";
     }
@@ -426,7 +460,10 @@ pub fn classify(auth: i32, infer: i32, body: &str) -> &'static str {
         403 if body.contains("Signature") => "signature_required",
         403 => "forbidden",
         429 => "rate_limited",
-        502 | 503 | 504 => "gateway_missing",
+        // 国内版：/model 这条路由在网关侧没开，503 是路由不存在，不是推理坏了
+        502 | 503 | 504 if region == "cn" => "gateway_missing",
+        // 其余 5xx（含国际版全部 5xx）：上游推理真的挂了，如实说"上游故障"
+        500..=599 => "upstream_error",
         _ => "infer_failed",
     }
 }
@@ -437,6 +474,7 @@ fn state_text(s: &str) -> &'static str {
         "token_invalid" => "登录已失效",
         "signature_required" => "要官方客户端签名（纯 HTTP 打不通）",
         "gateway_missing" => "网关没开这条路由",
+        "upstream_error" => "上游故障（5xx）",
         "rate_limited" => "被限流",
         "forbidden" => "被拒（账号权限）",
         "infer_failed" => "推理失败",
@@ -450,7 +488,13 @@ fn state_text(s: &str) -> &'static str {
 /// `deep=false` 时跳过国内版那条慢探测（最坏 25 秒）——它的结论本来就能从 /model 的 503 推出来，
 /// 一键流程用快档，手动「探测」才走全档。
 pub fn probe(app: &str, name: &str, with_infer: bool, deep: bool, model: &str) -> Value {
-    let model = if model.trim().is_empty() { "auto" } else { model.trim() };
+    // 模型目录里那些名字（qmodel_38max、dfmodel…）是 Qoder 客户端的显示别名，
+    // 上游推理接口只认 auto / gpt-5。转发路径（proxy.rs）早就归一到 auto 了，
+    // 但探针这条没归——于是「测试」把别名原样发上去，Qoder 回 invalid_model_error，
+    // 界面上显示"测试失败"，看着像接入坏了，其实真跑起来是通的。这里补上同一套归一。
+    let asked = model.trim().to_string();
+    let (model_owned, model_changed) = normalize_model(&asked);
+    let model = model_owned.as_str();
     let a = match accounts().into_iter().find(|a| a.app == app && a.name == name) {
         Some(a) => a,
         None => return json!({ "ok": false, "msg": "没找到这个账号" }),
@@ -519,7 +563,7 @@ pub fn probe(app: &str, name: &str, with_infer: bool, deep: bool, model: &str) -
         (infer, body)
     };
     // 没跑推理那一步时，只有令牌结论
-    let mut state = if infer == 0 { "token_ok" } else { classify(auth, infer, &body) };
+    let mut state = if infer == 0 { "token_ok" } else { classify(auth, infer, &body, a.region) };
     let mut detail: String = body.chars().take(160).collect();
     // 国内版的定论：/model 这条路由没开（稳定 503），真正在用的 /algo 通道要官方客户端签名。
     // 两个证据都指向同一件事，所以不管这次 /algo 探针有没有排上队，都如实按"要签名"报。
@@ -542,7 +586,8 @@ pub fn probe(app: &str, name: &str, with_infer: bool, deep: bool, model: &str) -
     let parsed: Option<Value> = serde_json::from_str(&body).ok();
     let model_used = parsed
         .as_ref()
-        .and_then(|v| v["model"].as_str().map(|s| s.to_string()));
+        .and_then(|v| v["model"].as_str().map(|s| s.to_string()))
+        .or_else(|| Some(model.to_string()));
     let usage = parsed
         .as_ref()
         .and_then(|v| v.get("usage").cloned())
@@ -551,7 +596,13 @@ pub fn probe(app: &str, name: &str, with_infer: bool, deep: bool, model: &str) -
         "ok": state == "ok" || state == "token_ok",
         "state": state, "text": state_text(state),
         "auth_code": auth, "infer_code": infer, "latency_ms": ms, "detail": detail,
-        "model_asked": model, "model_used": model_used, "usage": usage,
+        "model_asked": asked, "model_used": model_used,
+        "model_note": if model_changed {
+            format!("{} → {}（Qoder 上游只认 auto / gpt-5，别名已自动收敛）", asked, model)
+        } else {
+            String::new()
+        },
+        "usage": usage,
     })
 }
 
@@ -611,7 +662,11 @@ pub fn note_by_base(base_url: &str, status: u16, ms: u64, label: &str) {
         } else if status == 401 {
             cur["state"] = json!("token_invalid");
         } else if status >= 500 {
-            cur["state"] = json!("gateway_missing");
+            // 别把两种完全不同的故障说成一句话：
+            //   国内版 502/503/504 = 网关侧根本没开 /model 这条路由（稳定现象）
+            //   其余 5xx（含国际版全部 5xx）= 上游推理自己挂了，跟"路由没开"无关
+            let missing = region == "cn" && matches!(status, 502 | 503 | 504);
+            cur["state"] = json!(if missing { "gateway_missing" } else { "upstream_error" });
         }
     }
     st["accounts"][&k] = cur;
@@ -919,9 +974,69 @@ pub fn one_click(proxy: &std::sync::Arc<crate::proxy::Proxy>, with_infer: bool) 
         });
     }
 
-    // 只起反代。上游组和接入密钥**不再代建**——归组、选 key 是用户的事，
-    // 到「上游组」「接入密钥」两个表里手动做（历史教训：按名复用一旦名字对不上，
-    // 每轮一键都会新建组+key，堆出一排同名残留）。
+    // 上游组：**先按名字找，找到就复用它的 id，找不到才建**。
+    // 历史教训是"按名复用一旦名字对不上，每轮一键都会新建组+key，堆出一排同名残留"——
+    // 病根不是复用，是只按 id 复用；按名字找一次就幂等了。
+    let n_members = members.len();
+    let existing_pool = crate::gateway::pools()
+        .into_iter()
+        .find(|p| p["name"].as_str().map(|s| s.trim()) == Some(pool_name()));
+    let mut pool_id = existing_pool
+        .as_ref()
+        .and_then(|p| p["id"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    // 成员合并而不是覆盖：本次探通的按最新结果写进去；本次没探通（临时限流、令牌刚好过期）
+    // 的账号只要还是这几个 Agent 的，就留在组里不动——一键不该因为一次探针失败把号踢出组。
+    let app_ids: Vec<String> = accts.iter().map(|a| a.app.clone()).collect();
+    let mut merged: Vec<Value> = existing_pool
+        .as_ref()
+        .and_then(|p| p["members"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| {
+            let src = m["src"].as_str().unwrap_or("");
+            !app_ids.iter().any(|id| {
+                src.starts_with(&format!("instance:{}/", id))
+                    || src.starts_with(&format!("bridge:{}/", id))
+            })
+        })
+        .collect();
+    merged.extend(members);
+    let (okp, msgp) = crate::gateway::upsert_pool(&json!({
+        "id": pool_id,
+        "name": pool_name(),
+        "enabled": true,
+        "members": merged,
+    }));
+    if !okp {
+        return json!({ "ok": false, "msg": format!("上游组没建成：{}", msgp) });
+    }
+    pool_id = find_pool()
+        .and_then(|p| p["id"].as_str().map(|s| s.to_string()))
+        .unwrap_or(pool_id);
+
+    // 接入密钥：同样按名字复用；复用时 upsert_dist 只改名字和授权范围，不动 key，
+    // 客户端里已经填过的那把继续有效。
+    let existing_dist = find_dist().and_then(|d| d["id"].as_str().map(|s| s.to_string()));
+    let (okd, msgd) = match existing_dist {
+        Some(id) => crate::gateway::upsert_dist(&json!({
+            "id": id, "name": dist_name(), "pools": [pool_id],
+        })),
+        None => crate::gateway::upsert_dist(&json!({
+            "name": dist_name(), "pools": [pool_id],
+        })),
+    };
+    if !okd {
+        return json!({ "ok": false, "msg": format!("接入密钥没建好：{}", msgd) });
+    }
+    let (dist_id, key) = find_dist()
+        .map(|d| {
+            let id = d["id"].as_str().unwrap_or("").to_string();
+            let k = crate::gateway::reveal_dist(&id).unwrap_or_default();
+            (id, k)
+        })
+        .unwrap_or_default();
+
     let port = proxy_port();
     let mut proxy_msg = "反代已在运行".to_string();
     if !proxy.is_running() {
@@ -940,8 +1055,9 @@ pub fn one_click(proxy: &std::sync::Arc<crate::proxy::Proxy>, with_infer: bool) 
     }
 
     let mut msg = format!(
-        "{} 个账号探通；{}。账号还没动上游组和接入密钥：到「上游组」把账号勾进组，客户端用「接入密钥」表里的 key。",
-        members.len(),
+        "{} 个账号已归入「{}」，接入密钥已就绪；{}。客户端填下面的地址和 Key 就能用。",
+        n_members,
+        pool_name(),
         proxy_msg
     );
     if !skipped.is_empty() {
@@ -950,7 +1066,10 @@ pub fn one_click(proxy: &std::sync::Arc<crate::proxy::Proxy>, with_infer: bool) 
     json!({
         "ok": true, "msg": msg,
         "base_url": format!("http://127.0.0.1:{}/v1", port),
-        "members": members.len(),
+        "members": n_members,
+        "key": key,
+        "pool": { "id": pool_id, "name": pool_name() },
+        "dist": { "id": dist_id, "name": dist_name() },
     })
 }
 
@@ -1481,15 +1600,39 @@ mod tests {
     /// 拒判必须分维度：签名问题、令牌问题、网关问题不能混成一个「失败」
     #[test]
     fn classify_keeps_the_three_dimensions_apart() {
-        assert_eq!(classify(200, 200, ""), "ok");
-        assert_eq!(classify(200, 403, r#"{"code":"101","message":"Signature invalid"}"#), "signature_required");
-        assert_eq!(classify(200, 403, "forbidden"), "forbidden");
-        assert_eq!(classify(401, -2, ""), "token_invalid");
-        assert_eq!(classify(200, 503, "alb"), "gateway_missing");
-        assert_eq!(classify(200, 429, ""), "rate_limited");
-        assert_eq!(classify(-1, -1, ""), "unreachable");
+        assert_eq!(classify(200, 200, "", "global"), "ok");
+        assert_eq!(classify(200, 403, r#"{"code":"101","message":"Signature invalid"}"#, "cn"), "signature_required");
+        assert_eq!(classify(200, 403, "forbidden", "global"), "forbidden");
+        assert_eq!(classify(401, -2, "", "global"), "token_invalid");
+        assert_eq!(classify(200, 503, "alb", "cn"), "gateway_missing");
+        assert_eq!(classify(200, 429, "", "global"), "rate_limited");
+        assert_eq!(classify(-1, -1, "", "global"), "unreachable");
         // 业务错误包在 HTTP 200 里时不能算探针通过
-        assert_eq!(classify(200, 200, r#"{"code":"invalid_model_error","message":"Unsupported model"}"#), "infer_failed");
+        assert_eq!(classify(200, 200, r#"{"code":"invalid_model_error","message":"Unsupported model"}"#, "global"), "infer_failed");
+    }
+
+    /// 同一段 5xx，两个区域的结论不一样：国内版是"路由没开"，国际版是"上游挂了"。
+    /// 混成一句话，界面就会出现「国际版 + 网关没开这条路由」这种自相矛盾的组合。
+    #[test]
+    fn classify_splits_5xx_by_region() {
+        assert_eq!(classify(200, 503, "", "cn"), "gateway_missing");
+        assert_eq!(classify(200, 502, "", "cn"), "gateway_missing");
+        assert_eq!(classify(200, 503, "", "global"), "upstream_error");
+        assert_eq!(classify(200, 500, "", "global"), "upstream_error");
+        assert_eq!(classify(200, 500, "", "cn"), "upstream_error");
+        assert_eq!(state_text("upstream_error"), "上游故障（5xx）");
+        assert_eq!(state_text("unknown"), "没探过");
+    }
+
+    /// Qoder 的拒答帧有两种写法，两种都得说得出人话
+    #[test]
+    fn sse_error_message_reads_nested_openai_error() {
+        let frame = br#"data: {"error":{"code":"invalid_parameter_error","type":"invalid_request_error","message":"When using `tool_choice`, `tools` must be set."}}
+
+"#;
+        let msg = sse_error_message(frame).expect("嵌套 error 也要认出来");
+        assert!(msg.contains("invalid_parameter_error"), "丢了错误码：{msg}");
+        assert!(msg.contains("must be set"), "丢了错误说明：{msg}");
     }
 
     #[test]

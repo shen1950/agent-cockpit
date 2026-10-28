@@ -64,6 +64,7 @@ fn link_into(mine: &Path, store: &Path) -> Result<(), String> {
 /// ③ 内容对不上（版本不同）→ 各留各的，如实说明。
 /// 返回（复制阶段可以跳过的相对路径，给人看的说明）。
 fn stage_shared(app_id: &str, src: Option<&Path>, data_dir: &Path, moved: bool) -> (Vec<String>, Vec<String>) {
+    if app_id == "codex-desktop" { return (Vec::new(), Vec::new()); }
     let mut skip: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     if share_list(app_id).is_empty() || !cfg!(windows) {
@@ -142,6 +143,7 @@ fn stage_shared(app_id: &str, src: Option<&Path>, data_dir: &Path, moved: bool) 
 
 /// 给已经存在的账号补做去重（共享层机制上线之前建的号，各自揣着一份 binaries）
 pub fn dedup_app(app_id: &str) -> Vec<String> {
+    if app_id == "codex-desktop" { return vec!["ChatGPT资料采用普通独立目录，跳过共享和目录链接处理。".into()]; }
     let mut out = Vec::new();
     if agent_running(app_id, &snapshot()) {
         out.push(format!("{} 还开着，先关掉再共用大文件", app_id));
@@ -277,6 +279,9 @@ pub fn seed_instance(
     origin: &str,
     from: Option<&Path>,
 ) -> Result<(String, String), String> {
+    if app_id == "codex-desktop" && origin != "fresh" && origin != "adopt" {
+        return Err("ChatGPT只允许创建空白实例或原位登记，不能复制、搬移或共享默认资料。".into());
+    }
     if origin == "adopt" {
         let src = from.ok_or_else(|| "接管原有档案：没有可接管的目录".to_string())?;
         if data_dir != src {
@@ -455,6 +460,7 @@ pub fn backup(app_id: &str, name: &str) -> (bool, String) {
 }
 
 pub fn restore(app_id: &str, name: &str) -> (bool, String) {
+    if app_id == crate::chatgpt::APP { return (false, "ChatGPT资料目录受保护，不能覆盖恢复。".into()); }
     let meta = match find_instance(app_id, name) {
         Some(m) => m,
         None => return (false, "实例不存在".into()),
@@ -675,6 +681,7 @@ pub fn delete_backup(file: &str) -> (bool, String) {
 
 /// 账号改名：同步改数据目录、档案 json 与换号记录
 pub fn rename_instance(app_id: &str, from: &str, to: &str) -> (bool, String) {
+    if app_id == crate::chatgpt::APP { return (false, "请使用ChatGPT专用改名入口，资料目录保持原位。".into()); }
     let to = to.trim();
     if to.is_empty() {
         return (false, "新名字不能为空".into());

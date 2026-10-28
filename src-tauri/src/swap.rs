@@ -36,6 +36,8 @@ pub(crate) fn remove_link(link: &Path) -> bool {
 /// 默认档案入口成了断链（指着已经不存在的账号目录）时把链接摘掉，返回是否修了。
 /// 留着它，目标程序连"自己新建一份档案"的机会都没有，只会硬报无法写入数据目录。
 pub fn repair_dangling(app_id: &str) -> bool {
+    if app_id == crate::zcode::APP { return false; }
+    if app_id == "codex-desktop" { return false; }
     let p = match crate::registry::profile_dir(app_id) {
         Some(p) => p,
         None => return false,
@@ -62,6 +64,13 @@ pub fn self_check() -> Vec<String> {
     let mut changed = false;
     for app in crate::registry::all_apps_raw() {
         let id = app.id.as_str();
+        // Native ChatGPT profiles are never repaired by creating/removing links.
+        if id == "codex-desktop" || id == crate::zcode::APP {
+            if profile_dir(id).is_some_and(|p| is_junction(&p)) {
+                out.push(format!("{}资料目录仍有旧链接，请先备份并单独处理；本次启动未改动资料。",app.name));
+            }
+            continue;
+        }
         let p = match profile_dir(id) {
             Some(p) => p,
             None => continue,
@@ -259,6 +268,8 @@ impl SwapOut {
 }
 
 pub fn swap_set(app_id: &str, name: &str, force: bool) -> SwapOut {
+    if app_id == crate::zcode::APP { return SwapOut::err("ZCode 使用凭据切换，不执行目录交换"); }
+    if app_id == "codex-desktop" { return SwapOut::err("ChatGPT使用独立实例登录，已禁止目录链接换号。默认资料未改动。"); }
     let app = match crate::registry::app_def(app_id) {
         Some(a) => a,
         None => return SwapOut::err("未知 Agent"),
@@ -464,6 +475,8 @@ fn swap_to_in_place(
 }
 
 pub fn swap_clear(app_id: &str) -> (bool, String) {
+    if app_id == crate::zcode::APP { return (false, "ZCode 数据保持原位，不执行目录交换".into()); }
+    if app_id == "codex-desktop" { return (false, "ChatGPT默认资料受保护，不执行目录交换。".into()); }
     let app = match crate::registry::app_def(app_id) {
         Some(a) => a,
         None => return (false, "未知 Agent".into()),
@@ -534,6 +547,8 @@ fn now_secs() -> u64 {
 /// 同盘 rename 是元数据操作，不复制内容；每一步失败都按原样退回，绝不留下断链。
 /// 原生位置被别的东西占着就拒绝动手。
 pub fn rehome(app_id: &str, name: &str, force: bool) -> (bool, String) {
+    if app_id == crate::zcode::APP { return (false, "ZCode 数据保持原位，不执行目录搬移".into()); }
+    if app_id == "codex-desktop" { return (false, "ChatGPT资料不再自动搬移；原有资料保留。".into()); }
     let app = match crate::registry::app_def(app_id) {
         Some(a) => a,
         None => return (false, "未知 Agent".into()),

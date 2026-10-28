@@ -455,6 +455,120 @@ pub fn toggle_dist(id: &str) -> (bool, String) {
     }
 }
 
+/// 一键反代的接线保障：确保「成员 ∈ 某个启用的上游组」且「该组 ⊆ 某把启用的接入密钥」。
+///
+/// 匹配顺序是刻意安排的：
+///   1. 先找**已经含这个成员**的启用上游组——用户手工编过的编制原样复用，绝不再建一个重复的；
+///   2. 找不到才按 `pool_id` 找（老编制按固定 id 建过）、把成员补进去；
+///   3. 还没有才新建 `{pool_id}`（固定 id，天然幂等——这就是老一键「按名匹配、每轮新建」
+///      那个教训的解法：名字会撞，id 不会）。
+///   接入密钥同理：先找覆盖该组的启用 key，找不到才按 `dist_id` 补授权/新建。
+///
+/// 返回 (pool_id, key, steps)：key 为空 = 组有了但没 key（罕见：组被建出来时就是没人认领）。
+pub fn ensure_wiring(
+    pool_id: &str,
+    pool_name: &str,
+    member_src: &str,
+    dist_id: &str,
+    dist_name: &str,
+) -> (String, String, Vec<String>) {
+    let mut steps: Vec<String> = Vec::new();
+
+    // ── 上游组 ──
+    let mut pid = String::new();
+    let mut pools = pools();
+    for p in pools.iter_mut() {
+        if p["enabled"].as_bool().unwrap_or(true)
+            && p["members"]
+                .as_array()
+                .map(|ms| ms.iter().any(|m| m["src"].as_str().unwrap_or("") == member_src))
+                .unwrap_or(false)
+        {
+            pid = p["id"].as_str().unwrap_or("").to_string();
+            break;
+        }
+    }
+    if pid.is_empty() {
+        // 没有现成的组：按固定 id 找，找到就补成员；没有就整条新建
+        let mut hit = false;
+        for p in pools.iter_mut() {
+            if p["id"].as_str().unwrap_or("") == pool_id {
+                let ms = p["members"].as_array().cloned().unwrap_or_default();
+                let mut members = norm_members(&Value::Array(ms));
+                members.push(json!({ "src": member_src, "enabled": true }));
+                p["members"] = json!(members);
+                p["enabled"] = json!(true);
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            pools.push(json!({
+                "id": pool_id,
+                "name": pool_name,
+                "enabled": true,
+                "members": [{ "src": member_src, "enabled": true }],
+            }));
+            steps.push(format!("已建上游组「{pool_name}」"));
+        } else {
+            steps.push(format!("已把成员补进「{pool_name}」"));
+        }
+        save_proxy_field("pools", json!(pools));
+        pid = pool_id.to_string();
+    }
+
+    // ── 接入密钥 ──
+    let mut key = String::new();
+    let mut dist = dist_keys();
+    for d in dist.iter() {
+        if d["enabled"].as_bool().unwrap_or(true)
+            && d["pools"]
+                .as_array()
+                .map(|ps| ps.iter().any(|x| x.as_str() == Some(pid.as_str())))
+                .unwrap_or(false)
+        {
+            key = d["key"].as_str().unwrap_or("").to_string();
+            break;
+        }
+    }
+    if key.is_empty() {
+        let mut hit = false;
+        for d in dist.iter_mut() {
+            if d["id"].as_str().unwrap_or("") == dist_id {
+                let mut ps: Vec<Value> = d["pools"].as_array().cloned().unwrap_or_default();
+                if !ps.iter().any(|x| x.as_str() == Some(pid.as_str())) {
+                    ps.push(json!(pid));
+                }
+                d["pools"] = json!(ps);
+                d["enabled"] = json!(true);
+                key = d["key"].as_str().unwrap_or("").to_string();
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            let obj = json!({
+                "id": dist_id,
+                "key": gen_dist_key(),
+                "name": dist_name,
+                "pools": [pid],
+                "enabled": true,
+                "calls": 0,
+                "last_used": 0,
+                "last_account": "",
+                "created": crate::registry::now_secs(),
+            });
+            key = obj["key"].as_str().unwrap_or("").to_string();
+            dist.push(obj);
+            steps.push(format!("已生成接入密钥「{dist_name}」"));
+        } else {
+            steps.push(format!("已把「{pool_name}」授权给「{dist_name}」"));
+        }
+        save_proxy_field("dist", json!(dist));
+    }
+    (pid, key, steps)
+}
+
 /// 单个成员解析成上游；来源失效（账号被删 / key 被删 / token 为空）返回 None
 fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option<(String, String, String)> {
     if let Some(rest) = src.strip_prefix("instance:") {
@@ -475,6 +589,10 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
         // 这里读不到就说明这个号没登录 / 档案身份不符 —— 如实返回 None，不拿别人的号顶替。
         if crate::asproxy::APPS.contains(&app_id) {
             tok = crate::asproxy::token();
+        } else if crate::mmproxy::APPS.contains(&app_id) {
+            // MiniMax Code 的 OAuth 令牌在 ~/.minimax/auth/<env>/<region>/mcode-public/auth.json
+            // （mmproxy 读 + 必要时刷新）；账号记录里的 token 字段一直是空的。
+            tok = crate::mmproxy::token();
         } else if tok.is_empty() {
             tok = if crate::traeproxy::APPS.contains(&app_id) {
                 crate::traeproxy::token_for(app_id, name).unwrap_or_default()
@@ -508,12 +626,20 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
         } else {
             String::new()
         };
+        // MiniMax Code：上游是 Anthropic 协议，proxy 见到这个标记就走 mmproxy 的翻译层
+        let mbase = if crate::mmproxy::APPS.contains(&app_id) {
+            crate::mmproxy::BASE_MARK.to_string()
+        } else {
+            String::new()
+        };
         let base = if !member_base.trim().is_empty() {
             member_base.trim().to_string()
         } else if !own.is_empty() {
             own
         } else if !abase.is_empty() {
             abase
+        } else if !mbase.is_empty() {
+            mbase
         } else if !tbase.is_empty() {
             tbase.to_string()
         } else if !wbase.is_empty() {
@@ -528,14 +654,39 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
         // bridge:qoder-cn/<账号> —— Qoder CN 的本地桥（官方运行时 + OpenAI 兼容外壳）。
         // 桥没在跑就没有上游，如实返回 None，别让上游组拿一个连不上的地址。
         let (app_id, name) = rest.split_once('/')?;
-        if app_id != "qoder-cn" || !crate::qproxy::cn_bridge_running() {
-            return None;
-        }
         let app_name = all_apps()
             .into_iter()
             .find(|a| a.id == app_id)
             .map(|a| a.name)
             .unwrap_or_else(|| app_id.to_string());
+        // bridge:qwenwork/<账号> —— 千问办公的本地桥：走网页版 chat-ws，桥自己不校验令牌。
+        // **不再要求桥在跑**：桥挂了就让成员照常进池子，serve() 那头连不上时会自己把桥拉起来
+        // （自愈）。反过来"桥没跑→成员消失"会让整条池子静默蒸发，用户只看到一句没头没尾的 404。
+        if crate::qwbridge::APPS.contains(&app_id) {
+            // 基址按 config 里记的实际端口来（首选口被占时起桥会换备用口并写回）
+            return Some((
+                format!("本地桥/{}", app_name),
+                "local".to_string(),
+                crate::qwbridge::base(),
+            ));
+        }
+        // bridge:catpaw/<账号> —— 妙手改成了**进程内云端直连**（协议底账见 pawbridge.rs）：
+        // 凭据就是 ~/.meituan-catpaw/auth.json 的 accessToken，反代自己带着它打妙手云端，
+        // 不再有桥进程、不再有命名管道、妙手桌面端也不用开。auth.json 在就给上游，
+        // 令牌过不过期由 serve_paw 现场验、把话说清楚。
+        if crate::pawbridge::APPS.contains(&app_id) {
+            if !crate::pawbridge::auth_file_exists() {
+                return None;
+            }
+            return Some((
+                format!("直连/{}", app_name),
+                "local".to_string(),
+                crate::pawbridge::BASE_MARK.to_string(),
+            ));
+        }
+        if app_id != "qoder-cn" || !crate::qproxy::cn_bridge_running() {
+            return None;
+        }
         Some((
             format!("本地桥/{}/{}", app_name, name),
             crate::qproxy::CN_KEY.to_string(),
@@ -663,8 +814,17 @@ pub fn member_options() -> Value {
                     && crate::qproxy::token_for(&app.id, &name).is_some())
                 || (crate::traeproxy::APPS.contains(&app.id.as_str())
                     && crate::traeproxy::token_for(&app.id, &name).is_some())
+                // WorkBuddy 的令牌在 `%LOCALAPPDATA%\CodeBuddyExtension\...\*.info`（wbproxy 读），
+                // 账号记录里那个 token 字段永远是空的。缺了这一支，池子里明明能用的号
+                // 在「选择成员」弹框里会被标成「不可用 / 该账号还没登记 Token」。
+                || (crate::wbproxy::APPS.contains(&app.id.as_str())
+                    && crate::wbproxy::token_for(&app.id, &name).is_some())
                 || (crate::asproxy::APPS.contains(&app.id.as_str())
-                    && !crate::asproxy::token().is_empty());
+                    && !crate::asproxy::token().is_empty())
+                // MiniMax Code：整机一份 OAuth 登录态（mmproxy 读 auth.json）。
+                // 这里用 token_quiet —— 界面 4 秒一轮的轮询不该触发轮换制刷新。
+                || (crate::mmproxy::APPS.contains(&app.id.as_str())
+                    && !crate::mmproxy::token_quiet().is_empty());
             instances.push(json!({
                 "src": member_src_instance(&app.id, &name),
                 "app": app.id,
@@ -676,7 +836,38 @@ pub fn member_options() -> Value {
                 "qstate": crate::qproxy::stored_state(&app.id, &name).unwrap_or_default(),
                 "trae": crate::traeproxy::APPS.contains(&app.id.as_str()),
                 "astudio": crate::asproxy::APPS.contains(&app.id.as_str()),
+                "minimax": crate::mmproxy::APPS.contains(&app.id.as_str()),
             }));
+            // 千问办公：桌面端登录态在就能挂「本地桥」（桥没跑 serve() 会自愈拉起）
+            if crate::qwbridge::APPS.contains(&app.id.as_str()) {
+                let up = crate::qwbridge::cred_exists();
+                instances.push(json!({
+                    "src": format!("bridge:{}/{}", app.id, name),
+                    "app": app.id,
+                    "app_name": app.name,
+                    "instance": name,
+                    "has_token": up,
+                    "proxy_base_url": crate::qwbridge::base(),
+                    "qregion": "",
+                    "qstate": if up { "bridge" } else { "bridge_idle" },
+                    "bridge": true,
+                }));
+            }
+            // 妙手：改成进程内云端直连了——auth.json 在就能挂，桌面端跑不跑无关
+            if crate::pawbridge::APPS.contains(&app.id.as_str()) {
+                let up = crate::pawbridge::auth_file_exists();
+                instances.push(json!({
+                    "src": format!("bridge:{}/{}", app.id, name),
+                    "app": app.id,
+                    "app_name": app.name,
+                    "instance": name,
+                    "has_token": up,
+                    "proxy_base_url": crate::pawbridge::BASE_MARK,
+                    "qregion": "",
+                    "qstate": if up { "bridge" } else { "bridge_idle" },
+                    "bridge": true,
+                }));
+            }
             // Qoder CN：CLI 登录过就能挂本地桥（国内版唯一通路，见 qproxy.rs）
             if app.id == "qoder-cn" && crate::qproxy::cn_logged_in(&name) {
                 let up = crate::qproxy::cn_bridge_running();

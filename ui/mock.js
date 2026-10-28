@@ -473,7 +473,7 @@ DATA.settings = {
   profile: { nickname: '', note: '' },
   general: { autostart: false, close_action: 'tray', notify_alerts: true, refresh_sec: 4, auto_scan: true },
   appearance: { theme: 'dark', density: 'comfortable', font_scale: 100, nav_w: 248, nav_h: 0, nav_collapsed: false,
-    side_visible: [], side_menu: ['collab', 'keys', 'proxy', 'checkin'], gear_menu: ['settings', 'appearance', 'logs', 'help'] },
+    side_visible: [], side_menu: ['collab', 'keys', 'proxy', 'checkin', 'remote'], gear_menu: ['settings', 'appearance', 'logs', 'help'] },
   quota: { warn_days: 30, danger_days: 7, auto_fetch_min: 30 },
   proxy: { port: 8788, upstream: 'https://api.openai.com', log_keep: 100 },
   checkin: { enabled: false, window_start: 6, window_end: 12, auto: { workbuddy: true },
@@ -745,6 +745,32 @@ window.__TAURI__ = {
       }
       if (cmd === 'action') {
         const p = args.payload || {};
+        // 远程控制页（侧栏一级入口）预览用：开关、配对码、设备、审计都给一份假数据
+        if (p.action === 'remote_view') {
+          return Promise.resolve({ ok: true, view: {
+            enabled: true, url: 'http://192.168.1.7:8790', port: 8790, idle_off_h: 2,
+            pair: {
+              url: 'http://192.168.1.7:8790/#t=884213', code: '884213', expires_in: 540,
+              qr_svg: '<svg xmlns="http://www.w3.org/2000/svg" width="190" height="190">'
+                + '<rect width="190" height="190" fill="#fff"/>'
+                + '<rect x="14" y="14" width="44" height="44" fill="none" stroke="#333" stroke-width="6"/>'
+                + '<rect x="132" y="14" width="44" height="44" fill="none" stroke="#333" stroke-width="6"/>'
+                + '<rect x="14" y="132" width="44" height="44" fill="none" stroke="#333" stroke-width="6"/>'
+                + '<text x="95" y="104" font-size="12" text-anchor="middle" fill="#999">QR 预览</text></svg>',
+            },
+            devices: [{ id: 'd1', name: 'Pixel 8', created_at: Date.now() / 1000 - 3600, last_seen_ago: 120 }],
+            audit: [
+              { t: '13:20:11', ev: 'pair', ip: '192.168.1.9', d: 'Pixel 8' },
+              { t: '13:24:02', ev: 'quota', ip: '192.168.1.9', d: '' },
+            ],
+          } });
+        }
+        if (p.action === 'remote_enable' || p.action === 'remote_disable' || p.action === 'remote_code') {
+          return Promise.resolve({ ok: true, msg: '预览模式：已更新（假数据）' });
+        }
+        if (p.action === 'remote_device_revoke') {
+          return Promise.resolve({ ok: true, msg: '预览模式：已吊销（假数据）' });
+        }
         if (p.action === 'qproxy_oneclick') {
           return Promise.resolve({ ok: true, msg: '1 个账号加入上游组，反代已启动 127.0.0.1:8788', result: { key: 'ac-6fb2190a555491fa4d88ab2d52908155' } });
         }
@@ -809,6 +835,31 @@ window.__TAURI__ = {
           })),
         }] : [];
         return Promise.resolve({ ok: true, locked: false, groups });
+      }
+      if (cmd === 'action' && args.payload?.action === 'site_reorder') {
+        // 演示数据下也真换顺序，load() 回来能看见
+        const order = args.payload.order || [];
+        const rest = (DATA.keys || []).slice();
+        const out = [];
+        for (const id of order) {
+          const i = rest.findIndex((x) => x.id === id);
+          if (i >= 0) out.push(rest.splice(i, 1)[0]);
+        }
+        DATA.keys = out.concat(rest);
+        return Promise.resolve({ ok: true, msg: `已按新顺序保存 ${DATA.keys.length} 个站点（演示数据）` });
+      }
+      if (cmd === 'action' && args.payload?.action === 'key_reorder') {
+        const p = (DATA.keys || []).find((x) => x.id === args.payload.site);
+        if (!p) return Promise.resolve({ ok: false, msg: '没找到这个站点（演示数据）' });
+        const order = args.payload.order || [];
+        const rest = (p.keys || []).slice();
+        const out = [];
+        for (const id of order) {
+          const i = rest.findIndex((x) => x.id === id);
+          if (i >= 0) out.push(rest.splice(i, 1)[0]);
+        }
+        p.keys = out.concat(rest);
+        return Promise.resolve({ ok: true, msg: `「${p.name || '站点'}」里 ${p.keys.length} 条密钥已按新顺序保存（演示数据）` });
       }
       if (cmd === 'action' && (args.payload?.action === 'key_batch_update'
         || args.payload?.action === 'key_batch_move'

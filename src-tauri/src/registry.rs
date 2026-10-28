@@ -113,6 +113,17 @@ pub fn apps() -> Vec<AppDef> {
             &["D:/Artificial_Intelligence/QwenWorkCN/1.2.5-26092902/QwenWorkCN.exe",
               "D:/Artificial_Intelligence/QwenWorkCN/Launcher.exe"], "",
             Some("{APPDATA}/QwenWorkCN|{APPDATA}/QwenWork|{LOCALAPPDATA}/QwenWorkCN"), false),
+        // 妙手（美团 CatPaw / CatDesk，product.json: applicationName=catpaw-moon,
+        // appId=com.catx.catpaw, cliCommandName=paw, dataFolderName=.meituan-catpaw）。
+        // 登录态 ~/.meituan-catpaw/auth.json 是**明文** accessToken（152 字符 Bearer），
+        // 额度走服务端 credit/balance；控制面（/cli/send 等）只挂命名管道 \\.\pipe\paw。
+        // 反代见 pawbridge.rs + catpaw-bridge/bridge.js。
+        // 档案候选里两段：家目录（令牌与 desk 工作区）在前，Electron userData 在后，
+        // resolve_profile 挑真有登录数据的那个。
+        // isolatable=false：未实测 --user-data-dir 隔离性，先按不可多开处理。
+        curated("catpaw", "妙手", "electron",
+            &["D:/Artificial_Intelligence/妙手/妙手.exe"], "",
+            Some(".meituan-catpaw|{APPDATA}/catpaw-moon"), false),
         // DeepSeek Harness：Electron（同目录有 resources.pak+locales，实测）。
         // 登录态是明文 ~/.dsh/.credentials.yaml（grant deepseek-account-platform/default 的 token），
         // Electron userData 在 {APPDATA}\@deepseek-ai\dsh-desktop——换号两处都要算，候选写法照 Qoder 系。
@@ -167,6 +178,12 @@ pub fn apps() -> Vec<AppDef> {
             "{LOCALAPPDATA}/Microsoft/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
         ], "", Some("{APPDATA}/Codex/web/Codex"), true),
         curated("claude", "Claude Code CLI", "cli", &["D:/npm-global/claude.cmd"], "CLAUDE_CONFIG_DIR", Some(".claude"), true),
+        // Claude 桌面版包含 Cowork / Code；Claude-3p 是它自行管理的资料目录，
+        // 不能当安装目录或换号档案。保留官方包身份启动，不复制/接管这份资料。
+        curated("claude-desktop", "Claude 桌面版", "plain", &[
+            "{PROGRAMFILES}/WindowsApps/Claude_*_x64__pzs8sxrjxfjjc/app/Claude.exe",
+            "D:/WindowsApps/Claude_*_x64__pzs8sxrjxfjjc/app/Claude.exe",
+        ], "", None, false),
         // ------------------------------------------------------------------
         // 以下这批是 2026-10-16 照着 jlcodes99/cockpit-tools 的平台清单补的：
         // Antigravity / Cursor / Kiro / Windsurf / GitHub Copilot / Zed / Grok Bot /
@@ -679,6 +696,7 @@ pub fn short_name(app_id: &str) -> &'static str {
         "zcode" => "ZC",
         "codex" => "CX",
         "claude" => "CC",
+        "claude-desktop" => "CL",
         "qwenwork" => "QW",
         "dsh" => "DSH",
         "marvis" => "MV",
@@ -818,6 +836,27 @@ pub fn resolve_exe(app: &AppDef) -> Option<PathBuf> {
         })
         .next()?;
     Some(newest_update(&base).unwrap_or(base))
+}
+
+/// MSIX 的启动身份独立于版本目录。由 Windows 激活已注册主应用，
+/// 不直接运行包内 exe，以免丢失包身份而进入另一套资料目录。
+pub fn registered_app_id(app_id: &str) -> Option<&'static str> {
+    match app_id {
+        "claude-desktop" => Some("Claude_pzs8sxrjxfjjc!Claude"),
+        _ => None,
+    }
+}
+
+/// 仅供查看的官方资料位置；不参与 profile、实例建档或目录换号。
+pub fn native_data_dir(app_id: &str) -> Option<PathBuf> {
+    if app_id != "claude-desktop" {
+        return None;
+    }
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    if !local.is_absolute() {
+        return None;
+    }
+    Some(local.join("Claude-3p"))
 }
 
 /// Qoder 系的更新把新构建放在 `<安装目录>/.qoder-versions/<版本>/<同名 exe>`，顶层那个 exe
@@ -965,6 +1004,7 @@ pub(crate) fn bound_instance_dir(app_id: &str) -> Option<PathBuf> {
 /// 磁盘上真正绑定的账号名（junction 目标落在 instances/<app>/ 下才算）。
 /// UI 上"当前账号"这种状态必须以它为准，否则记录过时会把界面带偏。
 pub(crate) fn bound_instance_name(app_id: &str) -> Option<String> {
+    if app_id == crate::zcode::APP { return crate::zcode::current_card(); }
     if let Some(dir) = bound_instance_dir(app_id) {
         if let Some(n) = instance_name_under(&dir, &instances_dir(app_id)) {
             return Some(n);
@@ -1049,6 +1089,8 @@ pub enum SwapOp {
 }
 
 pub fn swap_op(app_id: &str, dir: &Path) -> SwapOp {
+    if app_id == crate::zcode::APP { return SwapOp::Unsupported; }
+    if app_id == "codex-desktop" { return SwapOp::Unsupported; }
     let p = match profile_dir(app_id) {
         Some(p) => p,
         None => return SwapOp::Unsupported,
@@ -1086,6 +1128,10 @@ pub fn swap_changes_nothing(app_id: &str, dir: &Path) -> bool {
 /// （同产品另一个真实档案目录上的**别名**链接不算——那种磁盘上什么都不用动，见 is_swap_link）；
 /// 最后还得真有一张卡认领这份档案，否则"共用"无从谈起。
 pub fn shares_one_profile(app_id: &str) -> bool {
+    if app_id == crate::zcode::APP { return !is_reparse_point(&crate::zcode::native_root()); }
+    // Antigravity 登录态在系统凭据库（整机一份），切换只切凭据 + 重启客户端，不做目录 junction——
+    // 数据目录 {APPDATA}\Antigravity 与 ~/.gemini 整机共享，和 ZCode 同一类「凭据注入换号」。
+    if app_id == crate::antigravity::APP { return true; }
     let app = match app_def(app_id) {
         Some(a) => a,
         None => return false,
@@ -1111,6 +1157,7 @@ pub fn shares_one_profile(app_id: &str) -> bool {
 /// 这个账号是不是「被搬进 instances/ 的接管账号」，是的话返回它原来的位置。
 /// 归位动作与界面入口共用这一条判据，别在两处各写一遍。
 pub fn rehome_slot(app_id: &str, meta: &Value) -> Option<PathBuf> {
+    if app_id == "codex-desktop" { return None; }
     let dir = PathBuf::from(meta["data_dir"].as_str()?);
     if dir.parent()? != instances_dir(app_id) {
         return None;
@@ -1223,8 +1270,8 @@ pub fn auth_pack_files(app_id: &str) -> &'static [&'static str] {
     match app_id {
         // 0.4.x 新壳：os_crypt v10 包着的 {token, refreshToken, expiresAt, user}
         "qoder" | "qoder-cn" => &["auth.v1.dat"],
-        // ZCode：一个 JSON 里装着 oauth access_token / jwt / api-key。
-        // 里面也夹着这个号自己的 bot 与项目配置——那本来就是它的配置，一起换回去是对的。
+        // ZCode uses a provider-scoped OAuth snapshot. Bot/project API credentials
+        // in this shared JSON stay in place; zcode.rs filters the snapshot.
         "zcode" => &["v2/credentials.json"],
         // WorkBuddy：登录态不在 ~/.workbuddy，在 CodeBuddy 扩展那份 .info 里。
         // 里面是 $wbEncrypted 信封——我们不解它（解不出来是"读余额"那条路的坎），
@@ -1310,6 +1357,9 @@ pub fn lockers(app_id: &str) -> &'static [&'static str] {
         "marvis" => &["marvis.exe", "marvislauncher.exe", "marvissvr.exe", "marvisassistant.exe"],
         "xiaomi-mimo" => &["xiaomi mimo.exe"],
         "opencode" => &["opencode.exe"],
+        // 妙手：主程序就叫「妙手.exe」（product.json 的 nameShort），产品标识 catpaw-moon /
+        // com.catx.catpaw；进程族里还有它自带的 CLI（paw.exe 是软链，实际还是它自己）。
+        "catpaw" => &["妙手.exe", "catpaw.exe"],
         _ => &[],
     }
 }
@@ -2192,6 +2242,45 @@ pub fn set_swap(cfg: &mut Value, app_id: &str, val: Option<Value>) {
 #[cfg(test)]
 mod msix_tests {
     use super::*;
+
+    #[test]
+    fn claude_desktop_is_distinct_from_cli_and_does_not_manage_user_data() {
+        let desktop = app_def("claude-desktop").expect("Claude 桌面版应已登记");
+        let cli = app_def("claude").expect("Claude Code CLI 应保持独立");
+        assert_eq!(desktop.kind, "plain");
+        assert!(!desktop.isolatable);
+        assert!(desktop.env.is_empty());
+        assert!(desktop.profile.is_none(), "Claude-3p 不得交给目录换号系统");
+        assert!(profile_dir(&desktop.id).is_none());
+        assert_eq!(cli.kind, "cli");
+        assert_eq!(cli.env, "CLAUDE_CONFIG_DIR");
+        assert_eq!(cli.profile.as_deref(), Some(".claude"));
+        assert_ne!(exe_name(&desktop).to_lowercase(), exe_name(&cli).to_lowercase());
+        assert_eq!(registered_app_id(&desktop.id), Some("Claude_pzs8sxrjxfjjc!Claude"));
+        assert!(registered_app_id(&cli.id).is_none());
+        assert!(native_data_dir(&cli.id).is_none());
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            if local.is_absolute() {
+                assert_eq!(native_data_dir(&desktop.id), Some(local.join("Claude-3p")));
+            }
+        }
+        assert!(desktop.exes.iter().all(|p| p.contains("Claude_*") && !p.contains("Claude-3p")));
+    }
+
+    /// 只读实机检查：即使开始菜单快捷方式仍指向已卸载的旧版本，
+    /// 内置版本通配也应找到当前安装，并能出现在程序侧栏。
+    #[test]
+    #[ignore]
+    fn real_claude_desktop_registration_is_visible_without_creating_an_account() {
+        let desktop = app_def("claude-desktop").unwrap();
+        let exe = resolve_exe(&desktop).expect("实机应已安装 Claude MSIX");
+        assert!(exe.is_file());
+        assert_eq!(exe.file_name().unwrap().to_string_lossy().to_lowercase(), "claude.exe");
+        assert!(exe.to_string_lossy().contains("Claude_"));
+        assert!(all_apps().iter().any(|a| a.id == desktop.id), "已安装的 Claude 应在侧栏中");
+        assert!(profile_dir(&desktop.id).is_none());
+    }
 
     /// MSIX 安装目录带版本号，登记只能写通配：解析到的必须是真文件，
     /// 且文件名对得上（不能把 app 目录里别的 exe 认成主程序）。

@@ -315,6 +315,18 @@ mod tests {
         assert!(skip.contains(&norm("WorkBuddyAI.exe")));
     }
 
+    #[test]
+    fn curated_claude_desktop_claims_its_shortcut_without_guessing_a_profile() {
+        let skip = crate::registry::manual_claimed_names();
+        assert!(claimed_by_manual(
+            &skip,
+            "Claude",
+            r"C:\Program Files\WindowsApps\Claude_3.6556.2.0_x64__pzs8sxrjxfjjc\app\Claude.exe"
+        ), "Claude 快捷方式不得再生成可隔离的自动副本");
+        assert!(skip.contains(&norm("claude.cmd")), "CLI 的入口仍独立登记");
+        assert!(!claimed_by_manual(&skip, "Claude helper", r"C:\Tools\Claude-helper.exe"));
+    }
+
     /// 千问办公：内置条目主 exe 是版本目录里的 QwenWorkCN.exe，兜底候选才是启动壳
     /// Launcher.exe。快捷方式指的就是 Launcher.exe——裸文件名 "launcher.exe" 不能
     /// 全局认领（会误吞别家恰好叫 Launcher.exe 的程序），拦住它的是解析后的绝对路径键。

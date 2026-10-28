@@ -143,6 +143,8 @@ cd src-tauri && cargo test
 
 ## 反代怎么用（三段式）
 
+每个 Agent 自己的面板上都有一个**「一键反代」主按钮**：探测/验登录态 → 接线（上游组、接入密钥**缺才建**，已有的原样复用）→ 起反代，一个按钮从"没配过"走到"客户端能调"。下面三段式是手工编制的完整路径（想精细控制时才需要）：
+
 ```
 某个 Agent 的某个账号 ┐
                      ├─→ 池子「主力池」 ┐
@@ -157,6 +159,35 @@ cd src-tauri && cargo test
 4. 回头想收权：列表上点「停用」（用它的客户端立刻 403）、「改」换授权范围、「删」彻底作废。每次调用都会记在卡片上（累计次数 + 最近落到哪个上游）。
 
 没有池子时行为不变：所有填了 Token 的账号按轮询/随机策略一起用。
+
+### 模型名一律带 Agent 前缀
+
+客户端里填的 Model 一律是 `owner/模型` 形状：`trae/glm-5.3-flash`、`workbuddy/kimi-k3.1-pro`、
+`qoder-cn/auto`、`astudio/spark-x2.6-4b`、`minimax/MiniMax-M3.1-Flash`、`qwenwork/flash`、
+`catpaw/LongCat-2.0`……（面板的「模型 ID」表和「复制接入配置」给出去的都带前缀）。
+同名模型（`glm-5.3-flash`、`kimi-k3` 每家都有）不带前缀就会在几家之间互相漂；
+带前缀的请求只在属于这一家的上游里挑，报文转发前剥成裸名。已知前缀：
+`workbuddy` / `workbuddy-intl` / `trae` / `qoder` / `qoder-cn` / `opencode` / `astudio` / `minimax` / `qwenwork` / `catpaw`。
+
+### 自愈与一键的行为约定
+
+- **千问办公**：本地桥（8765）没跑时，反代收到请求会当场把它拉起来（约 2~5 秒）；面板「获取模型ID」也会自动起桥。桥自带 2 小时空闲自退，下次请求再自愈，不留常驻空进程。
+- **妙手**：2026-10-26 起改成**进程内云端直连**——反代带着 `~/.meituan-catpaw/auth.json` 的 accessToken 直接打妙手云端（nocode.cn + ai.catpaw.meituan.com），**不需要妙手桌面端在跑**，8789 桥进程和命名管道方案整体废弃。唯一要打开妙手的时刻：令牌过期后的重登（一键会替你把窗口拉起来）。一轮对话答完即删云会话，不留垃圾历史。
+
+### 各家上游的差别（谁需要协议翻译）
+
+| Agent | 上游协议 | 令牌来源 | 备注 |
+|---|---|---|---|
+| WorkBuddy 国内/国际、Qoder、AStudio | OpenAI 兼容 | 各家自己的档案 | 只换鉴权头，个别厂商要改 body |
+| 千问办公 | OpenAI 兼容（本地桥 → 网页版 chat-ws） | `%APPDATA%\QwenWorkCN\auth-v2.dat`（桥自己解） | 桥挂了反代自愈拉起；桌面网关要 WASM 签名走不了，走网页版通道 |
+| 妙手 | OpenAI 兼容（进程内 → 云端 create/agent-stream/SSE） | `~/.meituan-catpaw/auth.json`（accessToken） | 反代这层翻译云端 SSE；模型目录云端现拉，答完即删会话 |
+| TRAE CN | 私有 SOLO 协议 | `storage.json`（byteCrypto） | 反代这层翻译 |
+| **MiniMax Code** | **Anthropic 协议**（`POST /messages` + Anthropic SSE） | `~/.minimax/auth/<env>/<region>/mcode-public/auth.json`（OAuth） | 请求/响应/流式双向翻译，思考块映射成 `reasoning_content`；上游没有 `/models`，模型清单按客户端白名单静态给 |
+
+MiniMax 的 OAuth 令牌寿命按小时算，反代会在到期前 60 秒自动换新并写回 `auth.json`
+（连同 `auth-state.json` 的 generation 一起 +1，否则官方客户端会判「凭据与状态不匹配」）。
+refresh token 是**轮换制**：换过一次旧的立刻作废，所以只在真过期时换一次、失败就退避，
+不会反复重试。整族令牌被服务端撤销时，只能重新打开 MiniMax Code 登录一次。
 
 ## 数据位置
 

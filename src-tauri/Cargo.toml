@@ -14,11 +14,15 @@ tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "=0.8.2"
 sysinfo = "0.33"
 ureq = { version = "2.12", features = ["json"] }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 tiny_http = "0.12"
 chrono = "0.4"
+# Web 远程控制的配对二维码（remote.rs）。纯 Rust、零传递依赖，只为把「扫码进入」
+# 从"手输地址+码"变成扫一下
+qrcode = "0.14"
 # 修复构建：schemars 0.8.22 拉 indexmap 1.9 时只带 serde-1、没带 std，indexmap 的 build.rs
 # 就退回去用 autocfg 探测 sysroot 里的 std crate；老版 autocfg 在 rustc 1.97 下探测失败，
 # has_std 为假 → IndexMap<K,V> 缺默认泛型参数 → schemars 报 E0107，整个项目编译不过。
@@ -30,7 +34,7 @@ indexmap = { version = "1.9", features = ["std"] }
 # （见 webquota.rs）。版本必须和 tauri/wry 用的那条链一致，否则 ICoreWebView2* 类型对不上。
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
-windows = { version = "0.62", features = ["Win32_Foundation"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem"] }
 
 [profile.release]
 codegen-units = 1
