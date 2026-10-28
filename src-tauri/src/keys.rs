@@ -711,6 +711,53 @@ pub fn update_keys_batch(pairs: &[(String, String)], patch: &Value) -> (usize, V
     (n, misses)
 }
 
+/// 按给定 id 顺序重排一个「带 id 的对象数组」。order 里没提到的条目按原相对顺序
+/// 排在后面——前端传漏了、或拖拽那一刻列表刚好变了，最多是顺序不理想，
+/// **一条都不会丢**：这里只挪位置，不碰任何字段。
+fn apply_order(list: Vec<Value>, order: &[String]) -> Vec<Value> {
+    let mut rest = list;
+    let mut out = Vec::with_capacity(rest.len());
+    for want in order {
+        if let Some(i) = rest.iter().position(|x| x["id"].as_str() == Some(want.as_str())) {
+            out.push(rest.remove(i));
+        }
+    }
+    out.extend(rest);
+    out
+}
+
+/// 站点排序：order = 全部站点 id 的新顺序。拖完一次读盘一次写盘。
+/// 反代、接入、测活记的账都按站点 id 找人，顺序变了不影响。
+pub fn reorder_sites(order: &[String]) -> (bool, String) {
+    let mut items = sites();
+    if items.is_empty() {
+        return (true, "还没有站点，不用排".into());
+    }
+    let n = items.len();
+    items = apply_order(items, order);
+    save(&items);
+    (true, format!("已按新顺序保存 {} 个站点", n))
+}
+
+/// 站点内密钥排序：order = 该站点全部 key id 的新顺序。
+pub fn reorder_keys(site_id: &str, order: &[String]) -> (bool, String) {
+    let mut items = sites();
+    let Some(p) = find_site_mut(&mut items, site_id) else {
+        return (false, "没找到这个站点".into());
+    };
+    let name = p["name"].as_str().unwrap_or("").to_string();
+    let mut ks = p["keys"].as_array().cloned().unwrap_or_default();
+    if ks.is_empty() {
+        return (true, format!("「{name}」里还没有密钥，不用排"));
+    }
+    let n = ks.len();
+    ks = apply_order(ks, order);
+    p["keys"] = json!(ks);
+    p["key_count"] = json!(n);
+    save(&items);
+    (true, format!("「{name}」里 {} 条密钥已按新顺序保存", n))
+}
+
 /// 把一批 key 挪到另一个站点：原站点删掉、目标站点按**原 id** 追加。
 /// 原 id 不变，反代与"接入到程序"那边记的账就不会断。
 /// 目标站里已经有同一条 key 原文的，跳过并记进 `dupes`——否则台账里又长一条重复。
@@ -773,26 +820,30 @@ pub fn probe(base_url: &str, key: &str) -> (bool, String, usize) {
     if base.is_empty() {
         return (false, "未填 Base URL".into(), 0);
     }
-    // base 可能已经是 /v1 或更深（如 /openai/v1）；统一探测 .../models
-    let url = if base.ends_with("/models") {
-        base.to_string()
-    } else if base.ends_with("/v1") {
-        format!("{}/models", base)
-    } else {
-        format!("{}/v1/models", base)
+    // base 可能已经是 /v1 或更深（如 /openai/v1）、也可能直接给到 /chat/completions；
+    // 统一走 models_url 归一（剥动作后缀 + 拼 /models），别在这里自己再拼一套
+    let url = match models_url(base) {
+        Some(u) => u,
+        None => return (false, "未填 Base URL".into(), 0),
     };
     // 测活是随手点的动作，超时压到 10 秒：站点不通时干等 20 秒太磨人
     // （B.ai 连不上那次，光一次测试就把整个后端锁了 20 秒）
     let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(10));
     if !key.is_empty() {
         req = req.set("Authorization", &format!("Bearer {}", key));
+        // Anthropic 系的口认 x-api-key 不认 Bearer；多带一个头对 OpenAI 系没影响
+        req = req.set("x-api-key", key);
     }
     match req.call() {
         Ok(resp) => {
             let n = resp
                 .into_json::<Value>()
                 .ok()
-                .and_then(|v| v["data"].as_array().map(|a| a.len()))
+                .and_then(|v| {
+                    v["data"].as_array()
+                        .or_else(|| v["models"].as_array())   // Gemini 的清单在 models 字段
+                        .map(|a| a.len())
+                })
                 .unwrap_or(0);
             (true, format!("可用（列出 {} 个模型）", n), n)
         }
@@ -824,6 +875,8 @@ pub fn probe_models(base_url: &str, key: &str) -> (bool, String, Vec<String>) {
     let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(20));
     if !key.is_empty() {
         req = req.set("Authorization", &format!("Bearer {}", key));
+        // Anthropic 系的口认 x-api-key 不认 Bearer；多带一个头对 OpenAI 系没影响
+        req = req.set("x-api-key", key);
     }
     match req.call() {
         Ok(resp) => {
@@ -831,13 +884,23 @@ pub fn probe_models(base_url: &str, key: &str) -> (bool, String, Vec<String>) {
                 .into_json::<Value>()
                 .ok()
                 .and_then(|v| {
-                    v["data"].as_array().map(|a| {
+                    // OpenAI 系清单在 data，Gemini 在 models；Gemini 的条目名在 "name"
+                    let a = v["data"].as_array().or_else(|| v["models"].as_array());
+                    a.map(|a| {
                         a.iter()
-                            .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                            .filter_map(|m| {
+                                m["id"].as_str()
+                                    .or_else(|| m["name"].as_str())
+                                    .map(|s| s.to_string())
+                            })
                             .collect::<Vec<_>>()
                     })
                 })
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                // Gemini 的 name 是 "models/gemini-..."，去掉前缀好认
+                .map(|s| s.strip_prefix("models/").map(|x| x.to_string()).unwrap_or(s))
+                .collect();
             let n = ids.len();
             (
                 true,
@@ -854,15 +917,36 @@ pub fn probe_models(base_url: &str, key: &str) -> (bool, String, Vec<String>) {
     }
 }
 
+/// 从文档复制来的地址常常已经带上了动作后缀
+/// （…/v1/chat/completions、…/responses、…/v1/messages 之类）。
+/// 测活和拉模型要的是 API 根：先把这些后缀剥掉再拼 /models，
+/// 否则拼出来是 .../chat/completions/v1/models，必然 HTTP 404
+/// （她 2026-10-28：带 chat/completions 或 responses 的永远测不通，就这个原因）。
+fn strip_action_suffix(mut base: &str) -> &str {
+    const ACTIONS: &[&str] = &[
+        "/chat/completions", "/responses", "/completions", "/messages", "/embeddings",
+    ];
+    loop {
+        let lower = base.to_ascii_lowercase();
+        match ACTIONS.iter().find(|s| lower.ends_with(*s)) {
+            Some(s) => base = &base[..base.len() - s.len()],
+            None => return base,
+        }
+    }
+}
+
 /// base 可能已经是 /v1 或更深（如 /openai/v1）；统一拼到 .../models
 fn models_url(base_url: &str) -> Option<String> {
-    let base = base_url.trim().trim_end_matches('/');
+    let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
     if base.is_empty() {
         return None;
     }
+    let has_version_tail = ["/v1", "/v1beta", "/v1beta1", "/v4"]
+        .iter()
+        .any(|s| base.ends_with(s));
     Some(if base.ends_with("/models") {
         base.to_string()
-    } else if base.ends_with("/v1") || base.ends_with("/v4") {
+    } else if has_version_tail {
         format!("{base}/models")
     } else {
         format!("{base}/v1/models")
@@ -950,6 +1034,34 @@ mod tests {
         assert_eq!(
             models_url("https://x.example.com/v1/models").as_deref(),
             Some("https://x.example.com/v1/models")
+        );
+    }
+
+    /// 从文档复制来的地址带动作后缀时（…/chat/completions、…/responses），
+    /// 直接拼 /models 必 404——先剥后缀再拼（2026-10-28 她报的 404 就是这个）
+    #[test]
+    fn models_url_strips_action_suffixes() {
+        assert_eq!(
+            models_url("https://maas-api.unisound.com/v1/chat/completions").as_deref(),
+            Some("https://maas-api.unisound.com/v1/models")
+        );
+        assert_eq!(
+            models_url("https://api.openai.com/v1/responses").as_deref(),
+            Some("https://api.openai.com/v1/models")
+        );
+        assert_eq!(
+            models_url("https://api.anthropic.com/v1/messages").as_deref(),
+            Some("https://api.anthropic.com/v1/models")
+        );
+        // 裸域 + 动作后缀：剥完没有版本尾巴，按缺 /v1 补
+        assert_eq!(
+            models_url("https://x.example.com/embeddings").as_deref(),
+            Some("https://x.example.com/v1/models")
+        );
+        // Gemini 的版本尾巴
+        assert_eq!(
+            models_url("https://generativelanguage.googleapis.com/v1beta").as_deref(),
+            Some("https://generativelanguage.googleapis.com/v1beta/models")
         );
     }
 

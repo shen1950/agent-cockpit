@@ -37,6 +37,11 @@ pub const LOCAL_STORES: &[(&str, &str)] = &[
     //                view_mode 的 "user" 字段（数字 userId）。没有昵称/邮箱/余额接口。
     ("antigravity", "antigravity"),
     ("coze", "coze"),
+    // 妙手（美团 CatPaw）：~/.meituan-catpaw/auth.json 明文 accessToken，
+    // 额度走服务端 catx.nocode.cn/api/gateway/credit/balance（可用积分 + 套餐 + 刷新时间）。
+    // 注意这个号**没有 refresh_token**，令牌一过期官方自己的日志就是 refresh_unsupported、
+    // 还会把 auth.json 清成空——所以读不到时如实报错，别显示成 0 积分。
+    ("catpaw", "catpaw"),
 ];
 
 pub fn store_for(app_id: &str) -> Option<&'static str> {
@@ -258,6 +263,11 @@ pub fn fetch_for_account(store: &str, data_dir: &str) -> Result<Quota, String> {
 /// agenthub 是 .cmd 包装，CreateProcess 直接执行不了，必须经 cmd.exe 转一手。
 /// profile = 该账号自己的档案目录（按账号分别读的关键），None 则读产品当前默认档案。
 pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
+    let zcode_root = profile.map(std::path::PathBuf::from).unwrap_or_else(crate::zcode::native_root);
+    let zcode_bytes = if store == crate::zcode::APP { Some(std::fs::read(zcode_root.join("v2/credentials.json")).map_err(|_|"无法读取 ZCode 登录文件")?) } else { None };
+    let zcode_identity = if store == crate::zcode::APP {
+        Some(crate::zcode::identity_at(&zcode_root)?)
+    } else { None };
     let mut c = Command::new("cmd.exe");
     // profile 给了就读那个账号自己的档案目录——单实例产品靠 junction 换号，
     // 每个账号的数据就在它自己的 data_dir 里，这样才能一账号一读数。
@@ -285,6 +295,11 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
     let parsed: Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| format!("agenthub 输出不是 JSON：{e}"))?;
     let d = parsed.get(0).ok_or_else(|| "agenthub 没返回任何条目".to_string())?;
+    if let Some(before) = zcode_bytes {
+        if std::fs::read(zcode_root.join("v2/credentials.json")).ok().as_deref() != Some(before.as_slice()) {
+            return Err("ZCode 登录在读取期间变化，请重新读取额度".into());
+        }
+    }
     if let Some(e) = d.get("error").and_then(|v| v.as_str()) {
         return Err(format!("读不到余额：{e}"));
     }
@@ -314,8 +329,8 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
     // 老版本 agenthub 没这个键时留空，界面退回按 buckets 画（不许自己编一组）。
     let groups = d["groups"].as_array().cloned().unwrap_or_default();
     Ok(Quota {
-        user_id: d["userId"].as_str().unwrap_or("").to_string(),
-        account: d["account"].as_str().unwrap_or("").to_string(),
+        user_id: zcode_identity.as_ref().and_then(|v|v["user_id"].as_str()).or_else(||d["userId"].as_str()).unwrap_or("").to_string(),
+        account: zcode_identity.as_ref().and_then(|v|v["account"].as_str()).or_else(||d["account"].as_str()).unwrap_or("").to_string(),
         user_type: d["userType"].as_str().unwrap_or("").to_string(),
         left: num(&d["left"]),
         total: num(&d["total"]),

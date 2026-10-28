@@ -121,16 +121,52 @@ const ACT_ICONS = {
    并明说"正在测"，不让请求叠起来。 */
 const KEY_TESTING = new Set();
 function keyTestBusy(site, id) { return KEY_TESTING.has(`${site}|${id}`); }
+/* 「测试」只换那一行的操作格：整表重建会把这行上下所有节点拔掉重插，
+   页面长度一变、滚动锚点一丢，就是"点一下整页往上错一截"。
+   定点替换一个 <td>，别处的节点全活着，位置纹丝不动。 */
+function keyActTd(site, k) {
+  return el('td', { class: 'acts', data: { kat: keySelSig(site.id, k.id) } },
+    keyTestBusy(site.id, k.id)
+      ? el('span', { class: 'muted', title: '正在向站点发请求，等它回来' }, '测试中…')
+      : iconBtn('test', () => keyTest(site.id, k.id),
+        '测试：向站点的接入点发一次 GET /models，验证这把 Key 还能不能用'),
+    iconBtn('edit', () => openKeyModal(site, k),
+      '编辑：名称、来源、密钥与截止日期'),
+    iconBtn('copy', () => copyKey(site.id, k.id, k.label || site.name),
+      '复制：把完整 Key 复制到剪贴板（列表里始终打码）'),
+    iconBtn('plug', () => openInjectModal(site, k),
+      '把这条密钥写进 Qoder / WorkBuddy 的自定义模型配置（写入前自动备份，可逐条撤掉）'),
+    iconBtn('trash', async () => {
+      if (await askConfirm(
+        `删除这条密钥后，正在用它发请求的程序会失败，也无法再查看或修改这条密钥。\n同站点其它密钥不受影响。`,
+        { danger: true, okText: '删除', title: `删除密钥${k.label ? ` · ${k.label}` : ''}` })) {
+        run('key_delete_key', { site: site.id, id: k.id });
+      }
+    }, '删除：删掉这条密钥，同站点其它密钥不受影响'));
+}
+function patchKeyAct(siteId, keyId) {
+  const site = (S.data?.keys || []).find((p) => p.id === siteId);
+  const k = site && (site.keys || []).find((x) => x.id === keyId);
+  const cell = document.querySelector(`#keysites td[data-kat="${CSS.escape(`${siteId}|${keyId}`)}"]`);
+  if (!site || !k || !cell) return false;
+  const td = keyActTd(site, k);
+  const dot = dragDot('按住拖动，调整这条密钥在站点内的顺序');
+  td.appendChild(dot);
+  cell.replaceWith(td);
+  // 行还在原位，dropZone 的监听跟着 tr 没丢；dragstart 因 __dragwired 也不会叠
+  attachDrag(dot, td.parentNode, { kind: 'key', site: site.id, id: k.id });
+  return true;
+}
 async function keyTest(site, id) {
   const sig = `${site}|${id}`;
   if (KEY_TESTING.has(sig)) { toast('上一条还没测完（站点不通时要等满 10 秒），稍等', false); return; }
   KEY_TESTING.add(sig);
-  renderKeyList(S.data);
+  if (!patchKeyAct(site, id)) renderKeys(S.data);   // 表没展开、找不到那一格 → 退整表（走护栏）
   try {
     await run('key_test', { site, id });
   } finally {
     KEY_TESTING.delete(sig);
-    renderKeyList(S.data);
+    if (!patchKeyAct(site, id)) renderKeys(S.data);
   }
 }
 function iconBtn(act, handler, title) {
@@ -143,6 +179,47 @@ function iconBtn(act, handler, title) {
   return b;
 }
 function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+/* ---------------- 整块重建的滚动护栏 ----------------
+   推倒重建的老毛病：clear() 一执行 scrollHeight 当场塌掉，浏览器立刻把 scrollTop
+   夹小，还会顺手把滚动锚定的锚点节点一起销毁——内容回来时没人放回原位，
+   表现就是"点个按钮，整页往上错一截，得手动滚回去"。
+   两道一起上：
+     ① 重建完立刻按原 scrollTop 放回去；
+     ② 下一帧再核一次——布局是在本任务结束后才算完，旧版 WebView2 会在这之后
+        再夹一次，只设一次不够。
+   fn 必须是同步的（里面有 await 就拆成两次调用，护栏不跨任务）。 */
+function restoreScroll(box, top) {
+  if (!box) return;
+  if (Math.abs(box.scrollTop - top) > 0.5) box.scrollTop = top;
+  if (top > 0) {
+    requestAnimationFrame(() => {
+      if (Math.abs(box.scrollTop - top) > 0.5) box.scrollTop = top;
+    });
+  }
+}
+function keepScroll(box, fn) {
+  if (!box) return fn();
+  const top = box.scrollTop;
+  try {
+    return fn();
+  } finally {
+    restoreScroll(box, top);
+  }
+}
+
+/* 这一页真正在滚的容器。带 .setlayout 的页（密钥 / 反代 / 设置）把 .pagebody
+   锁成 overflow-y:hidden，滚的是右栏 .setbody；账号库、首页滚的是 .pagebody。
+   拿错容器等于保持了个 0——`rerenderProxy` 早先在「模型反代」页就是这么空转的。 */
+function scrollerIn(view) {
+  const root = $(`view-${view}`);
+  if (!root) return null;
+  for (const sel of ['.setbody', '.pagebody']) {
+    const el0 = root.querySelector(sel);
+    if (el0 && el0.scrollHeight > el0.clientHeight + 1) return el0;
+  }
+  return root.querySelector('.setbody') || root.querySelector('.pagebody');
+}
 
 /* ---------------- 内置品牌图标 ----------------
    CLI（Codex / Claude Code）与独立客户端（ChatGPT 桌面版）没有 exe 可供后端提取图标，
@@ -191,10 +268,8 @@ function builtinIcon(a) {
   return '';
 }
 
-/* ---------------- 行内问号提示 ----------------
-   设置项的长说明从行里收进 label 旁的问号圈：悬停即看、单击钉住（再点/点别处/Esc/滚动收掉）。
-   气泡 fixed 挂 body 手动定位——设置面板与浮窗都是 overflow 滚动容器，absolute 会被裁。 */
-const DESC_INLINE_MAX = 0;   // 行内不再摆说明文字：所有说明都收进问号（悬停/单击看全文）
+/* 说明按需查看。远程控制页由另一项任务维护，保留其现有行内说明。 */
+const DESC_INLINE_MAX = 120;
 let qtipEl = null;
 let qtipAnchor = null;        // 被单击钉住的那个问号；null = 当前只是悬停态
 function qtipShow(anchor, text, pin) {
@@ -218,9 +293,11 @@ function qtipHide() {
   if (qtipEl) { qtipEl.remove(); qtipEl = null; }
 }
 function qhelp(text) {
-  const s = el('span', { class: 'qhelp', role: 'note', tabindex: '0', aria: { label: `说明：${text}` } }, '?');
+  const s = el('button', { class: 'qhelp', type: 'button', aria: { label: `说明：${text}` } }, '?');
   s.addEventListener('mouseenter', () => { if (qtipAnchor !== s) qtipShow(s, text, false); });
   s.addEventListener('mouseleave', () => { if (!qtipAnchor) qtipHide(); });
+  s.addEventListener('focus', () => { if (qtipAnchor !== s) qtipShow(s, text, false); });
+  s.addEventListener('blur', () => { if (!qtipAnchor) qtipHide(); });
   s.addEventListener('click', (e) => {
     e.stopPropagation();
     if (qtipAnchor === s) qtipHide();
@@ -391,8 +468,10 @@ function editingIn(sel) {
   return !!(a && host && host.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
 }
 
-// 账号库整页重建会跳回页顶，记着"同一个产品"才把滚动位置还回去
+// 账号库整页重建会跳回页顶，记着"同一个产品"才把滚动位置还回去；
+// 切到别的 Agent 再切回来也一样——每个 Agent 各记一份，只放在内存里，重启即清零
 let agentsKey = '';
+const agentScrolls = new Map();
 
 function render() {
   const d = S.data;
@@ -415,16 +494,29 @@ function render() {
     // 卡片/福利/进程这三块每轮都整块重建：清空的那一瞬间 scrollHeight 没了，
     // 浏览器把 scrollTop 夹回 0——看起来就是"点一下按钮，整个页面跳回最上面"（4 秒轮询同样会跳）
     const pb = document.querySelector('#view-agents .pagebody');
-    const keep = pb ? pb.scrollTop : 0;
-    const sameApp = agentsKey === `${S.view}|${S.cur}`;
+    if (pb && agentsKey) agentScrolls.set(agentsKey, pb.scrollTop);
     agentsKey = `${S.view}|${S.cur}`;
-    renderToolbar(d); renderCards(d); renderAgentProxy(d); renderPerks(d); renderProcs(d);
-    if (pb) pb.scrollTop = sameApp ? keep : 0;
+    const restore = agentScrolls.get(agentsKey) || 0;
+    renderToolbar(d);
+    // 卡片正在拖拽时别重建：整块 clear 会把被拖的卡和目标提示一起抹掉
+    if (!cardDrag) renderCards(d);
+    renderPerks(d); renderProcs(d);
+    // 反代面板里挂着模型下拉：下拉弹层开着时（焦点停在 select 上）整块重建会
+    // 把 <select> 从 DOM 里拔掉，WebView2 立刻收起弹层——就是"还没选它自己闪没"。
+    // 焦点在面板里就跳过这一拍，选完或点到别处，下一拍自动恢复。
+    if (!editingIn('#agent-proxy')) renderAgentProxy(d);
+    if (pb) restoreScroll(pb, restore);
   }
-  if (S.view === 'proxy') renderProxyPage(d);
-  if (S.view === 'keys') renderKeys(d);
+  // 反代页整页重建，4 秒轮询每拍都走一次：不套护栏就 4 秒跳一次
+  if (S.view === 'proxy') keepScroll(scrollerIn('proxy'), () => renderProxyPage(d));
+  // 远程控制同理：二维码和设备列表每拍都可能变
+  if (S.view === 'remote') keepScroll(scrollerIn('remote'), () => renderRemotePage());
+  // 密钥页批量条里有「挪到哪个站点」下拉，同一类问题：焦点在列表里就别整块重建
+  if (S.view === 'keys' && !editingIn('#keysites')) renderKeys(d);
   if (S.view === 'checkin') { renderCheckin(); loadCheckin(false); }
-  if (S.view === 'settings' && !editingIn('#set-body')) renderSettings();
+  // 设置页 4 秒轮询整块重建；侧导菜单拖拽中绝不能重建——面板一换，
+  // 落点线和被拖的行当场消失，用户看到的就是"拖到一半没反应"
+  if (S.view === 'settings' && !editingIn('#set-body') && !seDrag) renderSettings();
   // 账号设置浮窗开着时跟着轮询刷新状态；有未保存改动或光标还在框里就不重绘
   if (S.detail && !S.detail.dirty && !editingIn('#im-body')) renderDetail();
   // 积分明细弹层：只在真的又读了一次数之后重绘。每 4 秒重建 60 多行会把滚动位置顶回顶部
@@ -565,7 +657,7 @@ function renderNav(d) {
     // 只有"有窗口"才算这个程序开着：后台驻留的进程不该让侧栏亮绿灯
     const running = d.instances.some((i) => i.app === a.id && i.running)
       || d.procs.some((p) => p.app_id === a.id && (p.windows ?? 1) > 0);
-    const cap = a.kind === 'cli' ? '终端' : (a.isolatable ? '可多开' : '仅换号');
+    const cap = a.id === 'claude-desktop' ? '桌面客户端' : a.kind === 'cli' ? '终端' : (a.isolatable ? '可多开' : '仅换号');
     // 「现在用的是哪个号」：共用一份档案的产品以客户端登录态为准（磁盘换号记录不随登录变化）；
     // 只有这个产品压根没有本机直读通道、登录态读不到时，才退回按档案认领关系标。
     const mv = (a.machine && a.machine.value) || {};
@@ -611,8 +703,8 @@ function renderNav(d) {
             ? `档案目录还指向已删除的账号「${a.swapped}」，点进该程序用「还原默认档案」修好`
             : `${cur.tag}：${cur.name}`,
         }, `⇄${cur.name || a.swapped}`) : null,
-        el('span', { class: `cap ${a.isolatable ? 'yes' : (a.kind === 'cli' ? 'cli' : 'no')}`, title: cap },
-          a.isolatable ? '多开' : (a.kind === 'cli' ? '终端' : '换号'))));
+        el('span', { class: `cap ${a.id === 'claude-desktop' ? 'cli' : a.isolatable ? 'yes' : (a.kind === 'cli' ? 'cli' : 'no')}`, title: cap },
+          a.id === 'claude-desktop' ? '客户端' : a.isolatable ? '多开' : (a.kind === 'cli' ? '终端' : '换号'))));
     b.addEventListener('click', () => {
       if (dragMoved) { dragMoved = false; return; }   // 刚拖完别顺手选中这一项
       S.view = 'agents';
@@ -629,7 +721,7 @@ function renderNav(d) {
     ul.appendChild(el('li', {}, b));
   }
   renderViewlist();   // 下半截 首页/更多/设置 也跟着 settings 每轮重画
-  if (box) box.scrollTop = keep;
+  if (box) restoreScroll(box, keep);
 }
 
 /* 侧栏拖动排序：按住某一项往上/下拖，亮线表示"插在这一项上面/下面"，松手先就地重排
@@ -700,7 +792,7 @@ function applyNavSort(fromId, toId, after) {
 
 /* 视图切换只换右栏内容：每页自己分「左菜单 + 右内容」，标题栏固定不滚 */
 function renderViews() {
-  for (const v of ['home', 'agents', 'collab', 'keys', 'proxy', 'checkin', 'settings']) {
+  for (const v of ['home', 'agents', 'collab', 'keys', 'proxy', 'remote', 'checkin', 'settings']) {
     $(`view-${v}`).hidden = S.view !== v;
   }
 }
@@ -800,7 +892,7 @@ function renderHome(d) {
   const hero = el('div', { class: 'hhero' },
     el('div', { class: 'hhero-t' },
       el('h2', {}, '今天要处理的事'),
-      el('p', { class: 'hhero-sub' }, todo.length ? todo.join(' · ') : '暂时没有要处理的，都挺干净')),
+      el('p', { class: 'hhero-sub' }, todo.length ? todo.join(' · ') : '暂无待办')),
     el('div', { class: 'hhero-b' },
       btn(running ? '↻ 正在刷新…' : '↻ 一键刷新全部额度', 'primary lg', () => refreshAllQuota(),
         '把每个账号的额度读一遍：能走官网读逐包明细，读不到退本机/服务端汇总。'
@@ -862,7 +954,7 @@ function renderHome(d) {
   host.appendChild(el('section', { class: 'panel' },
     el('header', { class: 'panelhead' },
       el('h2', {}, '按 Agent 看余额'),
-      el('span', { class: 'sub' }, '同一 Agent 内才相加；只列读得到余额的 Agent')),
+      qhelp('按产品汇总可读取的余额，不跨产品或计量单位相加。')),
     balances.length
       ? el('div', { class: 'tablewrap' }, btable)
       : el('p', { class: 'qempty' }, '还没有读到可比较的余额；先点上方「一键刷新全部额度」。')));
@@ -871,7 +963,7 @@ function renderHome(d) {
   const cols = el('div', { class: 'hcols' });
   const acard = el('section', { class: 'panel' },
     el('header', { class: 'panelhead' }, el('h2', {}, '临期积分'),
-      el('span', { class: 'sub' }, alerts.length ? '点一行进它的账号页' : '30 天内没有到期的')),
+      alerts.length ? null : el('span', { class: 'sub' }, '30 天内无到期额度')),
     el('div', { class: 'hlist' },
       ...(alerts.length
         ? alerts.slice(0, 8).map((a) => el('button', {
@@ -914,8 +1006,8 @@ function renderHome(d) {
     const ci = insts.map((i) => i.checkin).find((c) => c && c.state);
     const tags = [
       run ? '运行中' : '未运行',
-      insts.length ? `${insts.length} 个账号` : '还没有账号',
-      a.isolatable ? '可多开' : (a.shared_profile ? '共用一份档案' : '仅可换号'),
+      a.id === 'claude-desktop' ? '' : insts.length ? `${insts.length} 个账号` : '还没有账号',
+      a.id === 'claude-desktop' ? '桌面客户端' : a.isolatable ? '可多开' : (a.shared_profile ? '共用一份档案' : '仅可换号'),
       logged ? `当前：${logged}` : '',
       aAlerts ? `${aAlerts} 笔临期` : '',
       ci ? `签到：${ciWord[ci.state] || '状态未知'}${ci.reward != null ? ` · 每日 ${ci.reward}` : ''}` : '',
@@ -934,7 +1026,7 @@ function renderHome(d) {
   if (log.length) {
     host.appendChild(el('section', { class: 'panel' },
       el('header', { class: 'panelhead' }, el('h2', {}, '最近领过的'),
-        el('span', { class: 'sub' }, '只记本机动作，不联网')),
+        qhelp('仅记录本机领取操作。')),
       el('div', { class: 'hlog' }, ...log.map((x) => {
         const t = ciLogTone(x);
         const cls = t.cls === 'ok' ? 'hlog-ok' : t.cls === 'mid' ? 'hlog-mid' : 'hlog-no';
@@ -944,7 +1036,7 @@ function renderHome(d) {
       }))));
   }
 
-  if (pb) pb.scrollTop = keep;
+  if (pb) restoreScroll(pb, keep);
 }
 
 /* 一键刷新全部额度：后端起后台任务，这里只管点火 + 提示，进度靠 4 秒轮询自己长出来 */
@@ -1377,10 +1469,6 @@ function renderCheckin() {
   S.checkinAuto = S.checkinAuto || st.auto || {};
   S.checkinMute = S.checkinMute || st.remind_mute || {};
   S.checkinEnabled = st.enabled;
-  host.appendChild(el('div', { class: 'hintline' },
-    el('span', {}, '查状态只读；'),
-    el('b', {}, '领取是写操作'),
-    el('span', {}, '，领走的当日名额退不回来。')));
   const bar = el('div', { class: 'cibar' },
     el('label', { class: 'cisw' }, (() => {
       const cb = el('input', { type: 'checkbox' });
@@ -1479,7 +1567,7 @@ function renderCheckin() {
   // 所以后端保留 2000 条（每天十来条，够一年），界面按天筛——不再压成"最近 6 条"。
   host.appendChild(ciLogPanel(d));
   if (today) host.appendChild(el('div', { class: 'cihint' }, `厂商侧的「今天」按本机日期算：${today}`));
-  if (pb) pb.scrollTop = keep;
+  if (pb) restoreScroll(pb, keep);
 }
 
 /* 本地日期串 YYYY-MM-DD：和后端 agenthub 报的 `today` / 日志里的 `at` 同一格式，
@@ -1633,8 +1721,9 @@ function renderToolbar(d) {
   clear(cap); clear(hint);
   if (!app) { cap.hidden = true; hint.hidden = true; return; }
   cap.hidden = false;
-  cap.className = `pill ${app.isolatable ? 'yes' : 'no'}`;
-  cap.append(app.isolatable ? '可多开' : (app.shared_profile ? '账号共用一份档案' : '仅可换号'));
+  cap.className = app.id === 'claude-desktop' ? 'pill' : `pill ${app.isolatable ? 'yes' : 'no'}`;
+  cap.title = '';
+  cap.append(app.id === 'claude-desktop' ? '桌面客户端' : app.id === 'zcode' || app.id === 'antigravity' ? '共享对话，可切换' : app.isolatable ? '可多开' : (app.shared_profile ? '账号共用一份档案' : '仅可换号'));
   hint.hidden = false;
   const forget = $('btn-forget');
   if (forget) forget.hidden = !(app.removed);
@@ -1642,8 +1731,14 @@ function renderToolbar(d) {
     hint.append(app.removed
       ? '可执行文件已不存在；记录保留，可点右上「清理记录」移除。'
       : '未找到可执行文件，无法启动；已卸载可从列表忽略。');
+  } else if (app.id === 'claude-desktop') {
+    cap.title = 'Cowork 与 Code 的登录和会话由 Claude 管理。';
   } else if (app.isolatable) {
     // 「可多开」徽章已经说清了，不再摆整段说明
+  } else if (app.id === 'zcode') {
+    cap.title = 'BigModel 与 Z.ai 独立保存凭据，共用本机对话。切换需重启 ZCode。';
+  } else if (app.id === 'antigravity') {
+    cap.title = 'Google 账号授权后凭据写入系统凭据库，共用本机对话。切换需重启 Antigravity。';
   } else if (app.shared_profile) {
     // 徽章自己写着「账号共用一份档案」，这里不再补一句废话；细节收进徽章的悬停
     cap.title = app.auth_switch
@@ -1693,8 +1788,9 @@ function renderToolbar(d) {
   hint.hidden = !hint.childNodes.length;
   const nb = $('btn-new');
   clear(nb);
-  nb.append('＋ 添加账号');
-  nb.title = '为这个程序再加一个账号档案；向导会带你完成建目录、登录、读额度';
+  nb.append(app.id === 'claude-desktop' ? '打开客户端' : '＋ 添加账号');
+  nb.title = app.id === 'claude-desktop' ? '打开已安装的 Claude 桌面客户端' : '为这个程序再加一个账号档案；向导会带你完成建目录、登录、读额度';
+  nb.disabled = app.id === 'claude-desktop' && !app.installed;
 }
 
 // 服务端读不成、只剩客户端旧缓存时（典型：Qoder 登录令牌过期，本地只剩 8 月的快照）：
@@ -2068,14 +2164,6 @@ function quotaBox(i) {
   }
   // 登录态是从哪个档案读的：Qoder 0.4.x 换壳后，读到旧档案就会是一份几个月前的旧账，
   // 把路径露出来，出问题时一眼能看出是"读错地方"还是"真没额度"
-  if (q.auth_from) {
-    const short = String(q.auth_from).split(/[\\/]/).slice(-3).join('\\');
-    box.appendChild(el('div', { class: 'stamp ell', title: q.auth_from }, `登录档案 …\\${short}`));
-  }
-  // 账号名可能很长（邮箱带用户名），单独一行并截断，别把上一行挤爆
-  if (q.local_account) {
-    box.appendChild(el('div', { class: 'stamp ell', title: q.local_account }, `本机账号 ${q.local_account}`));
-  }
   return box;
 }
 
@@ -2301,7 +2389,7 @@ function trendCharts(q) {
         + `${nfmt(picked.v)} ${utxt(s.unit)}`
         + (picked.v <= 0 ? ' · 那天没有消耗记录'
           : s.hasSessions && picked.n ? ` · ${picked.n} 场会话` : ''))
-      : el('span', { class: 'trhint' }, '点曲线或方格上的任意一天，这里会钉住那天的消耗'));
+      : qhelp('选择日期查看当日消耗。'));
   if (picked) {
     const cl = el('button', { type: 'button', class: 'tchip' }, '清除');
     cl.addEventListener('click', () => { S.trendSel = ''; renderDetail(); });
@@ -2511,6 +2599,25 @@ function renderQuotaDetail() {
 }
 
 function identLine(i) {
+  if (i.app === 'zcode') {
+    const auth = i.zcode_auth || {};
+    const state = auth.auth_status === 'locked' ? '保管箱未解锁' : auth.has_auth ? '登录已保存' : '需要登录';
+    return el('div', { class: `ident ${auth.has_auth ? 'logged' : 'none'}` },
+      `${zcodeProvider(auth.provider)} · ${auth.account || i.name} · ${state}`);
+  }
+  if (i.app === 'antigravity') {
+    const auth = i.antigravity_auth || {};
+    const state = auth.auth_status === 'locked' ? '保管箱未解锁' : auth.ready ? '登录已保存' : '需要登录';
+    return el('div', { class: `ident ${auth.ready ? 'logged' : 'none'}` },
+      `${auth.account || i.name} · ${state}`);
+  }
+  if (i.app === 'codex-desktop' && i.chatgpt_auth) {
+    const auth = i.chatgpt_auth;
+    const label = auth.has_auth
+      ? auth.mode === 'apikey' ? `API Key 登录${auth.base_url ? ' · ' + auth.base_url : ''}` : `ChatGPT 登录${auth.account ? ' · ' + auth.account : ''}`
+      : '尚未保存这个账号的登录凭据';
+    return el('div', { class: `ident ${auth.has_auth ? 'logged' : 'none'}` }, label);
+  }
   const id = i.identity || { state: 'none', label: '' };
   return el('div', { class: `ident ${id.state}` }, id.label);
 }
@@ -2531,6 +2638,7 @@ function accountMark(i, app, shared) {
 // 卡片上的数属于谁 ≠ 本机现在登的是谁。以前不一致时后端直接把新读数挡回去，
 // 界面就永远停在旧号身上，看起来像"刷新坏了"。现在把这件事写在卡片上并给出动作。
 function mismatchLine(i, app) {
+  if (i.app === 'zcode' || i.app === 'antigravity') return null;
   const q = i.quota || {};
   if (!q.bound_mismatch) return null;
   const mv = (app && app.machine && app.machine.value) || {};
@@ -2557,6 +2665,23 @@ function mismatchLine(i, app) {
   return n;
 }
 
+/* 卡片顺序：每个产品一份，存在本机（localStorage）。
+   后端给的 instances 顺序是"扫描出来的顺序"，不该被界面的手工排序污染；
+   这份表只记名字，认不出来的名字自动忽略（账号删了不会留坑）。 */
+function cardOrder(app) {
+  try {
+    const m = JSON.parse(localStorage.getItem('cockpit-card-order') || '{}');
+    return Array.isArray(m[app]) ? m[app] : [];
+  } catch (_) { return []; }
+}
+function saveCardOrder(app, names) {
+  try {
+    const m = JSON.parse(localStorage.getItem('cockpit-card-order') || '{}');
+    m[app] = names;
+    localStorage.setItem('cockpit-card-order', JSON.stringify(m));
+  } catch (_) {}
+}
+
 function renderCards(d) {
   const app = d.apps.find((a) => a.id === S.cur);
   const wrap = $('cards');
@@ -2566,13 +2691,112 @@ function renderCards(d) {
   for (const msg of (d.selfcheck || [])) {
     wrap.appendChild(el('div', { class: 'hintline' }, '启动体检 · ' + msg));
   }
+  if (app?.id === 'claude-desktop') {
+    wrap.appendChild(claudeDesktopPanel(app));
+    return;
+  }
   const list = d.instances.filter((i) => i.app === S.cur);
   if (!list.length) {
     wrap.appendChild(el('div', { class: 'empty' },
       '还没有账号　点右上「＋ 添加账号」'));
     return;
   }
-  for (const i of list) wrap.appendChild(card(i, app));
+  // 按存下来的手工顺序排；不在表里的（新加的账号）排最后，保持后端给的先后
+  const order = cardOrder(S.cur);
+  if (order.length) {
+    const pos = new Map(order.map((n, k) => [n, k]));
+    const at = (n) => (pos.has(n) ? pos.get(n) : 1e9);
+    list.sort((a, b) => at(a.name) - at(b.name));
+  }
+  const names = list.map((i) => i.name);
+  for (const i of list) {
+    const node = card(i, app);
+    startCardDrag(node, i, names);
+    wrap.appendChild(node);
+  }
+}
+
+function claudeDesktopPanel(app) {
+  const path = String(app.native_data_dir || '');
+  const open = btn('打开目录', 'sm', () => run('claude_desktop_open_data', { app: app.id }));
+  open.disabled = !path;
+  return el('section', { class: 'panel', data: { product: 'claude-desktop' } },
+    el('div', { class: 'panelhead' }, el('h2', {}, 'Claude 桌面版'),
+      qhelp('包含 Cowork 与 Code。登录、配置和会话由 Claude 客户端管理。')),
+    el('div', { class: 'cpt-location' },
+      el('h3', {}, '资料位置'),
+      path ? el('code', { class: 'cpt-path' }, path) : el('span', {}, '未找到资料位置'),
+      el('div', { class: 'cpt-actions' }, open)));
+}
+
+/* 卡片拖拽排序：按住卡片空白处拖动（按在按钮/输入框/额度块上不算），
+   鼠标在目标卡左半区就插到它前面、右半区插到它后面，松手落盘。
+   和侧导菜单那套一样：拖的时候挂一个跟手的幽灵标签，目标位画一条竖线。
+   拖拽期间 render() 不重建卡片（否则卡片当场消失），落盘后自己重建一次。 */
+let cardDrag = null;        // 拖拽中 = 被拖的账号名
+let cardDragEndAt = 0;      // 刚松手的那一下别再被当成点击打开账号设置
+
+function startCardDrag(node, inst, names) {
+  node.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest('button, input, select, textarea, a, .jump')) return;
+    // 按下就占住：4 秒轮询正好撞上按下到第一次移动之间时，会整块重建卡片，
+    // 之后 dragging 就加在一个已经脱离文档的旧节点上——看着像"没在拖"
+    cardDrag = inst.name;
+    const sx = e.clientX, sy = e.clientY;
+    let live = false;
+    let target = null;
+    let ghost = null;
+    const clearMarks = () => {
+      $('cards')?.querySelectorAll('.card').forEach((c) =>
+        c.classList.remove('drop-before', 'drop-after'));
+    };
+    const move = (ev) => {
+      if (!live) {
+        if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 6) return;   // 还在点，不是在拖
+        live = true;
+        node.classList.add('dragging');
+        document.body.classList.add('card-dragging');
+        ghost = el('div', { class: 'se-ghost' }, el('span', {}, inst.name));
+        document.body.appendChild(ghost);
+      }
+      ev.preventDefault();
+      ghost.style.left = `${ev.clientX + 16}px`;
+      ghost.style.top = `${ev.clientY - 34}px`;
+      clearMarks();
+      target = null;
+      const under = document.elementFromPoint(ev.clientX, ev.clientY);
+      const over = under && under.closest && under.closest('.card');
+      if (!over || over === node) return;
+      const r = over.getBoundingClientRect();
+      const after = ev.clientX > r.left + r.width / 2;
+      over.classList.add(after ? 'drop-after' : 'drop-before');
+      target = { name: over.dataset.name, after };
+    };
+    const up = () => {
+      document.removeEventListener('pointermove', move, true);
+      document.removeEventListener('pointerup', up, true);
+      document.removeEventListener('pointercancel', up, true);
+      clearMarks();
+      if (ghost) ghost.remove();
+      node.classList.remove('dragging');
+      document.body.classList.remove('card-dragging');
+      cardDrag = null;
+      if (!live) return;                 // 没动过：交给原来的 click 打开账号设置
+      cardDragEndAt = Date.now();
+      if (!target) { renderCards(S.data); return; }
+      const next = names.filter((n) => n !== inst.name);
+      let to = next.indexOf(target.name);
+      if (to < 0) to = next.length;
+      if (target.after) to += 1;
+      next.splice(to, 0, inst.name);
+      saveCardOrder(inst.app, next);
+      renderCards(S.data);
+    };
+    document.addEventListener('pointermove', move, true);
+    document.addEventListener('pointerup', up, true);
+    document.addEventListener('pointercancel', up, true);
+  });
 }
 
 // 数据来源标签：这个账号打开时会不会带着你原来的对话与记忆
@@ -2582,6 +2806,14 @@ const ORIGIN_LABEL = {
   fresh: '全新（无历史）',
 };
 function originText(i) {
+  if (i.app === 'codex-desktop' && i.chatgpt_auth) {
+    const auth = i.chatgpt_auth, history = auth.history_snapshot;
+    if (auth.native) return '沿用本机原有档案';
+    if (history?.threads > 0) return `已保留 ${history.threads} 条对话索引${history.projects ? '、' + history.projects + ' 个项目' : ''}${history.missing_archived_rollouts ? ' · ' + history.missing_archived_rollouts + ' 条归档的原文件已缺失' : ''}`;
+    if (history?.preserved_existing) return '保留这个账号已有历史';
+    if (auth.history_mode === 'copy') return '已复制已有对话和项目快照';
+    return '独立账号，空白历史';
+  }
   if (!i.origin) return '';
   const t = ORIGIN_LABEL[i.origin] || i.origin;
   const from = i.seeded_from
@@ -2606,7 +2838,15 @@ function card(i, app) {
   // 「窗口都关了、进程还挂着」不算开着：Electron 的主进程被结束后，崩溃上报那类子进程
   // 还会在进程表里赖上一分钟左右，那期间把主按钮留在「■ 结束」上，看着就像按钮卡住了。
   let primary;
-  if (i.running) {
+  if (i.app === 'codex-desktop') {
+    primary = btn(i.running || i.resident ? '打开窗口' : '▶ 启动', 'primary sm',
+      () => run('chatgpt_show_window', { app: i.app, name: i.name }),
+      '打开这张卡片对应的账号窗口。窗口隐藏或关闭后也可恢复，不影响其他账号。');
+  } else if (i.app === 'zcode') {
+    primary = zcodeOpenButton(i);
+  } else if (i.app === 'antigravity') {
+    primary = antigravityOpenButton(i);
+  } else if (i.running) {
     primary = btn('■ 结束', 'sm', () => run('kill', { app: i.app, name: i.name }),
       canIso
         ? '只结束这个账号自己的窗口，不影响同程序其它实例；未保存的内容会被强制中断'
@@ -2642,7 +2882,7 @@ function card(i, app) {
   }
   // 次按钮：只有"现在是当前账号"才需要"还原默认"；可多开的产品才留「设为当前」。
   // 原地账号本来就是这台机器的默认档案，磁盘上没有让位备份可还原——摆这颗按钮只会骗人
-  const swapBtn = !app || !app.swap_ok || i.in_place ? null
+  const swapBtn = i.app === 'zcode' || !app || !app.swap_ok || i.in_place ? null
     : i.swapped
       ? btn('还原默认', 'danger sm', () => run('swap_clear', { app: i.app }),
         '默认入口换回你的原档案（需先关掉程序窗口）；账号目录保留，可随时再切回来')
@@ -2659,41 +2899,53 @@ function card(i, app) {
     : null;
   // 能多开的产品（ZCode 这类）主按钮留给「启动」，一键切号作为次按钮放在旁边：
   // 它们的登录态同样是全机一份，多开只是窗口多开，账号还是那一个
-  const jumpBtn = canIso && app && app.auth_switch && i.auth_pack && !i.logged_in
+  const jumpBtn = !['zcode', 'antigravity'].includes(i.app) && canIso && app && app.auth_switch && i.auth_pack && !i.logged_in
     ? btn('⇄ 切换到此账号', 'sm', () => authSwitch(i.app, i.name),
       `把「${i.name}」存过的登录态写回 ${i.app_name}，然后自动重开它。\n`
       + '登录态全机一份，多开窗口不多开账号；当前号的登录态写之前会先收好。')
     : null;
   // 残留进程只在真有残留的那一瞬出现：平时不占卡片位置，出现时正好是需要它的时刻
-  const reap = i.resident
+  const reap = i.app === 'zcode'
+    ? (i.resident && i.zcode_auth?.current ? btn('结束后台', 'sm', () => zcodeAction('kill', i.name)) : null)
+    : i.app === 'antigravity'
+    ? (i.running || i.resident ? btn(i.resident ? '结束后台' : '■ 结束', 'sm', () => antigravityAction('kill', i.name), '结束 Antigravity 进程。请先保存尚未完成的内容。') : null)
+    : i.app === 'codex-desktop'
+    ? (i.running || i.resident ? btn(i.resident ? '结束后台' : '■ 结束', 'sm',
+      () => run('kill', { app: i.app, name: i.name }), '结束这个账号的进程。请先保存尚未完成的内容。') : null)
+    : i.resident
     ? btn(`■ 清残留 ×${i.procs}`, 'sm', () => run('kill', { app: i.app, name: i.name }),
       '窗口已关但这几个进程还挂着，会挡住换号和改名；要立刻腾出来就点这一下')
     : null;
-  const detail = btn('账号设置 ⚙', 'sm', () => openDetail(i.app, i.name),
-    '账号信息 / 额度与用量 / 运行与换号 / 目录与数据 / 凭据与反代 / 删除账号');
+  const detail = btn('账号设置 ⚙', 'sm', () => openDetail(i.app, i.name), i.app === 'codex-desktop'
+    ? '概览 / 额度与用量 / 运行管理 / 对话与项目 / 文件位置 / 登录管理'
+    : '账号信息 / 额度与用量 / 运行与换号 / 目录与数据 / 凭据与反代 / 删除账号');
   // 删除放在这一行最外侧：它属于"整个账号"的级别，不该藏在设置里绕一圈
-  const delBtn = btn('删除', 'sm del', () => del(i.app, i.name), '删掉这个账号的数据目录（含登录状态）。删除前会自动打一个 zip 备份');
+  const delBtn = i.app === 'codex-desktop' ? null : i.app === 'zcode' || i.app === 'antigravity'
+    ? btn('移除', 'sm del', () => del(i.app, i.name), '仅移除卡片，保留登录凭据和本机数据。')
+    : btn('删除', 'sm del', () => del(i.app, i.name), '删除账号及其数据目录，操作前备份。');
 
   // 额度那一块单独可点：它讲的是"还剩多少、什么时候作废"，点它就该直接落到额度页，
   // 不用先落在设置首页再去左边找分组
-  const qbox = quotaBox(i);
+  const qbox = i.app === 'codex-desktop' ? chatgptQuotaPanel(i, { compact: true })
+    : i.app === 'zcode' ? zcodeQuotaPanel(i, { compact: true }) : quotaBox(i);
   qbox.classList.add('jump');
-  qbox.setAttribute('title', '看每一档额度的逐笔到期明细');
+  qbox.setAttribute('title', i.app === 'codex-desktop' ? '查看这个账号的额度与用量' : '看每一档额度的逐笔到期明细');
   qbox.addEventListener('click', (e) => {
     e.stopPropagation();
-    openDetail(i.app, i.name, 'quota');
+    if (!e.target.closest('button')) openDetail(i.app, i.name, 'quota');
   });
-  const node = el('div', { class: `card${i.running ? ' running' : (i.resident ? ' resident' : '')}`, tabindex: 0, role: 'button',
-    'aria-label': `${i.name} 账号设置` },
+  const highlight = S.chatgptReveal?.app === i.app && S.chatgptReveal.name === i.name && S.chatgptReveal.until > Date.now();
+  const node = el('div', { class: `card${i.running ? ' running' : (i.resident ? ' resident' : '')}${highlight ? ' cpt-just-added' : ''}`, tabindex: 0, role: 'button', data: { app: i.app, name: i.name },
+    aria: { label: `${i.name} 账号设置` } },
     el('div', { class: 'top' },
       el('div', {},
-        el('div', { class: 'nm' }, i.name,
+        el('div', { class: 'nm' }, i.name.includes('@') ? el('span', { class: 'account-email' }, i.name) : i.name,
           accountMark(i, app, shared),
           checkinMark(i),
-          i.released && !i.logged_in ? el('span', { class: 'swapmark off' }, '已让位') : null),
+          i.app !== 'zcode' && i.app !== 'antigravity' && i.released && !i.logged_in ? el('span', { class: 'swapmark off' }, '已让位') : null),
         el('div', { class: 'meta' },
           `${i.app_name} · ${kindLabel(i.kind)} · 建于 ${i.created}`),
-        originText(i) ? el('div', { class: 'orig', title: i.seeded_from || '' }, originText(i)) : null,
+        !['codex-desktop', 'zcode', 'antigravity'].includes(i.app) && originText(i) ? el('div', { class: 'orig', title: i.seeded_from || '' }, originText(i)) : null,
         identLine(i),
         mismatchLine(i, app),
         i.usage && i.usage.total != null
@@ -2719,14 +2971,17 @@ function card(i, app) {
           : (i.resident ? `后台驻留 ×${i.procs}` : '未运行'))),
     qbox,
     el('div', { class: 'acts' },
-      el('div', { class: 'acts-main' }, primary, reap, jumpBtn, swapBtn, pull, detail),
+      el('div', { class: 'acts-main' }, primary, reap, jumpBtn, swapBtn, i.app === 'codex-desktop' ? null : pull, detail),
       delBtn));
-  // 卡片表头/空白处 = 账号设置首页；只有额度那块跳到额度页
+  // 卡片表头/空白处 = 账号设置首页；只有额度那块跳到额度页。
+  // 刚拖完卡片的那一下不算点击——否则拖到一半松手就弹开账号设置
   node.addEventListener('click', (e) => {
     if (e.target.closest('button')) return;
+    if (Date.now() - cardDragEndAt < 300) return;
     openDetail(i.app, i.name);
   });
   node.addEventListener('keydown', (e) => {
+    if (e.target !== node && e.target.closest('button,input,select,textarea')) return;
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(i.app, i.name); }
   });
   return node;
@@ -2765,13 +3020,16 @@ function perkForm(item) {
   const daily = el('input', { type: 'checkbox' });
   daily.checked = !!f.daily;
   daily.addEventListener('change', () => { f.daily = daily.checked; });
+  const endsInp = inp('ends_on', '2026-10-19', 'text');
+  endsInp.title = '这条福利的截止日期；勾了「每天重复」可以不填，列表里直接显示「每天」';
   return el('div', { class: 'perkform' },
     el('div', { class: 'prow' }, el('label', {}, '程序'), sel, el('label', {}, '标题'),
       inp('title', '如：每天免费用 Qwen3.8-Max-Preview')),
-    el('div', { class: 'prow' }, el('label', {}, '备注'),
+    el('div', { class: 'prow' }, el('label', {}, '内容'),
       inp('detail', '如：0 倍率 · 每天 00:05 重置额度'),
-      el('label', {}, '到期日'), inp('ends_on', '2026-10-19', 'text'),
-      el('label', { class: 'chk' }, daily, '每天重复'),
+      el('label', {}, '到期日'), endsInp,
+      el('label', { class: 'chk', title: '勾上＝这条福利每天都可用（如每日赠送额度），列表里显示「每天」；不勾就按到期日算还剩几天，过期自动收起' },
+        daily, '每天重复'),
       el('label', {}, '出处'), inp('url', 'https://… 可选')),
     el('div', { class: 'prow' },
       el('span', { class: 'kv' }, '截图识别：这个表单开着时按 Ctrl+V 贴截图'),
@@ -2787,9 +3045,14 @@ function perkForm(item) {
 function renderPerks(d) {
   const host = $('perks-list');
   if (!host) return;
-  // 正在填表时 4 秒轮询别重绘，否则输入到一半的字会被吞掉
-  if (S.perkForm && host.querySelector('.perkform')) return;
+  // 正在填表时 4 秒轮询别重绘，否则输入到一半的字会被吞掉。
+  // 但"表单里是哪一条"变了必须重绘——否则开着「添加福利」去点某行的「编辑」，
+  // 会被这行护栏直接吃掉，看上去就是"编辑按钮点了没反应"。
+  const formSig = !S.perkForm ? ''
+    : (S.perkForm.item && S.perkForm.item.id ? `p:${S.perkForm.item.id}` : 'new');
+  if (S.perkForm && host.dataset.formsig === formSig && host.querySelector('.perkform')) return;
   clear(host);
+  host.dataset.formsig = formSig;
   const addBtn = btn('＋ 添加福利', S.perkForm ? 'sm' : 'primary sm',
     () => { S.perkForm = { item: null }; renderPerks(S.data); });
   const all = d.perks || [];
@@ -2797,21 +3060,41 @@ function renderPerks(d) {
   const dead = all.filter((p) => !p.live);
   const rank = (p) => (p.app === S.cur ? 0 : 1);
   live.sort((a, b) => rank(a) - rank(b) || (a.days_left ?? 9e9) - (b.days_left ?? 9e9));
-  const line = (p, dim) => el('div', { class: `perk${dim ? ' dim' : ''}` },
-    el('span', { class: 'pag' }, p.app_name || '通用'),
-    el('b', {}, p.title),
-    p.detail ? el('span', { class: 'pd' }, p.detail) : null,
-    p.url ? el('a', { href: p.url, target: '_blank', rel: 'noreferrer' }, '出处') : null,
-    el('span', { class: 'pspacer' }),
-    el('span', { class: dim ? 'exp danger' : 'exp' }, !p.live
-      ? '已过期'
-      : p.daily ? '每天' : p.days_left != null ? `还剩 ${p.days_left} 天` : (p.ends_on ? dtxt(p.ends_on) : '长期')),
-    btn('编辑', 'sm', () => { S.perkForm = { item: p }; renderPerks(S.data); }),
-    btn('删除', 'sm', async () => {
-      if (!await askConfirm(`删掉这条福利「${p.title}」？`, { danger: true, okText: '删除' })) return;
-      S.perkForm = null;
-      run('perk_delete', { id: p.id });
-    }));
+  // 每条福利两行：第一行「徽章 + 黑色标题 …… 还剩多久 + 编辑/删除」，
+  // 第二行是内容（原「备注」），左边和标题对齐、占满整行宽度，随便换行。
+  // 右段整块 flex:none——窗口再窄也不许把"还剩 4 天"压成竖排。
+  const expText = (p) => (!p.live
+    ? '已过期'
+    : p.daily ? '每天' : p.days_left != null ? `还剩 ${p.days_left} 天` : (p.ends_on ? dtxt(p.ends_on) : '长期'));
+  const expTip = (p) => {
+    const bits = [];
+    if (!p.live) bits.push('已过期，自动收起');
+    if (p.daily) bits.push('每天重复');
+    if (p.ends_on) bits.push(`到期日 ${dtxt(p.ends_on)}`);
+    if (p.live && p.days_left != null) bits.push(`还剩 ${p.days_left} 天`);
+    return bits.join(' · ') || '没登记到期日';
+  };
+  const line = (p, dim) => {
+    // 没有内容也没有出处就不占第二行，行高跟只有标题时一样
+    const body = (p.detail || p.url)
+      ? el('div', { class: 'pbody' },
+        p.detail ? el('span', { class: 'pd', title: p.detail }, p.detail) : null,
+        p.url ? el('a', { href: p.url, target: '_blank', rel: 'noreferrer', title: p.url }, '出处') : null)
+      : null;
+    return el('div', { class: `perk${dim ? ' dim' : ''}` },
+      el('div', { class: 'pmain' },
+        el('span', { class: 'pag' }, p.app_name || '通用'),
+        el('b', { title: p.title }, p.title),
+        body),
+      el('div', { class: 'pright' },
+        el('span', { class: dim ? 'exp danger' : 'exp', title: expTip(p) }, expText(p)),
+        btn('编辑', 'sm', () => { S.perkForm = { item: p }; renderPerks(S.data); }),
+        btn('删除', 'sm', async () => {
+          if (!await askConfirm(`删掉这条福利「${p.title}」？`, { danger: true, okText: '删除' })) return;
+          S.perkForm = null;
+          run('perk_delete', { id: p.id });
+        })));
+  };
   if (!all.length) {
     host.append(el('div', { class: 'perk-empty' },
       el('p', {}, '还没有记录'),
@@ -2861,6 +3144,9 @@ function proxyKind(appId) {
   if (appId === 'workbuddy' || appId === 'workbuddy-intl') return 'w';
   if (appId === 'opencode') return 'oc';
   if (appId === 'astudio') return 'a';
+  if (appId === 'minimax') return 'mm';
+  if (appId === 'qwenwork') return 'qw';
+  if (appId === 'catpaw') return 'paw';
   return '';
 }
 function pxState(appId) {
@@ -2906,6 +3192,55 @@ function pxIdsOwner(appId) { return PX_OWNER[appId] || appId; }
 async function loadAgentModelIds(appId) {
   const st = pxState(appId);
   if (st.idsLoading) return;
+  // 千问办公不向反代要清单：桥自己就有 /v1/models，反代没开也能列
+  if (appId === 'qwenwork') {
+    st.idsLoading = true;
+    replacePxIds(appId);
+    try {
+      const r = await invoke('action', { payload: { action: 'qwbridge_model_ids' } });
+      st.ids = r.ok
+        ? { models: r.models || [], count: r.count || 0 }
+        : { models: [], count: 0, note: r.msg || '桥没在跑，列不出模型' };
+    } catch (e) {
+      st.ids = { models: [], count: 0, error: String(e) };
+    }
+    st.idsLoading = false;
+    replacePxIds(appId);
+    return;
+  }
+  // 妙手同理：桥的 /v1/models 就是权威清单（管道通、闸门开才列得出来）
+  if (appId === 'catpaw') {
+    st.idsLoading = true;
+    replacePxIds(appId);
+    try {
+      const r = await invoke('action', { payload: { action: 'pawbridge_model_ids' } });
+      st.ids = r.ok
+        ? { models: r.models || [], count: r.count || 0 }
+        : { models: [], count: 0, note: r.msg || '桥没在跑，列不出模型' };
+    } catch (e) {
+      st.ids = { models: [], count: 0, error: String(e) };
+    }
+    st.idsLoading = false;
+    replacePxIds(appId);
+    return;
+  }
+  // OpenCode 同理：桥的 /v1/models 就是权威清单，不绕反代
+  if (appId === 'opencode') {
+    st.idsLoading = true;
+    replacePxIds(appId);
+    try {
+      if (!S.proxyPage.bridge) await loadOpenCodeModels(false);
+      const b = S.proxyPage.bridge || {};
+      st.ids = b.ok
+        ? { models: b.models || [], count: b.count || 0 }
+        : { models: [], count: 0, note: '本地桥没通：先启动 opencode-bridge' };
+    } catch (e) {
+      st.ids = { models: [], count: 0, error: String(e) };
+    }
+    st.idsLoading = false;
+    replacePxIds(appId);
+    return;
+  }
   st.idsLoading = true;
   replacePxIds(appId);
   try {
@@ -2988,7 +3323,7 @@ function pxTestLine(st) {
   if (t.provider) bits.push(`provider ${t.provider}`);
   const u = t.usage || {};
   if (u.credit != null) bits.push(`${Number(u.credit).toFixed(2)} 积分`);
-  const detail = t.error || t.detail || t.msg || '';
+  const detail = t.error || t.model_note || t.detail || t.msg || '';
   return el('div', { class: `px-testresult ${ok ? 'ok' : 'bad'}` },
     chip(ok ? '测试通过' : '测试失败', ok ? 'swap' : 'expired'),
     el('span', { class: 'px-testbits' }, bits.join(' · ') || (detail || '没有返回详情')),
@@ -2998,13 +3333,16 @@ function pxKeyAction(kind) {
   if (kind === 'q') return { get: () => S.qkey, set: (v) => { S.qkey = v; }, reveal: 'qproxy_reveal' };
   if (kind === 'w') return { get: () => S.wkey, set: (v) => { S.wkey = v; }, reveal: 'wproxy_reveal' };
   if (kind === 'a') return { get: () => S.akey, set: (v) => { S.akey = v; }, reveal: 'astudio_reveal' };
+  if (kind === 'mm') return { get: () => S.mmkey, set: (v) => { S.mmkey = v; }, reveal: 'minimax_reveal' };
+  if (kind === 'qw') return { get: () => S.qwkey, set: (v) => { S.qwkey = v; }, reveal: 'qwbridge_reveal' };
+  if (kind === 'paw') return { get: () => S.pawkey, set: (v) => { S.pawkey = v; }, reveal: 'pawbridge_reveal' };
   return { get: () => S.tkey, set: (v) => { S.tkey = v; }, reveal: 'trae_reveal' };
 }
 function pxAccess(d, kind, dist, modelId, modelName) {
   const base = proxyBase(d);
   const ka = pxKeyAction(kind);
   const cached = ka.get();
-    const keyNode = el('code', { class: 'mono' }, cached || dist?.masked || '还没有：到「接入密钥」表生成一把');
+    const keyNode = el('code', { class: 'mono' }, cached || dist?.masked || '还没有：点右边「生成密钥」一把搞定');
   const ensureKey = async () => {
     if (ka.get()) return ka.get();
     if (!dist) return '';
@@ -3018,9 +3356,31 @@ function pxAccess(d, kind, dist, modelId, modelName) {
     const key = await ensureKey();
     if (key) copyText(key);
   }, '显示完整接入密钥并复制') : null;
+  // 密钥没生成时就地给一个生成入口：调后端的一键接线（ensure_wiring 只补缺的，
+  // 池子和密钥已存在时原样复用），成功后刷新面板把新 key 显示出来。
+  const genKey = !dist ? btn('生成密钥', 'primary sm', async () => {
+    const oc = { paw: 'pawbridge_oneclick', qw: 'qwbridge_oneclick' }[kind];
+    if (!oc) { toast('到「接入密钥」表生成一把，或点面板的「一键反代」', false); return; }
+    toast('正在接线（缺什么补什么，已有的不动）…');
+    try {
+      const r = await invoke('action', { payload: { action: oc } });
+      toast(r.msg || (r.ok ? '已就绪' : '没成'), !!r.ok);
+    } catch (e) {
+      toast(String(e), false);
+    }
+    load();
+  }, '自动建好上游组和接入密钥（已存在的原样复用，不会重复建）；密钥已有时这步只做确认') : null;
   // 给客户端的 Model 一律带 Agent 前缀（qoder/xxx、workbuddy/xxx、trae/xxx）：
   // 同名模型不会漂到别家，指向固定在这一家的上游。
-  const nsOwner = kind === 't' ? 'trae' : (kind === 'a' ? 'astudio' : ((kind === 'q' || kind === 'w') ? S.cur : ''));
+  // 模型一律带 Agent 前缀：glm-5.3-flash / kimi-k3 这些每家都有，裸名会串到别家去。
+  // 反代见到 `owner/模型` 会先按前缀挑上游、再把报文里剥成裸名（见 proxy.rs split_namespaced）。
+  const nsOwner = kind === 't' ? 'trae'
+    : kind === 'a' ? 'astudio'
+    : kind === 'mm' ? 'minimax'
+    : kind === 'paw' ? 'catpaw'
+    : kind === 'qw' ? 'qwenwork'
+    : kind === 'oc' ? 'opencode'
+    : ((kind === 'q' || kind === 'w') ? S.cur : '');
   const clientModel = modelId && nsOwner ? `${nsOwner}/${modelId}` : (modelId || '');
   const copyCfg = btn('复制接入配置', 'primary sm', async () => {
     const key = await ensureKey();
@@ -3031,7 +3391,7 @@ function pxAccess(d, kind, dist, modelId, modelName) {
   return el('div', { class: 'px-access' },
     pxRow('接入地址 / Base URL', base, [btn('复制', 'sm', () => copyText(base), '复制接入地址')]),
     pxRow('推荐模型', modelLabel, clientModel ? [btn('复制', 'sm', () => copyText(clientModel), '复制模型 ID（带 Agent 前缀，指向固定）')] : []),
-    pxRow('接入密钥', keyNode, reveal ? [reveal] : []),
+    pxRow('接入密钥', keyNode, [reveal, genKey].filter(Boolean)),
     el('div', { class: 'px-actions' }, copyCfg));
 }
 
@@ -3099,7 +3459,7 @@ function renderAstudioPanel(a, host, appId) {
   }
   const modelName = pxModelOf(models, st.model)?.name || st.model;
   const inPool = accts.some((x) => inEnabledPool(x.app, x.name));
-  host.appendChild(pxHead('AStudio 模型', '读 astron-session.json 的 modelBearerToken，直连讯飞云端模型网关（OpenAI 兼容，无需翻译）', [
+  host.appendChild(pxHead('AStudio 模型', '', [
     el('span', {
       class: `tag ${inPool ? 'swap' : ''}`.trim(),
       title: inPool
@@ -3143,6 +3503,121 @@ function renderAstudioPanel(a, host, appId) {
   host.appendChild(acctTable);
 }
 
+/* ---------------- MiniMax Code 反代面板 ----------------
+   上游是 **Anthropic 协议**（POST /messages + Anthropic SSE 事件），不是 OpenAI 形状：
+   驾驶舱这层把客户端发来的 OpenAI 请求翻成 Anthropic、把流翻回 OpenAI chunk（见 mmproxy.rs）。
+   令牌是 OAuth（refresh token 轮换制），整机一份登录态，所以没有「每个账号各读各的」。 */
+async function minimaxOneClick() {
+  const st = pxState('minimax');
+  if (st.busy) return;
+  st.busy = true;
+  rerenderProxy();
+  try {
+    const r = await invoke('action', { payload: { action: 'minimax_oneclick' } });
+    st.test = r.ok ? { ok: true, msg: r.msg } : { ok: false, error: r.msg };
+    await load();
+  } catch (e) {
+    st.test = { ok: false, error: String(e) };
+  }
+  st.busy = false;
+  rerenderProxy();
+}
+async function minimaxRefreshToken() {
+  const st = pxState('minimax');
+  if (st.refreshing) return;
+  st.refreshing = true;
+  rerenderProxy();
+  try {
+    const r = await invoke('action', { payload: { action: 'minimax_refresh' } });
+    st.test = { ok: !!r.ok, msg: r.msg, error: r.ok ? '' : r.msg };
+    await load();
+  } catch (e) {
+    st.test = { ok: false, error: String(e) };
+  }
+  st.refreshing = false;
+  rerenderProxy();
+}
+async function pxTestMinimax(st) {
+  st.testing = true;
+  rerenderProxy();
+  try {
+    const r = await invoke('action', { payload: { action: 'minimax_test', model: st.model } });
+    st.test = r.result || { ok: false, error: r.msg };
+  } catch (e) {
+    st.test = { ok: false, error: String(e) };
+  }
+  st.testing = false;
+  rerenderProxy();
+}
+function renderMmPanel(a, host, appId) {
+  if (!a) return;
+  const st = pxState(appId || 'minimax');
+  const accts = a.accounts || [];
+  let models = (a.models && a.models.length) ? a.models
+    : [{ id: 'MiniMax-M3.1-Flash', name: 'M3.1-Flash（订阅限免）', free: true }];
+  if (!models.some((m) => m.id === st.model)) {
+    st.model = (models.find((m) => m.free) || models[0]).id;
+  }
+  const modelName = pxModelOf(models, st.model)?.name || st.model;
+  const inPool = accts.some((x) => inEnabledPool(x.app, x.name)) || !!(a.pool && a.dist);
+  const tokenBad = a.token_state === 'no_login' || a.token_state === 'expired';
+  host.appendChild(pxHead('MiniMax Code 模型',
+    '', [
+    el('span', {
+      class: `tag ${tokenBad ? 'expired' : 'swap'}`.trim(),
+      title: a.token_text || '',
+    }, tokenBad ? (a.token_state === 'no_login' ? '未登录' : '令牌过期') : '令牌可读'),
+    el('span', {
+      class: `tag ${inPool ? 'swap' : ''}`.trim(),
+      title: inPool
+        ? '账号在启用的上游组里：反代一开，带授权的 key 就能调它'
+        : '账号还没进任何上游组：点「一键反代」，或到「上游组」把它勾进去',
+    }, inPool ? '已配置' : '未配置'),
+    btn(st.refreshing ? '刷新中…' : '刷新令牌', 'sm', minimaxRefreshToken,
+      '令牌过期才真的去换（refresh token 是轮换制，换一次旧的立刻作废，不能反复试）'),
+    btn(st.busy ? '正在配置…' : (inPool ? '重新配置' : '一键反代'), 'primary sm', minimaxOneClick,
+      '账号进上游组 → 生成接入密钥 → 启动反代'),
+    pxRunBtn(S.data, true),
+  ].filter(Boolean)));
+  if (st.busy) { const b = host.querySelector('button.primary'); if (b) b.disabled = true; }
+
+  host.appendChild(pxAccess(S.data, 'mm', a.dist, st.model, modelName));
+
+  const sel = el('select', { class: 'px-select' });
+  for (const m of models) sel.appendChild(el('option', { value: m.id }, pxMmModelLabel(m)));
+  sel.value = st.model;
+  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
+  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm',
+    () => pxTestMinimax(st), '用选中的模型发一次极小请求（约 10 token）');
+  if (st.testing) testBtn.disabled = true;
+  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
+  host.appendChild(pxTestLine(st));
+  host.appendChild(pxIdsRow(appId || 'minimax'));
+  host.appendChild(pxNote(
+    '上游没有 /models 接口，下拉里的清单取自客户端自己的白名单（M3.1-Flash 订阅限免、M3 / M2.7 按积分扣）。'
+    + 'access token 寿命按小时算，反代会在到期前 60 秒自动换新并写回 auth.json；'
+    + '只有整族令牌被服务端撤销时才需要重新打开 MiniMax Code 登录一次。'));
+  if (tokenBad) host.appendChild(pxNote(a.token_text || '令牌不可用', true));
+
+  let acctTable;
+  if (!accts.length) {
+    acctTable = pxEmpty('还没有 MiniMax Code 账号。到账号页建一个（它会认 ~/.minimax 这份登录态）。');
+  } else {
+    const rows = accts.map((x) => el('tr', {},
+      el('td', {}, el('b', {}, x.name)),
+      el('td', {}, chip(x.text || x.state || '—', x.usable ? 'swap' : 'expired')),
+      el('td', { class: 'mono muted' }, `${x.masked || '—'}${x.remain_min ? `（剩 ${x.remain_min} 分钟）` : ''}`),
+      el('td', {}, x.in_pool ? '已进上游组' : '未进上游组')));
+    acctTable = pxAccountTable(['账号', '令牌状态', 'OAuth 令牌', '上游组'], rows);
+  }
+  host.appendChild(acctTable);
+}
+function pxMmModelLabel(m) {
+  const tag = m.free ? '（限免）' : (m.reasoning ? '（带思考）' : '');
+  const ctx = m.context_window ? ` · ${Math.round(m.context_window / 1000)}K` : '';
+  return `${m.name && m.name !== m.id ? `${m.name} · ` : ''}${m.id}${tag}${ctx}`;
+}
+
 function renderAgentProxy(d) {
   const panel = $('agent-proxy-panel');
   const host = $('agent-proxy');
@@ -3161,6 +3636,283 @@ function renderAgentProxy(d) {
     if (!S.proxyPage.bridge && !S.proxyPage.bridgeLoading) loadOpenCodeModels(false);
   }
   if (kind === 'a') renderAstudioPanel(d.proxy.astudio, host, S.cur);
+  if (kind === 'mm') renderMmPanel(d.proxy.minimax, host, S.cur);
+  if (kind === 'qw') renderQwPanel(d.proxy.qwbridge, host, S.cur);
+  if (kind === 'paw') renderPawPanel(d.proxy.pawbridge, host, S.cur);
+}
+
+/* 千问办公：本地桥（qwenwork-bridge）跑在 127.0.0.1:8765，用桌面端积分。
+   摆法和 Trae 面板一致：抬头（状态 + 一键反代 + 启停）→ 接入三行 → 模型+测试 → 模型ID → 账号表。
+   一键从"没配过"走到"客户端能调"：起桥 → 接线（上游组/接入密钥缺才建）→ 起反代；
+   桥就算没跑，反代收到请求也会自己把它拉起来（自愈），不用人管。 */
+function renderQwPanel(q, host, appId) {
+  if (!q) return;
+  const id = appId || 'qwenwork';
+  const st = pxState(id);
+  const up = !!q.running;
+  const models = (q.models && q.models.length) ? q.models : [{ id: 'flash', name: '标准' }];
+  if (!models.some((m) => m.id === st.model)) st.model = models[0].id;
+  const modelName = pxModelOf(models, st.model)?.name || st.model;
+  const inPool = !!q.in_pool;
+  // 端口在监听但不是自家的桥：把话摆在明处，别让人对着「桥没开」排查半天（后端 view 有就亮）
+  if (q.port_conflict) host.appendChild(pxNote(q.port_conflict_msg || '千问桥端口被其它程序占用', true));
+  host.appendChild(pxHead('千问办公 模型',
+    '读桌面端登录态，走网页版 chat-ws（不需要客户端签名）', [
+      el('span', {
+        class: `tag ${inPool ? 'swap' : ''}`.trim(),
+        title: inPool
+          ? '已在上游组里：反代一开，带接入密钥的客户端就能用这些积分'
+          : '还没进上游组：点「一键反代」会自动接线',
+      }, inPool ? '已配置' : '未配置'),
+      el('span', {
+        class: `tag ${up ? '' : 'off'}`.trim(),
+        title: up ? `127.0.0.1:${q.port} 在监听` : '桥没启动：点「一键反代」会拉起来；反代收到请求也会自愈拉起',
+      }, up ? '桥在跑' : '桥没开'),
+      btn('刷新', 'sm', () => load(), '重读一次账号与桥状态'),
+      btn('重新探测', 'sm', () => qwProbe(), '重新读桥的模型清单和登录态'),
+      btn(S.qwbusy ? '正在就绪…' : '一键反代', 'primary sm', qwOneClick,
+        '一个按钮走完：验登录态 → 起桥 → 接线（上游组/接入密钥缺才建）→ 起反代'),
+      pxRunBtn(S.data, true),
+    ].filter(Boolean)));
+  if (S.qwbusy) { const b = host.querySelector('button.primary'); if (b) b.disabled = true; }
+
+  host.appendChild(pxAccess(S.data, 'qw', q.dist, st.model, modelName));
+
+  const sel = el('select', { class: 'px-select' });
+  for (const m of models) sel.appendChild(el('option', { value: m.id }, pxModelLabel(m)));
+  sel.value = st.model;
+  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
+  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm', () => pxTestQw(st),
+    '用选中的模型发一次极小请求，确认积分真的能花出去');
+  if (st.testing) testBtn.disabled = true;
+  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
+  host.appendChild(pxTestLine(st));
+
+  host.appendChild(pxIdsRow(id));
+
+  const probeCell = (a) => {
+    const pr = (st.probe && st.probe.name === a.name) ? st.probe : null;
+    if (pr && pr.testing) {
+      const b = btn('探活中…', 'sm', () => {}, '正在发一次极小请求');
+      b.disabled = true;
+      return b;
+    }
+    const mark = pr
+      ? (pr.ok ? chip(`✓ ${((pr.ms || 0) / 1000).toFixed(1)}s`, 'swap') : chip('✗ 失败', 'expired'))
+      : null;
+    return el('span', { class: 'px-acts' }, mark,
+      btn('探活', 'sm', () => pxProbeQw(st, a.name), '发一次极小请求，确认这个号现在真能出字'));
+  };
+  const rows = (q.accounts || []).map((a) => el('tr', {},
+    el('td', {}, a.name),
+    el('td', {}, a.region || '国内'),
+    el('td', {}, el('span', { class: `chip ${a.state === 'ok' ? 'swap' : 'off'}` },
+      a.text || (a.state === 'ok' ? '可用' : '桥没开'))),
+    el('td', {},
+      a.token_mask ? `${a.token_mask} · ${a.token_days >= 0 ? `${a.token_days} 天` : '到期未知'}` : '—',
+      a.token_exp ? el('span', { class: 'px-k', title: a.token_exp }) : null),
+    el('td', {}, a.left != null ? `${Number(a.left).toFixed(2)} 积分` : '—',
+      a.expires_on ? el('span', { class: 'px-k', title: `积分到期 ${a.expires_on}` }) : null),
+    el('td', {}, `${a.calls || 0} 次`),
+    el('td', {}, probeCell(a))));
+  if (!rows.length) {
+    host.appendChild(pxEmpty('还没有千问办公账号。先在账号页建一个，再回来起桥。'));
+  } else {
+    host.appendChild(pxAccountTable(['账号', '区域', '状态', '令牌 · 到期', '积分', '调用', ''], rows));
+  }
+}
+
+async function qwOneClick() {
+  if (S.qwbusy) return;
+  S.qwbusy = true;
+  rerenderProxy();
+  toast('正在就绪千问办公：起桥 → 接线 → 起反代…');
+  let r;
+  try {
+    r = await invoke('action', { payload: { action: 'qwbridge_oneclick' } });
+  } catch (e) {
+    toast(`一键反代没跑通：${e}`, false);
+    S.qwbusy = false;
+    load();
+    return;
+  }
+  if (r.ok && S.cur) rememberProxyApp(S.cur);
+  const steps = Array.isArray(r.steps) && r.steps.length ? `（${r.steps.join(' → ')}）` : '';
+  toast((r.msg || (r.ok ? '已就绪' : '还差一步')) + steps, !!r.ok);
+  S.qwbusy = false;
+  load();
+}
+
+async function qwProbe() {
+  try {
+    const r = await invoke('action', { payload: { action: 'qwbridge_probe' } });
+    const v = r.result || {};
+    toast(v.running ? `桥在跑 · ${(v.models || []).length} 个模型 · ${v.accounts?.length || 0} 个号`
+      : '桥没在跑：先点「启动桥」', !!v.running);
+  } catch (e) {
+    toast(String(e), false);
+  }
+  load();
+}
+
+async function pxTestQw(st) {
+  st.testing = true;
+  rerenderProxy();
+  try {
+    const r = await invoke('action', { payload: { action: 'qwbridge_test', model: st.model } });
+    st.test = r.result || { ok: false, error: r.msg };
+  } catch (e) {
+    st.test = { ok: false, error: String(e) };
+  }
+  st.testing = false;
+  rerenderProxy();
+}
+
+/* 行内探活：结果就地写在那一行，别再往上面那行公共测试结果里塞（塞了看不出是哪次点的） */
+async function pxProbeQw(st, name) {
+  st.probe = { name, testing: true };
+  rerenderProxy();
+  try {
+    const r = await invoke('action', { payload: { action: 'qwbridge_test', model: st.model } });
+    const t = r.result || { ok: false, error: r.msg };
+    st.probe = { name, testing: false, ok: !!t.ok, ms: t.ms || 0, error: t.error || '' };
+  } catch (e) {
+    st.probe = { name, testing: false, ok: false, ms: 0, error: String(e) };
+  }
+  rerenderProxy();
+}
+
+/* 妙手：进程内云端直连（2026-10-26 起）。反代自己带着 ~/.meituan-catpaw/auth.json 的
+   accessToken 打妙手云端，**不需要妙手桌面端在跑**，也没有 8789 桥进程。
+   唯一要妙手窗口的时刻是令牌过期后的重登（passport 不给 refresh_token）。
+   摆法和 Trae 面板一致：抬头（状态 + 一键反代 + 启停）→ 接入三行 → 模型+测试 → 模型ID → 账号表。 */
+function renderPawPanel(p, host, appId) {
+  if (!p) return;
+  const id = appId || 'catpaw';
+  const st = pxState(id);
+  const ready = !!p.ready;
+  const models = (p.models && p.models.length) ? p.models : [{ id: 'LongCat-2.0', name: 'LongCat-2.0' }];
+  if (!models.some((m) => m.id === st.model)) st.model = models[0].id;
+  const modelName = pxModelOf(models, st.model)?.name || st.model;
+  const inPool = !!p.in_pool;
+  const busy = !!S.pawBusy;
+  // 8788 是本机共用的那个监听口：登录态好了但它没开，顶栏就还写着「反代停止」。
+  const portOn = !!(((S.data || {}).proxy) || {}).running;
+  const allUp = ready && portOn;
+
+  const main = allUp
+    ? btn(busy ? '处理中…' : '重新探测', 'primary sm', () => pawOneClick(),
+        '再验一遍令牌、接线与反代端口，缺哪样补哪样')
+    : btn(busy ? '启动中…' : '一键反代', 'primary sm', () => pawOneClick(),
+        '一个按钮走完：验令牌 → 接线（上游组/接入密钥缺才建）→ 起反代。不需要妙手在跑');
+  if (busy) main.disabled = true;
+
+  host.appendChild(pxHead('妙手 模型',
+    '云端直连（nocode.cn + ai.catpaw.meituan.com），用妙手积分，妙手桌面端不用开', [
+      el('span', {
+        class: `tag ${inPool ? 'swap' : ''}`.trim(),
+        title: inPool
+          ? '已在上游组里：反代一开，带接入密钥的客户端就能用这些积分'
+          : '还没进上游组：点「一键反代」会自动接线',
+      }, inPool ? '已配置' : '未配置'),
+      el('span', {
+        class: `tag ${ready ? 'swap' : 'expired'}`.trim(),
+        title: p.token_msg || (ready ? 'accessToken 有效' : ''),
+      }, ready ? '登录态可用' : '登录态不可用'),
+      el('span', {
+        class: 'tag',
+        title: '反代进程内直连妙手云端，不再经过命名管道和 8789 桥',
+      }, '云端直连'),
+      btn('刷新', 'sm', () => load(), '重读一次状态'),
+      btn('重新探测', 'sm', () => pawProbe(), '再验一遍令牌（顺带读余额）'),
+      main,
+      pxRunBtn(S.data, true),
+    ].filter(Boolean)));
+
+  // 只在缺的那一步说话；余额读到就顺带报一句
+  if (!ready) {
+    const tip = p.state === 'need_login'
+      ? `${p.text || '登录态失效'}：点「一键反代」会把妙手窗口拉起来让你重登。`
+      : (p.text || '');
+    host.appendChild(pxNote(tip, p.state === 'need_login'));
+  } else if (!portOn) {
+    host.appendChild(pxNote('登录态可用，但反代端口 8788 没开：点「一键反代」把它打开。', false));
+  } else if (!inPool) {
+    host.appendChild(pxNote('登录态可用，但还没进上游组：点「一键反代」自动接线。', false));
+  } else if (p.balance != null) {
+    host.appendChild(pxNote(`余额 ${Number(p.balance).toFixed(2)} 积分。一轮对话按模型倍率扣，实测约 1.3 积分/轮起。`));
+  }
+
+  host.appendChild(pxAccess(S.data, 'paw', p.dist, st.model, modelName));
+
+  const sel = el('select', { class: 'px-select' });
+  for (const m of models) sel.appendChild(el('option', { value: m.id }, pxModelLabel(m)));
+  sel.value = st.model;
+  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
+  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm', () => pxTestPaw(st),
+    '发一次极小请求验证整条链。耗时看模型：LongCat-2.0 走完整 agent 运行时，一轮 60~120 秒是正常的；GLM-5.3-Flash 系约 15 秒。测试中别重复点。');
+  if (st.testing) testBtn.disabled = true;
+  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
+  host.appendChild(pxTestLine(st));
+
+  host.appendChild(pxIdsRow(id));
+
+  const rows = (p.accounts || []).map((a) => el('tr', {},
+    el('td', {}, a.name),
+    el('td', {}, a.region || '国内'),
+    el('td', {}, el('span', { class: `chip ${a.state === 'ok' ? 'swap' : 'off'}` }, a.text || (a.state === 'ok' ? '可用' : '登录失效'))),
+    el('td', {}, a.token_mask || '—',
+      a.token_age_h != null ? el('span', { class: 'px-k' }, ` · 令牌 ${a.token_age_h} 小时前写入`) : null),
+    el('td', {}, `${a.calls || 0} 次`),
+    el('td', {}, btn(st.testing ? '探活中…' : '探活', 'sm', () => pxTestPaw(st),
+      '发一次极小请求，确认这个号现在真能出字'))));
+  if (!rows.length) host.appendChild(pxEmpty('还没读到妙手的登录态：点「一键反代」，令牌缺失时它会把妙手打开让你登录。'));
+  else host.appendChild(pxAccountTable(['账号', '区域', '状态', '身份', '调用', ''], rows));
+}
+
+async function pawOneClick() {
+  if (S.pawBusy) return;
+  S.pawBusy = true;
+  rerenderProxy();
+  let ok = false;
+  let msg = '还差一步';
+  let steps = [];
+  try {
+    const r = await invoke('action', { payload: { action: 'pawbridge_oneclick' } });
+    ok = !!r.ok;
+    msg = r.msg || (ok ? '反代已可用' : '还差一步');
+    steps = Array.isArray(r.steps) ? r.steps.slice() : [];
+  } catch (e) {
+    msg = String(e);
+  }
+  if (ok && S.cur) rememberProxyApp(S.cur);
+  S.pawBusy = false;
+  toast(msg + (steps.length ? `（${steps.join(' → ')}）` : ''), ok);
+  load();
+}
+
+async function pawProbe() {
+  try {
+    const r = await invoke('action', { payload: { action: 'pawbridge_probe' } });
+    const v = r.result || {};
+    toast(v.ready ? `可用 · ${v.accounts?.length || 0} 个号` : (v.text || '还差一步'), !!v.ready);
+  } catch (e) {
+    toast(String(e), false);
+  }
+  load();
+}
+
+async function pxTestPaw(st) {
+  st.testing = true;
+  rerenderProxy();
+  try {
+    const r = await invoke('action', { payload: { action: 'pawbridge_test', model: st.model } });
+    st.test = r.result || { ok: false, error: r.msg };
+  } catch (e) {
+    st.test = { ok: false, error: String(e) };
+  }
+  st.testing = false;
+  rerenderProxy();
 }
 
 async function pxTestQoder(appId, accts, st) {
@@ -3406,12 +4158,13 @@ function rerenderProxy() {
   // 她的老毛病（二·续十三在 renderKeys 修过一轮）：面板整体重建会改页面总长度，
   // 清空的一瞬间 scrollHeight 塌掉、scrollTop 被浏览器夹回去，内容回来后没人放回原位——
   // 表现就是点「获取模型ID / 展开全部」之后页面莫名往上错，得重新滚回来。
-  // 面板里滚动的是外层 .pagebody，重建前后把它拿住。
-  const pb = document.querySelector(S.view === 'proxy' ? '#view-proxy .pagebody' : '#view-agents .pagebody');
-  const keep = pb ? pb.scrollTop : 0;
-  if (S.view === 'proxy') renderProxyPage(S.data);
-  else if (S.view === 'agents') renderAgentProxy(S.data);
-  if (pb) pb.scrollTop = keep;
+  // 容器要挑对：「模型反代」页的 .pagebody 被 overflow-y:hidden 锁着（CSS 1317），
+  // 真正在滚的是右栏 .setbody——早先这里拿 .pagebody，等于保持了个 0。
+  const box = S.view === 'proxy' ? scrollerIn('proxy') : document.querySelector('#view-agents .pagebody');
+  keepScroll(box, () => {
+    if (S.view === 'proxy') renderProxyPage(S.data);
+    else if (S.view === 'agents') renderAgentProxy(S.data);
+  });
 }
 
 /* 「获取模型ID / 展开全部」这类只动「模型 ID」一块的状态，走定点替换：
@@ -3593,39 +4346,72 @@ function ctxLabel(n) {
 
 function renderOpenCodeBridge(host, d, compact) {
   const st = S.proxyPage;
-  host.appendChild(pxHead('OpenCode 本地桥', compact ? '模型来自桥的 /v1/models' : '本机 8211 端口 · 免费层走会话接口', [
-    btn(st.bridgeLoading ? '读取中…' : '获取模型', 'sm', () => loadOpenCodeModels(true), '向本机桥要一次模型清单'),
+  const distRec = ((d && d.proxy ? d.proxy.dist : (S.data && S.data.proxy.dist)) || [])
+    .find((x) => x.id === 'dk_ocbridge');
+  const pools = (d && d.proxy ? d.proxy.pools : (S.data && S.data.proxy.pools)) || [];
+  const g = pools.find((x) => x.id === 'gp_ocbridge');
+  const inPool = !!(g && g.enabled !== false && distRec);
+  host.appendChild(pxHead('OpenCode 模型', '本机 8211 端口 · 免费层走会话接口', [
+    el('span', {
+      class: `tag ${inPool ? 'swap' : ''}`.trim(),
+      title: inPool
+        ? '已在上游组里：反代一开，带接入密钥的客户端就能调它'
+        : '还没进上游组：到「上游组」把「OpenCode 本地桥」勾进去',
+    }, inPool ? '已配置' : '未配置'),
+    btn('刷新', 'sm', () => load(), '重读一次反代与上游状态'),
+    btn(st.bridgeLoading ? '读取中…' : '重新探测', 'primary sm', () => loadOpenCodeModels(true),
+      '向本机桥要一次模型清单，确认 8211 通不通'),
   ]));
   if (st.bridgeLoading) {
-    const b = host.querySelector('button');
-    if (b) b.disabled = true;
+    const b0 = host.querySelector('button.primary');
+    if (b0) b0.disabled = true;
   }
+
+  const base = (st.bridge && st.bridge.base_url) || 'http://127.0.0.1:8211/v1';
+  const modelId = st.bridgeModel || ((st.bridge && (st.bridge.models || [])[0]) || {}).id || '';
+  host.appendChild(pxRow('接入地址 / Base URL', proxyBase(d),
+    [btn('复制', 'sm', () => copyText(proxyBase(d)), '复制统一反代地址')]));
+  host.appendChild(pxRow('推荐模型', modelId || '—',
+    modelId ? [btn('复制', 'sm', () => copyText(modelId), '复制这个 Model ID')] : []));
+  host.appendChild(pxRow('接入密钥', distRec?.masked || '还没有：到「接入密钥」表生成一把', [
+    distRec ? btn('显示', 'sm', async () => {
+      const r = await invoke('action', { payload: { action: 'proxy_dist_reveal', id: 'dk_ocbridge' } });
+      if (r.ok) { copyText(r.msg); toast('接入密钥已复制', true); } else toast(r.msg || '读不到', false);
+    }, '显示完整接入密钥并复制') : null,
+  ].filter(Boolean)));
+  host.appendChild(el('div', { class: 'px-modelrow' },
+    el('span', { class: 'px-k' }, ''),
+    btn('复制接入配置', 'primary sm', async () => {
+      let key = '';
+      if (distRec) {
+        const r = await invoke('action', { payload: { action: 'proxy_dist_reveal', id: 'dk_ocbridge' } });
+        key = r.ok ? r.msg : '';
+      }
+      copyText(`Base URL: ${proxyBase(d)}\nModel: ${modelId || ''}\nAPI Key: ${key || '(未生成)'}`);
+    }, '地址、模型、接入密钥一次复制完')));
+
   const b = st.bridge;
   if (!b) {
-    host.appendChild(pxEmpty('还没读取本地桥。点「获取模型」检查 8211 端口。'));
-    return;
-  }
-  if (!b.ok) {
+    host.appendChild(pxNote('还没读到本地桥。点「重新探测」检查 8211 端口。'));
+  } else if (!b.ok) {
     host.appendChild(pxNote(`本地桥没通：${b.error || '连接失败'}。先启动 opencode-bridge（一键接入.cmd）。`, true));
-    return;
+  } else {
+    const models = b.models || [];
+    if (models.length) {
+      const sel = el('select', { class: 'px-select' });
+      for (const m of models) sel.appendChild(el('option', { value: m.id }, m.id));
+      if (!models.some((m) => m.id === st.bridgeModel)) st.bridgeModel = models[0].id;
+      sel.value = st.bridgeModel;
+      sel.addEventListener('change', () => { st.bridgeModel = sel.value; rerenderProxy(); });
+      const testBtn = btn(st.bridgeTesting ? '测试中…' : '测试所选模型', 'primary sm', () => pxTestOpenCode(st),
+        '发一次极小请求，验证本地桥和模型');
+      if (st.bridgeTesting) testBtn.disabled = true;
+      host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
+      host.appendChild(pxTestLine({ test: st.bridgeTest, testing: st.bridgeTesting }));
+    }
   }
-  const base = b.base_url || 'http://127.0.0.1:8211/v1';
-  host.appendChild(pxRow('反代接入地址 / Base URL', proxyBase(d), [btn('复制', 'sm', () => copyText(proxyBase(d)), '复制统一反代地址')]));
-  host.appendChild(pxRow('桥地址', base, [btn('复制', 'sm', () => copyText(base), '复制桥地址')]));
-  host.appendChild(pxRow('模型', `${b.count || 0} 个可用`, []));
-  const models = b.models || [];
-  if (models.length) {
-    const sel = el('select', { class: 'px-select' });
-    for (const m of models) sel.appendChild(el('option', { value: m.id }, m.id));
-    if (!models.some((m) => m.id === st.bridgeModel)) st.bridgeModel = models[0].id;
-    sel.value = st.bridgeModel;
-    sel.addEventListener('change', () => { st.bridgeModel = sel.value; });
-    const testBtn = btn(st.bridgeTesting ? '测试中…' : '测试所选模型', 'primary sm', () => pxTestOpenCode(st),
-      '发一次极小请求，验证本地桥和模型');
-    if (st.bridgeTesting) testBtn.disabled = true;
-    host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
-    host.appendChild(pxTestLine({ test: st.bridgeTest, testing: st.bridgeTesting }));
-  }
+
+  host.appendChild(pxIdsRow('opencode'));
   host.appendChild(pxNote('统一入口用本机反代地址 + 接入密钥；OpenCode 那一把在「模型反代」页的接入密钥表里。'));
 }
 
@@ -3652,14 +4438,19 @@ function guideAccounts(d, sel) {
   return [];
 }
 
+/* Qoder 的上游推理接口只认这两个模型名（qproxy.rs 的 QODER_MODELS）。客户端
+   模型目录里那些 qmodel_38max / dfmodel 是 Qoder 自己的显示别名，转发时会自动
+   收敛到 auto——把它们列成可选项，用户选了也只会得到一个假的"测试失败"。 */
+const QODER_UPSTREAM = [
+  { id: 'auto', name: 'Auto（Qoder 自己选）', free: false, default: true },
+  { id: 'gpt-5', name: 'GPT-5', free: false },
+];
+
 function guideModels(d, appId) {
   const kind = proxyKind(appId);
   if (kind === 'q') {
     const row = (d.proxy.qproxy?.models || []).find((x) => x.app === appId) || {};
-    return {
-      models: row.models || [],
-      error: row.error || ((row.models || []).length ? '' : 'Qoder 模型目录还没读到，开一次客户端再刷新'),
-    };
+    return { models: QODER_UPSTREAM, all: QODER_UPSTREAM, aliases: row.models || [], error: '' };
   }
   if (kind === 'w') {
     const row = (d.proxy.wbproxy?.models || []).find((x) => x.app === appId) || {};
@@ -3871,6 +4662,8 @@ async function guideConnect() {
     return;
   }
   const key = (r.result && r.result.key) || r.key || '';
+  const poolName = r.result && r.result.pool && r.result.pool.name;
+  const distName = r.result && r.result.dist && r.result.dist.name;
   S.guide.busy = false;
   S.guide.error = '';
   S.guide.needSecret = false;
@@ -3878,7 +4671,8 @@ async function guideConnect() {
   S.guide.result = {
     app: sel.app, name: sel.name, model,
     modelName: guideModelText(sel, model),
-    key,
+    key, pool: poolName, dist: distName,
+    msg: (r.result && r.result.msg) || r.msg || '',
   };
   await load();
   renderProxyPage(S.data);
@@ -3947,7 +4741,7 @@ function renderGuide(d) {
     el('div', { class: 'guide-title' },
       el('b', {}, '一键接入'),
       el('span', { class: 'guide-sub' },
-        `自动检测到 ${agents.length} 个可反代的 Agent；地址按当前机器生成`)),
+        `${agents.length} 个可接入 Agent`)),
     el('span', { class: 'sp' }),
     chip(d.proxy.running ? '反代运行中' : '反代未启动', d.proxy.running ? 'swap' : 'expired'),
     pxRunBtn(d),
@@ -4004,15 +4798,19 @@ function renderGuide(d) {
     const cur = agents.find((a) => a.app === r.app) || sel;
     const key = r.key || '';
     body.appendChild(el('div', { class: 'guide-donehead' },
-      chip('反代已启动', 'swap'),
-      el('b', {}, `${r.name} · ${r.model}`),
+      chip(cur && cur.usable > 0 ? '反代已启动' : '反代已启动 · 账号未探通',
+        cur && cur.usable > 0 ? 'swap' : 'expired'),
+      el('b', {}, `${r.name} · ${r.modelName || r.model}`),
       el('span', { class: 'sp' }),
       btn('再接入一个', 'sm', guideReset, '重新选一个 Agent')));
     body.appendChild(pxRow('接入地址', base, [btn('复制', 'sm', () => copyText(base))]));
-    body.appendChild(pxRow('模型', r.model, [btn('复制', 'sm', () => copyText(r.model))]));
+    body.appendChild(pxRow('模型', r.modelName || r.model, [btn('复制', 'sm', () => copyText(r.model))]));
     body.appendChild(pxRow('给客户端的 Key', key || '到「接入密钥」表点「显示」',
       key ? [btn('复制', 'sm', () => copyText(key), '复制完整 Key')] : []));
-    if (!key) body.appendChild(pxNote('还差两步才算通：到「上游组」把这个 Agent 的账号勾进组；客户端填「接入密钥」表里的 key（没有就生成一把）。'));
+    body.appendChild(pxNote(key
+      ? `账号已归入「${r.pool || '上游组'}」，密钥已生成（「${r.dist || '接入密钥'}」）。把上面三行填进客户端即可。`
+      : '账号已归入上游组。到「接入密钥」表点「显示」拿明文 Key，填进客户端即可。'));
+    if (r.msg) body.appendChild(el('div', { class: 'guide-note' }, r.msg));
     body.appendChild(el('div', { class: 'guide-actions' },
       btn('复制接入配置', 'primary sm', () => {
         const cfg = `Base URL: ${base}\nModel: ${r.model}\nAPI Key: ${key || '(到接入密钥表查看)'}`;
@@ -4134,6 +4932,11 @@ function renderGuide(d) {
         ? { test: S.proxyPage.bridgeTest, testing: S.proxyPage.bridgeTesting }
         : pxState(sel.app)));
       if (mm.error) body.appendChild(pxNote(mm.error, true));
+      if (mm.aliases && mm.aliases.length) {
+        const names = mm.aliases.slice(0, 3).map((m) => m.name || m.id).join('、');
+        body.appendChild(el('div', { class: 'guide-note' },
+          `这里只列 Qoder 上游真正认的名字。你在客户端里看到的 ${names}${mm.aliases.length > 3 ? ' 等' : ''} 是 Qoder 自己的显示名，转发时会自动收敛到 auto，不影响使用。`));
+      }
       body.appendChild(el('div', { class: 'guide-actions' },
         btn('下一步：接通', 'primary sm', () => {
           S.guide.phase = 'connect'; S.guide.error = '';
@@ -4176,13 +4979,15 @@ function renderProxyPage(d) {
   const pools = p.pools || [];
   const dist = p.dist || [];
   if ($('proxy-count')) $('proxy-count').textContent = `${pools.length} 个上游组 · ${dist.length} 把接入密钥`;
-  renderGuide(d);
+  // 一键接入 / 模型列表 / 本地桥三块里都有模型下拉：下拉弹层开着时重建对应块
+  // 会把它闪没。焦点停在哪一块就只跳过那一拍，组表、密钥表、请求日志照常刷新。
+  if (!editingIn('#proxy-guide')) renderGuide(d);
   const mh = $('proxy-models');
-  if (mh) { clear(mh); renderProxyModels(mh, d); }
+  if (mh && !editingIn('#proxy-models')) { clear(mh); renderProxyModels(mh, d); }
   renderProxyGroups(d);
   renderProxyKeys(d);
   const bh = $('proxy-bridge');
-  if (bh) { clear(bh); renderOpenCodeBridge(bh, d, false); }
+  if (bh && !editingIn('#proxy-bridge')) { clear(bh); renderOpenCodeBridge(bh, d, false); }
   if (!S.proxyPage.bridge && !S.proxyPage.bridgeLoading) loadOpenCodeModels(false);
   renderProxyLogs(d);
   renderProxyAdvanced(d);
@@ -4554,7 +5359,7 @@ function renderPoolMembers() {
     for (const m of mem.instances) {
       host.appendChild(poolRow({
         src: m.src,
-        label: `${m.app_name} / ${m.instance}`,
+        label: `${m.app_name} / ${m.instance}${m.bridge ? ' · 本地桥' : ''}`,
         bad: !m.has_token ? '该账号还没登记 Token，勾了也用不上' : '',
         checked: has(m.src),
         base: baseOf(m.src),
@@ -4777,9 +5582,11 @@ function keySelIds() {
 function keySelToggle(sig, on) {
   const sel = keySel();
   if (on) sel.add(sig); else sel.delete(sig);
-  renderKeyList(S.data);
+  // 勾一条会多出/少掉顶部那条批量操作条，整表高度会变——必须走 renderKeys 的护栏，
+  // 直接 renderKeyList 是裸奔（就是"勾一下复选框整页往上错"的来路）
+  renderKeys(S.data);
 }
-function keySelClear() { keySel().clear(); renderKeyList(S.data); }
+function keySelClear() { keySel().clear(); renderKeys(S.data); }
 
 /* 站点内批量操作条：勾了东西才出现，钉在内容区顶部（滚动时也看得见） */
 function keySelBar(sites) {
@@ -4801,18 +5608,18 @@ function keySelBar(sites) {
     if (r.ok) { keySelClear(); await load(); }
   }, '统一改「名称」这一列（单个密钥的编辑框里那一项）'));
 
-  bar.appendChild(btn('改来源', 'sm', async () => {
+  bar.appendChild(btn('修改来源', 'sm', async () => {
     const v = await askText('给勾选的这些密钥统一设一个来源（如 官方申请 / 群里分享）。留空则清掉来源。',
-      '', { title: `批量改来源 · ${ids.length} 条`, okText: '应用' });
+      '', { title: `批量修改来源 · ${ids.length} 条`, okText: '应用' });
     if (v === null) return;
     const r = await invoke('action', { payload: { action: 'key_batch_update', ids, patch: { source: v } } });
     toast(r.msg, r.ok);
     if (r.ok) { keySelClear(); await load(); }
   }, '统一改「来源」这一列'));
 
-  bar.appendChild(btn('改截止日', 'sm', async () => {
+  bar.appendChild(btn('修改截止日期', 'sm', async () => {
     const v = await askText('统一设截止日期，格式 2026-12-31。留空表示未填。',
-      '', { title: `批量改截止日 · ${ids.length} 条`, okText: '应用' });
+      '', { title: `批量修改截止日期 · ${ids.length} 条`, okText: '应用' });
     if (v === null) return;
     if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v.trim())) { toast('格式不对，要 2026-12-31 这样', false); return; }
     const r = await invoke('action', { payload: { action: 'key_batch_update', ids, patch: { expires_on: v.trim() } } });
@@ -4887,12 +5694,73 @@ function keySelBar(sites) {
   return bar;
 }
 
+/* ---------------- 拖拽排序（2026-10-28）：站点卡 & 站点内 key 行 ----------------
+   手柄（⠿）按下才把所在容器设成 draggable：整行/整卡常年可拖会把
+   名字选中、按钮点击一起拖坏。拖完把**全量** id 顺序发给后端
+   （site_reorder / key_reorder），后端只挪位置不碰内容，
+   顺序里漏掉的条目原样排后面，一条不会丢。
+   落盘走 load() → renderKeys 护栏，不在这里手动重排 DOM。 */
+const dragst = { kind: '', site: '', id: '', el: null };
+
+function dragDot(title) {
+  return el('span', { class: 'dragdot', title: title || '按住拖动排序' }, '⠿');
+}
+
+/* handle 是 ⠿，node 是被拖着走的容器（站点卡 section / key 行 tr）。
+   info = {kind:'site'|'key', site:站点id, id:站点或key的id}
+   dragstart/dragend 只挂一次（node.__dragwired），顺序信息存在 node.__draginfo：
+   操作列会被 patchKeyAct 定点替换、手柄跟着重建，重挂时不能叠出两份监听。 */
+function attachDrag(handle, node, info) {
+  handle.addEventListener('mousedown', () => node.setAttribute('draggable', 'true'));
+  node.__draginfo = info;
+  if (node.__dragwired) return;
+  node.__dragwired = true;
+  node.addEventListener('dragstart', (e) => {
+    // key 行嵌在站点卡里：dragstart/dragend 一路冒泡会把祖先（站点卡）的
+    // 拖拽状态盖成自己的，反过来站内拖就被记成站点拖——这里掐掉冒泡。
+    e.stopPropagation();
+    Object.assign(dragst, node.__draginfo, { el: node });
+    node.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', 'sort'); } catch (_) { /* IE 老脾气，随它 */ }
+  });
+  node.addEventListener('dragend', (e) => {
+    e.stopPropagation();
+    node.classList.remove('dragging');
+    node.removeAttribute('draggable');
+    dragst.kind = ''; dragst.el = null;
+  });
+}
+
+/* 落点容器：上半边插到它前面、下半边插到它后面。before/after 用类画指示线。 */
+function dropZone(node, allowed, onDrop) {
+  const clear = () => node.classList.remove('drop-before', 'drop-after');
+  node.addEventListener('dragover', (e) => {
+    if (!dragst.kind || dragst.el === node || !allowed(dragst)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const r = node.getBoundingClientRect();
+    const before = e.clientY < r.top + r.height / 2;
+    node.classList.toggle('drop-before', before);
+    node.classList.toggle('drop-after', !before);
+  });
+  node.addEventListener('dragleave', clear);
+  node.addEventListener('drop', async (e) => {
+    if (!dragst.kind || dragst.el === node || !allowed(dragst)) return;
+    e.preventDefault();
+    const before = node.classList.contains('drop-before');
+    clear();
+    const dragged = dragst.el;
+    dragst.el = null;   // load() 会推倒重建，dragend 还会在这具空壳上放一次，别让它碰新列表
+    dragged.classList.remove('dragging');
+    dragged.removeAttribute('draggable');   // dragend 正常也会清，这里兜底（合成事件没有 dragend）
+    await onDrop(before, dragged);
+  });
+}
+
 function renderKeys(d) {
-  // 右栏自己滚（左菜单另算）：重建前记住右栏位置，重建后原样放回去
-  const box = $('keysites').closest('.setbody');
-  const keep = box ? box.scrollTop : 0;
-  renderKeyList(d);
-  if (box) box.scrollTop = keep;
+  // 右栏自己滚（左菜单另算）。整表重建统一走护栏：先钉高度、再还位置
+  keepScroll($('keysites')?.closest('.setbody'), () => renderKeyList(d));
 }
 
 function renderKeyList(d) {
@@ -4922,6 +5790,7 @@ function renderKeyList(d) {
     const box = el('section', {
       class: `panel site${S.keysOpen[p.id] ? ' open' : ''}`,
       id: `site-${p.id}`,          // 左菜单点站点名要能滚到它
+      data: { sid: p.id },         // 拖拽落盘时要认这条卡是哪个站点（全小写：dataset 读回不歧义）
     });
 
     const flip = () => { S.keysOpen[p.id] = !S.keysOpen[p.id]; renderKeys(S.data); };
@@ -4935,7 +5804,29 @@ function renderKeyList(d) {
     toggle.addEventListener('click', (e) => { e.stopPropagation(); flip(); });
 
     // 站点头：名字、类型、key 数、额度（额度挂在站点上，不是每个 key 一份）、操作
+    // 最前面那个 ⠿ 是排序手柄：按住上下拖，松手落盘（site_reorder）
+    const siteDot = dragDot('按住拖动，给站点排序');
+    attachDrag(siteDot, box, { kind: 'site', site: p.id, id: p.id });
+    dropZone(box, (x) => x.kind === 'site', async (before, dragged) => {
+      const sites = (S.data.keys || []).slice();
+      const from = sites.findIndex((x) => x.id === dragged.dataset.sid);
+      const to = sites.findIndex((x) => x.id === p.id);
+      if (from < 0 || to < 0 || from === to) return;
+      const [moved] = sites.splice(from, 1);
+      let at = sites.findIndex((x) => x.id === p.id);
+      if (!before) at += 1;
+      sites.splice(at, 0, moved);
+      const r = await invoke('action', { payload: { action: 'site_reorder', order: sites.map((x) => x.id) } });
+      if (!r.ok) { toast(r.msg, false); return; }   // 成功不弹通知——挪个位置而已，列表动了就是反馈
+      // 乐观更新：落盘成功就用手上这份已排好的数组立即重绘。不能只等 load()——
+      // 它有「焦点在 #keysites 里就跳过重绘」的闸（防批量条下拉被重建抖掉），
+      // 拖完焦点多半还在表里，表现就是拖完 5 秒才动、焦点不挪就一直不动
+      S.data.keys = sites;
+      renderKeys(S.data);
+      load();   // 后台对账（左菜单计数、额度等），不阻塞显示
+    });
     const head = el('div', { class: 'sitehead' },
+      siteDot,
       toggle,
       el('div', { class: 'sitename' },
         el('b', {}, p.name || '未命名站点'),
@@ -4991,7 +5882,7 @@ function renderKeyList(d) {
           keys.length ? tb : null)));
       if (!keys.length) {
         box.appendChild(el('div', { class: 'empty' },
-          '这个站点还没有密钥。点右上「添加密钥」登记——同一个站可以有多个密钥，各自用于不同地方。'));
+          '暂无密钥'));
       }
     }
     host.appendChild(box);
@@ -5017,20 +5908,34 @@ function siteInfo(p) {
     const fmt = b.format || 'openai';
     const label = (BASE_FMT.find((x) => x[0] === fmt) || [, fmt])[1] || fmt;
     rows.appendChild(el('div', { class: 'sirow' },
-      chip(label, 'fmt'),
-      el('span', { class: 'url', title: b.url }, b.url),
+      // 格式 chip + 地址作为一组在剩余空间里居中（她 2026-10-28 点名往中间挪）
+      el('span', { class: 'simain' },
+        chip(label, 'fmt'),
+        el('span', { class: 'url', title: b.url }, b.url)),
       btn('复制', 'plain sm', () => copyText(b.url), '复制这个接入点'),
       btn('获取模型', 'plain sm', () => pullSiteModels(p, b),
         `向 ${b.url}/models 发一次请求，把拉到的模型并进站点的「可用模型」`)));
   }
 
   const chips = el('div', { class: 'sichips' });
-  for (const m of models.slice(0, 40)) {
+  // 模型清单默认收起只露 12 个：拉一次「获取模型」就 150+ 个 chip，撑得整卡一屏都看不下
+  // （她 2026-10-28 要个收起按钮）。展开/收起记在 S.modelsOpen，会话内记忆，不落盘。
+  const MODEL_PREVIEW = 12;
+  if (!S.modelsOpen) S.modelsOpen = {};
+  const showAll = !!S.modelsOpen[p.id];
+  const visible = showAll ? models : models.slice(0, MODEL_PREVIEW);
+  for (const m of visible) {
     const c = el('button', { type: 'button', class: 'chip', title: '点击复制模型名' }, m);
     c.addEventListener('click', () => copyText(m));
     chips.appendChild(c);
   }
-  if (models.length > 40) chips.appendChild(el('span', { class: 'muted' }, `+${models.length - 40}`));
+  if (models.length > MODEL_PREVIEW) {
+    if (!showAll) chips.appendChild(el('span', { class: 'muted' }, `+${models.length - MODEL_PREVIEW}`));
+    chips.appendChild(btn(showAll ? '收起' : `展开全部 ${models.length}`, 'plain sm', () => {
+      S.modelsOpen[p.id] = !showAll;
+      renderKeys(S.data);   // 走护栏重绘，滚动位置不丢
+    }, showAll ? '把模型清单收回去' : '展开这个站点的全部模型'));
+  }
 
   return el('div', { class: 'siteinfo' },
     bases.length ? rows : null,
@@ -5096,34 +6001,47 @@ function keyRow(site, k) {
   cb.checked = keySel().has(sig);
   cb.title = '勾上之后到页面顶部那条操作条里批量处理';
   cb.addEventListener('change', () => keySelToggle(sig, cb.checked));
-  return el('tr', { class: keySel().has(sig) ? 'sel' : '' },
+  // ⠿ 排序手柄放在行尾操作列（她 2026-10-28 点名挪过去的），测试后 patchKeyAct
+  // 定点换操作格时会补回一个新的（见下）
+  const rowDot = dragDot('按住拖动，调整这条密钥在站点内的顺序');
+  const actTd = keyActTd(site, k);
+  actTd.appendChild(rowDot);
+  const tr = el('tr', { class: keySel().has(sig) ? 'sel' : '', data: { kid: k.id } },
     el('td', { class: 'k-sel' }, cb),
     el('td', { class: 't', title: k.note || k.label || '' }, k.label || el('span', { class: 'muted' }, '未命名')),
     el('td', { class: 't', title: k.source || '' }, k.source || el('span', { class: 'muted' }, '—')),
     el('td', { class: 'k-key', title: '点「复制」取全文' },
       el('span', { class: 'mono' }, k.masked || '—'),
       k.use_in_proxy ? chip('进反代', 'swap') : null,
-      k.base_url ? chip('自带接入点', '') : null),
+      // 站点没配 base url 也能测通的就是这种：key 自带接入点（base_for 优先用它），
+      // 悬停把地址露出来，别让人对着「可用」找半天是哪个地址在通
+      k.base_url ? el('span', {
+        class: 'tag', title: `这条密钥自带接入点：${k.base_url}\n站点没配接入点时，测试与调用都走它`,
+      }, '自带接入点') : null),
     el('td', {}, expChip(k)),
     el('td', {}, k.last_status ? chip(k.last_status === 'ok' ? '可用' : '失败', k.last_status) : chip('未测', '')),
-    el('td', { class: 'acts' },
-      keyTestBusy(site.id, k.id)
-        ? el('span', { class: 'muted', title: '正在向站点发请求，等它回来' }, '测试中…')
-        : iconBtn('test', () => keyTest(site.id, k.id),
-          '测试：向站点的接入点发一次 GET /models，验证这把 Key 还能不能用'),
-      iconBtn('edit', () => openKeyModal(site, k),
-        '编辑：名称、来源、密钥与截止日期'),
-      iconBtn('copy', () => copyKey(site.id, k.id, k.label || site.name),
-        '复制：把完整 Key 复制到剪贴板（列表里始终打码）'),
-      iconBtn('plug', () => openInjectModal(site, k),
-        '把这条密钥写进 Qoder / WorkBuddy 的自定义模型配置（写入前自动备份，可逐条撤掉）'),
-      iconBtn('trash', async () => {
-        if (await askConfirm(
-          `删除这条密钥后，正在用它发请求的程序会失败，也无法再查看或修改这条密钥。\n同站点其它密钥不受影响。`,
-          { danger: true, okText: '删除', title: `删除密钥${k.label ? ` · ${k.label}` : ''}` })) {
-          run('key_delete_key', { site: site.id, id: k.id });
-        }
-      }, '删除：删掉这条密钥，同站点其它密钥不受影响')));
+    actTd);
+  attachDrag(rowDot, tr, { kind: 'key', site: site.id, id: k.id });
+  // 只支持站内排序：跨站挪走批量条里的「移动」，那边有确认和查重兜底
+  dropZone(tr, (x) => x.kind === 'key' && x.site === site.id, async (before, dragged) => {
+    const p = (S.data.keys || []).find((x) => x.id === site.id);
+    const ks = ((p && p.keys) || []).slice();
+    const from = ks.findIndex((x) => x.id === dragged.dataset.kid);
+    const to = ks.findIndex((x) => x.id === k.id);
+    if (from < 0 || to < 0 || from === to) return;
+    const [moved] = ks.splice(from, 1);
+    let at = ks.findIndex((x) => x.id === k.id);
+    if (!before) at += 1;
+    ks.splice(at, 0, moved);
+    const r = await invoke('action', { payload: { action: 'key_reorder', site: site.id, order: ks.map((x) => x.id) } });
+    if (!r.ok) { toast(r.msg, false); return; }   // 成功不弹通知
+    // 同站点拖拽：乐观更新立即重绘（原因见上面 site_reorder 那条注释）
+    const p2 = (S.data.keys || []).find((x) => x.id === site.id);
+    if (p2) p2.keys = ks;
+    renderKeys(S.data);
+    load();
+  });
+  return tr;
 }
 
 /* ---------------- 接入 Agent：把台账里这条 key 写进程序的自定义模型配置 ----------------
@@ -5469,17 +6387,25 @@ function browseBtn(get, set, title) {
 function renderDetail() {
   const d = S.detail;
   const { app, name, meta } = d;
+  $('im-save').hidden = app === 'codex-desktop' && ['auth', 'data', 'danger'].includes(d.sec);
   const i = S.data.instances.find((x) => x.app === app && x.name === name);
   if (!i) { closeDetailNow(); return; }
   const a = S.data.apps.find((x) => x.id === app) || {};
   d.f = d.f || {};
   const q = i.quota;
 
-  $('im-title').textContent = `${i.app_name} / ${name}`;
+  const title = $('im-title');
+  clear(title);
+  title.append(`${i.app_name} / `, name.includes('@') ? el('span', { class: 'account-email' }, name) : name);
   $('im-sub').textContent =
     `${kindLabel(i.kind)}`
-    + ` · 建于 ${i.created} · ${i.running ? `${i.procs} 个进程在跑` : '未运行'}`
+    + ` · ${i.created} · ${i.running ? '运行中' : i.resident ? '后台运行' : '未运行'}`
     + (a.shared_profile ? (i.logged_in ? ' · 本机登录中' : '') : (i.swapped ? ' · 当前默认账号' : ''));
+  $('im-body').classList.toggle('cpt-detail-body', ['codex-desktop', 'zcode'].includes(app));
+  $('im-nav').classList.toggle('cpt-detail-nav', ['codex-desktop', 'zcode'].includes(app));
+  if (app === 'codex-desktop') { renderChatgptDetail(d, i); return; }
+  if (app === 'zcode') { renderZcodeDetail(d, i); return; }
+  if (app === 'antigravity') { renderAntigravityDetail(d, i); return; }
 
   /* ---- 各分组的行 ---- */
   const secs = {};
@@ -5561,17 +6487,18 @@ function renderDetail() {
     row('账号名', '列表、临期提醒、备份文件名都用这个名字。程序在跑时目录改名会延后',
       btn('改名', 'sm', () => renameAccount(app, name))),
     ...sub('登录与档案', '这个号现在登没登、这份档案从哪来——换号、删号之前先看这两行。'),
-    row('登录状态', i.identity && i.identity.state === 'logged'
+    row('登录状态', i.app === 'codex-desktop' ? '读取这个账号自己的登录凭据。'
+      : i.identity && i.identity.state === 'logged'
       ? '已检测到登录痕迹，可以直接用'
       : '还没检测到登录：换号切到空目录会让程序显示未登录甚至黑屏，属正常，登录一次即可',
-      el('span', { class: 'kv' }, i.identity ? i.identity.label || '—' : '—')),
+      i.app === 'codex-desktop' ? identLine(i) : el('span', { class: 'kv' }, i.identity ? i.identity.label || '—' : '—')),
     row('本机账号', i.quota.local_account || meta.quota_account
       ? '从这份档案里读出来的登录名，用来核对"卡片上的号"和"客户端里登的号"是不是同一个'
       : '还没从任何数据源读到过登录名',
-      el('span', { class: 'kv' }, i.quota.local_account || meta.quota_account || '—')),
+      el('span', { class: 'kv' }, i.app === 'codex-desktop' ? (i.chatgpt_auth?.mode === 'apikey' ? 'API Key' : i.chatgpt_auth?.account || '未读取到邮箱') : i.quota.local_account || meta.quota_account || '—')),
     row('档案来源', originText(i) === '沿用本机原有档案'
       ? '这张卡认领的就是这台机器上原本那份档案，驾驶舱没有搬动过它'
-      : '这张卡的档案是怎么来的；换号时搬来搬去的都是这个目录',
+      : i.app === 'codex-desktop' ? '新建时复制对话与项目，账号的资料目录保持固定。' : '这张卡的档案是怎么来的；换号时搬来搬去的都是这个目录',
       el('span', { class: 'kv', title: i.seeded_from || '' }, originText(i) || '未登记')),
     // CLI 产品（Codex）的三种登录方式，全部走官方 codex login。
     // 登录态落在**这个账号自己的 CODEX_HOME** 里，所以换号＝换目录、多开各登各的。
@@ -5624,7 +6551,7 @@ function renderDetail() {
     return secPanel('额度与用量', ...rows);
   };
 
-  secs.data = () => secPanel('目录与数据',
+  secs.data = () => a.id === 'codex-desktop' ? chatgptDataPanel(app, name, i) : secPanel('目录与数据',
     ...sub('路径', '这个账号在哪打开、档案实际存在哪。'),
     (() => {
       const wd = dField('workdir', i.workdir, { placeholder: 'D:\\Projects\\…', spellcheck: 'false' });
@@ -5659,7 +6586,7 @@ function renderDetail() {
     row('从备份恢复', '用最近一次备份覆盖当前账号目录，备份之后新产生的改动会丢失；需先关闭该账号窗口',
       btn('恢复', 'sm', () => restoreConfirm(app, name))));
 
-  secs.auth = () => secPanel('凭据与反代',
+  secs.auth = () => a.id === 'codex-desktop' ? chatgptAuthPanel(app, name, i) : secPanel('凭据与反代',
     row('API Token', 'OpenAI billing 抓额度、反代上游替换 Authorization，都用它',
       dField('token', meta.token, { type: 'password', placeholder: 'sk-…', autocomplete: 'off' })),
     (() => {
@@ -5676,7 +6603,7 @@ function renderDetail() {
 
   // 「隐藏整个程序」是程序级动作、内容区右上本来就有那颗按钮，不放进"这个账号"的设置里；
   // 改名已挪到「账号信息」，这一组只剩不可回退的那一件事，所以留在最后
-  secs.danger = () => secPanel('删除账号',
+  secs.danger = () => a.id === 'codex-desktop' ? secPanel('移除账号登记', row('移除登记', '账号资料和登录凭据保留。', btn('移除登记', 'danger sm', async () => { if (await del(app, name)) closeDetailNow(); }))) : secPanel('删除账号',
     row('删除账号', '删除这个账号的档案与整个数据目录（含登录状态），不可恢复。只想隐藏整个程序用右上「隐藏程序」',
       btn('删除账号', 'danger sm', async () => {
         if (await del(app, name)) closeDetailNow();
@@ -5687,7 +6614,7 @@ function renderDetail() {
   clear(nav);
   for (const [id, label] of IN_SECTIONS) {
     if (id === 'danger') nav.appendChild(el('li', { class: 'sep', 'aria-hidden': 'true' }));
-    const b = el('button', { type: 'button', class: id === 'danger' ? 'danger' : '' }, label);
+    const b = el('button', { type: 'button', class: id === 'danger' ? 'danger' : '' }, app === 'codex-desktop' && id === 'danger' ? '移除登记' : label);
     b.dataset.sec = id;
     b.setAttribute('aria-current', String(d.sec === id));
     b.addEventListener('click', () => { d.sec = id; d.scroll = 0; renderDetail(); });
@@ -5697,7 +6624,7 @@ function renderDetail() {
   d.scroll = body.scrollTop;
   clear(body);
   body.appendChild((secs[d.sec] || secs.info)());
-  body.scrollTop = d.scroll;
+  restoreScroll(body, d.scroll);
 }
 function closeDetailNow() { S.detail = null; $('imodal').hidden = true; }
 function secPanel(title, ...rows) {
@@ -5736,20 +6663,69 @@ function saveDetail() {
 /* ---------------- 站点编辑弹窗 ---------------- */
 let siteEditing = null;
 // 接入点挂在站点上：一个站常常同时给 OpenAI / Anthropic / DashScope 三种口
-const BASE_FMT = [['openai', 'OpenAI 兼容', 's-b-openai'], ['anthropic', 'Anthropic 兼容', 's-b-anth'], ['other', '其他', 's-b-other']];
-function baseOf(list, fmt) {
-  const hit = (list || []).find((b) => (b.format || 'openai') === fmt && String(b.url || '').trim());
-  return hit ? hit.url : '';
+/* 兼容格式：前四种是站点弹窗的默认行，other 供自定义行兜底。
+   名称按她 2026-10-28 点名的写法（别再写「OpenAI 兼容格式」）；
+   openai-resp 是 OpenAI 的 Responses API（/v1/responses），和 chat completions 分开记。 */
+const BASE_FMT = [
+  ['openai', 'OpenAI Chat Completions'],
+  ['openai-resp', 'OpenAI Responses API'],
+  ['anthropic', 'Anthropic'],
+  ['gemini', 'Gemini / Google'],
+  ['other', '其他'],
+];
+const BASE_DEFAULTS = ['openai', 'openai-resp', 'anthropic', 'gemini'];
+/* 兼容格式行：一行 = 协议下拉 + 地址 + 加号 + 删除号。
+   她 2026-10-28 要的：默认给四种（OpenAI chat completions / OpenAI Responses /
+   Anthropic / Gemini），每行行尾一个小加号、可以无限往下加——同一格式也能并存
+   多条（GMI Cloud 就有两个 OpenAI 口，旧弹窗每种格式只有一个格子，第二条
+   既显示不出来、一保存还会被丢掉）。 */
+function sbaseRow(fmt, url) {
+  const sel = el('select', { class: 'sbase-fmt', title: '这条接入点按哪种协议调用' });
+  for (const [f, label] of BASE_FMT) sel.appendChild(el('option', { value: f }, label));
+  sel.value = BASE_FMT.some((x) => x[0] === fmt) ? fmt : 'other';
+  const inp = el('input', {
+    class: 'sbase-url', placeholder: 'https://…（可留空）',
+    autocomplete: 'off', spellcheck: 'false',
+  });
+  inp.value = url || '';
+  const add = el('button', { class: 'sbase-add', type: 'button', title: '在这行下面加一行（默认同格式）' }, '+');
+  add.addEventListener('click', () => {
+    const row = sbaseRow(sel.value, '');
+    row.querySelector('.sbase-url').placeholder = '同一格式也可以再挂一个地址';
+    sel.closest('.sbase-row').after(row);
+    row.querySelector('.sbase-url').focus();
+  });
+  const del = el('button', { class: 'sbase-del', type: 'button', title: '删掉这一行' }, '×');
+  del.addEventListener('click', () => {
+    if (document.querySelectorAll('#s-bases .sbase-row').length <= 1) { inp.value = ''; return; }
+    sel.closest('.sbase-row').remove();
+  });
+  return el('div', { class: 'sbase-row' }, sel, inp, add, del);
 }
+
+/* 装载：默认四行按固定顺序摆（有旧值的填旧值），存过但不在四种之内的
+   （第二条 OpenAI、其他格式）按原顺序追加在后面，一条不丢。 */
+function sbaseLoad(bu) {
+  const host = $('s-bases');
+  clear(host);
+  const saved = (bu || []).filter((b) => String(b.url || '').trim());
+  const used = new Set();
+  for (const fmt of BASE_DEFAULTS) {
+    const hit = saved.find((b) => (b.format || 'openai') === fmt && !used.has(b));
+    if (hit) used.add(hit);
+    host.appendChild(sbaseRow(fmt, hit ? hit.url : ''));
+  }
+  for (const b of saved) {
+    if (!used.has(b)) host.appendChild(sbaseRow(b.format || 'other', b.url));
+  }
+}
+
 function openSiteModal(p) {
   siteEditing = p || { id: '', kind: 'relay' };
   $('sm-title').textContent = p ? `编辑站点 · ${p.name}` : '添加站点';
   $('s-name').value = p?.name || '';
   $('s-kind').value = p?.kind || 'relay';
-  const bu = p?.base_urls || [];
-  $('s-b-openai').value = baseOf(bu, 'openai');
-  $('s-b-anth').value = baseOf(bu, 'anthropic');
-  $('s-b-other').value = baseOf(bu, 'other');
+  sbaseLoad(p?.base_urls || []);
   $('s-models').value = p?.models_list || '';
   // 额度挂在站点上：一个站一份总额度/剩余，不是每条 key 各一份
   $('s-total').value = p?.total ?? '';
@@ -5762,9 +6738,9 @@ function openSiteModal(p) {
 function closeSiteModal() { $('smodal').hidden = true; siteEditing = null; }
 async function saveSiteModal() {
   const bases = [];
-  for (const [fmt, , id] of BASE_FMT) {
-    const url = $(id).value.trim();
-    if (url) bases.push({ format: fmt, url });
+  for (const row of document.querySelectorAll('#s-bases .sbase-row')) {
+    const url = row.querySelector('.sbase-url').value.trim();
+    if (url) bases.push({ format: row.querySelector('.sbase-fmt').value, url });
   }
   const item = {
     // 新站点留空 id：后端按归一化站点名 / base_url 自动并入已有站点，不会重复建
@@ -5908,7 +6884,7 @@ function kmRenderCands() {
     return;
   }
   host.appendChild(el('div', { class: 'hintline' },
-    `认出 ${kmCands.length} 条密钥。名称可以就地改，截止日期统一用文本里那个；确认无误点「全部保存」。`));
+    `已识别 ${kmCands.length} 条密钥`));
   kmCands.forEach((c, i) => {
     const inp = el('input', { value: c.label, placeholder: '这条密钥用在哪（Pot / WorkBuddy…）', autocomplete: 'off' });
     inp.addEventListener('input', () => { kmCands[i].label = inp.value.trim(); });
@@ -6502,6 +7478,11 @@ function factsLine(s) {
 }
 const ORIGIN_TXT = { adopt: '接着用本机原来那份', copy: '复制一份带来对话与记忆', fresh: '从零开始，空目录' };
 function openWizard() {
+  const selectedApp = S.data.apps.find((a) => a.id === S.cur);
+  if (selectedApp?.id === 'claude-desktop') { run('launch_app', { app: selectedApp.id }); return; }
+  if (selectedApp?.id === 'codex-desktop') { openChatgptAdd(selectedApp); return; }
+  if (selectedApp?.id === 'zcode') { openZcodeAdd(); return; }
+  if (selectedApp?.id === 'antigravity') { openAntigravityAdd(); return; }
   const app = S.data.apps.find((a) => a.id === S.cur);
   if (!app) return;
   if (!app.installed) { toast('未找到该程序的可执行文件，无法新建账号', false); return; }
@@ -7242,6 +8223,8 @@ function endTour() {
 }
 
 /* ---------------- 设置页 ---------------- */
+/* 远程控制不在这一列里：它是侧栏上的一级入口（跟密钥管理 / 模型反代并列），
+   自己一整页，见 renderRemotePage。 */
 const SET_SECTIONS = [
   ['profile', '个人资料'], ['general', '常规'], ['appearance', '外观'],
   ['quota', '额度提醒'], ['ai', 'AI 识别'],
@@ -7285,13 +8268,24 @@ async function setSetting(section, key, value) {
   renderSettings();
 }
 
+/* 设置页的一行：标题 + 说明上下堆叠在左，控件贴右（跟 Qoder 的设置行一个思路）。
+   大块内容（侧导菜单这类编辑器）不要塞进右边那一列——那会把整块推到右侧、左边留
+   一大片空白；用 rowWide：标题在上，内容在下面整宽铺开。 */
 function row(label, desc, ctl) {
-  // 长说明收进 label 旁的问号圈（悬停/单击看全文），行内只留短句，版面不再被说明文字顶得忽高忽低
-  const long = typeof desc === 'string' && desc.length > DESC_INLINE_MAX;
+  const help = typeof desc === 'string' && (S.view !== 'remote' || desc.length > DESC_INLINE_MAX);
   return el('div', { class: 'setrow' },
     el('div', {},
-      el('div', { class: 'lab' }, label, long ? qhelp(desc) : null),
-      desc && !long ? el('div', { class: 'desc' }, desc) : null),
+      el('div', { class: 'lab' }, label, desc && help ? qhelp(desc) : null),
+      desc && !help ? el('div', { class: 'desc' }, desc) : null),
+    el('div', { class: 'ctl' }, ctl));
+}
+/* 上下结构：标题（+ 说明）占满一行在上，控件/编辑器在下面整宽。 */
+function rowWide(label, desc, ctl) {
+  const help = typeof desc === 'string' && (S.view !== 'remote' || desc.length > DESC_INLINE_MAX);
+  return el('div', { class: 'setrow wide' },
+    el('div', {},
+      el('div', { class: 'lab' }, label, desc && help ? qhelp(desc) : null),
+      desc && !help ? el('div', { class: 'desc' }, desc) : null),
     el('div', { class: 'ctl' }, ctl));
 }
 function segCtrl(opts, value, pick) {
@@ -7739,10 +8733,10 @@ function sideMenuEditor() {
   };
   const A = mkPanel('侧栏布局预览', 'side');
   const B = mkPanel('收进「更多」', 'more');
-  const lockedRow = (iconId, label) => {
+  const lockedRow = (iconId, label, key) => {
     const lk = menuIcon('lock');
     lk.classList.add('se-lockico');
-    return el('div', { class: 'se-row locked' },
+    return el('div', { class: 'se-row locked', data: { lock: key } },
       menuIcon(iconId), el('span', { class: 'se-name' }, label),
       el('span', { class: 'se-lock', title: '固定项' }, lk));
   };
@@ -7755,53 +8749,85 @@ function sideMenuEditor() {
     handle.addEventListener('pointerdown', (e) => startRowDrag(e, id, panelKey, row, A, B));
     return row;
   };
-  A.list.appendChild(lockedRow('home', '首页'));
+  A.list.appendChild(lockedRow('home', '首页', 'home'));
   for (const id of vis) A.list.appendChild(dragRow(id, 'side'));
-  A.list.appendChild(lockedRow('more', '更多'));
-  A.list.appendChild(lockedRow('gear', '设置'));
-  if (!more.length) B.list.appendChild(el('div', { class: 'se-empty' }, '把右边的行拖回这里，就收进「更多」'));
+  A.list.appendChild(lockedRow('more', '更多', 'more'));
+  A.list.appendChild(lockedRow('gear', '设置', 'gear'));
+  if (!more.length) B.list.appendChild(el('div', { class: 'se-empty' }, '把左边的行拖进来，就收进「更多」'));
   for (const id of more) B.list.appendChild(dragRow(id, 'more'));
   wrap.appendChild(A.panel);
   wrap.appendChild(B.panel);
   return wrap;
 }
 
-/* 一次跨栏拖拽：pointerdown 抓住六个点 → move 时按指针找目标面板与插入位（亮线提示）
-   → up 落盘。数据源是两个数组（side_visible / side_menu），并集恒等于全部候选项。 */
+/* 一次跨栏拖拽：pointerdown 抓住六个点 → 移动时跟手一个幽灵标签（看得到自己拖的是谁），
+   目标面板整块高亮 + 在真实插入位置画一条落点线（空列表也有落点，不再"一点反应都没有"）
+   → 松手落盘。数据源是两个数组（side_visible / side_menu），并集恒等于全部候选项。 */
 function startRowDrag(e, id, fromPanel, rowEl, A, B) {
   if (e.button !== 0) return;
   e.preventDefault();
   seDrag = id;
   rowEl.classList.add('dragging');
+  const ghost = el('div', { class: 'se-ghost' }, menuIcon(id),
+    el('span', {}, SIDE_MENU_ITEMS[id][0]));
+  document.body.appendChild(ghost);
+  const ind = el('div', { class: 'se-ind' });
+  let indHost = null;
   let target = null;
-  const mark = (row, above) => {
+  const clearMarks = () => {
+    document.querySelectorAll('.se-panel').forEach((p) => p.classList.remove('drop-on'));
     document.querySelectorAll('.se-row').forEach((r) => r.classList.remove('drop-above', 'drop-below'));
-    if (!row) return;
-    row.classList.add(above ? 'drop-above' : 'drop-below');
+    if (indHost) { ind.remove(); indHost = null; }
   };
   const move = (ev) => {
+    // 幽灵标签压在光标左上方，不遮住下面那条落点线
+    ghost.style.left = `${ev.clientX + 16}px`;
+    ghost.style.top = `${ev.clientY - 34}px`;
+    clearMarks();
+    target = null;
     const under = document.elementFromPoint(ev.clientX, ev.clientY);
     const panel = under && under.closest('.se-panel');
-    target = null;
-    if (!panel) { mark(null); return; }
-    const rows = [...panel.querySelectorAll('.se-row:not(.locked):not(.dragging)')];
+    if (!panel) return;
+    const key = panel.dataset.panel;
+    const rows = [...panel.querySelectorAll('.se-row')];
+    const locks = rows.filter((r) => r.classList.contains('locked'));
+    const cands = rows.filter((r) => !r.classList.contains('locked') && r !== rowEl);
+    const pr = panel.getBoundingClientRect();
+    // 可插入区间：左栏夹在「首页」和「更多」之间（三行固定项不能被动），右栏整块都行。
+    // 注意 vis 为空时这个区间只有行间那 3px——不能因为"窄"就不提示，那正是最需要提示的时候。
+    const topBound = key === 'side' && locks[0]
+      ? locks[0].getBoundingClientRect().bottom : pr.top + 8;
+    const botBound = key === 'side' && locks[1]
+      ? locks[1].getBoundingClientRect().top : pr.bottom - 8;
+    panel.classList.add('drop-on');
     let before = null;
-    for (const r of rows) {
+    for (const r of cands) {
       const rc = r.getBoundingClientRect();
       if (ev.clientY < rc.top + rc.height / 2) { before = r; break; }
     }
-    target = { panel: panel.dataset.panel, before: before ? before.dataset.id : null };
-    const ref = before || rows[rows.length - 1];
-    mark(ref, !!before);
+    let y;
+    if (before) y = before.getBoundingClientRect().top - pr.top - 2;
+    else {
+      const last = cands[cands.length - 1];
+      y = last ? last.getBoundingClientRect().bottom - pr.top : topBound - pr.top + 2;
+    }
+    const lo = topBound - pr.top;
+    const hi = Math.max(lo, botBound - pr.top - 3);
+    y = Math.min(Math.max(y, lo), hi);
+    panel.appendChild(ind);
+    indHost = panel;
+    ind.style.top = `${y}px`;
+    target = { panel: key, before: before ? before.dataset.id : null };
   };
   const up = () => {
     document.removeEventListener('pointermove', move, true);
     document.removeEventListener('pointerup', up, true);
     document.removeEventListener('pointercancel', up, true);
-    mark(null);
+    clearMarks();
+    ghost.remove();
     rowEl.classList.remove('dragging');
     seDrag = null;
-    if (!target || (target.panel === fromPanel && target.before === rowEl.dataset.id)) { renderSettings(); return; }
+    if (!target || (target.panel === fromPanel && target.before === id)) { renderSettings(); return; }
     const vis = sideMenuSplit().vis.slice();
     const more = sideMenuSplit().more.slice();
     const src = fromPanel === 'side' ? vis : more;
@@ -7820,7 +8846,127 @@ function startRowDrag(e, id, fromPanel, rowEl, A, B) {
   document.addEventListener('pointercancel', up, true);
 }
 
+/* ---------------- 远程控制页（手机扫码） ----------------
+   原来是设置里的一节，现在跟密钥管理 / 模型反代并列，是侧栏一级入口。
+   只在打开这一页时读 remote_view（带 4.5 秒防抖，4 秒轮询重渲染不会连打后端）。
+   开关 / 配对码 / 设备吊销都走 action，视图跟着回包重读。 */
+let remoteBusy = false;
+let remoteSelectedIp = '';
+async function loadRemoteView(force) {
+  if (remoteBusy) return;
+  if (!force && S.remoteView && Date.now() - (S.remoteAt || 0) < 4500) return;
+  remoteBusy = true;
+  const r = await invoke('action', { payload: { action: 'remote_view' } }).catch(() => null);
+  remoteBusy = false;
+  if (r && r.ok) { S.remoteView = r.view; S.remoteAt = Date.now(); }
+  if (S.view === 'remote') renderRemotePage();
+}
+
+function remoteAgo(sec) {
+  if (sec == null) return '—';
+  if (sec < 90) return '刚刚';
+  if (sec < 5400) return Math.round(sec / 60) + ' 分钟前';
+  if (sec < 172800) return Math.round(sec / 3600) + ' 小时前';
+  return Math.round(sec / 86400) + ' 天前';
+}
+
+function remoteSection(body, panel, row, actBtn) {
+  const V = S.remoteView;
+  if (!V) {
+    if (!remoteBusy) loadRemoteView(true);
+    body.appendChild(panel('远程控制', el('div', { class: 'empty' }, '正在读…')));
+    return;
+  }
+  if (!V.enabled) {
+    body.appendChild(panel('远程控制（手机 / 平板）',
+      el('div', { class: 'invline' },
+        '关着。开启后本机监听 ', el('b', {}, `${V.url}`), '，同一网络里的手机扫码进来，能看额度、触发刷新和签到。'),
+      el('div', { class: 'invline warn' },
+        '这是把驾驶舱放到网络上：只放行只读+刷新+签到（换号/删除/搬家不开放），明文 Key 永不出网；重启后需要重新开启。'),
+      row('开关', '开启即生成配对二维码（10 分钟有效）', actBtn('开启', async () => {
+        const r = await invoke('action', { payload: { action: 'remote_enable' } });
+        toast((r && r.msg) || '', r && r.ok);
+        loadRemoteView(true);
+      }))));
+    return;
+  }
+  // 已开启：二维码 + 配对码 + 设备 + 审计
+  loadRemoteView();   // 防抖刷新：面板开着时 4 秒轮询重渲染，这里顶多 4.5 秒真拉一次
+  const P = V.pair;
+  const addresses = P?.urls || [];
+  const selected = addresses.find(a => a.ip === remoteSelectedIp) || addresses[0];
+  if (selected) remoteSelectedIp = selected.ip;
+  const addressSelect = addresses.length > 1
+    ? el('select', { value: remoteSelectedIp, onchange: e => {
+        remoteSelectedIp = e.target.value;
+        renderRemotePage();
+      } }, addresses.map(a => el('option', { value: a.ip, selected: a.ip === remoteSelectedIp },
+        `${a.interface || '网卡'} · ${a.ip}`)))
+    : null;
+  const pairBox = P
+    ? el('div', { style: 'display:flex;flex-direction:column;gap:6px' },
+        addressSelect,
+        el('img', {
+          src: 'data:image/svg+xml;utf8,' + encodeURIComponent(selected?.qr_svg || P.qr_svg || ''),
+          alt: '手机扫码配对', width: 190, height: 190,
+          style: 'background:#fff;border-radius:12px;padding:8px;display:block',
+        }),
+        el('div', { class: 'kv' }, `${selected?.url || P.url}`),
+        el('div', { class: 'kv' }, `配对码 `, el('b', {}, P.code), ` · ${Math.max(0, Math.round(P.expires_in / 60))} 分钟内有效`))
+    : el('div', { class: 'empty' }, '（当前没有有效配对码，点「生成配对码」）');
+  body.appendChild(panel('远程控制 · 监听中',
+    row('状态', '手机请连接与电脑互通的网络，然后扫下面的二维码',
+      el('span', { class: 'kv' }, `0.0.0.0:${V.port}`)),
+    el('div', { class: 'invline' }, V.fw_ok
+      ? '已找到远控防火墙规则；这不保证手机与电脑之间的网络互通。'
+      : '未找到远控防火墙规则；如系统弹出授权，请允许添加规则。'),
+    el('div', { class: 'invline' }, '校园网或访客 Wi‑Fi 可能禁止设备互访。扫码无法打开时，可尝试让电脑连接手机热点后重新生成二维码。'),
+    rowWide('二维码', '一次性配对码换设备凭据，扫完即作废', pairBox),    row('生成新码', '旧码立刻作废', actBtn('生成配对码', async () => {
+      await invoke('action', { payload: { action: 'remote_code' } });
+      loadRemoteView(true);
+    })),
+    row('关闭', `无人访问 ${V.idle_off_h} 小时也会自动关`, actBtn('关闭远程控制', async () => {
+      const r = await invoke('action', { payload: { action: 'remote_disable' } });
+      toast((r && r.msg) || '', r && r.ok);
+      loadRemoteView(true);
+    }))));
+  const dev = (V.devices || []).map((d) => row(
+    d.name || d.id,
+    `${d.created_at ? '配对于 ' + remoteAgo(Date.now() / 1000 - d.created_at) + ' · ' : ''}最近访问 ${remoteAgo(d.last_seen_ago)}`,
+    actBtn('吊销', async () => {
+      const r = await invoke('action', { payload: { action: 'remote_device_revoke', id: d.id } });
+      toast((r && r.msg) || '', r && r.ok);
+      loadRemoteView(true);
+    })));
+  body.appendChild(panel('已配对设备',
+    ...(dev.length ? dev : [el('div', { class: 'empty' }, '还没有设备配对，扫码进来第一台')]),
+    el('div', { class: 'invline' }, '手机端能做的：看板 / 额度 / 签到 / 一键刷新 / Key 测活。别的都得回桌面。')));
+  const log = (V.audit || []).map((a) => el('div', { class: 'kv' },
+    `${a.t || ''} · ${a.ev || ''} · ${a.ip || ''}${a.d ? ' · ' + a.d : ''}`));
+  body.appendChild(panel('访问记录',
+    ...(log.length ? log : [el('div', { class: 'empty' }, '还没有记录')]),
+    el('div', { class: 'invline' }, '完整日志在 数据根/logs/remote-access.log。手机连不上时先看 Windows 防火墙有没有放行本程序。')));
+}
+
+/* 远程控制整页：内容区就是 remoteSection 那几块，外面套侧栏一级页的骨架。
+   4 秒轮询每拍都会重画，滚动位置由 render() 里的 keepScroll 兜住。 */
+function renderRemotePage() {
+  const body = $('remote-body');
+  if (!body) return;
+  clear(body);
+  const panel = (title, ...rows) => el('section', { class: 'panel' }, el('h2', {}, title), ...rows);
+  try {
+    remoteSection(body, panel, row, actBtn);
+  } catch (err) {
+    body.appendChild(el('section', { class: 'panel' },
+      el('h2', {}, '远程控制：渲染出错'),
+      el('div', { class: 'invline bad' }, String((err && err.stack) || err))));
+  }
+}
+
 function renderSettings() {
+  // 远程控制已经搬出设置页：万一 setSection 还停在一个不存在的节上，回落到常规
+  if (!SET_SECTIONS.some(([id]) => id === setSection)) setSection = 'general';
   // 右栏自己滚（左菜单另算）
   const host = $('set-body') || document.querySelector('.content');
   if (setLast !== setSection) {
@@ -7891,17 +9037,14 @@ function renderSettings() {
         el('div', { class: 'ctlrow' },
           numCtrl(navWidth(a.nav_w), NAV_MIN, NAV_MAX, (v) => setSetting('appearance', 'nav_w', v)),
           actBtn('恢复默认', () => setSetting('appearance', 'nav_w', NAV_DEFAULT)))),
-      row('侧栏底部菜单区高度',
-        '固定：正好装下 首页 / 更多 / 设置 这三行，不随窗口大小变化，也不再能拖动。'
-        + '字号调大时它会跟着变高——那是内容变了，不是窗口变了。'),
       row('侧栏形态', '只剩一列程序图标，悬停可看名字；点 « / » 或 Ctrl+B 切换。',
         segCtrl([['auto', '自动'], ['expand', '总是展开'], ['collapse', '总是收起']],
           a.nav_collapsed === true ? 'collapse' : (a.nav_collapsed === false ? 'expand' : 'auto'),
           (v) => setSetting('appearance', 'nav_collapsed', v === 'auto' ? null : v === 'collapse'))),
-      row('侧导菜单', '左边是侧栏上实际的样子（首页 / 更多 / 设置固定不动），右边是收进「更多」的；'
+      rowWide('侧导菜单', '左边是侧栏上实际的样子（首页 / 更多 / 设置固定不动），右边是收进「更多」的；'
         + '按住行尾六个点拖动，可以排序、也可以跨栏。',
         sideMenuEditor()),
-      row('「设置」菜单', '侧栏「设置」弹层里放哪些项、按什么顺序。',
+      rowWide('「设置」菜单', '侧栏「设置」弹层里放哪些项、按什么顺序。',
         menuEditor('gear_menu', GEAR_MENU_ITEMS, '在「设置」里'))));
   }
 
@@ -8105,7 +9248,7 @@ function renderSettings() {
 
   if (setSection === 'about') {
     body.appendChild(panel('关于',
-      row('版本', 'Tauri 2 + Rust 原生壳（WebView2），与 Cockpit Tools 同构',
+    row('版本', '',
         el('span', { class: 'kv' }, `v${S.data.app_version || '2.0.0'}`)),
       row('数据位置', '全部只存本机，不随代码上传。要迁到别的盘（或看占了多少地方）去 设置→存储',
         el('span', { class: 'kv' }, S.data.data_root || '~/.agent-cockpit/')),
@@ -8118,7 +9261,7 @@ function renderSettings() {
       row('监听地址', '反代与界面只绑回环，不对外网开放',
         el('span', { class: 'kv' }, `127.0.0.1:${p.port || 8788}`))));
   }
-  host.scrollTop = setScroll;
+  restoreScroll(host, setScroll);
 }
 // 本机余额直读：串号时先问一句要不要改绑，绝不静默覆盖另一个账号的数
 /* 读数结果的三种收尾：认人（改绑）、缺登录（开这个号自己的窗口）、成功（报一句）。
@@ -8639,6 +9782,7 @@ async function swapSetAndLaunch(app, name) {
 // 切换账号＝在客户端里退出登录再登录。驾驶舱只把程序打开——不 swap_set、不结束任何进程，
 // 因为她只是换个号，没有任何理由因此被要求关掉正在用的程序。
 async function openClient(app, name) {
+  if (app === 'zcode') return !!(await zcodeAction('launch_app', name))?.ok;
   const i = S.data.instances.find((x) => x.app === app && x.name === name);
   const a = S.data.apps.find((x) => x.id === app);
   const r = await invoke('action', { payload: { action: 'launch_app', app, name } })
@@ -8654,6 +9798,7 @@ async function openClient(app, name) {
 // 一键换号：把目标号存过的登录态写回档案位置，再自动重开客户端。
 // 这里"重启"是真的需要——客户端只在启动时读那份文件；和以前那种"文件根本没改却要求关程序"不是一回事。
 async function authSwitch(app, name) {
+  if (app === 'zcode') return !!(await zcodeAction('zcode_switch', name))?.ok;
   const a = S.data.apps.find((x) => x.id === app) || {};
   const cur = (S.data.instances || []).find((x) => x.app === app && x.logged_in);
   if (!await askConfirm(
@@ -8689,6 +9834,15 @@ async function cleanCache(app, name) {
   }
 }
 async function del(app, name) {
+  if (app === 'zcode') {
+    if (!await askConfirm(`移除「${name}」的卡片？登录备份、本机对话和项目保留。`, { title: '移除 ZCode 账号', okText: '移除' })) return false;
+    return !!(await zcodeAction('zcode_remove', name))?.ok;
+  }
+  if (app === 'codex-desktop') {
+    if (!await askConfirm('移除这个账号的登记？资料目录、登录凭据和对话均保留。', { title: '移除 ChatGPT 账号' })) return false;
+    const result = await run('delete', { app, name });
+    return !!result?.ok;
+  }
   const i = S.data.instances.find((x) => x.app === app && x.name === name);
   // 接管进来的账号里那份数据可能是从默认档案搬过来的**唯一一份**，删掉就真没了 —— 必须说清
   const orphan = i && i.rehome_to
@@ -8748,6 +9902,7 @@ const MENU_ICONS = {
   keys: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="11" r="2.7"/><path d="M6.9 9.1 13 3M10.2 5.8l2 2M12 4l2 2"/></svg>',
   proxy: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 8h10M9.8 5.2 12.9 8l-3.1 2.8"/></svg>',
   checkin: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M5.3 8.3l1.9 1.9 3.5-4"/></svg>',
+  remote: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="1.8" width="6" height="12.4" rx="1.4"/><path d="M7.2 12.4h1.6"/></svg>',
   appearance: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 2a6 6 0 0 1 0 12Z" fill="currentColor" stroke="none"/></svg>',
   logs: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5.6 4h7.8M5.6 8h7.8M5.6 12h7.8"/><circle cx="2.7" cy="4" r=".5" fill="currentColor" stroke="none"/><circle cx="2.7" cy="8" r=".5" fill="currentColor" stroke="none"/><circle cx="2.7" cy="12" r=".5" fill="currentColor" stroke="none"/></svg>',
   help: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M6.3 6.3a1.8 1.8 0 1 1 2.7 1.9c-.6.4-1 .7-1 1.5"/><circle cx="8" cy="11.6" r=".5" fill="currentColor" stroke="none"/></svg>',
@@ -8767,6 +9922,8 @@ const SIDE_MENU_ITEMS = {
   keys: ['密钥管理', () => { S.view = 'keys'; }],
   proxy: ['模型反代', () => { S.view = 'proxy'; }],
   checkin: ['每日签到', () => { S.view = 'checkin'; }],
+  // 远程控制是独立一整页（跟密钥管理 / 模型反代并列），不再挂在设置里当一节
+  remote: ['远程控制', () => { S.view = 'remote'; }],
 };
 const GEAR_MENU_ITEMS = {
   settings: ['设置', () => { setSection = 'general'; S.view = 'settings'; }],
@@ -8908,6 +10065,7 @@ function bind() {
   $('btn-home').addEventListener('click', () => { S.view = 'home'; render(); });
 
   bindProxyNums();
+  $('btn-remote-refresh')?.addEventListener('click', () => loadRemoteView(true));
   $('c-alerts').addEventListener('click', showAlerts);
   bindCtx();
   $('btn-new').addEventListener('click', openWizard);

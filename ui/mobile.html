@@ -1,0 +1,219 @@
+<!doctype html>
+<!-- 手机端远程控制页（remote.rs 单独分发这一份 + mobile.js，桌面那套 UI 不从这里出）。
+     配对：桌面端侧栏「远程控制」生成二维码，扫开后 URL 里的 #t=码 在 mobile.js 里自动换 token。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Agent 驾驶舱 · 远程</title>
+<style>
+  :root {
+    --bg: #f2f4f7; --card: #fff; --card2: #f6f8fa; --line: #e3e7ec;
+    --tx: #1b2129; --sub: #66707c; --blue: #2f7ef7; --blue-weak: rgba(47,126,247,.12);
+    --ok: #23a06f; --ok-weak: rgba(35,160,111,.13);
+    --warn: #d98a1f; --warn-weak: rgba(217,138,31,.15);
+    --bad: #d5586c; --bad-weak: rgba(213,88,108,.12);
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1318; --card: #161d24; --card2: #1d262f; --line: #29333d;
+      --tx: #e7ecf2; --sub: #8d98a5; --blue: #4f97ff;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { background: var(--bg); color: var(--tx); }
+  body {
+    font: 15px/1.55 "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui,
+      -apple-system, "Microsoft YaHei UI", "PingFang SC", sans-serif;
+    font-variant-numeric: lining-nums tabular-nums;
+    max-width: 640px; margin: 0 auto;
+    padding-bottom: calc(58px + env(safe-area-inset-bottom));
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; background: var(--card);
+    border-bottom: 1px solid var(--line);
+    padding: calc(10px + env(safe-area-inset-top)) 14px 10px;
+    display: flex; align-items: center; gap: 9px;
+  }
+  header h1 { font-size: 17px; font-weight: 600; flex: 1; }
+  .sub { font-size: 12px; color: var(--sub); display: flex; align-items: center; gap: 5px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  .dot.off { background: var(--bad); }
+  .badge { font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--warn-weak); color: var(--warn); white-space: nowrap; }
+  .badge.ok { background: var(--ok-weak); color: var(--ok); }
+  main { padding: 12px 12px 8px; }
+  section { display: none; }
+  section.on { display: block; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 13px; margin-bottom: 10px; }
+  .card h3 { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .meta { font-size: 12px; color: var(--sub); }
+  .row { display: flex; align-items: center; gap: 9px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+  .row:last-child { border-bottom: none; padding-bottom: 2px; }
+  .row .grow { flex: 1; min-width: 0; }
+  .row .t { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .d { font-size: 12px; color: var(--sub); margin-top: 1px; }
+  b.num { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .btn {
+    appearance: none; border: none; font: inherit; cursor: pointer;
+    border-radius: 11px; padding: 11px 14px; font-size: 14px; font-weight: 500;
+    background: var(--blue); color: #fff; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    min-height: 44px;
+  }
+  .btn[disabled] { opacity: .5; }
+  .btn.ghost { background: var(--card2); color: var(--tx); border: 1px solid var(--line); }
+  .btn.sm { min-height: 36px; padding: 6px 12px; font-size: 13px; border-radius: 9px; font-weight: 400; }
+  .btn.block { width: 100%; }
+  .pill { font-size: 12px; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+  .pill.ok { background: var(--ok-weak); color: var(--ok); }
+  .pill.warn { background: var(--warn-weak); color: var(--warn); }
+  .pill.bad { background: var(--bad-weak); color: var(--bad); }
+  .pill.blue { background: var(--blue-weak); color: var(--blue); }
+  .pill.grey { background: var(--card2); color: var(--sub); }
+  .track { height: 7px; border-radius: 4px; background: var(--card2); overflow: hidden; margin-top: 9px; }
+  .fill { height: 100%; border-radius: 4px; background: var(--blue); width: 0; transition: width .5s; }
+  .fill.warn { background: var(--warn); }
+  .kv { display: flex; justify-content: space-between; align-items: baseline; margin-top: 8px; font-size: 13px; color: var(--sub); }
+  .kv .val { color: var(--tx); }
+  nav {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    background: var(--card); border-top: 1px solid var(--line);
+    padding-bottom: env(safe-area-inset-bottom);
+    max-width: 640px; margin: 0 auto;
+  }
+  nav button {
+    appearance: none; border: none; background: none; font: inherit; cursor: pointer;
+    color: var(--sub); font-size: 11px; padding: 7px 0 6px;
+    display: flex; flex-direction: column; align-items: center; gap: 2px;
+  }
+  nav button.on { color: var(--blue); }
+  nav .ic { font-size: 19px; line-height: 1; font-weight: 400; }
+  /* 配对门：没 token / token 失效时整页只留这一个卡 */
+  #gate { display: none; position: fixed; inset: 0; z-index: 20; background: var(--bg); padding: 24px 18px; overflow: auto; }
+  #gate.on { display: block; }
+  #gate .box { max-width: 420px; margin: 8vh auto 0; }
+  #gate h2 { font-size: 18px; margin-bottom: 6px; }
+  #gate p { color: var(--sub); font-size: 14px; margin-bottom: 16px; }
+  #gate code { background: var(--card2); border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; font-size: 13px; }
+  #toast {
+    position: fixed; left: 50%; transform: translateX(-50%); bottom: 76px; z-index: 30;
+    background: var(--tx); color: var(--bg); font-size: 13px; border-radius: 10px;
+    padding: 9px 16px; max-width: 86vw; opacity: 0; transition: opacity .25s; pointer-events: none;
+  }
+  #toast.on { opacity: .96; }
+  .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: rot .8s linear infinite; vertical-align: -2px; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } .fill { transition: none; } }
+  .empty { text-align: center; color: var(--sub); font-size: 13px; padding: 18px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent 驾驶舱 <span class="sub" style="font-weight:400">· 远程</span></h1>
+  <span class="sub"><span class="dot" id="connDot"></span><span id="connText">连接中</span></span>
+  <span class="badge" id="alertBadge" hidden></span>
+</header>
+
+<main>
+  <!-- 看板 -->
+  <section id="tab-dash" class="on" aria-label="看板">
+    <div class="card" id="refreshCard" hidden>
+      <div class="row" style="border:none;padding-top:0">
+        <div class="grow"><div class="t" id="jobText">刷新中…</div><div class="d" id="jobSub"></div></div>
+        <b class="num" id="jobNum"></b>
+      </div>
+      <div class="track"><div class="fill" id="jobFill"></div></div>
+    </div>
+    <div style="display:flex;gap:9px;margin-bottom:10px">
+      <button class="btn" style="flex:1" id="btnRefreshAll">↻ 一键刷新全部额度</button>
+    </div>
+    <div class="card" id="alertCard" hidden>
+      <h3>⏰ 临期额度</h3>
+      <div id="alertList"></div>
+    </div>
+    <div class="card">
+      <h3>概况</h3>
+      <div class="row"><div class="grow"><div class="t">Agent 在跑</div><div class="d" id="statSub"></div></div><b class="num" id="statRun">–</b></div>
+      <div class="row"><div class="grow"><div class="t">今日待领签到</div><div class="d" id="checkinSub">–</div></div><b class="num" id="statCheckin">–</b></div>
+      <div class="row"><div class="grow"><div class="t">本地反代 8788</div><div class="d" id="proxySub">–</div></div><span class="pill grey" id="proxyPill">–</span></div>
+    </div>
+  </section>
+
+  <!-- 额度 -->
+  <section id="tab-quota" aria-label="额度">
+    <div id="quotaList"></div>
+    <div class="card" id="siteCard" hidden>
+      <h3>🗝 站点 Key 台账</h3>
+      <div id="siteList"></div>
+    </div>
+  </section>
+
+  <!-- 签到 -->
+  <section id="tab-checkin" aria-label="每日签到">
+    <div class="card">
+      <div class="row" style="border:none;padding-top:0">
+        <div class="grow meta" id="checkinMeta">加载中…</div>
+        <button class="btn ghost sm" id="btnCheckinRefresh">↻ 全部重查</button>
+      </div>
+      <div id="checkinList"></div>
+    </div>
+    <div class="card" id="ciLogCard" hidden>
+      <div class="row" style="border:none;padding-top:0">
+        <div class="grow"><div class="t">领取日志</div><div class="d" id="ciLogMeta"></div></div>
+        <div style="display:flex;gap:5px" id="ciLogRanges"></div>
+      </div>
+      <div id="ciLogList"></div>
+    </div>
+  </section>
+
+  <!-- 更多 -->
+  <section id="tab-more" aria-label="更多">
+    <div class="card">
+      <h3>🔐 连接</h3>
+      <div class="row"><div class="grow"><div class="t">本机设备</div><div class="d" id="meName">–</div></div><span class="pill ok" id="mePill">已配对</span></div>
+      <div class="row"><div class="grow"><div class="t">无人访问自动关闭</div><div class="d" id="idleNote">–</div></div></div>
+    </div>
+    <div class="card" id="pxCard">
+      <h3>⚙ 反代与保管箱</h3>
+      <div class="row"><div class="grow"><div class="t">本地反代</div><div class="d" id="pxLogSub">–</div></div><span class="pill grey" id="pxPill2">–</span></div>
+      <div id="pxLogList"></div>
+      <div class="row"><div class="grow"><div class="t">凭据保管箱</div><div class="d" id="vaultSub">–</div></div><span class="pill grey" id="vaultPill">–</span></div>
+    </div>
+    <div class="card">
+      <h3>📲 装进主屏</h3>
+      <div class="meta">iPhone：Safari 分享 → 添加到主屏幕；安卓：Chrome 菜单 → 安装应用。之后从主屏图标进，全屏像 App。</div>
+    </div>
+    <div class="card">
+      <button class="btn ghost block" id="btnUnpair">退出配对（清除本机凭据）</button>
+    </div>
+    <p class="meta" style="text-align:center" id="verNote"></p>
+  </section>
+</main>
+
+<nav>
+  <button data-tab="dash" class="on"><span class="ic">▦</span>看板</button>
+  <button data-tab="quota"><span class="ic">◎</span>额度</button>
+  <button data-tab="checkin"><span class="ic">✓</span>签到</button>
+  <button data-tab="more"><span class="ic">⋯</span>更多</button>
+</nav>
+
+<div id="gate">
+  <div class="box">
+    <h2>需要配对</h2>
+    <p id="gateMsg">在电脑上打开 Agent 驾驶舱的「远程控制」，开启服务并扫描二维码。如果邮箱验证后未自动配对，请输入电脑页面显示的配对码。</p>
+    <form id="gatePairForm">
+      <label for="gateCode">配对码</label>
+      <input id="gateCode" type="password" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="32" placeholder="输入电脑上显示的 32 位配对码" style="width:100%;box-sizing:border-box;margin:8px 0 12px;padding:10px">
+      <button class="btn block" id="gatePair" type="submit">配对</button>
+    </form>
+    <button class="btn ghost block" id="gateRetry" type="button" style="margin-top:10px">重试连接</button>
+    <p style="margin-top:14px;font-size:12px" id="gateErr" role="alert"></p>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="mobile.js"></script>
+</body>
+</html>

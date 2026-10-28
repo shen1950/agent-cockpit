@@ -357,13 +357,20 @@ pub fn spawn_refresh_all(app: &tauri::AppHandle) -> bool {
 pub async fn action(
     handle: tauri::AppHandle,
     payload: Value,
-    state_ref: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
+    service_action(&handle, &payload)
+}
+
+/// action 的传输无关本体：桌面 Tauri IPC 和 Web 远程控制（remote.rs）走同一条分发路，
+/// 锁策略与 catch_unwind 只此一份。payload 形如 {action, app?, name?, ...}。
+pub fn service_action(handle: &tauri::AppHandle, payload: &Value) -> Result<Value, String> {
+    use tauri::Manager;
+    let state_ref = handle.state::<AppState>();
     let act = payload["action"].as_str().unwrap_or("").to_string();
     // 「一键刷新全部额度」不在这里同步跑：十几个账号挨个读，官网那条还要建隐藏窗口，
     // 一路同步下去窗口要冻好几分钟。起个后台任务，界面靠 4 秒一轮的进度自己看。
     if act == "refresh_all" {
-        let started = spawn_refresh_all(&handle);
+        let started = spawn_refresh_all(handle);
         return Ok(json!({
             "ok": true, "started": started,
             "msg": if started { "已经开始逐个读各账号的额度" } else { "上一轮还在跑，等它跑完" },
@@ -383,13 +390,19 @@ pub async fn action(
     // 所以界面看着是活的。锁只在真正落账的那一段拿。
     // Qoder 的探测/一键也走这条"锁外探测"的路：它们要等上游响应（国内版那条探测最坏 25 秒），
     // 持锁跑就是"点了没反应、别的动作全被挡"——2026-10-20 实测复现过。
-    if matches!(
+    if act.starts_with("chatgpt_") || app_id == "zcode" || matches!(
         act.as_str(),
         "key_test" | "key_probe_models" | "key_models"
             | "qproxy_probe" | "qproxy_oneclick"
             | "qproxy_cn_login" | "qproxy_cn_bridge"
             | "wproxy_probe" | "wproxy_oneclick"
             | "astudio_probe" | "astudio_oneclick" | "astudio_test" | "astudio_refresh"
+            // MiniMax 的 test 要等上游模型回话、oneclick 要起反代，同样不压全局锁
+            | "minimax_probe" | "minimax_oneclick" | "minimax_test" | "minimax_refresh"
+            // 起桥要等端口、测试要等模型回话，都不能压着全局锁
+            | "qwbridge_start" | "qwbridge_stop" | "qwbridge_test" | "qwbridge_oneclick"
+            // 妙手的 test 要等整个云端回合跑完（最坏几十秒）、oneclick 要起反代
+            | "pawbridge_test" | "pawbridge_probe" | "pawbridge_oneclick"
     ) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_action(&act, &app_id, &name, &payload, &state_ref)
@@ -410,6 +423,14 @@ pub async fn action(
 }
 
 fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppState) -> Value {
+    if app_id == crate::zcode::APP {
+        let mut request = payload.clone(); request["app"] = json!(app_id); request["name"] = json!(name);
+        if let Some(result) = crate::zcode::action(act, &request) { return result; }
+    }
+    if app_id == crate::antigravity::APP {
+        let mut request = payload.clone(); request["app"] = json!(app_id); request["name"] = json!(name);
+        if let Some(result) = crate::antigravity::action(act, &request) { return result; }
+    }
     // 台账 / AI / 福利 / 反代 / 数据根 / 保管箱这些跟产品无关的动作先分流走，
     // 走到下面这道门的，分支里必然要用 AppDef 或实例 meta，才真的要求选中 Agent
     if let Some(v) = app_free(act, payload, st) {
@@ -486,6 +507,9 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
         }
 
         "new_instance" => {
+            if reg::registered_app_id(app_id).is_some() {
+                return err("Claude 桌面版的登录由官方客户端管理，请使用“打开客户端”");
+            }
             if reg::resolve_exe(&app).is_none() {
                 return err(format!("未找到 {} 可执行文件", app.name));
             }
@@ -786,12 +810,9 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                 Some(e) => e,
                 None => return err(format!("未找到 {} 可执行文件", app.name)),
             };
-            let r = if app.kind == "cli" {
-                procs::launch_terminal(&exe).map(|_| ())
-            } else {
-                procs::launch_plain(&exe).map(|_| ())
-            };
+            let r = procs::launch_default_app(&app, &exe).map(|_| ());
             match r {
+                Ok(_) if reg::registered_app_id(app_id).is_some() => ok(format!("已打开 {}", app.name)),
                 Ok(_) if app.kind == "plain" => ok(format!(
                     "已打开 {}（该程序不支持独立数据目录，多开无效）", app.name)),
                 Ok(_) => ok(format!("已打开 {}", app.name)),
@@ -1038,6 +1059,16 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                 ok(m)
             } else {
                 err(m)
+            }
+        }
+
+        "claude_desktop_open_data" => {
+            if app_id != "claude-desktop" {
+                return err("请选择 Claude 桌面版");
+            }
+            match procs::open_native_data_dir(app_id) {
+                Ok(()) => ok("已打开 Claude 资料目录"),
+                Err(message) => err(message),
             }
         }
 
@@ -1674,7 +1705,62 @@ fn ids_of(payload: &Value) -> Vec<(String, String)> {
 }
 
 fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
+    if let Some(result) = crate::chatgpt::action(act, payload) { return Some(result); }
     let v = match act {
+        // ===== Web 远程控制（手机扫码）=====
+        // 这些动作只给桌面端用；手机端能碰的只有 remote.rs 里 WEB_ACTIONS 那张表
+        "remote_view" => {
+            let mut view = crate::remote::view();
+            let tunnel = crate::remote_tunnel::view();
+            if let (Some(url), Some(code)) = (tunnel["url"].as_str(), view["pair"]["code"].as_str()) {
+                let pair_url = format!("{url}/#t={code}");
+                let qr = crate::remote::qr_svg(&pair_url);
+                view["public_pair"] = json!({"url": pair_url, "qr_svg": qr});
+            }
+            view["tunnel"] = tunnel;
+            json!({ "ok": true, "view": view })
+        }
+        "remote_enable" => {
+            let (ok, msg) = crate::remote::start();
+            if ok {
+                let pair = crate::remote::new_pair();
+                if let Some(e) = pair["error"].as_str() { let _ = crate::remote::stop(); err(e) }
+                else { json!({ "ok": true, "msg": msg, "pair": pair }) }
+            } else {
+                err(&msg)
+            }
+        }
+        "remote_disable" => {
+            let (done, msg) = crate::remote::stop();
+            if done { ok(&msg) } else { err(&msg) }
+        }
+        "remote_code" => {
+            let pair = crate::remote::new_pair();
+            if let Some(e) = pair["error"].as_str() { err(e) } else { json!({ "ok": true, "pair": pair }) }
+        }
+        "remote_tunnel_start" => {
+            if !crate::remote::is_running() { err("请先开启远程控制") }
+            else {
+                let email = payload["email"].as_str().unwrap_or("");
+                match crate::remote_tunnel::start(email) {
+                    Ok(()) => ok("正在建立公网连接"),
+                    Err(e) => err(&e),
+                }
+            }
+        }
+        "remote_tunnel_stop" => match crate::remote_tunnel::stop() {
+            Ok(()) => ok("公网连接已关闭"),
+            Err(e) => err(&e),
+        },
+        "remote_device_revoke" => {
+            let id = payload["id"].as_str().unwrap_or("").to_string();
+            if crate::remote::revoke(&id) {
+                ok("已吊销，那台设备下次请求会被拒")
+            } else {
+                err("没有这个已配对设备")
+            }
+        }
+
         // ===== 数据根与空间治理 =====
         // sizes=false 只报位置和各盘余量（毫秒级）；sizes=true 交给后台线程数，先回 counting
         "storage_report" => {
@@ -1842,11 +1928,7 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             let snap = crate::procs::snapshot_fresh();
             let live = crate::procs::program_pids(&reg::exe_name(&app).to_lowercase(), &snap);
             let launched = if live.is_empty() {
-                let r = if app.kind == "cli" {
-                    crate::procs::launch_terminal(&exe).map(|_| ())
-                } else {
-                    crate::procs::launch_plain(&exe).map(|_| ())
-                };
+                let r = crate::procs::launch_default_app(&app, &exe).map(|_| ());
                 match r {
                     Ok(_) => true,
                     Err(e) => return Some(err(format!("启动 {} 失败：{}", app.name, e))),
@@ -2286,6 +2368,96 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             }
         }
 
+        // ── MiniMax Code（见 mmproxy.rs）──
+        // 上游是 Anthropic 协议（/messages），反代这层翻成 OpenAI 形状给客户端用。
+        "minimax_status" => ok(crate::mmproxy::view().to_string()),
+
+        // 只验令牌：不发模型请求（不花积分）
+        "minimax_probe" => {
+            let r = crate::mmproxy::probe();
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["text"].as_str().unwrap_or("探完了"),
+                "result": r,
+            })
+        }
+
+        // 用指定模型发一次极小补全（约 10 token）
+        "minimax_test" => {
+            let r = crate::mmproxy::test(payload["model"].as_str().unwrap_or("MiniMax-M3.1-Flash"));
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["error"].as_str().unwrap_or("测完了"),
+                "result": r,
+            })
+        }
+
+        // 刷新 OAuth 令牌（轮换制，只有真过期才换；成功立刻写回 auth.json）
+        "minimax_refresh" => {
+            let r = crate::mmproxy::refresh_now();
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["msg"].as_str().unwrap_or("刷新完了"),
+                "result": r,
+            })
+        }
+
+        // 一键：建/复用上游组 → 建/复用接入密钥 → 起反代
+        "minimax_oneclick" => {
+            let r = crate::mmproxy::one_click(&st.proxy);
+            json!({
+                "ok": r["ok"].as_bool().unwrap_or(false),
+                "msg": r["msg"].as_str().unwrap_or("跑完了"),
+                "result": r,
+            })
+        }
+
+        "minimax_reveal" => {
+            let k = crate::mmproxy::dist_reveal();
+            if k.is_empty() {
+                err("还没有 MiniMax Code 的接入密钥：点「一键反代」会自动建一把")
+            } else {
+                ok(k)
+            }
+        }
+
+        "qwbridge_start" => crate::qwbridge::start(),
+        "qwbridge_stop" => crate::qwbridge::stop(),
+        "qwbridge_probe" => json!({ "ok": true, "result": crate::qwbridge::probe() }),
+        "qwbridge_model_ids" => crate::qwbridge::model_ids(),
+        // 一键：验登录态 → 起桥 → 接线（缺才建）→ 起反代，一个按钮走完
+        "qwbridge_oneclick" => crate::qwbridge::one_click(&st.proxy),
+        "qwbridge_reveal" => {
+            let k = crate::qwbridge::reveal();
+            if k.is_empty() {
+                err("还没有千问办公的接入密钥：到「接入密钥」表里生成一把，勾上「千问办公 上游组」")
+            } else {
+                ok(k)
+            }
+        }
+        "qwbridge_test" => {
+            let model = payload["model"].as_str().unwrap_or("flash");
+            json!({ "ok": true, "result": crate::qwbridge::test(model) })
+        }
+
+        // ── 妙手（进程内云端直连，见 pawbridge.rs；旧命名管道桥已废弃）──
+        "pawbridge_probe" => json!({ "ok": true, "result": crate::pawbridge::probe() }),
+        "pawbridge_model_ids" => crate::pawbridge::model_ids(),
+        // 一键：验令牌 → 接线（缺才建）→ 起反代。不再拉起妙手、不再起桥。
+        "pawbridge_oneclick" => crate::pawbridge::one_click(&st.proxy),
+        "pawbridge_reveal" => {
+            let k = crate::pawbridge::reveal();
+            if k.is_empty() {
+                err("还没有妙手的接入密钥：到「接入密钥」表里生成一把，勾上「妙手 上游组」")
+            } else {
+                ok(k)
+            }
+        }
+        "pawbridge_test" => {
+            let model = payload["model"].as_str().unwrap_or("LongCat-2.0");
+            json!({ "ok": true, "result": crate::pawbridge::test(model) })
+        }
+
         "key_upsert" => {
             let (o, m, sid) = keys::upsert_site(&payload["item"]);
             if o {
@@ -2363,6 +2535,33 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
                 m.push_str(&format!("；{} 条目标站里已经有了，跳过（{}）", dupes, dupe_names.join("、")));
             }
             ok(m)
+        }
+
+        // 站点排序：order = 全部站点 id 的新顺序（拖拽落盘用）
+        "site_reorder" => {
+            let order: Vec<String> = payload["order"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if order.is_empty() {
+                return Some(err("没说要排成什么顺序"));
+            }
+            let (o, m) = keys::reorder_sites(&order);
+            if o { ok(m) } else { err(m) }
+        }
+
+        // 站点内密钥排序：site + order = 该站点 key id 的新顺序
+        "key_reorder" => {
+            let site = payload["site"].as_str().unwrap_or("");
+            let order: Vec<String> = payload["order"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if site.is_empty() || order.is_empty() {
+                return Some(err("缺站点或没说要排成什么顺序"));
+            }
+            let (o, m) = keys::reorder_keys(site, &order);
+            if o { ok(m) } else { err(m) }
         }
 
         // 批量删除：ids = [{site, id}]，一次读盘写盘
@@ -3075,6 +3274,23 @@ fn adopt_needs_confirm(origin: &str, src: Option<&PathBuf>, confirmed: Option<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_desktop_rejects_instance_creation_before_any_profile_operation() {
+        let state = AppState { proxy: crate::proxy::Proxy::shared() };
+        let result = run_action("new_instance", "claude-desktop", "Claude", &json!({"origin":"adopt"}), &state);
+        assert_eq!(result["ok"], false);
+        assert!(result["msg"].as_str().unwrap().contains("官方客户端管理"));
+    }
+
+    #[test]
+    fn claude_desktop_data_action_rejects_other_products_and_arbitrary_paths() {
+        let state = AppState { proxy: crate::proxy::Proxy::shared() };
+        let result = run_action("claude_desktop_open_data", "claude", "", &json!({"path":"C:/Windows"}), &state);
+        assert_eq!(result["ok"], false);
+        assert!(result["msg"].as_str().unwrap().contains("请选择 Claude 桌面版"));
+        assert!(procs::open_native_data_dir("claude").is_err());
+    }
 
     /// 接管＝原地登记：账号目录必须就是默认档案目录本身，一个字节都不搬。
     #[test]

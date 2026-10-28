@@ -4,9 +4,11 @@
 #![recursion_limit = "256"]
 
 mod ai;
+mod antigravity;
 mod asproxy;
 mod authpack;
 mod checkin;
+mod chatgpt;
 mod cliauth;
 mod commands;
 mod discover;
@@ -19,15 +21,21 @@ mod keys;
 mod local_quota;
 mod lifecycle;
 mod machine;
+mod mmproxy;
 mod opencode;
+mod pawbridge;
 mod procs;
 mod proxy;
 mod qproxy;
+mod qwbridge;
 mod quota;
 mod registry;
+mod remote;
+mod remote_tunnel;
 mod secrets;
 mod settings;
 mod shelllink;
+mod shell_identity;
 mod space;
 mod state;
 mod storage;
@@ -36,10 +44,11 @@ mod traeproxy;
 mod usage;
 mod wbproxy;
 mod webquota;
+mod zcode;
 
 use std::time::Duration;
 
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 use tauri_plugin_autostart::ManagerExt;
@@ -84,6 +93,7 @@ fn main() {
     // 放在 --rehome 分支之前，命令行那条路同样要留痕。
     lifecycle::install_panic_hook();
     lifecycle::start();
+    if let Err(error) = shell_identity::process() { lifecycle::note(&error); }
     if let Some(code) = cli_rehome() {
         lifecycle::why(&format!("命令行 --rehome 跑完，退出码 {}", code));
         lifecycle::exit();
@@ -108,16 +118,23 @@ fn main() {
         .setup(|app| {
             // 官网额度要开一个自己的登录窗口，得先拿到 AppHandle
             webquota::set_app(app.handle().clone());
+            // Web 远程控制同理：/api/action 要从 HTTP 线程回到这份 AppState 上分发。
+            // 注意这里**不启动监听**——同 8788 反代，开着端口这件事必须由用户显式点开
+            remote::set_app(app.handle().clone());
             // 还没安家的话先按盘况挑位置（系统盘满了不该再往上堆十几 GB），再建目录
             storage::ensure_first_run();
             registry::ensure_dirs();
             // 保管箱先解锁到内存（没设主密码就是 DPAPI 直接解），再把散落的明文收进去
             secrets::load();
             commands::sweep_plaintext();
+            if let Err(error) = zcode::migrate_registered() { lifecycle::note(&format!("ZCode 账号登记：{error}")); }
             // 开机先把「换号记录 vs 磁盘上的 junction」对一遍：两者脱节的后果不是显示错，
             // 是目标程序直接起不来（默认入口指着已删除的账号目录）。放在建托盘之前，
             // 让第一次 get_state 就能带上体检结果。
             swap::self_check();
+            if let Some(w) = app.get_webview_window("main") {
+                if let Err(error) = shell_identity::window(&w) { lifecycle::note(&error); }
+            }
             build_tray(app.handle())?;
             // 窗口配置为 visible:false，由这里显式决定显示还是静默驻留托盘：
             // 继承父进程 STARTUPINFO 会让某些启动方式下窗口以最小化出现
@@ -176,6 +193,7 @@ fn main() {
 
 fn show_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
+        if let Err(error) = shell_identity::window(&w) { lifecycle::note(&error); }
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
@@ -184,6 +202,8 @@ fn show_main(app: &tauri::AppHandle) {
 
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开驾驶舱", true, None::<&str>)?;
+    let clients = Submenu::with_id(app, "chatgpt_windows", "打开 ChatGPT 窗口", true)?;
+    refresh_chatgpt_tray(app, &clients)?;
     let rescan = MenuItem::with_id(app, "rescan", "重新扫描本机程序", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh_quota", "立即刷新额度", true, None::<&str>)?;
     let proxy = CheckMenuItem::with_id(app, "proxy", "本地反代", true, false, None::<&str>)?;
@@ -197,7 +217,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open, &rescan, &refresh, &proxy, &data_dir, &sep, &auto, &sep2, &restart, &quit],
+        &[&open, &clients, &rescan, &refresh, &proxy, &data_dir, &sep, &auto, &sep2, &restart, &quit],
     )?;
 
     if let Ok(enabled) = app.autolaunch().is_enabled() {
@@ -218,6 +238,13 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     // 左键单击 = 打开主窗口；右键仍弹菜单
     let handle = app.clone();
     builder = builder.on_tray_icon_event(move |_tray, event| {
+        if matches!(&event, tauri::tray::TrayIconEvent::Enter { .. }
+            | tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Right,
+                button_state: tauri::tray::MouseButtonState::Down, ..
+            }) {
+            let _ = refresh_chatgpt_tray(&handle, &clients);
+        }
         if let tauri::tray::TrayIconEvent::Click {
             button: tauri::tray::MouseButton::Left,
             button_state: tauri::tray::MouseButtonState::Up,
@@ -231,6 +258,18 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let auto_item = auto.clone();
     let proxy_item = proxy.clone();
     builder = builder.on_menu_event(move |app: &tauri::AppHandle, event| {
+        if let Some(name) = chatgpt_tray_account(event.id().as_ref()) {
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                let result = chatgpt::action("chatgpt_show_window", &serde_json::json!({"app":chatgpt::APP,"name":name}));
+                if let Some(result) = result.filter(|v| v["ok"] != true) {
+                    let message = result["msg"].as_str().unwrap_or("打开窗口失败，请在驾驶舱查看该账号");
+                    let _ = handle.notification().builder().title("ChatGPT 窗口").body(message).show();
+                    show_main(&handle);
+                }
+            });
+            return;
+        }
         match event.id().as_ref() {
             "open" => show_main(app),
             "rescan" => {
@@ -269,11 +308,13 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     let _ = auto_item.set_checked(!enabled);
                 }
             }
-            // 重启＝把当前 exe 原样再拉一遍：换过新版 exe、或者后台线程卡住时，
-            // 这一下比"去任务管理器结束进程再双击"清楚得多
+            // 菜单回调必须先返回：restart() 在主线程直接清理托盘资源，
+            // 会重入菜单分发持有的锁，并跳过 single-instance 的 Exit 清理。
+            // request_restart() 交给事件循环退出，释放托盘及单实例后再启动。
             "restart" => {
                 lifecycle::why("托盘「重启应用」");
-                app.restart()
+                lifecycle::note("已收到托盘重启请求，等待事件循环退出");
+                app.request_restart();
             }
             "quit" => {
                 lifecycle::why("托盘「退出」");
@@ -284,6 +325,42 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     });
     builder.build(app)?;
     Ok(())
+}
+
+const CHATGPT_TRAY_PREFIX: &str = "chatgpt_open:";
+fn chatgpt_tray_id(name: &str) -> String {
+    format!("{CHATGPT_TRAY_PREFIX}{}", secrets::b64_encode(name.as_bytes()))
+}
+fn chatgpt_tray_account(id: &str) -> Option<String> {
+    let encoded = id.strip_prefix(CHATGPT_TRAY_PREFIX)?;
+    let name = String::from_utf8(secrets::b64_decode(encoded).ok()?).ok()?;
+    if name.is_empty() || registry::bad_account_name(&name).is_some() { return None; }
+    Some(name)
+}
+fn refresh_chatgpt_tray(app: &tauri::AppHandle, submenu: &Submenu<tauri::Wry>) -> tauri::Result<()> {
+    while submenu.remove_at(0)?.is_some() {}
+    let accounts = registry::load_instances(chatgpt::APP);
+    if accounts.is_empty() {
+        submenu.append(&MenuItem::with_id(app, "chatgpt_empty", "暂无 ChatGPT 账号", false, None::<&str>)?)?;
+    }
+    for account in accounts {
+        let name = account["name"].as_str().unwrap_or("");
+        if name.is_empty() { continue; }
+        // IDs carry the exact name; adding, removing and renaming accounts cannot
+        // leave a stale index pointing at another account in a long-lived tray.
+        submenu.append(&MenuItem::with_id(app, chatgpt_tray_id(name), name, true, None::<&str>)?)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)] mod tray_tests {
+    #[test] fn account_menu_ids_preserve_exact_identity() {
+        for name in ["API 工作账号", "Plus@example.com", "AIWelink-Pro"] {
+            assert_eq!(super::chatgpt_tray_account(&super::chatgpt_tray_id(name)).as_deref(), Some(name));
+        }
+        assert!(super::chatgpt_tray_account("open").is_none());
+        assert!(super::chatgpt_tray_account("chatgpt_open:").is_none());
+    }
 }
 
 /// 后台循环：启动先扫一遍本机新装程序，再提醒临期额度，之后按设置里的间隔抓取 + 复查

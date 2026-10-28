@@ -333,25 +333,22 @@ pub fn ensure_start_menu() {
         .map(|o| {
             o.get("exe").and_then(|v| v.as_str()) == Some(exe_s.as_str())
                 && o.get("lnk").and_then(|v| v.as_str()) == Some(lnk_s.as_str())
+                && o.get("app_id").and_then(|v| v.as_str()) == Some(crate::shell_identity::APP_ID)
         })
         .unwrap_or(false);
     if unchanged && t.start.exists() && alias.exists() {
         return;
     }
-    if t.start.exists() {
-        // 已经有一个了：是我们的就只补记账，不是我们的（比如别的会话建的）就别动
-        if let Some(target) = read_targets(&[t.start.clone()]).ok().and_then(|v| v.first().cloned()) {
-            if !target.is_empty() && !is_our_target(&target, &t.exe) {
-                return;
-            }
-        }
-        if !alias.exists() {
-            let _ = write_lnk(&t.exe, &alias);
-        }
-    } else if !create("startmenu")["ok"].as_bool().unwrap_or(false) {
-        return;
+    for link in [&t.start, &alias, &t.desktop] {
+        if link.exists() {
+            // Only stamp a shortcut whose target was positively confirmed. A
+            // failed read must not authorize altering a namesake shortcut.
+            let target = read_targets(&[link.clone()]).ok().and_then(|v| v.first().cloned());
+            if !target.as_deref().is_some_and(|target| is_our_target(target, &t.exe)) { continue; }
+            if crate::shell_identity::shortcut(link).is_err() { return; }
+        } else if link != &t.desktop && write_lnk(&t.exe, link).is_err() { return; }
     }
-    crate::settings::update(&json!({ "start_menu_link": { "exe": exe_s, "lnk": lnk_s } }));
+    crate::settings::update(&json!({ "start_menu_link": { "exe": exe_s, "lnk": lnk_s, "app_id": crate::shell_identity::APP_ID } }));
 }
 
 /// 写一个 .lnk。图标用 exe 自己（IconLocation "exe,0"），工作目录设成 exe 所在目录——
@@ -382,7 +379,7 @@ fn write_lnk(exe: &Path, lnk: &Path) -> Result<(), String> {
         ps_quote(&l), ps_quote(&e), ps_quote(&w), ps_quote(&e), ps_quote(&l)
     );
     match run_ps(&script) {
-        Ok(o) if o.lines().any(|x| x.trim() == "DONE") => Ok(()),
+        Ok(o) if o.lines().any(|x| x.trim() == "DONE") => crate::shell_identity::shortcut(lnk),
         Ok(_) => Err(format!("PowerShell 未确认落盘（{l}）")),
         Err(x) => Err(x),
     }

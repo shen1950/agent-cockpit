@@ -61,6 +61,7 @@ fn exp_sort_key(s: &str) -> String {
 
 /// 该 Agent 能否真正多开：先看静态判定，再看实测结论（启动后校验失败会写进 app_caps）
 fn isolate_ok(cfg: &Value, app: &crate::registry::AppDef) -> bool {
+    if app.id == crate::zcode::APP { return false; }
     // CLI（CODEX_HOME 环境变量）与 Chromium PWA（--user-data-dir）都是目录隔离，
     // 实测都真能并存，不需要靠 app_caps 记录"试过没有"
     if app.kind == "cli" || app.kind == "pwa" {
@@ -150,7 +151,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
         let inst_names: Vec<&str> = insts.iter().filter_map(|m| m["name"].as_str()).collect();
         // 「这台机器现在登的是谁」——产品级的一份真值，和卡片上绑的账号是两件事。
         // 不摆出来，就出现"人早换成另一个号了，卡片还停在旧号"这种看着像 bug 的错。
-        let machine = crate::machine::current(&app.id);
+        let machine = if app.id == crate::zcode::APP { crate::zcode::machine_state(crate::machine::current(&app.id)) } else { crate::machine::current(&app.id) };
         // 这个产品是不是几个账号共用默认位置那一份档案。共用的那种，切换账号＝在客户端里
         // 退出登录再登录：界面不许摆"换号要先关程序"，程序级进程也要按现在登着谁归属。
         let shared = crate::registry::shares_one_profile(&app.id);
@@ -174,10 +175,11 @@ pub fn build_state(proxy: &Proxy) -> Value {
             "discovered": app.discovered, "isolatable": can_isolate,
             "custom": app.id.starts_with("custom-"),
             "removed": removed, "new": is_new,
-            "swap_ok": app.kind != "plain" && profile_dir(&app.id).is_some(),
+            "swap_ok": app.id != "codex-desktop" && app.kind != "plain" && profile_dir(&app.id).is_some(),
             "local_quota": crate::local_quota::store_for(&app.id).is_some(),
             "icon": crate::icons::get(&app.id),
             "exe": resolve_exe(&app).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            "native_data_dir": crate::registry::native_data_dir(&app.id).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         }));
 
         for m in insts {
@@ -189,6 +191,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
             // 这个账号名下的进程：先按实例目录精确匹配；匹配不到而它又是当前换号账号，
             // 才按程序级算（换号产品的进程命令行里只有默认档案路径）
             let owned: Vec<u32> = match app.kind.as_str() {
+                "pwa" if app.id == crate::chatgpt::APP => crate::chatgpt::instance_pids(&m, &snap),
                 // 共用一份档案的产品：每个账号的 data_dir 都是同一个目录，按目录匹配会把
                 // 整棵进程树算到每张卡头上（两张卡同时显示"运行中"）。谁在跑只有登录态知道，
                 // 所以按"现在登着的那个号"归属；读不到登录态才退回换号记录。
@@ -218,6 +221,10 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 let pid = m["pid"].as_u64().unwrap_or(0) as u32;
                 let on = pid != 0 && alive(&snap, pid);
                 (on, if on { 1 } else { 0 })
+            } else if app.id == crate::chatgpt::APP {
+                // ChatGPT keeps titled tray/helper HWNDs after its real window
+                // closes. Only the account's actual document counts as open.
+                (crate::chatgpt::window_visible(&m, &snap), owned.len())
             } else {
                 (windowed_count(&owned, &vis) > 0, owned.len())
             };
@@ -536,7 +543,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
             instances.push(json!({
                 "app": app.id, "app_name": app.name, "kind": app.kind,
                 "name": m["name"], "workdir": m["workdir"].as_str().unwrap_or(""),
-                "created": fmt_date(m["created"].as_f64().unwrap_or(0.0)),
+                "created": if app.id==crate::zcode::APP {m["created"].as_str().map(str::to_string).unwrap_or_else(||fmt_date(m["created"].as_f64().unwrap_or(0.0)))} else {fmt_date(m["created"].as_f64().unwrap_or(0.0))},
                 // 这个账号的数据是怎么来的：adopt=接管了本机原有档案 / copy=从别处复制 / fresh=空档
                 "origin": m["origin"].as_str().unwrap_or(""),
                 "seeded_from": m["seeded_from"].as_str().unwrap_or(""),
@@ -564,6 +571,10 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 // 这个号存过登录态没有：存过才能一键切回来，没存过界面只给"去登一次"
                 "auth_pack": crate::authpack::stored(&app.id, m["name"].as_str().unwrap_or("")),
                 "identity": identity::inspect(m["data_dir"].as_str().unwrap_or("")),
+                "chatgpt_auth": if app.id == "codex-desktop" { crate::chatgpt::status(&m) } else { Value::Null },
+                "chatgpt_quota": if app.id == "codex-desktop" { crate::chatgpt::quota_status(&m) } else { Value::Null },
+                "zcode_auth": if app.id == crate::zcode::APP { crate::zcode::status(&m) } else { Value::Null },
+                "antigravity_auth": if app.id == crate::antigravity::APP { crate::antigravity::status(&m) } else { Value::Null },
                 "usage": m["usage"],
                 "usage_fetched_at": m["usage_fetched_at"],
                 // 今天签到状态：只读后台缓存，绝不在这里发网络请求（见 checkin::for_app）
@@ -727,6 +738,13 @@ pub fn build_state(proxy: &Proxy) -> Value {
             // AStudio：模型令牌读 astron-session.json 的 modelBearerToken，
             // 直连讯飞云端 model-gateway（OpenAI 兼容，不需要协议翻译）
             "astudio": crate::asproxy::view(),
+            // MiniMax Code：上游是 Anthropic 协议（/messages），mmproxy 负责
+            // 令牌（OAuth，轮换制刷新）+ OpenAI ⇄ Anthropic 双向翻译
+            "minimax": crate::mmproxy::view(),
+            // 千问办公：本地桥（qwenwork-bridge）探活、模型清单、有没有进上游组
+            "qwbridge": crate::qwbridge::view(),
+            // 妙手：本地桥（catpaw-bridge）探活 + 管道闸门 + 登录态 + 有没有进上游组
+            "pawbridge": crate::pawbridge::view(),
             "logs": proxy.recent_logs(30),
         },
         "now": chrono::Local::now().format("%H:%M:%S").to_string(),

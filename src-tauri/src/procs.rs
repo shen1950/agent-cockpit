@@ -55,9 +55,12 @@ fn snapshot_inner(fresh: bool) -> HashMap<u32, ProcInfo> {
     if !fresh && now - guard.at < 10.0 && !guard.map.is_empty() {
         return guard.map.clone();
     }
-    use sysinfo::{ProcessesToUpdate, System};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    // sysinfo 0.33's default refresh omits command lines. Account ownership
+    // depends on the actual arguments; an empty command cannot identify a profile.
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet));
     let mut out = HashMap::new();
     for (pid, p) in sys.processes() {
         out.insert(
@@ -214,13 +217,46 @@ pub fn instance_pids(app: &AppDef, cands: &[String], snap: &HashMap<u32, ProcInf
 }
 
 pub fn program_pids(exe_name_lower: &str, snap: &HashMap<u32, ProcInfo>) -> Vec<u32> {
+    // Claude 桌面版与原生 Claude Code CLI 都可能叫 claude.exe。桌面版的
+    // 进程表和结束动作必须确认完整 MSIX 路径；读不到身份时不认领同名进程。
+    // CLI 实例本来按登记的 PID 管理，不走这份桌面程序名匹配。
+    let image = if exe_name_lower == "claude.exe" {
+        match app_def("claude-desktop").and_then(|a| crate::registry::resolve_exe(&a)) {
+            Some(path) => Some(path),
+            None => return Vec::new(),
+        }
+    } else {
+        None
+    };
+    program_pids_for_image(exe_name_lower, snap, image.as_deref())
+}
+
+fn program_pids_for_image(exe_name_lower: &str, snap: &HashMap<u32, ProcInfo>, image: Option<&Path>) -> Vec<u32> {
     let mut v: Vec<u32> = snap
         .iter()
-        .filter(|(_, i)| i.name == exe_name_lower)
+        .filter(|(_, i)| i.name == exe_name_lower
+            && image.map(|path| command_starts_with_image(&i.cmdline, path)).unwrap_or(true))
         .map(|(p, _)| *p)
         .collect();
     v.sort_unstable();
     v
+}
+
+fn command_starts_with_image(cmdline: &str, image: &Path) -> bool {
+    let expected = image.to_string_lossy().replace('\\', "/").to_lowercase();
+    if expected.is_empty() {
+        return false;
+    }
+    let command = cmdline.trim_start().replace('\\', "/").to_lowercase();
+    if let Some(quoted) = command.strip_prefix('"') {
+        return quoted.strip_prefix(&expected)
+            .and_then(|tail| tail.strip_prefix('"'))
+            .map(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+            .unwrap_or(false);
+    }
+    command.strip_prefix(&expected)
+        .map(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+        .unwrap_or(false)
 }
 
 pub fn kill_pids(pids: &[u32]) {
@@ -316,8 +352,36 @@ pub fn launch_cli(app: &AppDef, exe: &Path, data_dir: &Path, workdir: &str) -> R
 /// 它把第一个位置参数当 URL/PWA 入口，传工作目录会开成网页。
 /// 不同目录＝不同浏览器实例，实测能与已在跑的实例共存（各自一份登录态）。
 pub fn launch_pwa(exe: &Path, data_dir: &Path) -> Result<(), String> {
+    launch_pwa_isolated(exe, data_dir, None)
+}
+
+pub fn launch_pwa_isolated(exe: &Path, data_dir: &Path, codex_home: Option<&Path>) -> Result<(), String> {
+    #[cfg(windows)]
+    if exe.to_string_lossy().to_lowercase().contains("\\windowsapps\\") {
+        if let Some(home)=codex_home {
+            crate::chatgpt::check_plain_path(data_dir)?;crate::chatgpt::check_plain_path(home)?;
+            let quote=|p:&Path|format!("'{}'",p.to_string_lossy().replace('\'',"''"));
+            let script=format!("{}\nStart-AgentCockpitChatgptPackage -Executable {} -Profile {} -AuthHome {} | Out-Null",include_str!("../scripts/chatgpt-launch.ps1"),quote(exe),quote(data_dir),quote(home));
+            let bytes:Vec<u8>=script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let encoded=crate::secrets::b64_encode(&bytes);
+            let mut command=Command::new("powershell.exe");
+            use std::os::windows::process::CommandExt;
+            let output=command.args(["-NoLogo","-NoProfile","-NonInteractive","-WindowStyle","Hidden","-EncodedCommand",&encoded]).creation_flags(CREATE_NO_WINDOW).output().map_err(|e|e.to_string())?;
+            return if output.status.success(){Ok(())}else{Err(format!("商店包启动失败，未回退到默认资料：{}",String::from_utf8_lossy(&output.stderr).chars().take(1000).collect::<String>()))};
+        }
+    }
+    pwa_command(exe, data_dir, codex_home)?.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+fn pwa_command(exe: &Path, data_dir: &Path, codex_home: Option<&Path>) -> Result<Command, String> {
+    crate::chatgpt::check_plain_path(data_dir)?;
     let mut c = Command::new(exe);
     scrub_env(&mut c);
+    if let Some(home) = codex_home {
+        crate::chatgpt::check_plain_path(home)?;
+        for key in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ACCESS_TOKEN", "OPENAI_IDENTITY_TOKEN_FILE"] { c.env_remove(key); }
+        c.env("CODEX_HOME", home).env("CODEX_ELECTRON_USER_DATA_PATH", data_dir);
+    }
     c.arg(format!("--user-data-dir={}", data_dir.display()))
         .current_dir(exe.parent().unwrap_or(Path::new(".")));
     #[cfg(windows)]
@@ -325,10 +389,105 @@ pub fn launch_pwa(exe: &Path, data_dir: &Path) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         c.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-    c.spawn().map(|_| ()).map_err(|e| e.to_string())
+    Ok(c)
 }
 
-/// 直接打开主程序（用默认档案，不隔离）：用于无法多开的程序与 CLI
+#[cfg(test)]
+mod chatgpt_launch_tests {
+    use super::*;
+    #[test]
+    fn managed_instances_have_separate_browser_and_auth_paths() {
+        let root=crate::registry::home().join("chatgpt-launch-test");
+        for name in ["account-a","account-b"] {
+            let browser=root.join(name).join("browser");let home=root.join(name).join("auth");
+            let c=pwa_command(&root.join("ChatGPT.exe"),&browser,Some(&home)).unwrap();
+            let env:std::collections::HashMap<_,_>=c.get_envs().map(|(k,v)|(k.to_string_lossy().into_owned(),v.map(|v|v.to_string_lossy().into_owned()))).collect();
+            assert_eq!(env["CODEX_HOME"].as_deref(),Some(home.to_string_lossy().as_ref()));
+            assert_eq!(env["CODEX_ELECTRON_USER_DATA_PATH"].as_deref(),Some(browser.to_string_lossy().as_ref()));
+            assert!(env["OPENAI_API_KEY"].is_none());assert!(env["OPENAI_BASE_URL"].is_none());
+            assert_eq!(c.get_args().next().unwrap().to_string_lossy(),format!("--user-data-dir={}",browser.display()));
+        }
+    }
+}
+
+/// 打开本机默认客户端。Claude 桌面版必须走注册包入口，不能借用 CLI
+/// 的 CLAUDE_CONFIG_DIR，也不能把 Claude-3p 改成独立实例目录。
+pub fn launch_default_app(app: &AppDef, exe: &Path) -> Result<u32, String> {
+    if crate::registry::registered_app_id(&app.id).is_some() {
+        return launch_registered_app(&app.id);
+    }
+    if app.kind == "cli" {
+        launch_terminal(exe)
+    } else {
+        launch_plain(exe)
+    }
+}
+
+#[cfg(windows)]
+fn registered_app_command(app_id: &str) -> Result<Command, String> {
+    use std::os::windows::process::CommandExt;
+    let aumid = crate::registry::registered_app_id(app_id)
+        .ok_or_else(|| "该程序没有注册包启动入口".to_string())?;
+    let windows = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+    let mut command = Command::new(PathBuf::from(windows).join("explorer.exe"));
+    scrub_env(&mut command);
+    command.arg(format!("shell:AppsFolder\\{aumid}"));
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    Ok(command)
+}
+
+fn launch_registered_app(app_id: &str) -> Result<u32, String> {
+    #[cfg(windows)]
+    {
+        // Explorer 通过 AppsFolder 激活注册应用；这里返回的是启动器 PID，
+        // 调用方只报告打开动作，不把它登记成 Claude 实例进程。
+        return registered_app_command(app_id)?
+            .spawn().map(|child| child.id()).map_err(|e| e.to_string());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app_id;
+        Err("该桌面客户端需要 Windows 注册包入口".to_string())
+    }
+}
+
+/// 打开登记的只读资料位置。固定产品路径，不收前端 path，也不创建目录。
+pub fn open_native_data_dir(app_id: &str) -> Result<(), String> {
+    let path = crate::registry::native_data_dir(app_id)
+        .ok_or_else(|| "该程序没有登记只读资料目录".to_string())?;
+    if !path.is_dir() {
+        return Err("Claude 资料目录不存在，请先在官方客户端完成初始化".to_string());
+    }
+    let windows = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+    let mut command = Command::new(PathBuf::from(windows).join("explorer.exe"));
+    scrub_env(&mut command);
+    command.arg(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, windows))]
+mod registered_app_launch_tests {
+    use super::*;
+
+    #[test]
+    fn claude_desktop_uses_registered_package_entry_without_profile_arguments() {
+        let command = registered_app_command("claude-desktop").unwrap();
+        assert_eq!(Path::new(command.get_program()).file_name().unwrap(), "explorer.exe");
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude"]);
+        assert!(command.get_current_dir().is_none(), "不要借用安装目录或资料目录作为工作目录");
+        assert!(!command.get_envs().any(|(k, v)| v.is_some() && poisoned(&k.to_string_lossy())));
+        assert!(registered_app_command("claude").is_err(), "不得用桌面包入口启动 CLI");
+        assert!(registered_app_command("codex-desktop").is_err(), "不改变现有 ChatGPT 多开入口");
+    }
+}
+
+/// 直接打开主程序（用默认档案，不隔离）：用于普通原生程序
 pub fn launch_plain(exe: &Path) -> Result<u32, String> {
     let mut c = Command::new(exe);
     scrub_env(&mut c);
@@ -455,8 +614,43 @@ pub fn procs_rows(snap: &HashMap<u32, ProcInfo>) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{poisoned, scrub_env, whole_path_hit, POISON_PREFIX};
+    use super::{command_starts_with_image, poisoned, program_pids_for_image, scrub_env, whole_path_hit, ProcInfo, POISON_PREFIX};
+    use std::collections::HashMap;
+    use std::path::Path;
     use std::process::Command;
+
+    #[test]
+    fn claude_desktop_processes_exclude_same_named_cli_and_unproven_identity() {
+        let image = Path::new(r"C:\Program Files\WindowsApps\Claude_3.6556.2.0_x64__pzs8sxrjxfjjc\app\Claude.exe");
+        let desktop = image.to_string_lossy();
+        let entries = [
+            (1, desktop.to_string()),
+            (2, format!("\"{desktop}\" --type=renderer")),
+            (3, format!("{} --type=gpu-process", desktop.replace('\\', "/").to_uppercase())),
+            (4, r"C:\Users\x\.local\bin\claude.exe --resume".to_string()),
+            (5, format!("C:\\Tools\\claude.exe --inspect \"{desktop}\"")),
+            (6, format!("{desktop}.old --type=renderer")),
+            (7, String::new()),
+            (8, "claude.exe".to_string()),
+        ];
+        let snap: HashMap<_, _> = entries.into_iter().map(|(pid, cmdline)| {
+            (pid, ProcInfo { name: "claude.exe".into(), cmdline })
+        }).collect();
+        assert_eq!(program_pids_for_image("claude.exe", &snap, Some(image)), [1, 2, 3]);
+        // 路径收紧只对需要确认映像的调用生效，其它产品仍保留原来的名称判据。
+        assert_eq!(program_pids_for_image("claude.exe", &snap, None).len(), snap.len());
+    }
+
+    #[test]
+    fn claude_desktop_image_match_requires_complete_leading_executable() {
+        let image = Path::new("C:/Program Files/WindowsApps/Claude_1_x64__pzs8sxrjxfjjc/app/Claude.exe");
+        let path = image.to_string_lossy();
+        assert!(command_starts_with_image(&format!("  \"{path}\"\t--type=utility"), image));
+        assert!(!command_starts_with_image(&format!("C:/CLI/claude.exe --path={path}"), image));
+        assert!(!command_starts_with_image(&format!("\"{path} backup\""), image));
+        assert!(!command_starts_with_image(&format!("\"{path}\".old"), image));
+        assert!(!command_starts_with_image("anything", Path::new("")));
+    }
 
     /// 路径要整段命中：`...\Roaming\Qoder` 不能把 `...\Roaming\QoderCN\...` 的进程
     /// 算成占用者，否则给国际版换号时会把隔壁 CN 的进程全列进阻塞名单
@@ -516,5 +710,13 @@ mod tests {
         ] {
             assert!(!poisoned(k), "{k} 不该动");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_reads_the_current_process_arguments() {
+        let processes=super::snapshot_fresh();
+        let current=processes.get(&std::process::id()).expect("current process is present");
+        assert!(!current.cmdline.trim().is_empty(), "account ownership requires command-line collection");
     }
 }

@@ -47,6 +47,7 @@ fn read_pack(app_id: &str) -> Result<Value, String> {
 
 /// 收下当前登录的号。account / user_id 由调用方从登录态里现读——包本身不解密，认不出是谁。
 pub fn capture(app_id: &str, name: &str, account: &str, user_id: &str) -> Result<Value, String> {
+    if app_id == crate::zcode::APP { return crate::zcode::capture(name, ""); }
     let mut pack = read_pack(app_id)?;
     pack["account"] = json!(account);
     pack["user_id"] = json!(user_id);
@@ -61,6 +62,7 @@ pub fn capture(app_id: &str, name: &str, account: &str, user_id: &str) -> Result
 
 /// 这个号存过登录态没有。返回的是摘要，包体不外传给界面。
 pub fn stored(app_id: &str, name: &str) -> Option<Value> {
+    if app_id == crate::zcode::APP { return crate::zcode::stored(name); }
     let raw = secrets::get(&vid(app_id, name))?;
     let pack: Value = serde_json::from_str(&raw).ok()?;
     let mut files = Vec::new();
@@ -100,6 +102,7 @@ pub fn current_mtime(app_id: &str) -> Option<u64> {
 /// 把某个号存过的登录态放回原位。先备份现在这份，再临时文件 + 改名原子覆盖，
 /// 中途失败不会留下半截文件。客户端还在跑就直接拒绝——那样写回去等于白写。
 pub fn restore(app_id: &str, name: &str) -> Result<Value, String> {
+    if app_id == crate::zcode::APP { return crate::zcode::restore(name); }
     let raw = secrets::get(&vid(app_id, name)).ok_or(format!(
         "「{name}」还没存过登录态：先在客户端里退出登录、登它一次，\
          登进来驾驶舱会自动收下这份登录态，之后就能一键切回来了"
@@ -177,6 +180,7 @@ pub fn restore(app_id: &str, name: &str) -> Result<Value, String> {
 /// 之后切回来都是一键。只在没存过、或者登录文件又写过（比上次收的更新）时才收。
 /// 收包只是读文件 + 写保管箱，不打扰界面；失败也不报（她没在等这个动作，下一轮还会再试）。
 pub fn capture_current(app_id: &str, account: &str, user_id: &str) {
+    if app_id == crate::zcode::APP { crate::zcode::capture_current(); return; }
     if auth_pack_files(app_id).is_empty() || (account.is_empty() && user_id.is_empty()) {
         return;
     }
@@ -229,6 +233,7 @@ pub fn card_for_login(app_id: &str, account: &str, user_id: &str) -> Option<Stri
 /// 返回临时目录；调用方用完删（`drop_profile`）。目录里放的是一份可解的登录密文，
 /// 但它只对这台机器这个 Windows 账户有效——和它原本的防护等级一致，没有降低。
 pub fn materialize(app_id: &str, name: &str) -> Result<PathBuf, String> {
+    if app_id == crate::zcode::APP { return crate::zcode::materialize(name); }
     let raw = secrets::get(&vid(app_id, name)).ok_or_else(|| {
         format!("「{name}」还没存过登录态，读不了它自己的签到/额度（先在客户端里登它一次）")
     })?;

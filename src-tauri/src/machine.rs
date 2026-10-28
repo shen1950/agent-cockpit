@@ -37,6 +37,11 @@ fn put(app_id: &str, v: Value) {
 
 /// 真读一次：走该产品当前的默认档案目录（换号后它就是现在挂着的那个账号）。
 pub fn read(app_id: &str) -> Value {
+    // Antigravity 2.0 登录态在 Windows 凭据管理器（gemini:antigravity），不在 state.vscdb——
+    // 走 agenthub 读到的还是旧壳那份，会认错号。这里直读凭据管理器。
+    if app_id == crate::antigravity::APP {
+        return crate::antigravity::machine_state();
+    }
     let store = match local_quota::store_for(app_id) {
         Some(s) => s,
         None => {

@@ -11,6 +11,32 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tiny_http::{Header, Response, Server, StatusCode};
 
+/// Qoder 分支的"开头看一眼"上限：读到第一个 SSE 空行就停，最多也就这么多字节。
+/// 不用固定字节数是因为 `take(N).read_to_end()` 会阻塞到凑满 N 字节或 EOF——
+/// 短回答要等整条流结束、慢模型要等好几秒，客户端首包超时就把这一轮判成失败。
+const HEAD_PROBE_MAX: usize = 2048;
+
+/// 读到一个完整 SSE 帧（空行收尾）就返回，最多 `HEAD_PROBE_MAX` 字节。
+/// 不能用 `take(N).read_to_end()`：那会一直阻塞到凑满 N 字节或 EOF，
+/// 短回答要等整条流跑完、慢模型要等好几秒，客户端首包超时就把这一轮判成失败。
+fn read_first_frame<R: Read>(r: &mut R) -> Vec<u8> {
+    let mut head = Vec::new();
+    let mut one = [0u8; 1];
+    while head.len() < HEAD_PROBE_MAX {
+        match r.read(&mut one) {
+            Ok(0) => break,
+            Ok(_) => {
+                head.push(one[0]);
+                if head.ends_with(b"\n\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    head
+}
+
 #[derive(Default)]
 pub struct Proxy {
     running: AtomicBool,
@@ -199,6 +225,77 @@ impl Proxy {
         }
     }
 
+    /// 失败快照：客户端（WorkBuddy / ZCode）只会显示一句 "Model request failed."，
+    /// 真正的原因——发出去的报文长什么样、上游到底回了什么——必须落到磁盘上。
+    /// 只记失败、且只记前几 KB，正常对话不会往这里写东西。
+    fn snapshot_fail(
+        &self,
+        path: &str,
+        model: &Option<String>,
+        status: u16,
+        upstream: &str,
+        req_body: &[u8],
+        resp_head: &[u8],
+    ) {
+        use std::io::Write;
+        const CAP: usize = 4096;
+        const MAX_BYTES: u64 = 512 * 1024;
+        let p = crate::registry::base_dir().join("proxy-fail.log");
+        // 体积封顶：留最近一次现场，不让它无限长
+        if std::fs::metadata(&p).map(|m| m.len() > MAX_BYTES).unwrap_or(false) {
+            let _ = std::fs::rename(&p, crate::registry::base_dir().join("proxy-fail.1.log"));
+        }
+        let clip = |b: &[u8]| -> String {
+            let s = String::from_utf8_lossy(&b[..b.len().min(CAP)]);
+            s.replace('\r', " ").replace('\n', " ")
+        };
+        let line = format!(
+            "[{}] {} status={} upstream={} model={}\n  req={}\n  resp={}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            path,
+            status,
+            upstream,
+            model.as_deref().unwrap_or("-"),
+            clip(req_body),
+            clip(resp_head),
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    /// 上游"后端全排不上"时换 auto 重排一次。
+    /// 只在这个明确信号下重试：模型名非法（invalid_model_error）重试也没用，
+    /// 白白多花一次配额。返回 Ok 时连首帧一起给出去，调用方直接透传。
+    fn qoder_retry_auto(
+        &self,
+        method: &str,
+        url: &str,
+        fwd: &[(String, String)],
+        token: &str,
+        body: &[u8],
+    ) -> Option<(Vec<u8>, std::io::BufReader<Box<dyn Read + Send + Sync>>, u16)> {
+        let mut v: Value = serde_json::from_slice(body).ok()?;
+        v["model"] = json!("auto");
+        let b = serde_json::to_vec(&v).ok()?;
+        let mut call = ureq::request(method, url).timeout(std::time::Duration::from_secs(300));
+        for (k, val) in fwd {
+            call = call.set(k, val);
+        }
+        call = call
+            .set("Authorization", &format!("Bearer {}", token))
+            .set("User-Agent", "agent-cockpit/2.0");
+        let resp = call.send(&b[..]).ok()?;
+        let status = resp.status() as u16;
+        let mut br = std::io::BufReader::new(resp.into_reader());
+        let head = read_first_frame(&mut br);
+        // 重排还是排不上，就别把错误帧当成功交出去
+        if crate::qproxy::sse_error_message(&head).is_some() {
+            return None;
+        }
+        Some((head, br, status))
+    }
+
     pub fn start(self: &Arc<Self>, port: u16) -> (bool, String) {
         if self.is_running() {
             return (false, "反代已在运行".into());
@@ -265,7 +362,7 @@ impl Proxy {
             }
             if matches!(
                 name.as_str(),
-                "host" | "content-length" | "connection" | "accept-encoding"
+                "host" | "content-length" | "transfer-encoding" | "connection" | "accept-encoding"
             ) {
                 continue;
             }
@@ -397,9 +494,38 @@ impl Proxy {
             self.serve_trae(req, &method, &path, &body, &up, &via, &route.dist_id, model.clone());
             return;
         }
-        let url = crate::qproxy::upstream_url(&up.base_url, &path);
+        // MiniMax Code：上游是 Anthropic 协议（/messages + Anthropic SSE），
+        // 进 OpenAI 出 OpenAI，翻译层在 mmproxy.rs
+        if crate::mmproxy::is_mm_base(&up.base_url) {
+            self.serve_mm(req, &method, &path, &body, &up, &via, &route.dist_id, model.clone());
+            return;
+        }
+        // 妙手：进程内云端直连（nocode.cn + ai.catpaw.meituan.com），翻译层在 pawbridge.rs
+        if crate::pawbridge::is_paw_base(&up.base_url) {
+            self.serve_paw(req, &method, &path, &body, &up, &via, &route.dist_id, model.clone());
+            return;
+        }
         let t0 = std::time::Instant::now();
         let qoder = crate::qproxy::is_qoder_base(&up.base_url);
+
+        // 千问办公的本地桥挂了就当场拉起来（自愈）：pythonw 起桥 2~5 秒，
+        // 比起让客户端吃一个没头没尾的 502 强。起不起来都不拦请求——起失败就让
+        // 连接错误如实往上传。
+        let base = up.base_url.trim_end_matches('/');
+        let is_qw = [crate::qwbridge::PORT, crate::qwbridge::ALT_PORT]
+            .iter()
+            .any(|port| base == format!("http://127.0.0.1:{port}/v1"));
+        if is_qw && !crate::qwbridge::running_verified() && crate::qwbridge::cred_exists() {
+            let _ = crate::qwbridge::start();
+        }
+        if is_qw && !crate::qwbridge::running_verified() {
+            self.push_log(&method, &path, model, 502, "千问桥不可用", "-", &via);
+            let _ = req.respond(text_response(502, &json!({ "error": "千问桥不可用，请检查登录状态和端口占用" }).to_string()));
+            return;
+        }
+        // start 可能切换端口，当前请求也必须使用新地址，不能发给旧端口的占用者。
+        let target_base = if is_qw { crate::qwbridge::base() } else { up.base_url.clone() };
+        let url = crate::qproxy::upstream_url(&target_base, &path);
 
         // 模型名归一：客户端（WorkBuddy / Cherry Studio / 各家 Agent）发的是自己的模型名，
         // Qoder 不认时仍然回 200，正文却是一帧 SSE `event: error`——客户端读不到字节就直接
@@ -429,7 +555,8 @@ impl Proxy {
         let res = if body.is_empty() {
             call.call()
         } else {
-            call.send(&body[..])
+            // body 已完整缓冲，明确发送长度；本地千问桥按 Content-Length 读取。
+            call.send_bytes(&body)
         };
 
         match res {
@@ -439,20 +566,60 @@ impl Proxy {
                     .header("Content-Type")
                     .unwrap_or("application/json")
                     .to_string();
-                let mut rd = resp.into_reader();
+                let rd = resp.into_reader();
                 // Qoder 上游的"模型不支持/参数不认"是 200 + 流量内错误帧，不是 4xx。
                 // 先看一眼开头几百字节：认出来就把话说清楚，别让客户端只显示"已取消"。
                 if qoder {
-                    let mut head = Vec::new();
-                    let _ = rd.by_ref().take(600).read_to_end(&mut head);
+                    // 只读到「第一帧结束」就往下走。原来的 `take(600).read_to_end()`
+                    // 会一直阻塞到凑满 600 字节或 EOF：短回答要等整条流跑完、
+                    // 慢模型要等好几秒才吐第一个字节，客户端首包/空闲超时就把这一轮
+                    // 判成 "Model request failed."——而内容其实已经全在缓冲里了。
+                    let mut br = std::io::BufReader::new(rd);
+                    let head = read_first_frame(&mut br);
                     if let Some(msg) = crate::qproxy::sse_error_message(&head) {
+                        // Qoder 容量紧张时的常态：模型名合法，只是后端排不上队
+                        // （`provider_error: All models failed` / `All backends failed`）。
+                        // 这不是"这条请求错了"，换 auto 再排一次往往就通了——auto 是上游
+                        // 自己的调度口。不重试的话，客户端只会看到一句 "Model request failed."。
+                        let used = serde_json::from_slice::<Value>(&body)
+                            .ok()
+                            .and_then(|v| v["model"].as_str().map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        let capacity = msg.contains("All models failed")
+                            || msg.contains("All backends failed")
+                            || msg.contains("provider_error");
+                        if capacity && !used.eq_ignore_ascii_case("auto") {
+                            if let Some((h2, br2, st2)) =
+                                self.qoder_retry_auto(&method, &url, &fwd, &up.token, &body)
+                            {
+                                self.push_log(&method, &path, model_log.clone(), st2, &up.label, &up.pool, &via);
+                                crate::qproxy::note_by_base(&up.base_url, st2, t0.elapsed().as_millis() as u64, &up.label);
+                                if !route.dist_id.is_empty() {
+                                    gateway::bump_dist(&route.dist_id, &up.label);
+                                }
+                                let response = Response::new(
+                                    StatusCode(st2),
+                                    vec![header("Content-Type", &ctype), cors_header()],
+                                    std::io::Cursor::new(h2).chain(br2),
+                                    None,
+                                    None,
+                                );
+                                let _ = req.respond(response);
+                                return;
+                            }
+                        }
                         self.push_log(&method, &path, model_log.clone(), 502, &up.label, &up.pool, &via);
                         crate::qproxy::note_by_base(&up.base_url, 502, t0.elapsed().as_millis() as u64, &up.label);
+                        self.snapshot_fail(&path, &model_log, 502, &up.label, &body, &head);
                         let hint = json!({
                             "error": {
                                 "message": format!("Qoder 上游拒了这条请求：{}", msg),
                                 "type": "upstream_error",
-                                "hint": "模型名已经按 auto 归一（可用：auto、gpt-5）；若改过还报，多为额度/限流，稍后重试",
+                                "hint": if capacity {
+                                    "上游后端全部排不上（Qoder 侧容量紧张，官方客户端里同样在排队）。已尝试自动换 auto 重排；仍失败就等几分钟再试，或换 gmodel / dmodel / mmodel 这几个实测能排上的模型"
+                                } else {
+                                    "模型名已经按 auto 归一（可用：auto、gpt-5、gmodel、dmodel、mmodel、performance）；若改过还报，多为额度/限流，稍后重试"
+                                },
                             }
                         });
                         let _ = req.respond(text_response(502, &hint.to_string()));
@@ -466,7 +633,7 @@ impl Proxy {
                     let response = Response::new(
                         StatusCode(status),
                         vec![header("Content-Type", &ctype), cors_header()],
-                        std::io::Cursor::new(head).chain(rd),
+                        std::io::Cursor::new(head).chain(br),
                         None,
                         None,
                     );
@@ -498,6 +665,10 @@ impl Proxy {
                     .to_string();
                 let mut buf = Vec::new();
                 let _ = resp.into_reader().read_to_end(&mut buf);
+                // 上游真回 4xx/5xx 时也留现场：客户端那边只会显示一句通用失败
+                if qoder {
+                    self.snapshot_fail(&path, &model, code as u16, &up.label, &body, &buf);
+                }
                 self.push_log(&method, &path, model, code as u16, &up.label, &up.pool, &via);
                 crate::qproxy::note_by_base(&up.base_url, code as u16, t0.elapsed().as_millis() as u64, &up.label);
                 let _ = req.respond(
@@ -511,6 +682,11 @@ impl Proxy {
                 );
             }
             Err(e) => {
+                // 连接层失败（超时、上游提前断流）最容易被客户端说成"模型请求失败"，
+                // 把 ureq 的原始错误一起落盘，才分得清是上游断的还是我们超时
+                if qoder {
+                    self.snapshot_fail(&path, &model, 502, &up.label, &body, e.to_string().as_bytes());
+                }
                 self.push_log(&method, &path, model, 502, &up.label, &up.pool, &via);
                 crate::qproxy::note_by_base(&up.base_url, 502, t0.elapsed().as_millis() as u64, &up.label);
                 let _ = req.respond(text_response(
@@ -716,6 +892,414 @@ impl Proxy {
         }
     }
 
+    /// MiniMax Code 上游：OpenAI 进、Anthropic 出、Anthropic SSE 再翻回 OpenAI SSE。
+    /// 协议、实测记录、令牌刷新纪律都在 mmproxy.rs。
+    ///
+    /// 与其余上游不同的一点：**令牌每次请求现取**（mmproxy::token 内部有缓存 +
+    /// 过期前 60 秒刷新），不信任路由时那一刻的快照 —— OAuth 令牌寿命按小时算，
+    /// 一个长跑的反代用快照会在半夜突然全 401。
+    fn serve_mm(
+        &self,
+        mut req: tiny_http::Request,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        up: &crate::gateway::Upstream,
+        via: &str,
+        dist_id: &str,
+        model: Option<String>,
+    ) {
+        let trimmed = path.trim_end_matches('/');
+        // 模型清单本地应答：上游根本没有 /models（503 direct_route_not_configured）
+        if method == "GET" && trimmed.ends_with("models") {
+            let data: Vec<Value> = crate::mmproxy::models()
+                .into_iter()
+                .map(|m| {
+                    json!({
+                        "id": format!("minimax/{}", m["id"].as_str().unwrap_or("")),
+                        "object": "model",
+                        "owned_by": "minimax",
+                        "name": m["name"].clone(),
+                        "context_window": m["context_window"].clone(),
+                        "max_output_tokens": m["max_output_tokens"].clone(),
+                    })
+                })
+                .collect();
+            self.push_log(method, path, None, 200, "-", "-", via);
+            let _ = req.respond(text_response(
+                200,
+                &json!({ "object": "list", "data": data }).to_string(),
+            ));
+            return;
+        }
+
+        let tok = {
+            let t = crate::mmproxy::token();
+            if t.is_empty() {
+                up.token.clone()
+            } else {
+                t
+            }
+        };
+        if tok.is_empty() {
+            self.push_log(method, path, model, 401, &up.label, &up.pool, via);
+            let _ = req.respond(text_response(
+                401,
+                &json!({ "error": {
+                    "message": "MiniMax Code 的登录令牌读不到或已过期：打开 MiniMax Code 登录一次，\
+                                或到「本地反代」页点「刷新令牌」再试",
+                    "type": "invalid_api_key"
+                }})
+                .to_string(),
+            ));
+            return;
+        }
+
+        let Ok(v) = serde_json::from_slice::<Value>(body) else {
+            let _ = req.respond(text_response(
+                400,
+                &json!({ "error": { "message": "请求体不是 JSON" } }).to_string(),
+            ));
+            return;
+        };
+        if !trimmed.ends_with("chat/completions") {
+            self.push_log(method, path, model, 404, &up.label, &up.pool, via);
+            let _ = req.respond(text_response(
+                404,
+                &json!({ "error": {
+                    "message": format!("MiniMax 上游只实现了 /v1/chat/completions，没有 {path}"),
+                    "type": "not_found"
+                }})
+                .to_string(),
+            ));
+            return;
+        }
+
+        let stream = v["stream"].as_bool().unwrap_or(false);
+        let up_body = crate::mmproxy::translate_request(&v);
+        let used = up_body["model"].as_str().unwrap_or("").to_string();
+
+        let res = ureq::post(&format!("{}/messages", crate::mmproxy::GATEWAY_BASE))
+            .set("Authorization", &format!("Bearer {tok}"))
+            .set("anthropic-version", "2023-06-01")
+            .set("Content-Type", "application/json")
+            .set(
+                "Accept",
+                if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            )
+            .timeout(std::time::Duration::from_secs(600))
+            .send_string(&up_body.to_string());
+
+        match res {
+            Ok(resp) => {
+                let status = resp.status() as u16;
+                if stream {
+                    let label = model.clone().unwrap_or_else(|| used.clone());
+                    let tr = crate::mmproxy::StreamTranslator::new(resp.into_reader(), &label);
+                    self.push_log(method, path, model, status, &up.label, &up.pool, via);
+                    if !dist_id.is_empty() {
+                        gateway::bump_dist(dist_id, &up.label);
+                    }
+                    let _ = req.respond(Response::new(
+                        StatusCode(status),
+                        vec![
+                            header("Content-Type", "text/event-stream; charset=utf-8"),
+                            header("Cache-Control", "no-cache"),
+                            cors_header(),
+                        ],
+                        tr,
+                        None,
+                        None,
+                    ));
+                    return;
+                }
+                let text = resp.into_string().unwrap_or_default();
+                let upv: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+                if let Some(msg) = crate::mmproxy::upstream_error(&upv) {
+                    self.push_log(method, path, model, 502, &up.label, &up.pool, via);
+                    let _ = req.respond(text_response(
+                        502,
+                        &json!({ "error": { "message": format!("MiniMax 上游报错：{msg}"),
+                                            "type": "upstream_error" } })
+                        .to_string(),
+                    ));
+                    return;
+                }
+                let out = crate::mmproxy::translate_response(
+                    &upv,
+                    model.as_deref().unwrap_or(&used),
+                );
+                self.push_log(method, path, model, status, &up.label, &up.pool, via);
+                if !dist_id.is_empty() {
+                    gateway::bump_dist(dist_id, &up.label);
+                }
+                let _ = req.respond(text_response(200, &out.to_string()));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let txt = resp.into_string().unwrap_or_default();
+                let msg = serde_json::from_str::<Value>(&txt)
+                    .ok()
+                    .and_then(|x| {
+                        x["error"]["message"]
+                            .as_str()
+                            .or_else(|| x["error"].as_str())
+                            .or_else(|| x["errorReason"].as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| txt.chars().take(300).collect());
+                self.push_log(method, path, model, code as u16, &up.label, &up.pool, via);
+                let hint = if code == 401 || code == 403 {
+                    "（令牌被上游拒了：MiniMax Code 重新登录一次，或在「本地反代」页点「刷新令牌」）"
+                } else {
+                    ""
+                };
+                let _ = req.respond(text_response(
+                    code as u16,
+                    &json!({ "error": {
+                        "message": format!("MiniMax 上游 {code}：{msg}{hint}"),
+                        "type": "upstream_error"
+                    }})
+                    .to_string(),
+                ));
+            }
+            Err(e) => {
+                self.push_log(method, path, model, 502, &up.label, &up.pool, via);
+                let _ = req.respond(text_response(
+                    502,
+                    &json!({ "error": { "message": format!("连不上 MiniMax 上游：{e}") } }).to_string(),
+                ));
+            }
+        }
+    }
+
+    /// 妙手上游：**进程内云端直连**（协议底账见 pawbridge.rs）。
+    /// OpenAI 进 → 妙手云端 create/agent-stream/connect 出 → 云端 SSE 翻回 OpenAI SSE。
+    /// 与旧命名管道方案的区别：不需要妙手桌面端在跑，也没有 8789 桥进程。
+    fn serve_paw(
+        &self,
+        mut req: tiny_http::Request,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        up: &crate::gateway::Upstream,
+        via: &str,
+        dist_id: &str,
+        model: Option<String>,
+    ) {
+        let trimmed = path.trim_end_matches('/');
+        // 模型清单本地应答：目录就在 pawbridge 的缓存里，不打云端
+        if method == "GET" && trimmed.ends_with("models") {
+            let data: Vec<Value> = crate::pawbridge::models()
+                .into_iter()
+                .map(|m| {
+                    let mut v = json!({
+                        "id": format!("catpaw/{}", m["id"].as_str().unwrap_or("")),
+                        "object": "model",
+                        "owned_by": "catpaw",
+                        "name": m["name"].clone(),
+                        "rate": m["rate"].clone(),
+                        "free": m["free"].clone(),
+                        "vision": m["vision"].clone(),
+                    });
+                    if let (Some(obj), Some(num)) = (v.as_object_mut(), m["numeric"].as_i64()) {
+                        obj.insert("numeric".into(), json!(num));
+                    }
+                    v
+                })
+                .collect();
+            self.push_log(method, path, None, 200, "-", "-", via);
+            let _ = req.respond(text_response(
+                200,
+                &json!({ "object": "list", "data": data }).to_string(),
+            ));
+            return;
+        }
+
+        let Ok(v) = serde_json::from_slice::<Value>(body) else {
+            let _ = req.respond(text_response(
+                400,
+                &json!({ "error": { "message": "请求体不是 JSON" } }).to_string(),
+            ));
+            return;
+        };
+        if !trimmed.ends_with("chat/completions") {
+            self.push_log(method, path, model, 404, &up.label, &up.pool, via);
+            let _ = req.respond(text_response(
+                404,
+                &json!({ "error": {
+                    "message": format!("妙手上游只实现了 /v1/chat/completions，没有 {path}"),
+                    "type": "not_found"
+                }})
+                .to_string(),
+            ));
+            return;
+        }
+        // CatPaw's agent runs its own tools in the cloud and has been observed
+        // refusing client-tool envelopes. Never present that as local execution.
+        if v["tools"].as_array().map_or(false, |tools| !tools.is_empty())
+            && v["tool_choice"].as_str() != Some("none")
+        {
+            let _ = req.respond(text_response(400, &json!({"error": {
+                "message": "妙手云端 Agent 暂不支持客户端本地工具调用，请选择支持工具调用的模型",
+                "type": "unsupported_feature"
+            }}).to_string()));
+            return;
+        }
+        let adapter = match crate::pawbridge::ToolAdapter::from_request(&v) {
+            Ok(a) => a,
+            Err(msg) => {
+                let _ = req.respond(text_response(400, &json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string()));
+                return;
+            }
+        };
+        let prompt = if let Some(a) = adapter.as_ref() {
+            a.prompt(&v["messages"])
+        } else if crate::pawbridge::has_tool_history(&v["messages"]) {
+            crate::pawbridge::structured_history(&v["messages"])
+        } else {
+            Ok(crate::pawbridge::flatten(&v["messages"]))
+        };
+        let prompt = match prompt {
+            Ok(p) => p,
+            Err(msg) => {
+                let _ = req.respond(text_response(400, &json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string()));
+                return;
+            }
+        };
+        if prompt.trim().is_empty() {
+            self.push_log(method, path, model, 400, &up.label, &up.pool, via);
+            let _ = req.respond(text_response(
+                400,
+                &json!({ "error": { "message": "messages 里没有可用文本" } }).to_string(),
+            ));
+            return;
+        }
+        let want = model.as_deref().unwrap_or("LongCat-2.0");
+        let used = crate::pawbridge::model_for_stream(want, &crate::pawbridge::models());
+        // 展示名：裸名（数字 id 是云端参数，给用户看没有意义）
+        let display = want.rsplit_once('/').map(|(_, b)| b).unwrap_or(want);
+        let stream = v["stream"].as_bool().unwrap_or(false);
+
+        let mut round = match crate::pawbridge::PawRound::open(&prompt, &used) {
+            Ok(r) => r,
+            Err(e) => {
+                let status = if e.kind == "auth" { 401 } else { 502 };
+                self.push_log(method, path, model, status, &up.label, &up.pool, via);
+                let _ = req.respond(text_response(
+                    status,
+                    &json!({ "error": { "message": e.msg, "type": e.kind } }).to_string(),
+                ));
+                return;
+            }
+        };
+
+        let mut tr = crate::pawbridge::PawTranslator::new(round.reader(), display);
+        let shared = tr.shared();
+        if let Some(adapter) = adapter {
+            // Tool compatibility is buffered: expose only a validated client call,
+            // never the cloud agent's own tool events or partial JSON.
+            let mut discard = Vec::new();
+            let read_result = tr.read_to_end(&mut discard);
+            round.cleanup();
+            let s = shared.lock().map(|g| g.clone()).unwrap_or_default();
+            let result = if let Err(e) = read_result {
+                Err(format!("妙手流读取失败：{e}"))
+            } else if let Some((_, msg)) = &s.error {
+                Err(msg.clone())
+            } else if !s.completed {
+                Err("妙手云端流未正常完成".to_string())
+            } else {
+                adapter.parse(&s.text)
+            };
+            let reply = match result {
+                Ok(r) => r,
+                Err(msg) => {
+                    self.push_log(method, path, model, 502, &up.label, &up.pool, via);
+                    let _ = req.respond(text_response(502, &json!({"error": {"message": msg, "type": "upstream_error"}}).to_string()));
+                    return;
+                }
+            };
+            let (message, finish) = match reply {
+                crate::pawbridge::ToolReply::Text(content) => (json!({"role":"assistant", "content":content}), "stop"),
+                crate::pawbridge::ToolReply::Calls(calls) => {
+                    let calls: Vec<Value> = calls.into_iter().map(|c| json!({"id":c.id,"type":"function","function":{"name":c.name,"arguments":c.arguments}})).collect();
+                    (json!({"role":"assistant", "content":null, "tool_calls":calls}), "tool_calls")
+                }
+            };
+            let id = format!("chatcmpl-paw-{}", crate::registry::now_secs());
+            let created = crate::registry::now_secs();
+            self.push_log(method, path, model.clone(), 200, &up.label, &up.pool, via);
+            if !dist_id.is_empty() { gateway::bump_dist(dist_id, &up.label); }
+            if !stream {
+                let body = json!({"id":id,"object":"chat.completion","created":created,"model":display,
+                    "choices":[{"index":0,"message":message,"finish_reason":finish}],"usage":s.usage});
+                let _ = req.respond(text_response(200, &body.to_string()));
+            } else {
+                let mut chunks = Vec::new();
+                let mut delta = message.clone();
+                if let Some(calls) = delta["tool_calls"].as_array_mut() {
+                    for (index, call) in calls.iter_mut().enumerate() { call["index"] = json!(index); }
+                }
+                for (d, f) in [(delta, Value::Null), (json!({}), json!(finish))] {
+                    let chunk = json!({"id":id,"object":"chat.completion.chunk","created":created,"model":display,
+                        "choices":[{"index":0,"delta":d,"finish_reason":f}]});
+                    chunks.extend_from_slice(format!("data: {chunk}\n\n").as_bytes());
+                }
+                chunks.extend_from_slice(b"data: [DONE]\n\n");
+                let _ = req.respond(Response::new(StatusCode(200), vec![header("Content-Type", "text/event-stream; charset=utf-8"), cors_header()], std::io::Cursor::new(chunks.clone()), Some(chunks.len()), None));
+            }
+            return;
+        }
+        if !stream {
+            // 非流式：收完再回一条完整 chat.completion
+            let out = crate::pawbridge::collect_completion(&mut tr, display);
+            round.cleanup();
+            let s = shared.lock().map(|g| g.clone()).unwrap_or_default();
+            if let Some((kind, msg)) = &s.error {
+                let status = if *kind == "auth" { 401 } else { 502 };
+                self.push_log(method, path, model, status, &up.label, &up.pool, via);
+                let _ = req.respond(text_response(
+                    status,
+                    &json!({ "error": { "message": msg, "type": kind } }).to_string(),
+                ));
+                return;
+            }
+            self.push_log(method, path, model, 200, &up.label, &up.pool, via);
+            if !dist_id.is_empty() {
+                gateway::bump_dist(dist_id, &up.label);
+            }
+            let _ = req.respond(text_response(200, &out.to_string()));
+            return;
+        }
+        // 流式：边读边翻，respond 返回（流写完）后才能收场与记账
+        let _ = req.respond(Response::new(
+            StatusCode(200),
+            vec![
+                header("Content-Type", "text/event-stream; charset=utf-8"),
+                header("Cache-Control", "no-cache"),
+                cors_header(),
+            ],
+            tr,
+            None,
+            None,
+        ));
+        round.cleanup();
+        let s = shared.lock().map(|g| g.clone()).unwrap_or_default();
+        let status = match &s.error {
+            Some((kind, _)) if *kind == "auth" => 401,
+            Some(_) => 502,
+            None => 200,
+        };
+        self.push_log(method, path, model, status, &up.label, &up.pool, via);
+        if !dist_id.is_empty() && s.error.is_none() {
+            gateway::bump_dist(dist_id, &up.label);
+        }
+    }
+
     /// WorkBuddy 上游：OpenAI 进、OpenAI 出。上游本身就是 OpenAI 形状，
     /// 我们只改头族 + 少量 body 字段（system 首条 / prompt_cache_key / 模型别名）。
     ///
@@ -761,13 +1345,17 @@ impl Proxy {
             let prepared = match crate::wbproxy::prepare(app, &route.dist_id, fwd, body) {
                 Ok(p) => p,
                 Err(e) => {
-                    // 请求级错误换号无用，直接回；账号级错误也该由上层决定，
-                    // 但 prepare 阶段的账号级错误（没令牌 / 护栏 / 冷却）换个号确实可能好
-                    if e.is_account_level() {
-                        last = Some((503, e.message(), name.clone()));
+                    // 账号级错误（没令牌 / 护栏 / 冷却 / 被拦）换号确实可能好。
+                    // **模型不在本区目录里也是「换个号可能好」** —— 池子里国内+国际混着，
+                    // 而 `kimi-k3.1-pro` / `step-5-preview` 这些只有国际版有；
+                    // 抽到国内号时直接回 400 会让明明能用的请求失败。
+                    // 只有「body 本身不合法」才立刻回，剩下的都先换号试完再报。
+                    let fatal = matches!(e, crate::wbproxy::PrepError::MalformedBody(_));
+                    let status = if e.is_account_level() { 503 } else { 400 };
+                    if !fatal {
+                        last = Some((status, e.message(), name.clone()));
                         continue;
                     }
-                    let status = 400;
                     self.push_log(method, path, model.clone(), status, &up.label, &up.pool, &route.via);
                     crate::wbproxy::append_log(json!({
                         "ts": crate::registry::now_secs(), "app": app, "region": region,
@@ -903,7 +1491,14 @@ impl Proxy {
                         "via": route.via, "dist": route.dist_id,
                     }));
                     last = Some((code as u16, outcome.message(), name.clone()));
-                    if outcome.should_rotate() && k + 1 < budget {
+                    // 目录外的模型（名字直接透传）撞上 11128「渠道/请求不合法」时，
+                    // 最可能的原因是**抽到了不支持这个模型的区域**（kimi-k3.1-pro 只有国内号有）。
+                    // 这种错平时不换号（换号确实没用），但配合透传就必须换——否则 50% 概率白失败。
+                    let pass_through = prepared.note.contains("目录外");
+                    let rotate = outcome.should_rotate()
+                        || (pass_through
+                            && matches!(outcome, crate::wbproxy::Outcome::RequestShape(_)));
+                    if rotate && k + 1 < budget {
                         continue;
                     }
                     // 不换号：把上游原话回给调用方（请求形状错、容量排队都走这条）
@@ -967,7 +1562,27 @@ impl<R: Read> Read for SseTap<R> {
 /// 四家都列：WorkBuddy（/v3/config 白名单 ∩ 免费倍率）、Trae（本地模型目录）、
 /// 已知的模型前缀（owner）集合——与 models_for 里各家的 owned_by 一致。
 fn known_owners() -> &'static [&'static str] {
-    &["workbuddy", "workbuddy-intl", "trae", "qoder", "qoder-cn", "opencode", "astudio"]
+    // 前缀在这张表里，客户端填 `owner/模型` 才会被切成「按这家挑上游 + 报文里剥成裸名」。
+    // 少登记一家的后果是：同名模型在几家之间互相漂（glm-5.3-flash 谁都有）。
+    &["workbuddy", "workbuddy-intl", "trae", "qoder", "qoder-cn", "opencode", "astudio",
+      "qwenwork", "catpaw", "minimax"]
+}
+
+/// 给一家自己的模型清单打上 `owner/` 前缀（幂等：已经带过的不重复加）。
+/// 面板「模型 ID」复制出去的就是这个形式——不带前缀，`flash`、`glm-5.3-flash`
+/// 这种同名模型在几家之间会互相漂，反代根本判不出该往哪家送。
+pub fn tag_owner(owner: &str, models: &[Value]) -> Vec<Value> {
+    models
+        .iter()
+        .map(|m| {
+            let mut v = m.clone();
+            let bare = v["id"].as_str().unwrap_or("");
+            if !bare.is_empty() && !bare.contains('/') {
+                v["id"] = json!(format!("{owner}/{bare}"));
+            }
+            v
+        })
+        .collect()
 }
 
 /// `trae/glm-5.3-flash` → Some(("trae", "glm-5.3-flash"))；不认识的前缀/空段回 None。
@@ -997,6 +1612,10 @@ fn owner_of_base(base: &str) -> Option<&'static str> {
     if crate::asproxy::is_astudio_base(base) {
         return Some("astudio");
     }
+    // MiniMax Code：Anthropic 协议，走 mmproxy 翻译层
+    if crate::mmproxy::is_mm_base(base) {
+        return Some("minimax");
+    }
     if crate::qproxy::is_qoder_base(base) {
         let b = base.trim_end_matches('/');
         return Some(if b.starts_with(crate::qproxy::model_base("cn")) {
@@ -1011,6 +1630,18 @@ fn owner_of_base(base: &str) -> Option<&'static str> {
     // Qoder CN 的本地桥（官方运行时 + OpenAI 兼容外壳）
     if base.starts_with(&format!("http://127.0.0.1:{}", crate::qproxy::CN_PORT)) {
         return Some("qoder-cn");
+    }
+    // 千问办公的本地桥：基址是同一台机器上的普通 http，只能按端口认。
+    // 备用口也要认——首选口被占时起桥会切 ALT_PORT 并写回 config（qwbridge::pick_port），
+    // 这里只认首选口的话，备用端口下 qwenwork/ 前缀模型会被前缀路由整组滤掉（404 无可用上游）。
+    if base.starts_with(&format!("http://127.0.0.1:{}", crate::qwbridge::PORT))
+        || base.starts_with(&format!("http://127.0.0.1:{}", crate::qwbridge::ALT_PORT))
+    {
+        return Some("qwenwork");
+    }
+    // 妙手：进程内云端直连，靠协议标记认
+    if crate::pawbridge::is_paw_base(base) {
+        return Some("catpaw");
     }
     None
 }
@@ -1086,6 +1717,7 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
     let mut has_qoder = false;
     let mut has_oc = false;
     let mut has_as = false;
+    let mut has_mm = false;
     for up in ups {
         if let Some(region) = crate::wbproxy::region_from_base(&up.base_url) {
             has_wb = true;
@@ -1104,8 +1736,34 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
             has_qoder = true;
         } else if crate::asproxy::is_astudio_base(&up.base_url) {
             has_as = true;
+        } else if crate::mmproxy::is_mm_base(&up.base_url) {
+            has_mm = true;
         } else if up.base_url.starts_with("http://127.0.0.1:8211") {
             has_oc = true;
+        } else if up.base_url.starts_with(&format!("http://127.0.0.1:{}", crate::qwbridge::PORT)) {
+            // 千问办公的本地桥：清单问桥要（缓存 30 秒），别漏——漏了客户端
+            // 拉 /v1/models 就看不到这一路，只能靠面板手动复制
+            for m in crate::qwbridge::models_view() {
+                push(
+                    m["id"].as_str().unwrap_or(""),
+                    "qwenwork",
+                    json!({ "name": m["name"].clone() }),
+                );
+            }
+        } else if crate::pawbridge::is_paw_base(&up.base_url) {
+            // 妙手：目录在云端 model-types，pawbridge 有 10 分钟缓存
+            for m in crate::pawbridge::models() {
+                push(
+                    m["id"].as_str().unwrap_or(""),
+                    "catpaw",
+                    json!({
+                        "name": m["name"].clone(),
+                        "free": m["free"].clone(),
+                        "rate": m["rate"].clone(),
+                        "vision": m["vision"].clone(),
+                    }),
+                );
+            }
         }
     }
     if has_trae {
@@ -1159,6 +1817,22 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
                     "name": m["name"].clone(),
                     "free": m["free"].clone(),
                     "multiplier": m["multiplier"].clone(),
+                }),
+            );
+        }
+    }
+    if has_mm {
+        // MiniMax 上游没有 /models，清单按客户端 whitelist 静态给（mmproxy::models）
+        for m in crate::mmproxy::models() {
+            push(
+                m["id"].as_str().unwrap_or(""),
+                "minimax",
+                json!({
+                    "name": m["name"].clone(),
+                    "free": m["free"].clone(),
+                    "reasoning": m["reasoning"].clone(),
+                    "context_window": m["context_window"].clone(),
+                    "max_output_tokens": m["max_output_tokens"].clone(),
                 }),
             );
         }
@@ -1234,18 +1908,33 @@ fn text_response(code: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 mod tests {
     use super::*;
 
+    /// 测试用端口：优先用产品端口；被占（驾驶舱自己正跑着、8788 在监听）就换一个
+    /// 系统分配的空闲口。硬编码 8788 会让「开着驾驶舱」时的每一批编译都栽在这一条上，
+    /// 而它和被测代码毫无关系。
+    fn test_port() -> u16 {
+        use std::net::TcpListener;
+        if TcpListener::bind(("127.0.0.1", crate::registry::PROXY_PORT)).is_ok() {
+            return crate::registry::PROXY_PORT;
+        }
+        TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .unwrap_or(crate::registry::PROXY_PORT)
+    }
+
     /// 真实起一次反代：验证监听、请求解析、响应回传、日志、停止后端口释放。
     /// token 池是否非空取决于本机数据，两种结果都接受，只校验不变量。
     #[test]
     fn proxy_serves_and_stops() {
+        let port = test_port();
         let p = Proxy::shared();
         p.set_config(Some("https://api.openai.com"), Some("round-robin"));
-        let (ok, msg) = p.start(crate::registry::PROXY_PORT);
+        let (ok, msg) = p.start(port);
         assert!(ok, "启动失败: {}", msg);
 
         let res = ureq::post(&format!(
             "http://127.0.0.1:{}/v1/chat/completions",
-            crate::registry::PROXY_PORT
+            port
         ))
         .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(20))
@@ -1272,7 +1961,7 @@ mod tests {
         assert!(ok);
         std::thread::sleep(std::time::Duration::from_millis(800));
         assert!(
-            std::net::TcpStream::connect("127.0.0.1:8788").is_err(),
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
             "停止后端口仍被占用"
         );
     }

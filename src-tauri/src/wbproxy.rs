@@ -28,7 +28,7 @@ use crate::registry::{base_dir, load_config, load_instances};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 // ───────────────────────── 区域与端点 ─────────────────────────
 
@@ -540,7 +540,135 @@ pub fn is_free(credits: &str) -> bool {
     s.parse::<f64>().map(|v| v == 0.0).unwrap_or(false)
 }
 
-/// 读 `/v3/config` 的本机缓存，**列出全部可当聊天用的模型（免费 + 付费）**。
+// ───────────────────────── 线上模型目录 ─────────────────────────
+// `~/.workbuddy*/cache/acc-product-config-v3.json` 是**客户端自己**缓存的，实测会和线上对不上，
+// 而且两个方向都会错（2026-10-25 实测）：
+//   · 国际版缓存 30 个，缺了 MiniMax-M3.1-Flash / Kimi-K3.1-Pro / step-5-preview ——
+//     官方选择器里有、反代里没有（她原话：「模型一点都不全」）。
+//   · 国内版缓存 58 个，比线上 37 个还多 22 个（glm-5.3 / hy4-preview / kimi-k3-2 …），
+//     那些线上已经没了，列出来点了必错（「调用不了的旧模型」）。
+// ⇒ 以线上 `/v3/config` 为准，本机缓存只做兜底与倍率补齐。
+//
+// `/v3/config` 不吃积分，但界面是 4 秒一轮轮询，**不能每次 view() 都打网络**：
+// 内存 TTL 10 分钟 + 落盘一份 + 后台刷新（先给旧数据，下一轮自动变新）。
+
+static LIVE_CFG: OnceLock<Mutex<HashMap<String, (Value, u64)>>> = OnceLock::new();
+static LIVE_BUSY: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+const LIVE_TTL: u64 = 600;
+
+fn live_mem() -> &'static Mutex<HashMap<String, (Value, u64)>> {
+    LIVE_CFG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 我们自己的线上快照（不写客户端那份缓存）
+pub fn live_path(app_id: &str) -> PathBuf {
+    base_dir().join(format!("wbproxy-modelconfig-{app_id}.json"))
+}
+
+fn store_live(app_id: &str, v: &Value) {
+    if let Ok(mut g) = live_mem().lock() {
+        g.insert(app_id.to_string(), (v.clone(), now_secs()));
+    }
+    let _ = std::fs::create_dir_all(base_dir());
+    let _ = std::fs::write(live_path(app_id), serde_json::to_string(v).unwrap_or_default());
+}
+
+/// 同步拉一次线上目录。花 0 积分。
+pub fn fetch_config(app_id: &str) -> Result<Value, String> {
+    let region = region_of(app_id).ok_or_else(|| "不是 WorkBuddy 产品".to_string())?;
+    let cred = read_login(app_id).map_err(|e| format!("登录态读不到：{e}"))?;
+    let ver = client_version(app_id);
+    let res = ureq::get(&format!("{}/v3/config", model_base(region)))
+        .timeout(std::time::Duration::from_secs(20))
+        .set("Authorization", &format!("Bearer {}", cred.token))
+        .set("Accept", "application/json")
+        .set("X-User-Id", &cred.user_id)
+        .set("X-Domain", &cred.domain)
+        .set("X-Product", "SaaS")
+        .set("X-IDE-Type", "WorkBuddy")
+        .set("X-IDE-Name", "WorkBuddy")
+        .set("X-IDE-Version", &ver)
+        .set("User-Agent", &format!("WorkBuddy/{ver} WorkBuddy/{ver}"))
+        .call();
+    let txt = match res {
+        Ok(r) => r.into_string().unwrap_or_default(),
+        Err(ureq::Error::Status(code, r)) => {
+            let mut txt = String::new();
+            let mut rd = r.into_reader();
+            let mut buf = vec![0u8; 800];
+            let n = std::io::Read::read(&mut rd, &mut buf).unwrap_or(0);
+            txt.push_str(&String::from_utf8_lossy(&buf[..n]));
+            return Err(format!("HTTP {code}：{}", txt.chars().take(200).collect::<String>()));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let v: Value = serde_json::from_str(&txt).map_err(|e| format!("不是 JSON：{e}"))?;
+    // 有的版本包一层 data
+    let body = if v["data"].is_object() && v["data"]["models"].is_array() {
+        v["data"].clone()
+    } else {
+        v
+    };
+    if !body["models"].is_array() {
+        return Err("线上目录里没有 models[]".into());
+    }
+    store_live(app_id, &body);
+    Ok(body)
+}
+
+/// 取目录：内存 → 落盘快照 → （都没有就起后台刷新）→ None
+pub fn live_config(app_id: &str) -> Option<Value> {
+    if let Ok(g) = live_mem().lock() {
+        if let Some((v, at)) = g.get(app_id) {
+            if now_secs().saturating_sub(*at) <= LIVE_TTL {
+                return Some(v.clone());
+            }
+        }
+    }
+    let p = live_path(app_id);
+    if let Ok(txt) = std::fs::read_to_string(&p) {
+        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+            if v["models"].is_array() {
+                let at = std::fs::metadata(&p)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if let Ok(mut g) = live_mem().lock() {
+                    g.insert(app_id.to_string(), (v.clone(), at));
+                }
+                spawn_refresh(app_id);
+                return Some(v);
+            }
+        }
+    }
+    spawn_refresh(app_id);
+    None
+}
+
+/// 后台刷一次，别把 4 秒轮询堵在网络里
+pub fn spawn_refresh(app_id: &str) {
+    let busy = LIVE_BUSY.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    {
+        let Ok(mut b) = busy.lock() else { return };
+        if b.contains(app_id) {
+            return;
+        }
+        b.insert(app_id.to_string());
+    }
+    let app = app_id.to_string();
+    std::thread::spawn(move || {
+        let _ = fetch_config(&app);
+        if let Some(b) = LIVE_BUSY.get() {
+            if let Ok(mut b) = b.lock() {
+                b.remove(&app);
+            }
+        }
+    });
+}
+
+/// 读 `/v3/config`（线上优先，缓存兜底），**列出全部可当聊天用的模型（免费 + 付费）**。
 ///
 /// ⚠️ `agents[cli].models` **不是鉴权闸门**，只是客户端模型选择器的展示清单。
 /// 2026-10-20 我把它当成了「不在名单里就调不动」，于是拿它做硬过滤 —— 2026-10-25 实测推翻：
@@ -551,68 +679,157 @@ pub fn is_free(credits: &str) -> bool {
 /// 所以取舍只剩一条：挡掉走不了 `/v2/chat/completions` 的非聊天模型（补全/图片/视频…）。
 /// 白名单只保留 `in_cli` 标记用于排序，不参与过滤；免费/付费都列出来，单价由 `credits` 注明。
 pub fn catalog(app_id: &str) -> Result<Catalog, String> {
-    let p = catalog_path(app_id).ok_or_else(|| format!("{app_id} 没有档案目录"))?;
-    if !p.is_file() {
-        return Err(format!(
-            "还没有模型目录缓存 {}（开一次 WorkBuddy 让它拉 /v3/config）",
-            p.display()
-        ));
-    }
-    let meta = std::fs::metadata(&p).ok();
-    let fetched_at = meta
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let txt = std::fs::read_to_string(&p).map_err(|e| format!("读不到 {}：{e}", p.display()))?;
-    let v: Value = serde_json::from_str(&txt).map_err(|e| format!("模型目录不是 JSON：{e}"))?;
+    // 四个来源取并集：本区线上、本区客户端缓存、另一区线上、另一区客户端缓存。
+    //
+    // 为什么必须并这么多（2026-10-26 实测）：
+    //   · 我们自己打 `GET /v3/config` 只拿到 37 个**全是老模型**（三个 origin、换头族、加参数都一样）；
+    //   · 而客户端自己写下的 `~/.workbuddy/cache/acc-product-config-v3.json` 同一时刻是
+    //     **73 个、39 个带倍率，含 `kimi-k3.1-pro` / `minimax-m3.1-flash` / `glm-5.3`**。
+    //   客户端拿到的是完整目录，我们那份是被降级的视图 —— 以缓存为准。
+    //   · 另一区的目录也要并：池子里国内+国际都在，模型名按 `app/` 前缀或轮询路由，
+    //     只列本区会把能调的模型从下拉里删掉。
+    let own_live = live_config(app_id);
+    let own_cache = read_client_cache(app_id);
+    let other = APPS.iter().copied().find(|a| *a != app_id);
+    let other_live = other.and_then(live_config);
+    let other_cache = other.and_then(read_client_cache);
 
-    let cli_ids: Vec<String> = v["agents"]
-        .as_array()
-        .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some("cli")))
-        .and_then(|a| a["models"].as_array())
+    // 官方选择器清单（只认本区线上的 agents[cli]）
+    let cli_ids: Vec<String> = own_live
+        .as_ref()
+        .and_then(|v| v["agents"].as_array().cloned())
+        .and_then(|a| a.into_iter().find(|x| x["name"].as_str() == Some("cli")))
+        .and_then(|a| a["models"].as_array().cloned())
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
 
-    let mut models = Vec::new();
-    if let Some(arr) = v["models"].as_array() {
+    let mut by_id: HashMap<String, ModelInfo> = HashMap::new();
+    let mut in_cli = |id: &str| cli_ids.iter().any(|x| x == id);
+    let mut feed = |v: &Value, own_region: bool| {
+        let Some(arr) = v["models"].as_array() else { return };
         for m in arr {
             let id = m["id"].as_str().unwrap_or("").trim().to_string();
             if id.is_empty() || is_non_chat(&id) {
                 continue;
             }
-            let credits = m["credits"].as_str().unwrap_or("").to_string();
-            let free = is_free(&credits);
-            let in_cli = cli_ids.iter().any(|x| x == &id);
-            models.push(ModelInfo {
+            let credits = m["credits"].as_str().unwrap_or("").trim().to_string();
+            let mark = own_region && in_cli(&id);
+            let e = by_id.entry(id.clone()).or_insert_with(|| ModelInfo {
                 id: id.clone(),
                 name: m["name"].as_str().unwrap_or(&id).to_string(),
-                credits,
-                free,
-                in_cli,
+                credits: credits.clone(),
+                free: is_free(&credits),
+                in_cli: mark,
                 supports_images: m["supportsImages"].as_bool().unwrap_or(false),
                 supports_reasoning: m["supportsReasoning"].as_bool().unwrap_or(false),
                 supports_tools: m["supportsToolCall"].as_bool().unwrap_or(false),
                 max_output: m["maxOutputTokens"].as_u64().unwrap_or(0),
                 context: m["maxInputTokens"].as_u64().unwrap_or(0),
             });
+            // 后到的来源只在「原来没倍率」时补，别覆盖已有的
+            if e.credits.trim().is_empty() && !credits.is_empty() {
+                e.credits = credits.clone();
+                e.free = is_free(&credits);
+            }
+            if mark {
+                e.in_cli = true;
+            }
+            if e.context == 0 {
+                e.context = m["maxInputTokens"].as_u64().unwrap_or(0);
+            }
+            if e.max_output == 0 {
+                e.max_output = m["maxOutputTokens"].as_u64().unwrap_or(0);
+            }
+        }
+    };
+    // 顺序：本区线上 → 本区缓存 → 另一区线上 → 另一区缓存
+    if let Some(v) = &own_live {
+        feed(v, true);
+    }
+    if let Some(v) = &own_cache {
+        feed(v, true);
+    }
+    if let Some(v) = &other_live {
+        feed(v, false);
+    }
+    if let Some(v) = &other_cache {
+        feed(v, false);
+    }
+    let mut models: Vec<ModelInfo> = by_id.into_values().collect();
+    if models.is_empty() {
+        return Err("目录里没有可用的聊天模型：既没读到线上 /v3/config，也没有客户端缓存".into());
+    }
+    // 「只列现在在售的」：两个来源都没给倍率的多是已下架或内部老模型
+    //（比如国内那份里的 glm-5.1 / glm-5.0 / kimi-k2.5 / deepseek-v3-* / Claude-3.7）。
+    // 判据是数据而不是写死型号：**有倍率 = 在售**。全被滤空就退回不滤。
+    if flag_b("hide_unpriced", true) {
+        let kept: Vec<ModelInfo> = models
+            .iter()
+            .filter(|m| !m.credits.trim().is_empty())
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            models = kept;
         }
     }
-    if models.is_empty() {
-        return Err(format!("{} 里没有可用的聊天模型", p.display()));
-    }
-    // 免费的排前面，同一档里白名单内的排前面，再按 id 稳定排序
     models.sort_by(|a, b| {
         b.free
             .cmp(&a.free)
             .then(b.in_cli.cmp(&a.in_cli))
             .then(a.id.cmp(&b.id))
     });
-    Ok(Catalog {
-        models,
-        fetched_at,
-        source: p.to_string_lossy().into_owned(),
-    })
+    let fetched_at = std::fs::metadata(live_path(app_id))
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or_else(now_secs);
+    let source = match (&own_live, &own_cache) {
+        (Some(_), _) => "线上 /v3/config + 客户端缓存".to_string(),
+        (None, Some(_)) => format!(
+            "客户端缓存 {}",
+            catalog_path(app_id)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ),
+        _ => "无来源".to_string(),
+    };
+    Ok(Catalog { models, fetched_at, source })
+}
+
+/// 读客户端自己写的那份产品配置（`~/.workbuddy{,-ai}/cache/acc-product-config-v3.json`）。
+/// 实测它比我们直接打 `/v3/config` 更全（73 vs 37）。
+fn read_client_cache(app_id: &str) -> Option<Value> {
+    let p = catalog_path(app_id)?;
+    let txt = std::fs::read_to_string(&p).ok()?;
+    let v: Value = serde_json::from_str(&txt).ok()?;
+    if v["models"].is_array() { Some(v) } else { None }
+}
+
+/// 客户端缓存里的 id → credits 映射（只收非空的）。
+fn client_credits(app_id: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(p) = catalog_path(app_id) else {
+        return out;
+    };
+    let Ok(txt) = std::fs::read_to_string(&p) else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+        return out;
+    };
+    if let Some(arr) = v["models"].as_array() {
+        for m in arr {
+            let (Some(id), Some(c)) = (m["id"].as_str(), m["credits"].as_str()) else {
+                continue;
+            };
+            let c = c.trim();
+            if !c.is_empty() {
+                out.insert(id.to_string(), c.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// `/v3/config` 的 `models[]` 里混着一堆非对话模型：补全、改写、内联建议、图片、视频。
@@ -710,8 +927,15 @@ pub fn first_free(app_id: &str) -> Option<String> {
 /// 把调用方要的模型名落到真实模型 id。
 /// 返回 (真实 id, 说明)。认不出来就报错并**带上可用清单** —— 原样透传必然 400，
 /// 而且错误信息对不上，她只会看到「连不上」。
+/// 把调用方要的模型名落到真实模型 id。
+///
+/// ⚠️ **目录不是白名单**。`/v3/config` 只报一部分模型：2026-10-25 实测国内版只报 37 个、
+/// 且一个都不带倍率，而拿国内号直接打 `kimi-k3.1-pro` 照样 **200 真流式**（她指出来的）。
+/// 所以「不在目录里」不能当错误——那会把明明能调的模型挡在门外（她看到的「启动反代也用不了」）。
+/// 目录只用于展示与别名，名字认不出来就**原样透传**给上游，让上游回答行不行。
 pub fn resolve_model(app_id: &str, asked: &str) -> Result<(String, String), PrepError> {
-    let cat = catalog(app_id).map_err(|e| PrepError::NoCredential(e))?;
+    // 目录读不到也**不能挡住请求**：清单只是展示用的，模型名能透传。
+    let cat = catalog(app_id).unwrap_or_default();
     let want = asked.trim();
     if want.is_empty() {
         return cat
@@ -747,11 +971,15 @@ pub fn resolve_model(app_id: &str, asked: &str) -> Result<(String, String), Prep
         if cat.models.iter().any(|m| m.id == target) {
             return Ok((target.clone(), format!("{want} → {target}（别名）")));
         }
+        // 别名指向的 id 也不在目录里：同样原样透传，让上游判定
+        return Ok((target.clone(), format!("{want} → {target}（别名，目录外，透传）")));
     }
-    Err(PrepError::ModelUnknown {
-        asked: want.to_string(),
-        available: cat.models.iter().map(|m| m.id.clone()).collect(),
-    })
+    // 目录里没有：**照样透传**。目录不全（国内版实报 37 个但能调更多），
+    // 挡在这里就是把能用的模型判死。上游认不认由上游回答。
+    Ok((
+        want.to_string(),
+        format!("{want} 不在本区目录里，已原样透传（目录不全，不代表调不动）"),
+    ))
 }
 
 // ───────────────────────── 请求准备 ─────────────────────────
@@ -2250,30 +2478,46 @@ mod tests {
     #[ignore]
     fn real_catalog_includes_free_models_outside_the_cli_list() {
         // 2026-10-25 的真实形状：cli 白名单只剩 9 个旧模型，hy3 不在其中但仍可调用。
-        // 这条钉住「白名单不作过滤」——再有人拿 cli_ids 当 if 条件，这里会红。
+        // 这条同时钉住「白名单不作过滤」和「目录取线上而不是本机缓存」。
+        crate::secrets::load();
         for app in APPS {
+            match fetch_config(app) {
+                Ok(_) => eprintln!("{app}: 线上 /v3/config 拉取成功"),
+                Err(e) => panic!("{app} 线上拉取失败：{e}"),
+            }
             let cat = catalog(app).expect("读目录失败");
-            let names: Vec<&str> = cat.models.iter().map(|m| m.id.as_str()).collect();
-            eprintln!("{app}: {} 个模型 · 免费 {:?}", cat.models.len(),
-                cat.models.iter().filter(|m| m.free).map(|m| m.id.as_str()).collect::<Vec<_>>());
+            let free: Vec<&str> = cat.models.iter().filter(|m| m.free).map(|m| m.id.as_str()).collect();
+            eprintln!(
+                "{app}: {} 个模型 · 来源 {} · 免费 {:?}",
+                cat.models.len(),
+                cat.source,
+                free
+            );
             assert!(!cat.models.is_empty(), "{app} 目录是空的");
+            assert!(cat.source.contains("线上"), "{app} 没用线上目录，仍在读缓存");
             for m in &cat.models {
                 assert!(!is_non_chat(&m.id), "{app} 把非聊天模型 {} 也列出来了", m.id);
             }
-            // 付费且不在白名单里的模型也必须列出来——她明确要「所有付费模型也要」
-            let paid_outside = cat
-                .models
-                .iter()
-                .filter(|m| !m.free && !m.in_cli)
-                .count();
+            // 付费模型必须列出来（她明确要「所有付费模型也要」）。
+            // 国际版的 cli 名单就是全部 27 个，所以「白名单外」只在国内版有意义。
+            let paid_outside = cat.models.iter().filter(|m| !m.free && !m.in_cli).count();
             eprintln!("  {app}: {} 个模型，其中付费且不在白名单 {paid_outside} 个", cat.models.len());
-            assert!(
-                paid_outside > 0,
-                "{app} 一个白名单外的付费模型都没有，说明闸门还在"
-            );
-            let free = cat.models.iter().filter(|m| m.free).count();
-            assert!(free > 0 || names.is_empty(), "{app} 一个免费模型都没有");
+            assert!(cat.models.len() >= 10, "{app} 只列了 {} 个模型，太少", cat.models.len());
+            if app == "workbuddy" {
+                assert!(paid_outside > 0, "国内版白名单外的付费模型没了，说明闸门还在");
+            }
         }
+        // 并集的判据：**国内版目录里也要有它自己 config 根本不报的模型**。
+        // 国内线上 37 个里没有 kimi-k3.1-pro（实测三个 origin 都没有），但它能调，
+        // 合并之后它必须出现在国内版的下拉里。
+        let cn = catalog("workbuddy").expect("cn 目录");
+        eprintln!("  cn 目录 {} 个，含 kimi-k3.1-pro={}", cn.models.len(),
+            cn.models.iter().any(|m| m.id == "kimi-k3.1-pro"));
+        assert!(
+            cn.models.iter().any(|m| m.id == "kimi-k3.1-pro"),
+            "国内版目录没合进「另一区才报」的模型，合并没生效"
+        );
+        assert!(cn.models.len() >= 10, "合并后模型太少：{}", cn.models.len());
     }
 
     #[test]
@@ -2387,6 +2631,82 @@ mod tests {
             .sum();
         eprintln!("账本 calls 合计 = {served}（探活 2 次 + 本发至少 1 次）");
         assert!(served >= 3, "聊天那一发没记账，账本只有 {served} 次");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_member_options_marks_workbuddy_usable() {
+        // 「选择上游组成员」那个弹框的可用性来自 gateway::member_options。
+        // 它曾经只认 qproxy/traeproxy/asproxy 的令牌，漏了 wbproxy ——
+        // 于是池子里明明「可用 2/2」，弹框里却把两个 WorkBuddy 号标成
+        // 「不可用 · 该账号还没登记 Token」（她截图里那四个红标）。
+        crate::secrets::load();
+        let v = crate::gateway::member_options();
+        let mut hit = 0;
+        for it in v["instances"].as_array().cloned().unwrap_or_default() {
+            let Some(app) = it["app"].as_str() else { continue };
+            if !APPS.contains(&app) {
+                continue;
+            }
+            eprintln!(
+                "{} has_token={}",
+                it["src"].as_str().unwrap_or(""),
+                it["has_token"]
+            );
+            assert_eq!(
+                it["has_token"].as_bool(),
+                Some(true),
+                "WorkBuddy 成员在「选择上游组」弹框里被标成不可用"
+            );
+            hit += 1;
+        }
+        assert!(hit > 0, "一台 WorkBuddy 账号都没登记");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_proxy_passes_through_unlisted_model() {
+        // 2026-10-25 她指出来的事实：国内版 `/v3/config` 只报 37 个模型、不报 kimi-k3.1-pro，
+        // 但拿国内号直接打它照样 200。所以「不在目录里」不能判死。
+        // 这条走**完整的反代链路**（独立端口 18999，不碰她正在用的 8788）：
+        // `workbuddy/kimi-k3.1-pro` → 前缀路由到国内号 → 透传 → 200。
+        crate::secrets::load();
+        let key = crate::gateway::dist_keys()
+            .into_iter()
+            .find(|d| d["name"].as_str().map(|n| n.contains("WorkBuddy")).unwrap_or(false))
+            .and_then(|d| d["id"].as_str().and_then(crate::gateway::reveal_dist))
+            .expect("config 里没有 WorkBuddy 的分发 Key（先点一次一键反代）");
+        let proxy = crate::proxy::Proxy::shared();
+        let (ok, msg) = proxy.start(18999);
+        assert!(ok, "起反代失败：{msg}");
+        // 前缀写法 + 两发**不带前缀**（不带的会被轮询随机抽到国内/国际号，
+        // 抽到国际号时靠「目录外 + 11128 → 换号」兜住）
+        for want in ["workbuddy/kimi-k3.1-pro", "kimi-k3.1-pro", "kimi-k3.1-pro"] {
+            let res = ureq::post("http://127.0.0.1:18999/v1/chat/completions")
+                .timeout(std::time::Duration::from_secs(90))
+                .set("Authorization", &format!("Bearer {key}"))
+                .set("Content-Type", "application/json")
+                .set("Accept", "text/event-stream")
+                .send_json(json!({
+                    "model": want,
+                    "messages": [{"role": "user", "content": "say OK"}],
+                    "stream": true,
+                    "max_tokens": 8,
+                }));
+            let out = match res {
+                Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+                Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+                Err(e) => {
+                    let _ = proxy.stop();
+                    panic!("{want} 打不通反代：{e}");
+                }
+            };
+            eprintln!("[{}] 反代视角：{} {}", want, out.0,
+                out.1.chars().take(200).collect::<String>());
+            assert_eq!(out.0, 200, "{want} 被挡住了（应当透传/换号成功）");
+            assert!(out.1.contains("chat.completion.chunk"), "{want} 没拿到真流式");
+        }
+        let _ = proxy.stop();
     }
 
     #[test]

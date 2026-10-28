@@ -137,7 +137,7 @@ pub fn login_browser(data_dir: &Path, device: bool) -> Result<u32, String> {
         "title Codex 登录（这个窗口关掉即结束） && set \"CODEX_HOME={}\" && \"{}\" {}",
         data_dir.display(),
         exe.display(),
-        args[1..].join(" ")
+        args.join(" ")
     );
     let mut c = Command::new("cmd");
     crate::procs::scrub_env_pub(&mut c);

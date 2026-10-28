@@ -36,6 +36,9 @@ pub fn models() -> Value {
         Ok(resp) => {
             let v: Value = resp.into_json().unwrap_or_else(|_| json!({}));
             let arr = v["data"].as_array().cloned().unwrap_or_default();
+            // 面板「模型 ID」要复制出去给客户端用，必须带 opencode/ 前缀，
+            // 否则 `glm-5.3-flash` 这种同名模型会和别家串。
+            let arr = crate::proxy::tag_owner("opencode", &arr);
             json!({
                 "ok": true, "base_url": base_url(), "models": arr,
                 "count": arr.len(), "ms": t0.elapsed().as_millis() as u64,
