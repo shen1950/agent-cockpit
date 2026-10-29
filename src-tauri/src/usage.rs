@@ -1,289 +1,103 @@
-// 本地会话用量聚合：从 CLI 工具的会话日志汇总真实 Token 用量（对标 Cockpit Tools 的做法）
-// Cockpit Tools 的做法之一就是「从本机会话日志汇总真实用量，不依赖官方配额接口」。
-// 内置两家，都逐条读日志、按时钟落账，不猜：
-//   · Codex：<data_dir>/sessions/**/*.jsonl 的 token_count 事件（累计值取最后一次）
-//   · Claude Code：<data_dir>/projects/*.jsonl 的 assistant usage 逐条累加
-// 按天序列（compute_trend）也在这里聚：驾驶舱的波形图 / 热力图只用它。
+//! Read-only usage aggregation for local Agent histories.
+//! Token totals, visible-text estimates and native vendor credits stay separate.
 use serde_json::{json, Value};
-use std::fs;
-use std::path::Path;
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-#[derive(Default)]
-struct Tokens {
-    input: f64,
-    output: f64,
-    cached: f64,
-    reasoning: f64,
-    total: f64,
+static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Option<Value>)>>> = OnceLock::new();
+const SCRIPT: &str = include_str!("../scripts/usage-local.py");
+const BOOTSTRAP: &str = "import io,json,sys; p=json.loads(sys.stdin.buffer.read().decode('utf-8')); sys.stdin=io.StringIO(json.dumps(p['request'])); exec(compile(p['script'],'<AgentCockpit usage>','exec'),{'__name__':'__main__'})";
+
+fn supported(app: &str) -> bool {
+    matches!(app, "codex" | "chatgpt" | "claude" | "claude-code" | "qoder" | "qoder-cn"
+        | "qoderwork" | "qwenwork" | "qwenworkcn" | "workbuddy" | "workbuddy-intl"
+        | "codebuddy" | "codebuddy-cn" | "zcode" | "opencode" | "minimax"
+        | "marvis" | "gemini" | "gemini-cli" | "dsh")
 }
 
-/// 按 app_id 分发到各 CLI 工具的会话日志解析器；返回可直接存进实例 meta 的 JSON。
-pub fn compute(app_id: &str, data_dir: &str) -> Option<Value> {
-    let dir = Path::new(data_dir);
-    let mut agg = Tokens::default();
-    let mut files = 0usize;
-    match app_id {
-        "codex" => walk_jsonl(&dir.join("sessions"), &mut |p| {
-            files += 1;
-            if let Some(t) = codex_file_totals(p) {
-                agg.input += t.input;
-                agg.output += t.output;
-                agg.cached += t.cached;
-                agg.reasoning += t.reasoning;
-                agg.total += t.total;
-            }
-        }),
-        // Claude Code：projects/*.jsonl 里每条 assistant 消息带一份 usage，
-        // 一个文件就是一场会话，逐条累加（它不像 Codex 那样记累计值）
-        "claude" => walk_jsonl(&dir.join("projects"), &mut |p| {
-            files += 1;
-            if let Some(t) = claude_file_totals(p) {
-                agg.input += t.input;
-                agg.output += t.output;
-                agg.cached += t.cached;
-                agg.total += t.total;
-            }
-        }),
-        _ => return None,
-    }
-    if files == 0 || agg.total <= 0.0 {
+/// Returns canonical source identity, daily buckets, models and timing samples.
+/// Empty or unsupported profiles never fall back to another account's history.
+pub fn collect(app_id: &str, data_dir: &str) -> Option<Value> {
+    if !supported(app_id) || data_dir.trim().is_empty() || !Path::new(data_dir).is_dir() {
         return None;
     }
-    Some(json!({
-        "input": agg.input,
-        "output": agg.output,
-        "cached": agg.cached,
-        "reasoning": agg.reasoning,
-        "total": agg.total,
-        "files": files,
-    }))
+    let path = Path::new(data_dir).canonicalize().ok()?;
+    let key = format!("{}|{}", app_id, path.to_string_lossy().to_lowercase());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut held = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, value)) = held.get(&key) {
+        if at.elapsed() < Duration::from_secs(15) { return value.clone(); }
+    }
+    let value = run_helper(app_id, &path);
+    held.insert(key, (Instant::now(), value.clone()));
+    value
 }
 
-fn walk_jsonl(dir: &Path, f: &mut impl FnMut(&Path)) {
-    let rd = match fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return,
+fn run_helper(app_id: &str, data_dir: &Path) -> Option<Value> {
+    let installed = crate::registry::home().join(".agenthub/venv/Scripts/python.exe");
+    let mut command = Command::new(if installed.is_file() { installed } else { PathBuf::from("python") });
+    command.args(["-I", "-X", "utf8", "-c", BOOTSTRAP])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)] {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command.spawn().ok()?;
+    let mut reader = child.stdout.take()?;
+    // Drain stdout while the child runs. Daily/model output can exceed the pipe
+    // buffer, so waiting for process exit before reading would deadlock.
+    let output = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        reader.by_ref().take(128 * 1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+        Some(bytes)
+    });
+    let request = json!({"script":SCRIPT,"request":{
+        "app_id":app_id,"data_dir":data_dir,
+        "cache_dir":crate::registry::base_dir().join("usage-cache")
+    }}).to_string();
+    let written = child.stdin.take().map(|mut input| input.write_all(request.as_bytes()).is_ok()).unwrap_or(false);
+    if !written { let _ = child.kill(); let _ = child.wait(); let _ = output.join(); return None; }
+    let started = Instant::now();
+    let success = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if started.elapsed() < Duration::from_secs(90) => std::thread::sleep(Duration::from_millis(50)),
+            _ => { let _ = child.kill(); let _ = child.wait(); break false; }
+        }
     };
-    for e in rd.filter_map(|x| x.ok()) {
-        let p = e.path();
-        if let Ok(t) = e.file_type() {
-            if t.is_dir() {
-                walk_jsonl(&p, f);
-            } else if p.extension().map(|x| x == "jsonl").unwrap_or(false) {
-                f(&p);
-            }
-        }
-    }
+    let bytes = output.join().ok()??;
+    if !success || bytes.len() > 128 * 1024 * 1024 { return None; }
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value.is_object().then_some(value)
 }
 
-/// 单个 Codex rollout 文件里，token_count 的 total_token_usage 是累计值，取最后一次即可。
-fn codex_file_totals(path: &Path) -> Option<Tokens> {
-    let s = fs::read_to_string(path).ok()?;
-    let mut last: Option<Tokens> = None;
-    for line in s.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v["type"].as_str() != Some("event_msg")
-            || v["payload"]["type"].as_str() != Some("token_count")
-        {
-            continue;
-        }
-        let u = &v["payload"]["info"]["total_token_usage"];
-        let mut t = Tokens::default();
-        t.input = u["input_tokens"].as_f64().unwrap_or(0.0);
-        t.output = u["output_tokens"].as_f64().unwrap_or(0.0);
-        t.cached = u["cached_input_tokens"].as_f64().unwrap_or(0.0);
-        t.reasoning = u["reasoning_output_tokens"].as_f64().unwrap_or(0.0);
-        t.total = u["total_tokens"]
-            .as_f64()
-            .unwrap_or(t.input + t.output + t.cached + t.reasoning);
-        last = Some(t);
-    }
-    last
+/// Legacy summary used on account cards, derived from the same de-duplicated
+/// events as the statistics page (cache reads are not added twice).
+pub fn compute(app_id: &str, data_dir: &str) -> Option<Value> {
+    let value = collect(app_id, data_dir)?;
+    if value["total"].as_f64().unwrap_or(0.0) <= 0.0 { return None; }
+    Some(json!({"input":value["input_tokens"],"output":value["output_tokens"],
+        "cached":value["cached_tokens"],"reasoning":0,"total":value["total"],
+        "files":value["files"],"exact_tokens":value["exact_tokens"],
+        "estimated_tokens":value["estimated_tokens"],"source":value["source"],
+        "coverage":value["coverage"]}))
 }
 
-/// 按天聚合的用量序列——驾驶舱「消耗趋势」（波形图 + 热力图）的数据源。
-/// 判据很硬：只有本机日志逐笔记了**时间**与**消耗**的产品才给得出。目前两家：
-///   · Codex：<data_dir>/sessions/**/*.jsonl 里带 timestamp 的 token_count 事件
-///   · Claude Code：<data_dir>/projects/*.jsonl 里带 timestamp 的 assistant usage
-/// 读不到就整块不出现——摆一张空图占位等于骗人（同"官方没给总额不许当 0"）。
-/// 单位统一 tokens：驾驶舱不把本地 token 数折算成别家的积分，那才是编数。
 pub fn compute_trend(app_id: &str, data_dir: &str) -> Option<Value> {
-    let dir = Path::new(data_dir);
-    let mut days: std::collections::BTreeMap<String, DayAgg> = std::collections::BTreeMap::new();
-    match app_id {
-        "codex" => {
-            // sessions 按"当天有几个会话文件"数，不是事件数——热力图脚注写的是"场会话"
-            let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
-                std::collections::HashMap::new();
-            walk_jsonl(&dir.join("sessions"), &mut |p| {
-                let s = match fs::read_to_string(p) {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                let fid = p.to_string_lossy().to_string();
-                // 同一个会话文件内，total_token_usage 是累计值：按天切的时候要么用
-                // last_token_usage（这一轮的增量），要么跟上一次的累计值做差
-                let mut prev_by_day: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-                for line in s.lines() {
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let v: Value = match serde_json::from_str(line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    if v["type"].as_str() != Some("event_msg")
-                        || v["payload"]["type"].as_str() != Some("token_count")
-                    {
-                        continue;
-                    }
-                    let day = local_day(v["timestamp"].as_str().unwrap_or(""));
-                    let inc = v["payload"]["info"]["last_token_usage"]["total_tokens"]
-                        .as_f64()
-                        .or_else(|| {
-                            let cur = v["payload"]["info"]["total_token_usage"]["total_tokens"]
-                                .as_f64()
-                                .unwrap_or(0.0);
-                            let prev = prev_by_day.insert(day.clone(), cur).unwrap_or(0.0);
-                            Some((cur - prev).max(0.0))
-                        })
-                        .unwrap_or(0.0);
-                    let e = days.entry(day.clone()).or_default();
-                    e.tokens += inc;
-                    seen.entry(day).or_default().insert(fid.clone());
-                }
-            });
-            // 场次数落实到每天
-            for (d, files) in seen {
-                if let Some(e) = days.get_mut(&d) {
-                    e.sessions = files.len();
-                }
-            }
-        }
-        "claude" => {
-            let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
-                std::collections::HashMap::new();
-            walk_jsonl(&dir.join("projects"), &mut |p| {
-                let s = match fs::read_to_string(p) {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                let fid = p.to_string_lossy().to_string();
-                for line in s.lines() {
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let v: Value = match serde_json::from_str(line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    if v["type"].as_str() != Some("assistant") {
-                        continue;
-                    }
-                    let day = local_day(v["timestamp"].as_str().unwrap_or(""));
-                    let u = &v["message"]["usage"];
-                    let inc = u["input_tokens"].as_f64().unwrap_or(0.0)
-                        + u["output_tokens"].as_f64().unwrap_or(0.0)
-                        + u["cache_read_input_tokens"].as_f64().unwrap_or(0.0)
-                        + u["cache_creation_input_tokens"].as_f64().unwrap_or(0.0);
-                    if inc <= 0.0 {
-                        continue;
-                    }
-                    let e = days.entry(day.clone()).or_default();
-                    e.tokens += inc;
-                    seen.entry(day).or_default().insert(fid.clone());
-                }
-            });
-            for (d, files) in seen {
-                if let Some(e) = days.get_mut(&d) {
-                    e.sessions = files.len();
-                }
-            }
-        }
-        _ => return None,
-    }
-    let mut out: Vec<Value> = Vec::new();
-    let mut peak = 0.0f64;
-    let mut peak_day = String::new();
-    for (d, a) in &days {
-        if a.tokens <= 0.0 {
-            continue;
-        }
-        if a.tokens > peak {
-            peak = a.tokens;
-            peak_day = d.clone();
-        }
-        out.push(json!({ "date": d, "credits": a.tokens, "sessions": a.sessions }));
-    }
-    if out.is_empty() {
-        return None;
-    }
-    let total: f64 = out.iter().map(|d| d["credits"].as_f64().unwrap_or(0.0)).sum();
-    let src = if app_id == "codex" { "本机 Codex 会话日志" } else { "本机 Claude Code 会话日志" };
-    Some(json!({
-        "unit": "tokens",
-        "days": out,
-        "total": total,
-        "peak": peak,
-        "peak_date": peak_day,
-        "source": src,
-    }))
-}
-
-#[derive(Default)]
-struct DayAgg {
-    tokens: f64,
-    sessions: usize,
-}
-
-/// UTC 时间戳（RFC3339，如 2026-05-27T06:07:18.088Z）→ 本机日期 YYYY-MM-DD。
-/// 驾驶舱所有时间都按本机显示，"昨晚跑的"不能算到第二天头上。
-fn local_day(ts: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|_| ts.get(..10).unwrap_or("").to_string())
-}
-
-/// 单个 Claude Code 会话文件：assistant 消息的 usage 逐条累加。
-/// cache_read / cache_creation 也计入——它们照样是花掉的 token。
-fn claude_file_totals(path: &Path) -> Option<Tokens> {
-    let s = fs::read_to_string(path).ok()?;
-    let mut t = Tokens::default();
-    let mut any = false;
-    for line in s.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v["type"].as_str() != Some("assistant") {
-            continue;
-        }
-        let u = &v["message"]["usage"];
-        t.input += u["input_tokens"].as_f64().unwrap_or(0.0);
-        t.output += u["output_tokens"].as_f64().unwrap_or(0.0);
-        t.cached += u["cache_read_input_tokens"].as_f64().unwrap_or(0.0)
-            + u["cache_creation_input_tokens"].as_f64().unwrap_or(0.0);
-        any = true;
-    }
-    if !any {
-        return None;
-    }
-    t.total = t.input + t.output + t.cached;
-    Some(t)
+    let mut value = collect(app_id, data_dir)?;
+    value["days"].as_array().filter(|days| !days.is_empty())?;
+    value.as_object_mut()?.remove("_records");
+    Some(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
 
     #[test]

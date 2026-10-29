@@ -42,7 +42,8 @@ function zcodeQuotaPanel(instance, options = {}) {
   const quota = instance.quota || {};
   if (instance.zcode_auth?.quota_state === 'no_plan' && !quota.live_error && !quota.stale) {
     return el('div', { class: 'cpt-quota' }, el('strong', {}, '暂无 ZCode 套餐'),
-      quota.fetched_at ? el('small', { class: 'cpt-quota-time' }, `更新于 ${stampTime(quota.fetched_at)}`) : null);
+      quota.fetched_at ? el('small', { class: 'cpt-quota-time' }, `更新于 ${stampTime(quota.fetched_at)}`) : null,
+      options.compact ? null : usageTrendPanel(instance));
   }
   return options.compact ? quotaBox(instance) : quotaPanel(instance);
 }

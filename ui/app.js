@@ -153,8 +153,8 @@ function patchKeyAct(siteId, keyId) {
   const dot = dragDot('按住拖动，调整这条密钥在站点内的顺序');
   td.appendChild(dot);
   cell.replaceWith(td);
-  // 行还在原位，dropZone 的监听跟着 tr 没丢；dragstart 因 __dragwired 也不会叠
-  attachDrag(dot, td.parentNode, { kind: 'key', site: site.id, id: k.id });
+  // 行还在原位，拖拽的落点监听跟着 tr 没丢；新手柄重新接线即可
+  wireKeyDrag(dot, td.parentNode, site, k);
   return true;
 }
 async function keyTest(site, id) {
@@ -191,9 +191,14 @@ function clear(node) { while (node.firstChild) node.removeChild(node.firstChild)
    fn 必须是同步的（里面有 await 就拆成两次调用，护栏不跨任务）。 */
 function restoreScroll(box, top) {
   if (!box) return;
+  const detail = box.id === 'im-body' ? S.detail : null;
+  const section = detail?.sec;
+  const revision = detail?._renderRevision;
   if (Math.abs(box.scrollTop - top) > 0.5) box.scrollTop = top;
   if (top > 0) {
     requestAnimationFrame(() => {
+      // An old frame must not restore the scroll of a different account or tab.
+      if (detail && (S.detail !== detail || detail.sec !== section || detail._renderRevision !== revision)) return;
       if (Math.abs(box.scrollTop - top) > 0.5) box.scrollTop = top;
     });
   }
@@ -480,6 +485,7 @@ function render() {
   renderAlerts(d);
   renderNav(d);
   renderViews();
+  globalThis.UsageDashboard?.setVisible(S.view === 'usage', invoke);
   // 签到状态：整份缓存由 4 秒一轮的 state 带回来。这一页自己那份 S.checkin 只用来
   // 触发刷新，显示一律以 state 里更新鲜的那份为准——否则页面会停在进来那一刻的旧数上。
   const dc = d.checkin || {};
@@ -511,8 +517,9 @@ function render() {
   if (S.view === 'proxy') keepScroll(scrollerIn('proxy'), () => renderProxyPage(d));
   // 远程控制同理：二维码和设备列表每拍都可能变
   if (S.view === 'remote') keepScroll(scrollerIn('remote'), () => renderRemotePage());
-  // 密钥页批量条里有「挪到哪个站点」下拉，同一类问题：焦点在列表里就别整块重建
-  if (S.view === 'keys' && !editingIn('#keysites')) renderKeys(d);
+  // 密钥页批量条里有「挪到哪个站点」下拉，同一类问题：焦点在列表里就别整块重建；
+  // 拖拽排序进行中更不能重建——整块 clear 会把被拖的行和落点线当场抹掉
+  if (S.view === 'keys' && !editingIn('#keysites') && !S.keyDrag) renderKeys(d);
   if (S.view === 'checkin') { renderCheckin(); loadCheckin(false); }
   // 设置页 4 秒轮询整块重建；侧导菜单拖拽中绝不能重建——面板一换，
   // 落点线和被拖的行当场消失，用户看到的就是"拖到一半没反应"
@@ -792,7 +799,7 @@ function applyNavSort(fromId, toId, after) {
 
 /* 视图切换只换右栏内容：每页自己分「左菜单 + 右内容」，标题栏固定不滚 */
 function renderViews() {
-  for (const v of ['home', 'agents', 'collab', 'keys', 'proxy', 'remote', 'checkin', 'settings']) {
+  for (const v of ['home', 'agents', 'usage', 'collab', 'keys', 'proxy', 'remote', 'checkin', 'settings']) {
     $(`view-${v}`).hidden = S.view !== v;
   }
 }
@@ -2307,10 +2314,6 @@ function trendWave(s, range) {
 function pickTrend(p) {
   S.trendSel = S.trendSel === p.date ? '' : p.date;
   renderDetail();
-  // 重建浮窗会把热力图的横向滚动位置打回最左（那里正好是一整片空格子），
-  // 所以点完立刻再滚回最近这一个月
-  const w = document.querySelector('#imodal .heatwrap');
-  if (w) w.scrollLeft = w.scrollWidth - w.clientWidth;
 }
 
 function trendHeat(s) {
@@ -2350,14 +2353,14 @@ function trendHeat(s) {
    渲染完滚到最右，进来先看见的就是最近这一个月。
    一次 rAF 不够：浮窗重绘时这个元素可能还没接进文档，scrollWidth 量出来是 0，
    所以按帧重试到真能量出可滚的宽度为止（最多 8 帧，之后就不管了）。 */
-function heatScrollToRecent(box, tries = 0) {
+function heatScrollToRecent(box, tries = 0, preferred = null) {
   const w = box.isConnected ? box.querySelector('.heatwrap') : null;
   const max = w ? w.scrollWidth - w.clientWidth : 0;
   if (max > 0) {
-    w.scrollLeft = max;
+    w.scrollLeft = preferred == null ? max : Math.min(max, Math.max(0, preferred));
     return;
   }
-  if (tries < 8) requestAnimationFrame(() => heatScrollToRecent(box, tries + 1));
+  if (tries < 8) requestAnimationFrame(() => heatScrollToRecent(box, tries + 1, preferred));
 }
 
 function trendCharts(q) {
@@ -2376,6 +2379,10 @@ function trendCharts(q) {
     return b;
   });
   const box = el('div', { class: 'trend' });
+  const estimated = t.days.reduce((sum, day) => sum + Math.max(0, Number(day.estimated_tokens) || 0), 0);
+  if (estimated > 0) box.appendChild(el('p', { class: 'qnote' },
+    `含 ${fmtTok(estimated)} 估算 Token。${t.estimate_method || t.estimation_method || '估算仅覆盖可见文本，未包含隐藏上下文。'}`));
+  if (typeof t.coverage === 'string' && t.coverage) box.appendChild(el('p', { class: 'qnote' }, t.coverage));
   box.appendChild(el('div', { class: 'trhead' },
     el('b', {}, '消耗趋势'),
     el('span', { class: 'trsum' },
@@ -2399,7 +2406,8 @@ function trendCharts(q) {
   box.appendChild(trendWave(s, range));
   box.appendChild(trendHeat(s));
   // 滚到最右要等元素真的进了文档、有了布局再做，这里建好还没插入，scrollWidth 是 0
-  requestAnimationFrame(() => heatScrollToRecent(box));
+  const heatLeft = S.detail?.trendHeatScroll ?? null;
+  requestAnimationFrame(() => heatScrollToRecent(box, 0, heatLeft));
   const how = s.srcNote
     ? `按天分桶来自 ${s.srcNote}`
     : '归日按会话最后活动时间（跨天的会话整笔算到最后那天，不是逐笔流水）';
@@ -2413,16 +2421,40 @@ function trendCharts(q) {
   return box;
 }
 
+// One shared component for every account detail, including products with no quota adapter.
+// A missing source is explained explicitly; it is not turned into a zero-valued chart.
+function usageTrendPanel(instance) {
+  const quota = instance.quota || {};
+  const result = trendCharts(quota);
+  const reasonByApp = {
+    'codex-desktop': '尚未读到这个账号的本机会话用量；共享历史可能无法按登录账号拆分。',
+    'traework-cn': '尚未找到可读取的逐次用量或完整对话记录，当前无法生成趋势。',
+    'opencode': '尚未从该档案读到带时间的模型用量记录。',
+    'antigravity': '尚未找到可读取的逐次用量记录；套餐剩余额度不能直接换算成每日 Token。',
+    'catpaw': '尚未找到可读取的逐次用量或完整对话记录，当前无法生成趋势。',
+  };
+  const reason = quota.trend_reason || quota.trend?.reason || quota.trend?.error
+    || reasonByApp[instance.app] || '尚未读到带日期的用量记录；没有记录不能表示当天没有消耗。';
+  const open = btn('查看用量统计', 'sm', async () => {
+    await closeDetail();
+    if (S.detail) return;
+    S.view = 'usage'; render(); globalThis.UsageDashboard?.selectApp(instance.app);
+  }, '打开统计页并筛选当前 Agent');
+  return el('div', { class: 'usage-trend-panel' },
+    el('h3', { class: 'subsec' }, '用量统计'),
+    result || el('p', { class: 'qnote', role: 'status' }, `暂无法展示用量趋势：${reason}`),
+    el('div', { class: 'ctlrow' }, open));
+}
+
 /* 账号设置里的「积分明细」整块：总览 + 每档一行 + 查看明细。版式照 WorkBuddy 官方。 */
 function quotaPanel(i) {
-  const q = i.quota;
+  const q = i.quota || {};
   const groups = quotaRows(i);
   const wrap = el('div', { class: 'qpanel' });
   if (!groups.length) {
     // 一档都没有：明说读不到（带后端给的原因），不摆 0
     wrap.appendChild(el('div', { class: 'qempty', title: String(q.live_error || '').trim() }, quotaMiss(q)));
-    const t0 = trendCharts(q);
-    if (t0) wrap.appendChild(t0);
+    wrap.appendChild(usageTrendPanel(i));
     return wrap;
   }
   const a = quotaAgg(groups);
@@ -2501,8 +2533,7 @@ function quotaPanel(i) {
       g.scope ? el('div', { class: 'qgscope' }, `这一档只用于：${g.scope}`) : null,
       pctG ? null : foot));
   }
-  const tc = trendCharts(q);
-  if (tc) wrap.appendChild(tc);
+  wrap.appendChild(usageTrendPanel(i));
   return wrap;
 }
 /* 查看明细：照官方那层「平台奖励积分明细」——有效期内 / 已过期 两个页签 + 逐笔列表。
@@ -2919,6 +2950,8 @@ function card(i, app) {
   const detail = btn('账号设置 ⚙', 'sm', () => openDetail(i.app, i.name), i.app === 'codex-desktop'
     ? '概览 / 额度与用量 / 运行管理 / 对话与项目 / 文件位置 / 登录管理'
     : '账号信息 / 额度与用量 / 运行与换号 / 目录与数据 / 凭据与反代 / 删除账号');
+  const usageDetail = btn('用量趋势', 'sm', () => openDetail(i.app, i.name, 'quota'),
+    '查看这个实例可读取的用量趋势；没有记录时会说明原因');
   // 删除放在这一行最外侧：它属于"整个账号"的级别，不该藏在设置里绕一圈
   const delBtn = i.app === 'codex-desktop' ? null : i.app === 'zcode' || i.app === 'antigravity'
     ? btn('移除', 'sm del', () => del(i.app, i.name), '仅移除卡片，保留登录凭据和本机数据。')
@@ -2971,7 +3004,7 @@ function card(i, app) {
           : (i.resident ? `后台驻留 ×${i.procs}` : '未运行'))),
     qbox,
     el('div', { class: 'acts' },
-      el('div', { class: 'acts-main' }, primary, reap, jumpBtn, swapBtn, i.app === 'codex-desktop' ? null : pull, detail),
+      el('div', { class: 'acts-main' }, primary, reap, jumpBtn, swapBtn, i.app === 'codex-desktop' ? null : pull, usageDetail, detail),
       delBtn));
   // 卡片表头/空白处 = 账号设置首页；只有额度那块跳到额度页。
   // 刚拖完卡片的那一下不算点击——否则拖到一半松手就弹开账号设置
@@ -5694,68 +5727,64 @@ function keySelBar(sites) {
   return bar;
 }
 
-/* ---------------- 拖拽排序（2026-10-28）：站点卡 & 站点内 key 行 ----------------
-   手柄（⠿）按下才把所在容器设成 draggable：整行/整卡常年可拖会把
-   名字选中、按钮点击一起拖坏。拖完把**全量** id 顺序发给后端
-   （site_reorder / key_reorder），后端只挪位置不碰内容，
-   顺序里漏掉的条目原样排后面，一条不会丢。
-   落盘走 load() → renderKeys 护栏，不在这里手动重排 DOM。 */
-const dragst = { kind: '', site: '', id: '', el: null };
-
+/* ---------------- 拖拽排序（照侧导菜单那套 pointer 拖拽，2026-10-29 重做） ----------------
+   ⠿ 手柄 pointerdown 抓起 → 幽灵标签跟手 + 落点上下沿画 accent 线 → 松手
+   **先改本地数组立刻重绘**（拖过去就呆在那，不回原位等接口回包），
+   再后台落盘 site_reorder / key_reorder（失败才提示并回读真数据）。
+   早先的 HTML5 拖拽在 WebView 里跟手性差：松手后原元素要等一轮 IPC 才挪窝。 */
 function dragDot(title) {
-  return el('span', { class: 'dragdot', title: title || '按住拖动排序' }, '⠿');
+  // 六点 SVG（同侧导菜单手柄）：别用 ⠿ 盲文文字——表格列是等宽字体，
+  // 缺这个字形会退化成"…"，而且字形在悬停高亮框里是偏的
+  const d = el('span', { class: 'dragdot', title: title || '按住拖动排序' });
+  d.innerHTML = MENU_ICONS.dots;
+  return d;
 }
 
-/* handle 是 ⠿，node 是被拖着走的容器（站点卡 section / key 行 tr）。
-   info = {kind:'site'|'key', site:站点id, id:站点或key的id}
-   dragstart/dragend 只挂一次（node.__dragwired），顺序信息存在 node.__draginfo：
-   操作列会被 patchKeyAct 定点替换、手柄跟着重建，重挂时不能叠出两份监听。 */
-function attachDrag(handle, node, info) {
-  handle.addEventListener('mousedown', () => node.setAttribute('draggable', 'true'));
-  node.__draginfo = info;
-  if (node.__dragwired) return;
-  node.__dragwired = true;
-  node.addEventListener('dragstart', (e) => {
-    // key 行嵌在站点卡里：dragstart/dragend 一路冒泡会把祖先（站点卡）的
-    // 拖拽状态盖成自己的，反过来站内拖就被记成站点拖——这里掐掉冒泡。
-    e.stopPropagation();
-    Object.assign(dragst, node.__draginfo, { el: node });
-    node.classList.add('dragging');
-    e.dataTransfer.effectAllowed = 'move';
-    try { e.dataTransfer.setData('text/plain', 'sort'); } catch (_) { /* IE 老脾气，随它 */ }
-  });
-  node.addEventListener('dragend', (e) => {
-    e.stopPropagation();
-    node.classList.remove('dragging');
-    node.removeAttribute('draggable');
-    dragst.kind = ''; dragst.el = null;
-  });
-}
-
-/* 落点容器：上半边插到它前面、下半边插到它后面。before/after 用类画指示线。 */
-function dropZone(node, allowed, onDrop) {
-  const clear = () => node.classList.remove('drop-before', 'drop-after');
-  node.addEventListener('dragover', (e) => {
-    if (!dragst.kind || dragst.el === node || !allowed(dragst)) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    const r = node.getBoundingClientRect();
-    const before = e.clientY < r.top + r.height / 2;
-    node.classList.toggle('drop-before', before);
-    node.classList.toggle('drop-after', !before);
-  });
-  node.addEventListener('dragleave', clear);
-  node.addEventListener('drop', async (e) => {
-    if (!dragst.kind || dragst.el === node || !allowed(dragst)) return;
-    e.preventDefault();
-    const before = node.classList.contains('drop-before');
+/* item 是被拖容器（站点卡 / key 行），ghostText 是跟手幽灵标签上的字。
+   hitTest(落点元素, 事件) 返回 {el, before} 或 null（无效落点）；
+   applyDrop(落点) 里自己改数据 + 立即重绘 + 后台落盘。 */
+function startSortDrag(e, item, ghostText, hitTest, applyDrop) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  S.keyDrag = true;   // 拖拽中掐掉 4 秒轮询重建，不然表整块被 clear，拖到一半就没了
+  item.classList.add('dragging');
+  const ghost = el('div', { class: 'se-ghost' }, ghostText);
+  document.body.appendChild(ghost);
+  const clear = () => {
+    document.querySelectorAll('#keysites .drop-before, #keysites .drop-after')
+      .forEach((n) => n.classList.remove('drop-before', 'drop-after'));
+  };
+  let target = null;
+  const move = (ev) => {
+    ghost.style.left = `${ev.clientX + 16}px`;
+    ghost.style.top = `${ev.clientY - 30}px`;
     clear();
-    const dragged = dragst.el;
-    dragst.el = null;   // load() 会推倒重建，dragend 还会在这具空壳上放一次，别让它碰新列表
-    dragged.classList.remove('dragging');
-    dragged.removeAttribute('draggable');   // dragend 正常也会清，这里兜底（合成事件没有 dragend）
-    await onDrop(before, dragged);
-  });
+    target = null;
+    // elementsFromPoint（复数）：页面可能有引导遮罩之类的覆盖层压在最上面，
+    // 单数的 elementFromPoint 会被它挡住，落点判定全废——从整摞元素里找落点容器
+    const stack = document.elementsFromPoint(ev.clientX, ev.clientY);
+    const hit = stack.map((n) => (n.closest ? n.closest('[data-sdgt]') : null)).find(Boolean) || null;
+    if (!hit) return;
+    const t = hitTest(hit, ev);
+    if (!t) return;
+    target = t;
+    t.el.classList.toggle('drop-before', t.before);
+    t.el.classList.toggle('drop-after', !t.before);
+  };
+  const up = () => {
+    document.removeEventListener('pointermove', move, true);
+    document.removeEventListener('pointerup', up, true);
+    document.removeEventListener('pointercancel', up, true);
+    clear();
+    ghost.remove();
+    item.classList.remove('dragging');
+    S.keyDrag = false;
+    if (target) applyDrop(target);
+  };
+  document.addEventListener('pointermove', move, true);
+  document.addEventListener('pointerup', up, true);
+  document.addEventListener('pointercancel', up, true);
 }
 
 function renderKeys(d) {
@@ -5790,7 +5819,7 @@ function renderKeyList(d) {
     const box = el('section', {
       class: `panel site${S.keysOpen[p.id] ? ' open' : ''}`,
       id: `site-${p.id}`,          // 左菜单点站点名要能滚到它
-      data: { sid: p.id },         // 拖拽落盘时要认这条卡是哪个站点（全小写：dataset 读回不歧义）
+      data: { sdgt: 'site', sid: p.id },   // 拖拽落点标记 + 落盘时要认这条卡是哪个站点
     });
 
     const flip = () => { S.keysOpen[p.id] = !S.keysOpen[p.id]; renderKeys(S.data); };
@@ -5806,24 +5835,29 @@ function renderKeyList(d) {
     // 站点头：名字、类型、key 数、额度（额度挂在站点上，不是每个 key 一份）、操作
     // 最前面那个 ⠿ 是排序手柄：按住上下拖，松手落盘（site_reorder）
     const siteDot = dragDot('按住拖动，给站点排序');
-    attachDrag(siteDot, box, { kind: 'site', site: p.id, id: p.id });
-    dropZone(box, (x) => x.kind === 'site', async (before, dragged) => {
-      const sites = (S.data.keys || []).slice();
-      const from = sites.findIndex((x) => x.id === dragged.dataset.sid);
-      const to = sites.findIndex((x) => x.id === p.id);
-      if (from < 0 || to < 0 || from === to) return;
-      const [moved] = sites.splice(from, 1);
-      let at = sites.findIndex((x) => x.id === p.id);
-      if (!before) at += 1;
-      sites.splice(at, 0, moved);
-      const r = await invoke('action', { payload: { action: 'site_reorder', order: sites.map((x) => x.id) } });
-      if (!r.ok) { toast(r.msg, false); return; }   // 成功不弹通知——挪个位置而已，列表动了就是反馈
-      // 乐观更新：落盘成功就用手上这份已排好的数组立即重绘。不能只等 load()——
-      // 它有「焦点在 #keysites 里就跳过重绘」的闸（防批量条下拉被重建抖掉），
-      // 拖完焦点多半还在表里，表现就是拖完 5 秒才动、焦点不挪就一直不动
-      S.data.keys = sites;
-      renderKeys(S.data);
-      load();   // 后台对账（左菜单计数、额度等），不阻塞显示
+    siteDot.addEventListener('pointerdown', (e) => {
+      startSortDrag(e, box, p.name || '未命名站点',
+        (hit, ev) => {
+          if (hit === box || hit.dataset.sdgt !== 'site') return null;
+          const rc = hit.getBoundingClientRect();
+          return { el: hit, before: ev.clientY < rc.top + rc.height / 2 };
+        },
+        (t) => {
+          const tid = t.el.dataset.sid;
+          const sites = S.data.keys.slice();
+          const from = sites.findIndex((x) => x.id === p.id);
+          const to = sites.findIndex((x) => x.id === tid);
+          if (from < 0 || to < 0 || from === to) return;
+          const [moved] = sites.splice(from, 1);
+          let at = sites.findIndex((x) => x.id === tid);
+          if (!t.before) at += 1;
+          sites.splice(at, 0, moved);
+          S.data.keys = sites;
+          renderKeys(S.data);   // 拖过去就呆在那，不回原位等接口
+          invoke('action', { payload: { action: 'site_reorder', order: sites.map((x) => x.id) } })
+            .then((r) => { if (!r.ok) { toast(r.msg, false); load(); } })
+            .catch(() => { toast('保存顺序失败', false); load(); });
+        });
     });
     const head = el('div', { class: 'sitehead' },
       siteDot,
@@ -5848,6 +5882,13 @@ function renderKeyList(d) {
         }
       }, '删除整个站点（含它下面所有 key）'));
     box.appendChild(head);
+
+    // 双击标头空白处也能展开/收起（她 2026-10-29 要的）。按钮/主页链接/拖拽手柄/
+    // 站点名文字除外：前几个是动作，名字留着单击选中复制
+    head.addEventListener('dblclick', (e) => {
+      if (e.target.closest('button, a, input, select, .dragdot, .sitename')) return;
+      flip();
+    });
 
     // 站点下的：接入点 + 模型清单 + key 表
     if (S.keysOpen[p.id]) {
@@ -6006,7 +6047,7 @@ function keyRow(site, k) {
   const rowDot = dragDot('按住拖动，调整这条密钥在站点内的顺序');
   const actTd = keyActTd(site, k);
   actTd.appendChild(rowDot);
-  const tr = el('tr', { class: keySel().has(sig) ? 'sel' : '', data: { kid: k.id } },
+  const tr = el('tr', { class: keySel().has(sig) ? 'sel' : '', data: { sdgt: 'key', kid: k.id } },
     el('td', { class: 'k-sel' }, cb),
     el('td', { class: 't', title: k.note || k.label || '' }, k.label || el('span', { class: 'muted' }, '未命名')),
     el('td', { class: 't', title: k.source || '' }, k.source || el('span', { class: 'muted' }, '—')),
@@ -6021,27 +6062,40 @@ function keyRow(site, k) {
     el('td', {}, expChip(k)),
     el('td', {}, k.last_status ? chip(k.last_status === 'ok' ? '可用' : '失败', k.last_status) : chip('未测', '')),
     actTd);
-  attachDrag(rowDot, tr, { kind: 'key', site: site.id, id: k.id });
-  // 只支持站内排序：跨站挪走批量条里的「移动」，那边有确认和查重兜底
-  dropZone(tr, (x) => x.kind === 'key' && x.site === site.id, async (before, dragged) => {
-    const p = (S.data.keys || []).find((x) => x.id === site.id);
-    const ks = ((p && p.keys) || []).slice();
-    const from = ks.findIndex((x) => x.id === dragged.dataset.kid);
-    const to = ks.findIndex((x) => x.id === k.id);
-    if (from < 0 || to < 0 || from === to) return;
-    const [moved] = ks.splice(from, 1);
-    let at = ks.findIndex((x) => x.id === k.id);
-    if (!before) at += 1;
-    ks.splice(at, 0, moved);
-    const r = await invoke('action', { payload: { action: 'key_reorder', site: site.id, order: ks.map((x) => x.id) } });
-    if (!r.ok) { toast(r.msg, false); return; }   // 成功不弹通知
-    // 同站点拖拽：乐观更新立即重绘（原因见上面 site_reorder 那条注释）
-    const p2 = (S.data.keys || []).find((x) => x.id === site.id);
-    if (p2) p2.keys = ks;
-    renderKeys(S.data);
-    load();
-  });
+  wireKeyDrag(rowDot, tr, site, k);
   return tr;
+}
+
+/* key 行拖拽接线：pointer 抓起，松手先改本地数组立即重绘（拖过去就呆在那），
+   再后台落盘。单独成函数是因为操作列会被 patchKeyAct 定点替换、手柄跟着重建，
+   重挂要走这里。 */
+function wireKeyDrag(dot, tr, site, k) {
+  dot.addEventListener('pointerdown', (e) => {
+    startSortDrag(e, tr, `${k.label || '未命名密钥'}（${site.name}）`,
+      (hit, ev) => {
+        if (hit === tr || hit.dataset.sdgt !== 'key') return null;   // 只认同站点的 key 行
+        if (hit.closest('.site') !== tr.closest('.site')) return null;
+        const rc = hit.getBoundingClientRect();
+        return { el: hit, before: ev.clientY < rc.top + rc.height / 2 };
+      },
+      (t) => {
+        const tid = t.el.dataset.kid;
+        const p2 = (S.data.keys || []).find((x) => x.id === site.id);
+        const ks = ((p2 && p2.keys) || []).slice();
+        const from = ks.findIndex((x) => x.id === k.id);
+        const to = ks.findIndex((x) => x.id === tid);
+        if (from < 0 || to < 0 || from === to) return;
+        const [moved] = ks.splice(from, 1);
+        let at = ks.findIndex((x) => x.id === tid);
+        if (!t.before) at += 1;
+        ks.splice(at, 0, moved);
+        if (p2) p2.keys = ks;
+        renderKeys(S.data);   // 拖过去就呆在那，不回原位等接口
+        invoke('action', { payload: { action: 'key_reorder', site: site.id, order: ks.map((x) => x.id) } })
+          .then((r) => { if (!r.ok) { toast(r.msg, false); load(); } })
+          .catch(() => { toast('保存顺序失败', false); load(); });
+      });
+  });
 }
 
 /* ---------------- 接入 Agent：把台账里这条 key 写进程序的自定义模型配置 ----------------
@@ -6386,6 +6440,19 @@ function browseBtn(get, set, title) {
 
 function renderDetail() {
   const d = S.detail;
+  const body = $('im-body');
+  // The same tab retains its position for chart clicks and background refreshes.
+  // A new detail object or a changed tab starts at the top.
+  if (d._renderedSection === d.sec) {
+    d.scroll = body.scrollTop;
+    const heat = body.querySelector('.heatwrap');
+    if (heat) d.trendHeatScroll = heat.scrollLeft;
+  } else {
+    d.scroll = 0;
+    d.trendHeatScroll = null;
+  }
+  d._renderedSection = d.sec;
+  d._renderRevision = (d._renderRevision || 0) + 1;
   const { app, name, meta } = d;
   $('im-save').hidden = app === 'codex-desktop' && ['auth', 'data', 'danger'].includes(d.sec);
   const i = S.data.instances.find((x) => x.app === app && x.name === name);
@@ -6472,14 +6539,15 @@ function renderDetail() {
   }
   // 本地会话用量是"用了多少"，归到额度那一组去。按天序列（波形图/热力图）
   // 也在这里一起刷：Codex / Claude Code 的本机日志带了时间戳，聚得出"哪天用了多少"
-  const usageRow = i.kind === 'cli'
-    ? row('本地会话用量', '从本地会话日志汇总真实 Token 用量（Codex / Claude Code），后台每轮自动刷新',
+  const usageRow = row('本地会话用量', '按本机记录统计；实测与估算在用量统计页分开显示。共用记录可能包含这个程序曾登录的多个账号。',
       el('div', { class: 'ctlrow' },
         el('span', { class: 'kv' }, i.usage
           ? `入 ${fmtTok(i.usage.input)} / 出 ${fmtTok(i.usage.output)} / 共 ${fmtTok(i.usage.total)}`
           : '未统计'),
-        btn('刷新用量', 'sm', () => run('fetch_usage', { app, name }))))
-    : null;
+        btn('查看统计', 'sm', async () => {
+          await closeDetail(); if (S.detail) return;
+          S.view = 'usage'; render(); globalThis.UsageDashboard?.selectApp(app);
+        })));
   secs.info = () => secPanel('概览',
     ...sub('这是哪个号', '这一组只说"它是谁"：属于哪个程序、在驾驶舱里叫什么名字。'),
     row('所属程序', '「建于」是这张卡在驾驶舱里登记的日子，不是这个产品的安装时间',
@@ -6620,8 +6688,6 @@ function renderDetail() {
     b.addEventListener('click', () => { d.sec = id; d.scroll = 0; renderDetail(); });
     nav.appendChild(el('li', {}, b));
   }
-  const body = $('im-body');
-  d.scroll = body.scrollTop;
   clear(body);
   body.appendChild((secs[d.sec] || secs.info)());
   restoreScroll(body, d.scroll);
@@ -8925,7 +8991,9 @@ function remoteSection(body, panel, row, actBtn) {
       await invoke('action', { payload: { action: 'remote_code' } });
       loadRemoteView(true);
     })),
-    row('关闭', `无人访问 ${V.idle_off_h} 小时也会自动关`, actBtn('关闭远程控制', async () => {
+    row('关闭', ['starting', 'ready', 'reconnecting'].includes(V.tunnel?.state)
+      ? '公网远控开启期间持续运行，关闭后停止连接'
+      : `无人访问 ${V.idle_off_h} 小时也会自动关`, actBtn('关闭远程控制', async () => {
       const r = await invoke('action', { payload: { action: 'remote_disable' } });
       toast((r && r.msg) || '', r && r.ok);
       loadRemoteView(true);
@@ -9895,6 +9963,7 @@ function pxRunBtn(d, onlyStop) {
    她点名"所有这几个选项的小图标都重新设计，尤其是那三个点"——文本的 ···/◎/⇢ 在
    等宽字体里又小又偏，全部换成线性稿（gear 用 24 网格的 Lucide 齿轮缩过来）。 */
 const MENU_ICONS = {
+  usage: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.5v11h11M5.5 10V7M8.5 10V4M11.5 10V6"/></svg>',
   home: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 7.3 8 3.2l5.2 4.1"/><path d="M4.4 6.6V13h7.2V6.6"/><path d="M6.7 13V9.4h2.6V13"/></svg>',
   more: '<svg viewBox="0 0 16 16" fill="currentColor" stroke="none"><circle cx="3.4" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="12.6" cy="8" r="1.5"/></svg>',
   gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
@@ -9918,6 +9987,7 @@ function menuIcon(id) {
    （设置页分组入口）。哪些项出现在侧栏上、哪些收进「更多」、按什么顺序，
    在 设置 → 外观 的「侧导菜单」里按住行尾六个点拖（Qoder 的「编辑侧导菜单」那套）。 */
 const SIDE_MENU_ITEMS = {
+  usage: ['用量统计', () => { S.view = 'usage'; }],
   collab: ['协作', () => { S.view = 'collab'; ensureCollab(false); }],
   keys: ['密钥管理', () => { S.view = 'keys'; }],
   proxy: ['模型反代', () => { S.view = 'proxy'; }],
@@ -10063,6 +10133,7 @@ function bind() {
   /* 左上角 logo = 回首页。整块还是拖拽区，但拖走要位移、单击照样跳。
      「首页」这一条在管理菜单里仍然保留——logo 是捷径，不是唯一入口。 */
   $('btn-home').addEventListener('click', () => { S.view = 'home'; render(); });
+  $('btn-home-usage').addEventListener('click', () => { S.view = 'usage'; render(); });
 
   bindProxyNums();
   $('btn-remote-refresh')?.addEventListener('click', () => loadRemoteView(true));
