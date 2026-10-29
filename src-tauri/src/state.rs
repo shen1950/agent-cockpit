@@ -621,7 +621,9 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     ),
                     // 按天消耗序列（波形图/热力图）：`{unit,days[],total,peak...}` 或 `{error}`；
                     // Null = 这个产品压根没有逐笔时刻可聚，界面就不许出现图占位
-                    "trend": m["quota_trend"],
+                    "trend": crate::usage_dashboard::trend_for(&app.id, m["data_dir"].as_str().unwrap_or(""))
+                        .unwrap_or_else(|| m["quota_trend"].clone()),
+                    "trend_reason": crate::usage_dashboard::unavailable_reason(&app.id),
                     // CLI 类产品（Codex）的登录态：只读 auth.json（不跑子进程——
                     // build_state 每 4 秒一次，跑 `codex login status` 太频）。
                     // 官方那句话（"Logged in using …"）由前端按需调 codex_status 拿。

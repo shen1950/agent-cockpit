@@ -162,6 +162,29 @@ fn short_err(s: &str) -> String {
     one.chars().take(140).collect()
 }
 
+/// A wrapper can exit successfully after Python has written an exception to
+/// stderr. Report the exception class without exposing credentials or paths.
+fn agenthub_output_error(stdout: &[u8], stderr: &[u8]) -> String {
+    let err = String::from_utf8_lossy(stderr);
+    let exception = err.lines().rev().find_map(|line| {
+        let name = line.trim().split(':').next().unwrap_or("");
+        match name {
+            "NameError" | "ImportError" | "ModuleNotFoundError" | "AttributeError"
+            | "TypeError" | "ValueError" | "RuntimeError" | "OSError" => Some(name),
+            _ => None,
+        }
+    });
+    let kind = if stdout.iter().all(u8::is_ascii_whitespace) {
+        "没有返回额度数据"
+    } else {
+        "返回的数据格式不正确"
+    };
+    match exception {
+        Some(name) => format!("agenthub {kind}（脚本异常：{name}）"),
+        None => format!("agenthub {kind}，请检查 agenthub 是否正常运行"),
+    }
+}
+
 fn num(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_i64().map(|x| x as f64))
 }
@@ -293,7 +316,7 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
         ));
     }
     let parsed: Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("agenthub 输出不是 JSON：{e}"))?;
+        .map_err(|_| agenthub_output_error(&out.stdout, &out.stderr))?;
     let d = parsed.get(0).ok_or_else(|| "agenthub 没返回任何条目".to_string())?;
     if let Some(before) = zcode_bytes {
         if std::fs::read(zcode_root.join("v2/credentials.json")).ok().as_deref() != Some(before.as_slice()) {
@@ -528,6 +551,17 @@ pub fn apply(meta: &Value, q: &Quota) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agenthub_empty_response_reports_exception_without_leaking_stderr() {
+        let message = super::agenthub_output_error(
+            b"",
+            b"Traceback (most recent call last):\nNameError: name 'secret-token' is not defined\n",
+        );
+        assert!(message.contains("没有返回额度数据"));
+        assert!(message.contains("NameError"));
+        assert!(!message.contains("secret-token"));
+        assert!(super::agenthub_output_error(b"bad", b"").contains("数据格式不正确"));
+    }
     use super::*;
 
     /// 只认账号、没有额度数字的店（MiMo/Antigravity/Coze）必须被认出来：

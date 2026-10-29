@@ -596,24 +596,32 @@ html.rail .layout.full { grid-template-columns: minmax(0, 1fr) }
 .cards {
   display: grid;
   /* auto-fit：账号数少于列数时空轨道要塌掉，别让唯一一张卡片卡在 300px 里 */
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
   gap: var(--sp-4);
-  /* 每张卡按自己内容的高度收口：并排的两张卡内容多少不同，
-     默认 stretch 会把内容少的那张拉成一块大白 */
-  align-items: start;
+  align-items: stretch;
 }
 /* 体检提示和空列表提示是横幅，不是卡片：跨满整行，否则两列以上时会被同一行的卡片拉成一块大白 */
 .cards > .hintline,
 .cards > .empty { grid-column: 1 / -1 }
 .card {
   min-width: 0;
-  /* 只有一个账号时轨道会摊满整屏：封顶，否则进度条被拉成一条一米五的带子 */
-  max-width: 720px;
   position: relative;
   display: flex; flex-direction: column; gap: var(--sp-3);
   background: var(--bg-raised); border: 1px solid var(--line);
   border-radius: var(--r-lg); padding: var(--sp-4);
 }
+/* 每排卡片共享表头、额度、操作三行：长账号名或更多额度信息只增加对应行的高度。
+   旧版 WebView 没有 subgrid 时仍由 stretch 和操作区的 auto margin 保持等高。 */
+@supports (grid-template-rows: subgrid) {
+  .cards > .card {
+    display: grid;
+    grid-row: span 3;
+    grid-template-rows: subgrid;
+    align-items: stretch;
+  }
+  .cards > .card > .acts { margin-top: 0; align-self: start }
+}
+.cards > .card:only-child { max-width: 720px; width: 100% }
 .card:hover { border-color: var(--line-strong) }
 .card[role="button"] { cursor: pointer }
 .card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
@@ -627,10 +635,12 @@ html.rail .layout.full { grid-template-columns: minmax(0, 1fr) }
 .card.drop-after::after { right: -8px }
 body.card-dragging, body.card-dragging * { user-select: none }
 .card .top { display: flex; align-items: flex-start; gap: var(--sp-2) }
-.card .nm { font-family: var(--font-data); font-size: 15px; font-weight: 650; display: flex; align-items: center; gap: 6px; flex-wrap: wrap }
+.card .top > :first-child { flex: 1 1 0; min-width: 0 }
+.card .nm { font-family: var(--font-data); font-size: 15px; font-weight: 650; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; overflow-wrap: anywhere }
+.card .nm > span { min-width: 0; max-width: 100%; overflow-wrap: anywhere }
 .card .nm .swapmark { color: var(--accent); font: 600 11.5px var(--font-data) }
 .card .nm .swapmark.off { color: var(--text-faint) }
-.card .meta { font-size: 12px; color: var(--text-muted); margin-top: 2px }
+.card .meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; overflow-wrap: anywhere }
 .card .usage { font-size: 11.5px; color: var(--text-muted); font-family: var(--font-data); margin-top: 3px; font-variant-numeric: tabular-nums }
 /* CLI 产品（Codex）的登录方式徽章：一眼看出这个号是 API Key 还是 ChatGPT 账号 */
 .card .cli-auth { display: inline-block; margin-top: 3px; padding: 1px 7px; border-radius: 999px;
@@ -816,7 +826,7 @@ html[data-theme="light"] .card.running { border-color: rgba(20, 125, 90, .30) }
 .qimid .exp.danger { color: var(--danger); border-color: var(--danger-line) }
 .qimid .exp.warn { color: var(--warn); border-color: var(--warn-line) }
 
-.acts { display: flex; align-items: flex-start; gap: var(--sp-2) }
+.acts { display: flex; align-items: flex-start; gap: var(--sp-2); margin-top: auto; min-width: 0 }
 /* 日常动作自己一行、可换行；删除永远钉在这一行的最右侧，不随按钮多少漂移 */
 .acts-main { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; flex: 1 1 auto; min-width: 0 }
 .acts > .btn.del { flex: none }
@@ -824,7 +834,7 @@ html[data-theme="light"] .card.running { border-color: rgba(20, 125, 90, .30) }
 .btn.del { color: var(--text-muted); border-color: var(--line); background: transparent }
 .btn.del:hover { color: var(--danger); border-color: var(--danger-line); background: var(--danger-soft) }
 /* 账号数据是怎么来的：接管本机原有档案 / 继承已有账号 / 全新空档 */
-.card .orig { font-size: 11.5px; color: var(--accent); margin-top: 3px }
+.card .orig { font-size: 11.5px; color: var(--accent); margin-top: 3px; overflow-wrap: anywhere }
 
 .empty {
   color: var(--text-faint); font-size: 13px;
@@ -1139,7 +1149,7 @@ html[data-theme="light"] .modal.blur { background: rgba(80, 72, 60, .30) }
 .grow-wrap { display: flex; justify-content: flex-end }
 .modelpick { margin: 2px 0 8px }
 .modelpick .chips { margin-top: 4px; max-height: 180px; overflow-y: auto }
-.card .ident { font-size: 12px; color: var(--text-muted) }
+.card .ident { font-size: 12px; color: var(--text-muted); min-width: 0; overflow-wrap: anywhere }
 .card .ident.none { color: var(--text-faint) }
 .card .ident.logged { color: var(--ok) }
 /* 卡片上的数不是本机当前登录那个号的：单独标出来，别让它看起来像"刷新没用" */
@@ -1295,15 +1305,34 @@ html[data-theme="light"] .modal.blur { background: rgba(80, 72, 60, .30) }
    （2026-10-28 她要求内容也跟标题一样居中，别一左一右错位） */
 .tbl.keys th { text-align: center }
 .tbl.keys tbody td { text-align: center }
-.tbl.keys .k-label { width: 15% } .tbl.keys .k-src { width: 12% }
-.tbl.keys .k-key { width: 20% }
-.tbl.keys .k-exp { width: 12% } .tbl.keys .k-st { width: 9% }
-/* 操作列必须定宽：table-layout fixed 下不定宽就被百分比列挤剩百来 px，
-   5 个图标 + ⠿ 拖拽手柄装不下，手柄被 overflow:hidden 裁掉——
-   她非最大化窗口里「移动按钮根本不显示」就是这条（2026-10-28）。
-   28px×5 图标 + 4px×5 间隙 + 手柄 ~18 + 左右内边距 24 ≈ 204。 */
+/* 列宽策略（2026-10-29 二改）：「来源」列 auto 吃掉全部剩余——她点名来源显示不全
+   还留大片空白；「密钥」列定宽 150px（masked 文本长度统一，永不溢出）。
+   千万别把剩余空间留给两个 px 定宽列分：Chrome 固定布局会把表格宽减去
+   百分比列之后的余量**平分给定宽列**，勾选列会被撑到 150px+（一大块空白）、
+   操作列反被压缩裁掉图标——她截图里"右边显示不全"就是这么来的。 */
+.tbl.keys .k-label { width: 14% }
+.tbl.keys .k-exp { width: 11% } .tbl.keys .k-st { width: 9% }
+/* 操作列必须定宽：5 个图标 × 28px + 间距 + ⠿ 拖拽手柄 ≈ 204。
+   （注意 2370 行有条 table-cell !important 的统一规则压着 td.acts，
+   这里定的宽度照常生效，但内容绝不能溢出——cell 模式溢出会画"…"叠在删除按钮上） */
 .tbl.keys .k-act { width: 204px }
-.tbl.keys .k-act { width: 25% }
+/* cell 模式的兜底：万一溢出，宁可裁掉也不画"…"骗人（悬停"…"会命中删除按钮） */
+.tbl.keys td.acts { text-overflow: clip }
+/* 压缩窗口适配（2026-10-29 她点名：窄窗把空白收一收、挤着排）：
+   内边距整体收窄、百分比列再降一档，操作列 196px 在 940 最小窗宽下也分毫不少。 */
+@media (max-width: 1180px) {
+  .tbl.keys th, .tbl.keys td { padding-left: 4px; padding-right: 4px }
+  /* thead/tbody 提一级特异性：压过后面批量管理区里同权重的 .k-sel/.acts 规则 */
+  .tbl.keys thead th.k-sel, .tbl.keys tbody td.k-sel { width: 36px; padding-left: 12px }
+  .tbl.keys thead th:first-child, .tbl.keys tbody td:first-child { padding-left: 10px }
+  .tbl.keys .k-label { width: 13% }
+  .tbl.keys .k-exp { width: 10% } .tbl.keys .k-st { width: 8% }
+  .tbl.keys .k-act { width: 196px }
+  .tbl.keys thead th:last-child, .tbl.keys tbody td:last-child { padding-right: 8px }
+  .panel.site .tablewrap { margin: 0 -4px }
+  .sitehead { padding: var(--sp-2) var(--sp-3) }
+  .siteinfo { padding: 8px var(--sp-3) 8px }
+}
 /* 操作列：LongCat 那种行内图标（测试/编辑/复制/接入/删除），悬停有 tooltip、不折行 */
 .tbl.keys td.acts { display: flex; align-items: center; gap: 4px; flex-wrap: wrap }
 .iconbtn {
@@ -1943,9 +1972,10 @@ svg.wave { display: block; width: 100%; height: 150px }
    ------------------------------------------------------------ */
 .dragdot {
   cursor: grab; user-select: none; touch-action: none;
-  font-size: 12px; line-height: 1; padding: 3px 4px; border-radius: 4px;
+  display: inline-grid; place-items: center; padding: 2px 3px; border-radius: 4px;
   color: var(--text-muted); opacity: .45;
 }
+.dragdot svg { display: block }
 .dragdot:hover { opacity: 1; background: var(--bg-hover); color: var(--text) }
 .dragdot:active { cursor: grabbing }
 .dragging { opacity: .35 }

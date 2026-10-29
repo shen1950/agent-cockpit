@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent 驾驶舱</title>
 <link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="usage-dashboard.css">
 </head>
 <body>
 <header class="topbar" data-tauri-drag-region>
@@ -78,6 +79,7 @@
         <h1>驾驶舱首页</h1>
         <span class="count" id="home-sub"></span>
         <span class="sp"></span>
+        <button class="btn" id="btn-home-usage">用量统计</button>
         <button class="btn" id="btn-home-reload" title="立刻刷新状态（只读，不改动任何账号）">刷新</button>
       </div>
       <div class="pagebody">
@@ -137,6 +139,15 @@
         <div id="agent-proxy"></div>
       </section>
       </div><!-- /pagebody -->
+    </div>
+
+    <div id="view-usage" class="view" hidden>
+      <div class="toolbar">
+        <button class="btn sm back-agents" title="返回账号列表">← 返回</button>
+        <h1>用量统计</h1>
+        <span class="count">每日用量 · 模型占比 · 速率监测</span>
+      </div>
+      <div class="pagebody"><div id="usage-dashboard" class="usage-dashboard"></div></div>
     </div>
 
     <!-- ================= 协作（AgentHub 工作流看板） ================= -->
@@ -274,7 +285,7 @@
       <div class="toolbar">
         <button class="btn sm back-agents" title="返回账号列表">← 返回</button>
         <h1>远程控制</h1>
-        <span class="count" id="remote-hint">同一网络里的手机 / 平板扫码接管，只读 + 刷新 + 签到</span>
+        <span class="count" id="remote-hint">手机扫码远程查看额度、刷新和签到</span>
         <span class="sp"></span>
         <button class="btn" id="btn-remote-refresh" title="重新读一次开关、配对码与设备列表">刷新</button>
       </div>
@@ -592,7 +603,9 @@
 <script src="chatgpt.js"></script>
 <script src="zcode.js"></script>
 <script src="antigravity.js"></script>
+<script src="usage-dashboard.js"></script>
 <script src="app.js"></script>
+<script src="remote-online.js"></script>
 <script src="proxy-guide.js"></script>
 </body>
 </html>

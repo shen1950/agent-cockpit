@@ -127,8 +127,9 @@ struct Inner {
     loaded: AtomicBool,
     pair: Mutex<Option<Pairing>>,
     last_seen: Mutex<f64>,
-    /// (ip, 失败时刻) 列表，只保留 10 分钟内的
-    fails: Mutex<Vec<(String, f64)>>,
+    /// 配对失败与设备凭据失败分开统计，避免中继共享来源导致配对被误封。
+    pair_fails: Mutex<Vec<(String, f64)>>,
+    auth_fails: Mutex<Vec<(String, f64)>>,
     started_at: Mutex<f64>,
 }
 
@@ -140,7 +141,8 @@ fn r() -> &'static Inner {
         loaded: AtomicBool::new(false),
         pair: Mutex::new(None),
         last_seen: Mutex::new(0.0),
-        fails: Mutex::new(Vec::new()),
+        pair_fails: Mutex::new(Vec::new()),
+        auth_fails: Mutex::new(Vec::new()),
         started_at: Mutex::new(0.0),
     })
 }
@@ -234,20 +236,23 @@ fn audit_tail(n: usize) -> Vec<Value> {
 
 /* ---------------- 限速 ---------------- */
 
-fn fail(ip: &str) {
+fn fail_in(fails: &Mutex<Vec<(String, f64)>>, ip: &str) {
     let now = now_secs();
-    let mut g = r().fails.lock().unwrap_or_else(|p| p.into_inner());
+    let mut g = fails.lock().unwrap_or_else(|p| p.into_inner());
     g.push((ip.to_string(), now));
     g.retain(|(_, t)| now - t < 600.0);
 }
 
-fn blocked(ip: &str) -> bool {
+fn blocked_in(fails: &Mutex<Vec<(String, f64)>>, ip: &str) -> bool {
     let now = now_secs();
-    let g = r().fails.lock().unwrap_or_else(|p| p.into_inner());
+    let g = fails.lock().unwrap_or_else(|p| p.into_inner());
     g.iter().filter(|(i, t)| i == ip && now - t < 600.0).count() >= FAIL_LIMIT
 }
 
 /* ---------------- 服务生命周期 ---------------- */
+
+// 统一串行远控监听和公网中继的启停；锁顺序为 CONTROL → listener → pair。
+static CONTROL: Mutex<()> = Mutex::new(());
 
 // tiny_http 的 unblock 只唤醒 recv_timeout，不会关闭其独立的 accept 线程。
 // 保持生命周期锁直到 worker 退出、Server 被 drop 且端口可重新绑定，避免两次启停交错。
@@ -308,6 +313,7 @@ fn stop_listener(slot: &Mutex<Option<Listener>>, expected: Option<&Arc<AtomicBoo
 }
 
 pub fn start() -> (bool, String) {
+    let _control = CONTROL.lock().unwrap_or_else(|p| p.into_inner());
     load_devices();
     // 0.0.0.0：要的就是局域网里手机能连。私网地址在二维码里给手机看。
     let active = match start_listener(&r().listener, ([0, 0, 0, 0], PORT).into()) {
@@ -330,8 +336,14 @@ pub fn start() -> (bool, String) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(60));
+            let _control = CONTROL.lock().unwrap_or_else(|p| p.into_inner());
             if !active.load(Ordering::SeqCst) {
                 break;
+            }
+            // 用户显式开启公网远控后，需要能在离开电脑超过六小时后继续访问。
+            // 只有公网中继活跃时保留服务，连接失败或手动停止后仍按闲置规则关闭。
+            if matches!(crate::remote_tunnel::view()["state"].as_str(), Some("starting" | "ready" | "reconnecting")) {
+                continue;
             }
             let last = *r().last_seen.lock().unwrap_or_else(|p| p.into_inner());
             if now_secs() - last > IDLE_OFF_HOURS * 3600.0 {
@@ -349,6 +361,7 @@ pub fn start() -> (bool, String) {
 }
 
 pub fn stop() -> (bool, String) {
+    let _control = CONTROL.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::remote_tunnel::stop();
     match stop_listener(&r().listener, None, || {
         *r().pair.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -364,6 +377,24 @@ pub fn stop() -> (bool, String) {
 pub fn is_running() -> bool {
     r().listener.lock().unwrap_or_else(|p| p.into_inner())
         .as_ref().is_some_and(|l| l.active.load(Ordering::SeqCst))
+}
+
+/// 在同一生命周期锁下检查监听并建立中继，避免关闭与启动交错。
+pub fn start_tunnel(email: &str) -> Result<(), String> {
+    let _control = CONTROL.lock().unwrap_or_else(|p| p.into_inner());
+    if !is_running() { return Err("请先开启远程控制".into()); }
+    crate::remote_tunnel::start(email)?;
+    // 监听线程也可能因自身错误退出，避免中继指向已关闭的本地服务。
+    if !is_running() {
+        let _ = crate::remote_tunnel::stop();
+        return Err("远程控制已关闭".into());
+    }
+    Ok(())
+}
+
+pub fn stop_tunnel() -> Result<(), String> {
+    let _control = CONTROL.lock().unwrap_or_else(|p| p.into_inner());
+    crate::remote_tunnel::stop()
 }
 
 /// 可用 IPv4 和网卡名。优先系统默认路由的本地地址，再提供其余网卡供用户选择。
@@ -518,7 +549,12 @@ fn pair_consume(code: &str, name: &str, ip: &str) -> Result<Value, (u16, String)
     if !ok {
         // 错码不能作废仍有效的配对码，否则任何访客都能阻止用户配对。
         if g.as_ref().is_some_and(|p| now >= p.expires_at) { *g = None; }
-        fail(ip);
+        // 中继的所有手机共用回环 IP。拒绝过量的错误码，但仍允许正确码配对，
+        // 避免一个设备的失败导致其他设备无法配对。
+        if blocked_in(&r().pair_fails, ip) {
+            return Err((429, "尝试太多次，等几分钟再来".into()));
+        }
+        fail_in(&r().pair_fails, ip);
         audit("pair_fail", ip, "");
         return Err((401, "配对码不对或已过期，去桌面端重新生成".into()));
     }
@@ -679,16 +715,19 @@ fn web_state() -> Value {
 /// 桌面端「远程控制」卡片要看的全部信息
 pub fn view() -> Value {
     load_devices();
-    let pair = r()
-        .pair
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .map(|p| {
+    let current_pair = {
+        let mut pair = r().pair.lock().unwrap_or_else(|p| p.into_inner());
+        if pair.as_ref().is_some_and(|p| p.expires_at <= now_secs()) { *pair = None; }
+        pair.as_ref().map(|p| (p.code.clone(), p.expires_at))
+    };
+    let pair = current_pair.map(|(code, expires_at)| {
+            let url = pair_url(&code);
+            let qr = qr_svg(&url);
+            let urls = pair_links(&code);
             json!({
-                "code": p.code, "url": pair_url(&p.code), "qr_svg": qr_svg(&pair_url(&p.code)),
-                "urls": pair_links(&p.code),
-                "expires_in": (p.expires_at - now_secs()).max(0.0) as i64,
+                "code": code, "url": url, "qr_svg": qr,
+                "urls": urls,
+                "expires_in": (expires_at - now_secs()).max(0.0) as i64,
             })
         });
     let devices: Vec<Value> = r()
@@ -784,10 +823,6 @@ fn serve(mut req: tiny_http::Request) {
 
     // 配对端点：唯一不需要 token 的入口（有码本身就是凭证）
     if method == "POST" && path == "/api/pair" {
-        if blocked(&ip) {
-            audit("blocked", &ip, "pair");
-            return err_json(req, 429, "尝试太多次，等几分钟再来");
-        }
         let mut body = String::new();
         if req.as_reader().take(MAX_BODY as u64 + 1).read_to_string(&mut body).is_err() || body.len() > MAX_BODY {
             return err_json(req, 413, "请求体太大");
@@ -814,10 +849,10 @@ fn serve(mut req: tiny_http::Request) {
             .unwrap_or_default();
         if auth(&bearer).is_none() {
             // 隧道连接可能共享回环源地址；不能因陌生人的失败封锁已配对设备。
-            if blocked(&ip) {
+            if blocked_in(&r().auth_fails, &ip) {
                 return err_json(req, 429, "尝试太多次，等几分钟再来");
             }
-            fail(&ip);
+            fail_in(&r().auth_fails, &ip);
             audit("401", &ip, &path);
             return err_json(req, 401, "先在桌面端扫码配对");
         }
@@ -994,9 +1029,13 @@ mod tests {
             *r().pair.lock().unwrap() = Some(Pairing { code: "XXXXXXXX".into(), expires_at: now_secs() + 60.0 });
             let _ = pair_consume("WRONGWRONG", &format!("10.1.1.{i}"), ip);
         }
-        assert!(blocked(ip), "连错太多次的 IP 要被挡住");
+        assert!(blocked_in(&r().pair_fails, ip), "连错太多次的 IP 要被挡住");
+        assert_eq!(pair_consume("WRONGWRONG", "测试机", ip).unwrap_err().0, 429);
+        let new_code = gen_code().unwrap();
+        *r().pair.lock().unwrap() = Some(Pairing { code: new_code.clone(), expires_at: now_secs() + 60.0 });
+        assert!(pair_consume(&new_code, "测试机", ip).is_ok(), "共享中继地址被限速后仍应允许正确配对码");
         // 恢复现场，别影响别的用例
-        r().fails.lock().unwrap().retain(|(failed_ip, _)| failed_ip != ip);
+        r().pair_fails.lock().unwrap().retain(|(failed_ip, _)| failed_ip != ip);
         r().devices.lock().unwrap().retain(|d| d.name != "测试机");
     }
 
@@ -1006,7 +1045,7 @@ mod tests {
         let _guard = PAIRING_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         *r().pair.lock().unwrap() = Some(Pairing { code: "AAAAAAAA".into(), expires_at: now_secs() - 1.0 });
         assert!(pair_consume("AAAAAAAA", "", "10.2.2.2").is_err());
-        r().fails.lock().unwrap().retain(|(failed_ip, _)| failed_ip != "10.2.2.2");
+        r().pair_fails.lock().unwrap().retain(|(failed_ip, _)| failed_ip != "10.2.2.2");
     }
 
     /// token 比较不短路、长度不等直接 false

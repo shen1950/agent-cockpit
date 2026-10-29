@@ -27,7 +27,7 @@ async function seed(page, zoom) {
       Object.assign(item, { app: 'codex-desktop', app_name: 'ChatGPT', name, kind: 'pwa', running: true,
         procs: 8, resident: false, swapped: false, in_place: false, created: '2026-10-27',
         data_dir: 'C:\\Users\\Example\\.agent-cockpit\\instances\\codex-desktop\\' + 'very-long-account-directory-'.repeat(5),
-        chatgpt_auth: { has_auth: true, mode, native: false, account: mode === 'chatgpt' ? 'plus@example.test' : null,
+        chatgpt_auth: { has_auth: true, mode, native: false, account: mode === 'chatgpt' ? 'very-long-account-identity-without-spaces-'.repeat(3) + '@example.test' : null,
           base_url: 'https://api.example.test/v1', home: 'C:\\Users\\Example\\.agent-cockpit\\chatgpt-auth\\' + 'very-long-account-directory-'.repeat(5),
           history_mode: 'copy', history_snapshot: { threads: 131, projects: 12, visibility_version: 2 },
           project_repair: { pending: true, state: 'pending', repairable_count: 8 } },
@@ -43,7 +43,7 @@ async function seed(page, zoom) {
     };
     S.data.apps = [{ id: 'codex-desktop', name: 'ChatGPT', short: 'CG', kind: 'pwa', installed: true,
       isolatable: true, swap_ok: false, swapped: '', icon: '' }];
-    S.data.instances = [make('API 工作账号，这是一个较长但仍有效的账号名称', 'apikey'), make('Plus 工作账号', 'chatgpt')];
+    S.data.instances = [make('long-account-name-without-spaces-'.repeat(3) + '@example.test', 'apikey'), make('Plus 工作账号', 'chatgpt')];
     S.data.settings.appearance = { ...S.data.settings.appearance, theme: 'light', font_scale: scale };
     S.data.stats = { ...S.data.stats, instances: 2, agents: 1, running: 1, running_instances: 2 };
     const fixture = S.data;
@@ -57,6 +57,38 @@ async function seed(page, zoom) {
     };
     S.view = 'agents'; S.cur = 'codex-desktop'; S.busy = false; render();
   }, zoom);
+}
+async function verifyCards(page) {
+  return page.evaluate(() => {
+    const cards = [...document.querySelectorAll('#cards > .card')];
+    const problems = [];
+    let pairs = 0;
+    const rect = node => node.getBoundingClientRect();
+    for (const card of cards) {
+      const children = [...card.children];
+      if (children.length !== 3 || !children[0].classList.contains('top') || !children[2].classList.contains('acts')) {
+        problems.push(`unexpected card structure: ${children.map(n => n.className).join(', ')}`);
+        continue;
+      }
+      for (const node of [card, ...card.querySelectorAll('.top, .nm, .ident, .quota, .cpt-quota, .acts')]) {
+        if (node.scrollWidth > node.clientWidth + 2) problems.push(`horizontal overflow: ${node.className} ${node.scrollWidth}/${node.clientWidth}`);
+      }
+    }
+    // Cards in the same visual row must share boundaries and content rows.
+    // Narrow layouts may legitimately use a single column.
+    for (let i = 0; i < cards.length; i++) for (let j = i + 1; j < cards.length; j++) {
+      const a = cards[i], b = cards[j], ar = rect(a), br = rect(b);
+      if (Math.abs(ar.top - br.top) > 2) continue;
+      pairs++;
+      for (const [label, x, y] of [
+        ['card bottom', ar.bottom, br.bottom],
+        ['quota top', rect(a.children[1]).top, rect(b.children[1]).top],
+        ['quota bottom', rect(a.children[1]).bottom, rect(b.children[1]).bottom],
+        ['actions top', rect(a.children[2]).top, rect(b.children[2]).top],
+      ]) if (Math.abs(x - y) > 2) problems.push(`${label} differs: ${x} / ${y}`);
+    }
+    return { count: cards.length, pairs, problems };
+  });
 }
 async function verifyPage(page, section) {
   return page.evaluate((id) => {
@@ -150,6 +182,10 @@ async function verifyClaudeDesktop(page, zoom) {
     for (const [width, height, zoom] of [[1320, 920, 100], [960, 850, 125]]) {
       await page.setViewportSize({ width, height }); await seed(page, zoom);
       await page.screenshot({ path: path.join(artifacts, `cards-${width}.png`), fullPage: true });
+      const cardsReport = await verifyCards(page);
+      assert.equal(cardsReport.count, 2);
+      if (width === 1320) assert.ok(cardsReport.pairs > 0, 'wide layout should show a pair of cards');
+      assert.deepEqual(cardsReport.problems, [], JSON.stringify({ product: 'chatgpt', width, zoom, ...cardsReport }));
       const plus = 'Plus 工作账号';
       for (const [section, label] of [['info','概览'],['quota','额度与用量'],['run','运行管理'],['history','对话与项目'],['data','文件位置'],['auth','登录管理'],['danger','移除账号']]) {
         await page.evaluate(async ({ name, sec }) => openDetail('codex-desktop', name, sec), { name: plus, sec: section });
@@ -165,6 +201,9 @@ async function verifyClaudeDesktop(page, zoom) {
       await page.evaluate(() => closeDetail());
       await seedZcode(page, zoom);
       await page.screenshot({ path: path.join(artifacts, `zcode-cards-${width}.png`), fullPage: true });
+      const zcodeCardsReport = await verifyCards(page);
+      assert.equal(zcodeCardsReport.count, 2);
+      assert.deepEqual(zcodeCardsReport.problems, [], JSON.stringify({ product: 'zcode', width, zoom, ...zcodeCardsReport }));
       for (const section of ['info', 'quota', 'run', 'auth', 'data', 'danger']) {
         await page.evaluate(async (sec) => openDetail('zcode', 'Z.ai 工作账号', sec), section);
         const report = await verifyPage(page, section); reports.push({ product: 'zcode', width, zoom, ...report });
@@ -176,6 +215,11 @@ async function verifyClaudeDesktop(page, zoom) {
       reports.push({ zoom, ...await verifyClaudeDesktop(page, zoom) });
       await page.screenshot({ path: path.join(artifacts, `claude-desktop-${width}.png`), fullPage: true });
     }
+    await page.setViewportSize({ width: 420, height: 850 });
+    await seed(page, 100);
+    const narrowCards = await verifyCards(page);
+    assert.equal(narrowCards.count, 2);
+    assert.deepEqual(narrowCards.problems, [], JSON.stringify({ product: 'chatgpt', width: 420, ...narrowCards }));
     assert.deepEqual(errors, [], 'no frontend runtime errors');
     fs.writeFileSync(path.join(artifacts, 'geometry.json'), JSON.stringify(reports, null, 2));
     console.log(JSON.stringify({ checked_pages: reports.length, screenshots: artifacts, result: 'PASS' }));

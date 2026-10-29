@@ -14,6 +14,7 @@
   let pendingPairCode = null; // 仅在当前页面内存中保留，以便网络失败后重试
   let pairing = false;
   let pollingStarted = false;
+  let visibilityListenerInstalled = false;
 
   /* ---------- 小工具 ---------- */
   const el = (tag, attrs, ...kids) => {
@@ -50,15 +51,24 @@
 
   /* ---------- API ---------- */
   async function api(path, body) {
+    const requestToken = localStorage.getItem(TOKEN_KEY);
     const r = await fetch(path, {
       method: body ? 'POST' : 'GET',
       headers: {
         ...(body ? { 'Content-Type': 'application/json' } : {}),
-        Authorization: 'Bearer ' + localStorage.getItem(TOKEN_KEY),
+        Authorization: 'Bearer ' + requestToken,
       },
       body: body ? JSON.stringify(body) : undefined,
     });
-    if (r.status === 401) { showGate('配对已失效（可能在桌面端被吊销），重新扫码'); throw new Error('401'); }
+    if (r.status === 401 || r.status === 429) {
+      // 不让较早请求的 401 清除刚刚重新配对得到的新 token。
+      if (localStorage.getItem(TOKEN_KEY) === requestToken) {
+        localStorage.removeItem(TOKEN_KEY);
+        stopPolling();
+        showGate(r.status === 429 ? '设备凭据未通过验证，请重新扫码或输入配对码。' : '配对已失效（可能在桌面端被吊销），重新扫码');
+      }
+      throw new Error('401');
+    }
     const v = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(v.msg || ('HTTP ' + r.status));
     return v;
@@ -404,6 +414,7 @@
 
   /* ---------- 轮询 ---------- */
   async function refresh(force) {
+    if (!localStorage.getItem(TOKEN_KEY)) return;
     if (busy && !force) return;
     busy = true;
     try {
@@ -421,20 +432,28 @@
   /* 自适应轮询：一键刷新在跑时 3 秒盯进度（桌面端同一份 alljob），平时 8 秒 */
   function schedule() {
     clearTimeout(timer);
+    if (!pollingStarted) return;
     const wait = S && S.alljob && S.alljob.running ? 3000 : 8000;
     timer = setTimeout(async () => {
       if (!document.hidden) await refresh();
-      schedule();
+      if (pollingStarted) schedule();
     }, wait);
   }
   function startPolling() {
-    if (pollingStarted) return;
+    if (pollingStarted || !localStorage.getItem(TOKEN_KEY)) return;
     pollingStarted = true;
     clearTimeout(timer);
     schedule();
-    document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) { refresh(true); schedule(); }
-    });
+    if (!visibilityListenerInstalled) {
+      visibilityListenerInstalled = true;
+      document.addEventListener('visibilitychange', () => {
+        if (pollingStarted && !document.hidden) { refresh(true); schedule(); }
+      });
+    }
+  }
+  function stopPolling() {
+    pollingStarted = false;
+    clearTimeout(timer);
   }
 
   /* ---------- Tab 切换 ---------- */
@@ -470,6 +489,7 @@
   });
   $('btnUnpair').addEventListener('click', () => {
     localStorage.removeItem(TOKEN_KEY);
+    stopPolling();
     pendingPairCode = null;
     $('gateCode').value = '';
     showGate('已清除本机凭据，重新扫码即可');
@@ -481,7 +501,8 @@
   });
   $('gateRetry').addEventListener('click', () => {
     if (pendingPairCode) pairWithCode(pendingPairCode);
-    else { hideGate(); refresh(true); }
+    else if (localStorage.getItem(TOKEN_KEY)) { hideGate(); refresh(true); }
+    else showGate('请重新扫码或输入电脑上显示的配对码。');
   });
 
   /* ---------- 启动 ---------- */

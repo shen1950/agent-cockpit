@@ -42,6 +42,7 @@ mod storage;
 mod swap;
 mod traeproxy;
 mod usage;
+mod usage_dashboard;
 mod wbproxy;
 mod webquota;
 mod zcode;
@@ -157,6 +158,7 @@ fn main() {
             // 签到状态也单独一条：不能再挂在额度自动取数后面（见 checkin_loop 注释）
             let h3 = app.handle().clone();
             std::thread::spawn(move || checkin_loop(h3));
+            std::thread::spawn(usage_dashboard::watch);
             // 便携 exe 不进开始菜单就搜不到，而搜不到就没人能进设置去点那个按钮——
             // 启动后自己在后台补一条（要起 PowerShell，不放启动路径上）
             std::thread::spawn(shelllink::ensure_start_menu);
@@ -168,6 +170,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
+            commands::usage_dashboard,
             commands::action,
             commands::get_meta,
             commands::get_key_plain,

@@ -1,7 +1,7 @@
 /* 模型反代引导：来源 → 上游组 → 本地反代 → 下游客户端。
    所有配置写入都交给已有组/密钥编辑器，向导本身不改动账号。 */
 (() => {
-  const wizard = { step: 1, model: '', keyId: '', key: '', revealing: false, error: '' };
+  const wizard = { step: 1, model: '', keyId: '', key: '', revealing: false, error: '', sourcesOpen: false };
   const sources = [
     ['qoder-cn', 'Qoder CN'], ['qoder', 'Qoder'], ['workbuddy', 'WorkBuddy'],
     ['workbuddy-intl', 'WorkBuddy 国际版'], ['traework-cn', 'TRAE CN'],
@@ -37,14 +37,17 @@
       btn('新建上游组（可多选来源）', 'primary sm', () => openPoolModal(null)),
       btn('查看全部上游组', 'sm', () => jump('proxy-groups'))));
     const details = el('details', { class: 'guide-client' }, el('summary', {}, '查看支持的模型来源与账号状态'));
+    details.open = wizard.sourcesOpen;
+    details.addEventListener('toggle', () => { wizard.sourcesOpen = details.open; });
     const grid = el('div', { class: 'guide-agents' });
     const detected = guideAgents(d);
     for (const [id, name] of sources) {
       const app = (d.apps || []).find(a => a.id === id && a.installed !== false);
       const info = detected.find(a => a.app === id);
+      const bridgeOnly = id === 'opencode' && !app && !!info;
       const item = el('div', { class: 'guide-agent' },
         el('div', { class: 'guide-agenthead' }, el('b', {}, name),
-          chip(app ? (info?.blocked ? '受限' : '已检测') : '未检测到', info?.blocked ? 'expired' : '')),
+          chip(app ? (info?.blocked ? '受限' : '已检测') : (bridgeOnly ? (info.usable ? '桥可用' : '桥已配置') : '未检测到'), info?.blocked ? 'expired' : '')),
         el('div', { class: 'guide-agentdetail' }, info?.detail || (app ? '在来源详情中查看账号和模型' : '安装或扫描后可查看')));
       if (app) item.appendChild(actions(btn('查看来源详情', 'sm', () => appDetail(id))));
       grid.appendChild(item);

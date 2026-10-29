@@ -389,7 +389,7 @@ function chatgptSettingsPanel(app, name, instance, detail) {
   const actions = () => el('div', { class: 'cpt-actions' },
     open(), active ? stop() : null);
   const mode = auth.mode === 'apikey' ? 'API Key' : 'ChatGPT 账号';
-  if (detail.sec === 'quota') return secPanel('额度与用量', chatgptQuotaPanel(instance));
+  if (detail.sec === 'quota') return secPanel('额度与用量', chatgptQuotaPanel(instance), usageTrendPanel(instance));
   if (detail.sec === 'data') return chatgptDataPanel(app, name, instance);
   if (detail.sec === 'auth') return chatgptAuthPanel(app, name, instance);
   if (detail.sec === 'run') return secPanel('运行管理', el('div', { class: 'cpt-settings cpt-run' },

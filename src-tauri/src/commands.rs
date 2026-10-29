@@ -254,6 +254,12 @@ pub async fn get_state(state_ref: tauri::State<'_, AppState>) -> Result<Value, S
     Ok(state::build_state(&state_ref.proxy))
 }
 
+#[tauri::command]
+pub async fn usage_dashboard(force: Option<bool>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::usage_dashboard::snapshot(force.unwrap_or(false)))
+        .await.map_err(|_| "本地用量采集未完成，请重新刷新".to_string())
+}
+
 /* ---------------- 一键刷新全部额度 ----------------
    首页那颗按钮要"把所有 Agent 所有账号的额度读一遍"。十几个账号挨个读，官网那条还要
    建隐藏窗口调三次接口，整轮是分钟级的——绝不能挂在一次 invoke 上。所以：
@@ -1462,7 +1468,7 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             }
             reg::save_instance(app_id, &m);
             if what.starts_with("没有可统计") && !what.contains("已更新") {
-                return err(format!("{}。目前支持 Codex / Claude Code", what));
+                return err(format!("{}。可在用量统计页查看各 Agent 的数据覆盖情况。", what));
             }
             ok(what)
         }
@@ -1739,16 +1745,13 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             if let Some(e) = pair["error"].as_str() { err(e) } else { json!({ "ok": true, "pair": pair }) }
         }
         "remote_tunnel_start" => {
-            if !crate::remote::is_running() { err("请先开启远程控制") }
-            else {
-                let email = payload["email"].as_str().unwrap_or("");
-                match crate::remote_tunnel::start(email) {
-                    Ok(()) => ok("正在建立公网连接"),
-                    Err(e) => err(&e),
-                }
+            let email = payload["email"].as_str().unwrap_or("");
+            match crate::remote::start_tunnel(email) {
+                Ok(()) => ok("正在建立公网连接"),
+                Err(e) => err(&e),
             }
         }
-        "remote_tunnel_stop" => match crate::remote_tunnel::stop() {
+        "remote_tunnel_stop" => match crate::remote::stop_tunnel() {
             Ok(()) => ok("公网连接已关闭"),
             Err(e) => err(&e),
         },

@@ -159,8 +159,9 @@ pub fn refresh() -> Value {
             // 产品行后面挂上各账号自己的行（只有"登录态按账号各存一份、且存了不止一个号"
             // 的产品才挂）。这一步是几次额外的 agenthub 调用，所以只在这一条后台路径上做，
             // 界面那 4 秒一轮读的是缓存。
-            let items = expand_accounts(items);
+            let mut items = expand_accounts(items);
             let st = load_state();
+            apply_workbuddy_statuses(&mut items, &st);
             // 把这次的结果落盘：下次刚开机、后台第一轮还没跑完时，界面就能拿它先把
             // 整张表画出来（产品名、备注、操作列都在里面），不用干等六家接口。
             let mut persisted = st.clone();
@@ -171,6 +172,36 @@ pub fn refresh() -> Value {
             v
         }
         Err(e) => json!({ "ok": false, "msg": e }),
+    }
+}
+
+/// 国际版账单只有到账时间，没有活跃日期。当天是否完成对话以本地记录为准，
+/// 到账归属仅按次日结算惯例推测；不能用今早的到账堵住今天的签到。
+fn apply_workbuddy_status(item: &mut Value, st: &Value) {
+    if item["product"].as_str() != Some("workbuddy-intl") || item.get("error").is_some() {
+        return;
+    }
+    let today = item["today"].as_str().unwrap_or("").to_string();
+    if today.is_empty() { return; }
+    let account = if item["scope"].as_str() == Some("account") {
+        item["account"].as_str().unwrap_or("")
+    } else { "" };
+    let key = if account.is_empty() { "workbuddy-intl".to_string() }
+              else { format!("workbuddy-intl@{account}") };
+    if st["done"][&key].as_str() != Some(today.as_str()) { return; }
+    let inferred = item["inferred_today_arrival"].as_bool() == Some(true);
+    let note = item["note"].as_str().unwrap_or("").to_string();
+    item["signed_today"] = json!(true);
+    item["claimable"] = json!(false);
+    item["words"]["done"] = json!(if inferred { "已签到·推测到账" } else { "已签到·积分未到账" });
+    item["words"]["done_act"] = json!("今天已签到");
+    item["note"] = json!(format!("今天的对话已完成，{}；{}",
+        if inferred { "有推测属于今天的到账记录，归属未经厂商确认" } else { "今天的积分尚未发现到账记录" }, note));
+}
+
+fn apply_workbuddy_statuses(items: &mut Value, st: &Value) {
+    if let Some(arr) = items.as_array_mut() {
+        for item in arr { apply_workbuddy_status(item, st); }
     }
 }
 
@@ -423,6 +454,7 @@ pub fn refresh_one(store: &str, acct: Option<(&str, &str)>) -> Value {
             o.insert("app".into(), json!(app_id));
         }
     }
+    apply_workbuddy_status(&mut item, &load_state());
     // 并进缓存：只换掉同一条，别的行原样留着。**不动 fetched_at**——
     // 那是"整张表最后一次查于"，动它会让别的行看起来也刚查过。
     {
@@ -568,12 +600,14 @@ fn note_settling(st: &mut Value, key: &str, item: &Value, today: &str) {
         Some(o) => o,
         None => return,
     };
+    // 国际版不同活跃日分开追踪；其他产品保留既有键和 24 小时期限定。
+    let intl = store == "workbuddy-intl";
+    let pending_key = if intl { format!("{key}|{today}") } else { key.to_string() };
     pend.insert(
-        key.to_string(),
+        pending_key,
         json!({
             "since": now, "today": today, "label": label, "expect": expect,
-            // 超过一天还没到账就别再盯了：那是厂商那边的问题，不是"还没结算"
-            "until": now + 86400.0,
+            "until": now + if intl { 172800.0 } else { 86400.0 },
         }),
     );
 }
@@ -601,15 +635,18 @@ pub fn check_arrivals() -> Vec<Value> {
         }
         // 待观察的键可能是"账号级"的（store@账号）：那个号的到没到账得用它自己的
         // 登录包去看，拿当前登着的那个号去读就是串号
-        let (store, acct) = match key.split_once('@') {
+        let base_key = key.split_once('|').map(|(k, _)| k).unwrap_or(key.as_str());
+        let (store, acct) = match base_key.split_once('@') {
             Some((s, n)) => (s.to_string(), Some(n.to_string())),
-            None => (key.clone(), None),
+            None => (base_key.to_string(), None),
         };
         let app_id = crate::local_quota::app_for_store(&store).unwrap_or("");
         let staged = match (&acct, app_id.is_empty()) {
             (Some(n), false) => stage(app_id, &store, n).ok(),
             _ => None,
         };
+        // 指定了账号但登录包铺不开时绝不能退回当前账号，避免串号。
+        if acct.is_some() && staged.is_none() { continue; }
         let mut extra: Vec<String> = vec![store.clone()];
         if let Some(d) = &staged {
             let (f, v) = stage_arg(app_id, &store, d);
@@ -632,20 +669,28 @@ pub fn check_arrivals() -> Vec<Value> {
         if let Some(d) = staged {
             crate::authpack::drop_profile(&d);
         }
-        if item["signed_today"].as_bool() != Some(true) {
-            continue;
-        }
+        let activity_date = p["today"].as_str().unwrap_or("");
+        let inferred_arrival = if store == "workbuddy-intl" {
+            item["bonus_entries"].as_array().and_then(|entries| entries.iter().find(|e|
+                e["inferred_activity_date"].as_str() == Some(activity_date)))
+        } else { None };
+        if store == "workbuddy-intl" {
+            if inferred_arrival.is_none() { continue; }
+        } else if item["signed_today"].as_bool() != Some(true) { continue; }
         let label = p["label"].as_str().unwrap_or(key).to_string();
         let expect = p["expect"].as_str().unwrap_or("今天这份积分").to_string();
         let credit = item["reward"].as_f64();
         arrived.push(json!({
             "id": format!("{key}-{}", p["today"].as_str().unwrap_or("")),
             "at": now, "store": store, "account": acct.clone().unwrap_or_default(),
+            "log_date": inferred_arrival.and_then(|entry| entry["arrived_at"].as_str())
+                .and_then(|date| date.get(..10)).unwrap_or(activity_date),
             "label": label,
-            "text": format!(
-                "「{label}」的{expect}到账了{}",
-                match credit { Some(c) => format!("（{} 积分）", num_text(c)), None => String::new() }
-            ),
+            "text": if let Some(entry) = inferred_arrival {
+                format!("「{label}」{} 到账的 30 积分，按次日结算惯例推测属于 {activity_date} 的活跃；厂商未提供归属日期", entry["arrived_at"].as_str().unwrap_or(""))
+            } else {
+                format!("「{label}」的{expect}到账了{}", match credit { Some(c) => format!("（{} 积分）", num_text(c)), None => String::new() })
+            },
         }));
         done.push(key.clone());
     }
@@ -664,6 +709,13 @@ pub fn check_arrivals() -> Vec<Value> {
         arr.drain(0..arr.len() - 20);
     }
     st["arrived"] = json!(arr);
+    let mut log = st["log"].as_array().cloned().unwrap_or_default();
+    for entry in &arrived {
+        log.push(json!({ "at": entry["log_date"], "store": entry["store"], "account": entry["account"],
+            "settling": true, "message": entry["text"] }));
+    }
+    if log.len() > 2000 { log.drain(0..log.len() - 2000); }
+    st["log"] = json!(log);
     save_state(&st);
     arrived
 }
@@ -1050,6 +1102,25 @@ pub fn tick(app: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workbuddy_intl_completion_is_separate_from_older_arrival() {
+        use super::*;
+        let base = json!({ "product": "workbuddy-intl", "today": "2026-10-29",
+            "scope": "product", "signed_today": false, "claimable": true,
+            "inferred_today_arrival": false, "note": "今早到账推测属于昨天", "words": {} });
+        let mut before = base.clone();
+        apply_workbuddy_status(&mut before, &json!({"done": {}}));
+        assert_eq!(before["claimable"], true);
+        let mut after = base.clone();
+        apply_workbuddy_status(&mut after, &json!({"done": {"workbuddy-intl": "2026-10-29"}}));
+        assert_eq!(after["claimable"], false);
+        assert_eq!(after["words"]["done"], "已签到·积分未到账");
+        let mut other = base.clone();
+        other["scope"] = json!("account"); other["account"] = json!("B");
+        apply_workbuddy_status(&mut other, &json!({"done": {"workbuddy-intl@A": "2026-10-29"}}));
+        assert_eq!(other["claimable"], true);
+    }
+
     use super::*;
 
     fn item(auto: bool, claimable: bool, active: bool) -> Value {

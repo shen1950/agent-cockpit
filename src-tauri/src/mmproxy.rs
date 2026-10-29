@@ -139,129 +139,29 @@ pub fn read_cred() -> Option<Cred> {
     None
 }
 
-fn write_json_atomic(path: &Path, v: &Value) -> Result<(), String> {
-    let tmp = path.with_extension("json.mm-tmp");
-    let text = serde_json::to_string(v).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text).map_err(|e| format!("写临时文件失败：{e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("替换 {} 失败：{e}", path.display()))?;
-    Ok(())
-}
-
-/// 把新令牌写回 auth.json，并把同目录 auth-state.json 的 generation / expiresAtMs 同步 +1。
-/// 官方客户端会比对两份文件的 generation，不同步就会被判「凭据与状态不匹配」。
-fn write_cred(c: &Cred, access: &str, refresh: &str, expires_ms: i64) -> Result<(), String> {
-    let text = std::fs::read_to_string(&c.path).map_err(|e| e.to_string())?;
-    let mut v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let gen = c.generation + 1;
-    {
-        let Some(rec) = v["records"]
-            .as_object_mut()
-            .and_then(|m| m.get_mut(&c.record_key))
-        else {
-            return Err("auth.json 里的记录不见了".into());
-        };
-        rec["accessToken"] = json!(access);
-        if !refresh.is_empty() {
-            rec["refreshToken"] = json!(refresh);
-        }
-        rec["expiresAtMs"] = json!(expires_ms);
-        rec["generation"] = json!(gen);
-    }
-    write_json_atomic(&c.path, &v)?;
-
-    let state = c.path.with_file_name("auth-state.json");
-    if let Ok(text) = std::fs::read_to_string(&state) {
-        if let Ok(mut s) = serde_json::from_str::<Value>(&text) {
-            s["generation"] = json!(gen);
-            s["expiresAtMs"] = json!(expires_ms);
-            let _ = write_json_atomic(&state, &s);
-        }
-    }
-    Ok(())
-}
-
 static TOKEN_LOCK: Mutex<()> = Mutex::new(());
 static TOKEN_CACHE: Mutex<Option<(String, i64)>> = Mutex::new(None);
 static REFRESH_FAIL_AT: Mutex<i64> = Mutex::new(0);
-static REFRESH_FAILS: Mutex<u32> = Mutex::new(0);
-/// 提前 60 秒换新，避免「刚好在请求途中过期」
+/// 提前 60 秒续期。
 const REFRESH_MARGIN_MS: i64 = 60_000;
-/// 刷新失败后的冷静期：这段时间内不再碰 refresh token（重放会把整族令牌打死）
-const REFRESH_BACKOFF_MS: i64 = 30_000;
 
-fn form_encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.as_bytes() {
-        match *b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char)
-            }
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
+/// AgentHub 的额度和签到也会续期同一个一次性 refresh token。
+/// 统一交给它在跨进程锁内续期，绝不由驾驶舱再独立兑换。
+fn refresh_via_agenthub() -> bool {
+    let Some(home) = std::env::var_os("USERPROFILE") else { return false; };
+    let root = PathBuf::from(home).join(".agenthub");
+    let python = root.join("venv").join("Scripts").join("python.exe");
+    let script = root.join("agenthub.py");
+    let mut cmd = std::process::Command::new(python);
+    cmd.arg("-X").arg("utf8").arg("-c")
+        .arg("import runpy,sys; runpy.run_path(sys.argv[1])['_minimax_access']()")
+        .arg(script);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
     }
-    out
-}
-
-fn refresh_cred(c: &Cred) -> Result<(String, String, i64), String> {
-    if c.refresh.is_empty() {
-        return Err("auth.json 里没有 refreshToken".into());
-    }
-    let scope = if c.scopes.is_empty() {
-        "agent.default".to_string()
-    } else {
-        c.scopes.join(" ")
-    };
-    let form = format!(
-        "grant_type=refresh_token&refresh_token={}&client_id={}&scope={}&audience={}",
-        form_encode(&c.refresh),
-        form_encode(&c.client_id),
-        form_encode(&scope),
-        form_encode(&c.audience)
-    );
-    let res = ureq::post(TOKEN_URL)
-        .set("Content-Type", "application/x-www-form-urlencoded")
-        .set("Accept", "application/json")
-        .set("User-Agent", "agent-cockpit/2.1")
-        .timeout(Duration::from_secs(20))
-        .send_string(&form);
-    let (status, text) = match res {
-        Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
-        Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
-        Err(e) => return Err(format!("刷新请求失败：{e}")),
-    };
-    if status >= 400 {
-        let msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v["error_description"]
-                    .as_str()
-                    .or_else(|| v["error"].as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| text.chars().take(200).collect());
-        return Err(format!("刷新被拒（{status}）：{msg}"));
-    }
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("刷新响应不是 JSON：{e}"))?;
-    let access = v["access_token"].as_str().unwrap_or("").trim().to_string();
-    if access.is_empty() {
-        return Err("刷新响应里没有 access_token".into());
-    }
-    let refresh = v["refresh_token"]
-        .as_str()
-        .unwrap_or(c.refresh.as_str())
-        .trim()
-        .to_string();
-    // expires_in 一般是秒；万一是毫秒级时间戳也能认
-    let expires_ms = match v["expires_in"].as_i64() {
-        Some(n) if n > 100_000_000_000 => n,
-        Some(n) if n > 0 => now_ms() + n * 1000,
-        _ => match v["expiresAtMs"].as_i64() {
-            Some(n) if n > 0 => n,
-            _ => now_ms() + 3_600_000,
-        },
-    };
-    Ok((access, refresh, expires_ms))
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// 取当前可用的 access token。空串 = 读不到 / 过期且刷新失败，如实返回空，
@@ -285,34 +185,22 @@ pub fn token() -> String {
         }
         return c.access;
     }
-    // 冷静期内不重试（连续失败就指数退避：30s → 60s → … 最多 10 分钟）
-    let fails = *REFRESH_FAILS.lock().unwrap_or_else(|p| p.into_inner());
-    let wait = (REFRESH_BACKOFF_MS << fails.min(5)).min(600_000);
-    if now_ms() - *REFRESH_FAIL_AT.lock().unwrap_or_else(|p| p.into_inner()) < wait {
+    // AgentHub 内部先落下尝试标记，再发一次请求；网络结果不明时不会重放。
+    if now_ms() - *REFRESH_FAIL_AT.lock().unwrap_or_else(|p| p.into_inner()) < 30_000 {
         return String::new();
     }
-    match refresh_cred(&c) {
-        Ok((access, refresh, expires_ms)) => {
-            if let Ok(mut f) = REFRESH_FAILS.lock() {
-                *f = 0;
+    if refresh_via_agenthub() {
+        if let Some(updated) = read_cred() {
+            if updated.expires_ms - now_ms() > REFRESH_MARGIN_MS {
+                if let Ok(mut g) = TOKEN_CACHE.lock() {
+                    *g = Some((updated.access.clone(), updated.expires_ms));
+                }
+                return updated.access;
             }
-            // 先落盘再回给调用方：写回失败也照样用（内存里这份是新的），但要把话留给人看
-            let _ = write_cred(&c, &access, &refresh, expires_ms);
-            if let Ok(mut g) = TOKEN_CACHE.lock() {
-                *g = Some((access.clone(), expires_ms));
-            }
-            access
-        }
-        Err(_) => {
-            if let Ok(mut f) = REFRESH_FAIL_AT.lock() {
-                *f = now_ms();
-            }
-            if let Ok(mut n) = REFRESH_FAILS.lock() {
-                *n = n.saturating_add(1);
-            }
-            String::new()
         }
     }
+    if let Ok(mut f) = REFRESH_FAIL_AT.lock() { *f = now_ms(); }
+    String::new()
 }
 
 /// 换号 / 重登后清缓存
@@ -322,9 +210,6 @@ pub fn invalidate() {
     }
     if let Ok(mut f) = REFRESH_FAIL_AT.lock() {
         *f = 0;
-    }
-    if let Ok(mut n) = REFRESH_FAILS.lock() {
-        *n = 0;
     }
 }
 
