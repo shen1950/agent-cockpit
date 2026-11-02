@@ -24,6 +24,8 @@ const context = {
   guideAgents:()=>[{app:'traework-cn', detail:'1 个可用'}, {app:'opencode', usable:1, detail:'3 个模型'}], PX_OWNER_NAME:{trae:'TRAE CN'},
   openPoolModal:g=>{modal=g || 'new';}, openDistModal:()=>{}, loadProxyModels:()=>{}, render:()=>{}, toast:()=>{},
   copyText:s=>{copied=s;}, invoke:async()=>({ok:true,msg:'test-key'}), renderGuide:()=>{},
+  // ui/legal.js 提供：反代卡片头部的常驻风险条
+  proxyRiskNote:()=>make('div', {class:'legalnote'}, make('b', {}, '用前须知')),
 };
 vm.createContext(context);
 vm.runInContext(fs.readFileSync('ui/proxy-guide.js','utf8'), context);

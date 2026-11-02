@@ -2479,3 +2479,31 @@ table.tbl td.acts > *:last-child { margin-right: 0 }
   .cpt-account-head { align-items: flex-start }
   .cpt-run-summary { padding: 14px; gap: 12px }
 }
+
+/* ---------- 法律声明与风险提示（ui/legal.js） ----------
+   风险条统一用 warn 系：是提醒，不是报错，别用 danger 红得让人以为出故障。 */
+.legalnote {
+  display: flex; align-items: flex-start; gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-3);
+  border: 1px solid var(--warn-line);
+  background: var(--warn-soft);
+  border-radius: var(--r-md);
+}
+.legalnote-main { flex: 1; min-width: 0 }
+.legalnote-main b { display: block; margin-bottom: 2px; font: 650 12.5px/1.5 var(--font-sans); color: var(--warn) }
+.legalnote-main p { margin: 0; font: 400 12.5px/1.7 var(--font-sans); color: var(--text-muted) }
+.legalnote-acts { display: flex; flex-shrink: 0; gap: var(--sp-3); padding-top: 1px }
+.legal-link { font: 400 12.5px/1.6 var(--font-sans); color: var(--accent); text-decoration: none; white-space: nowrap }
+.legal-link:hover { text-decoration: underline }
+
+/* 关于页那条常驻声明：标签 + 一句话，别铺成大段免责。 */
+.legalabout { display: grid; gap: var(--sp-2) }
+.legalabout-item { display: grid; grid-template-columns: minmax(72px, 92px) minmax(0, 1fr); gap: var(--sp-3); font: 400 12.5px/1.7 var(--font-sans) }
+.legalabout-item b { font-weight: 650; color: var(--text) }
+.legalabout-item span { color: var(--text-muted) }
+
+.legaldialog { width: min(520px, calc(100vw - 96px)) }
+.legalack { display: flex; align-items: flex-start; gap: var(--sp-2); margin: var(--sp-4) 0 var(--sp-2); font: 400 13px/1.6 var(--font-sans); color: var(--text); cursor: pointer }
+.legalack input { flex-shrink: 0; margin-top: 3px }
+.legal-fine { margin-top: var(--sp-2); font: 400 12px/1.7 var(--font-sans); color: var(--text-muted) }

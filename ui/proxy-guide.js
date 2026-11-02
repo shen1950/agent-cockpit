@@ -135,6 +135,7 @@
       el('span', { class: 'sp' }), chip(d.proxy.running ? '反代运行中' : '反代未启动', d.proxy.running ? 'swap' : 'expired'),
       pxRunBtn(d), el('code', { class: 'mono guide-base', title: base }, base),
       btn('复制地址', 'sm', () => copyText(base))));
+    card.appendChild(proxyRiskNote());
     const labels = ['配置上游来源', '选择模型', '启动与密钥', '配置客户端'];
     const progress = el('div', { class: 'guide-progress' });
     labels.forEach((label, index) => {

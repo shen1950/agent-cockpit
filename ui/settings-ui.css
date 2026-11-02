@@ -1,0 +1,68 @@
+/* Scoped to the application settings, leaving account dialogs independent. */
+.brand img.mark { width: 30px; height: 30px; border: 0; background: transparent; border-radius: 0; object-fit: contain }
+#view-settings .brand-choices { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px; margin: 16px 0 }
+#view-settings .brand-choice { display: block; padding: 0; overflow: hidden; border-radius: 12px; border: 2px solid var(--line); background: var(--bg-raised) }
+#view-settings .brand-choice[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft) }
+#view-settings .brand-pair { display: grid; grid-template-columns: 1fr 1fr }
+#view-settings .brand-sample { min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 20px 8px 10px; font-size: 12px }
+#view-settings .brand-sample.light { background: #f6f4ef; color: #66594b }
+#view-settings .brand-sample.dark { background: #191c20; color: #d5c7b8 }
+#view-settings .brand-sample img { width: min(100%,110px); aspect-ratio: 1; object-fit: contain }
+#view-settings .brand-choice-label { display: block; padding: 12px; color: var(--text) }
+@media (max-width: 1000px) { #view-settings .brand-choices { grid-template-columns: 1fr } }
+#view-settings .setlayout { grid-template-columns: 190px minmax(0, 1fr); gap: 24px }
+#view-settings .setnav { padding-right: 12px; border-right: 1px solid var(--line) }
+#view-settings .settings-group { padding: 18px 12px 7px; color: var(--text-muted); font-size: 11px; letter-spacing: .06em }
+#view-settings .settings-group:first-child { padding-top: 4px }
+#view-settings .setnav button { display: flex; align-items: center; gap: 11px; min-height: 40px; border-radius: 8px }
+#view-settings .setnav svg { width: 18px; height: 18px; flex: none }
+#view-settings .setnav button[aria-current="true"] { color: var(--accent); background: var(--accent-soft) }
+#view-settings .setbody { padding: 4px 18px 32px 0; gap: 20px; scroll-behavior: auto }
+#view-settings .setbody > * { flex-shrink: 0 }
+#view-settings .settings-heading h2 { font: 650 24px/1.4 var(--font-ui, sans-serif); margin: 0 0 5px }
+#view-settings .settings-heading p, #view-settings .settings-copy { color: var(--text-muted); font-size: 13px; line-height: 1.7; margin: 0 0 12px; overflow-wrap: anywhere }
+#view-settings .settings-heading p { margin: 0 }
+#view-settings .panel { border-radius: 12px; padding: 20px; box-shadow: none }
+#view-settings .panel h2 { font-family: inherit; font-size: 15px; line-height: 1.5; margin-bottom: 12px }
+#view-settings .setrow { grid-template-columns: minmax(180px, 1fr) minmax(0, auto); padding: 16px 0; gap: 20px }
+#view-settings .setrow.wide { grid-template-columns: minmax(0, 1fr) }
+#view-settings .setrow .desc { color: var(--text-muted); overflow-wrap: anywhere }
+#view-settings .ctl { min-width: 0; max-width: 100% }
+#view-settings .ctl input { max-width: 100% }
+#view-settings .ctl > div { max-width: 100%; min-width: 0; flex-wrap: wrap }
+#view-settings .panel { min-width: 0; overflow-wrap: anywhere }
+#view-settings .ctlrow { flex-wrap: wrap; min-width: 0 }
+#view-settings .ctlrow input { min-width: 0; max-width: 100% }
+#view-settings .setbody .seg { flex-wrap: wrap; max-width: 100% }
+#view-settings .setbody .kv { overflow-wrap: anywhere; white-space: normal }
+#view-settings .settings-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px }
+#view-settings a.btn { display: inline-flex; align-items: center; gap: 6px; text-decoration: none }
+#view-settings :is(button, a, input, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px }
+#view-settings .help-search { width: 100%; margin-bottom: 14px }
+#view-settings .help-questions details { border-top: 1px solid var(--line) }
+#view-settings .help-questions summary { padding: 16px 4px; cursor: pointer; font-size: 14px; font-weight: 600 }
+#view-settings .settings-answer { padding: 0 4px 16px; color: var(--text-muted); font-size: 13px; line-height: 1.8; overflow-wrap: anywhere }
+#view-settings .about-hero { text-align: center; padding: 30px 24px 24px; border: 1px solid var(--line); border-radius: 16px; background: var(--bg-raised) }
+#view-settings .about-hero img { display: block; margin: 0 auto 16px; border-radius: 24px }
+#view-settings .about-hero h2 { font: 700 30px/1.3 var(--font-ui, sans-serif); margin: 0 0 4px; letter-spacing: -.6px }
+#view-settings .about-name { color: var(--text-muted); margin: 0 0 12px; font-size: 14px }
+#view-settings .about-version { display: inline-block; padding: 4px 12px; margin-bottom: 14px; border-radius: 20px; background: var(--accent-soft); color: var(--accent); font-size: 12px }
+#view-settings .about-repo { border: 0; background: transparent; margin-bottom: 16px; max-width: 100%; overflow-wrap: anywhere }
+#view-settings .about-repo svg { width: 21px; height: 21px; flex-shrink: 0 }
+#view-settings .about-hero .settings-actions { justify-content: center }
+#view-settings .about-note { font-size: 12px; margin: 16px auto 0; max-width: 54ch }
+#view-settings .about-resources { display: grid; grid-template-columns: 1fr 1fr; gap: 16px }
+@media (max-width: 1100px) {
+  #view-settings .setlayout { grid-template-columns: 156px minmax(0, 1fr); gap: 16px }
+  #view-settings .setrow { grid-template-columns: minmax(0, 1fr); gap: 10px }
+  #view-settings .ctl { justify-content: flex-start }
+  #view-settings .about-resources { grid-template-columns: 1fr }
+}
+@media (max-width: 650px) {
+  #view-settings .setlayout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) }
+  #view-settings .setnav { flex-direction: row; overflow-x: auto; padding: 0 0 8px; border-right: 0; border-bottom: 1px solid var(--line) }
+  #view-settings .settings-group { display: none }
+  #view-settings .setnav button { white-space: nowrap }
+  #view-settings .setbody { padding-right: 4px }
+  #view-settings #set-hint { display: none }
+}

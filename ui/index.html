@@ -6,6 +6,7 @@
 <title>Agent 驾驶舱</title>
 <link rel="stylesheet" href="styles.css">
 <link rel="stylesheet" href="usage-dashboard.css">
+<link rel="stylesheet" href="settings-ui.css">
 </head>
 <body>
 <header class="topbar" data-tauri-drag-region>
@@ -14,7 +15,7 @@
        「驾驶舱」三个字（<b>，没挂拖拽属性）才有用"。拖拽区留给 tagline / dragfill。 -->
   <div class="brand" id="btn-home" role="button" tabindex="-1"
        title="回驾驶舱首页">
-    <span class="mark" aria-hidden="true"></span>
+    <img class="mark" data-brand-icon src="brand-light.png" alt="">
     <span class="name">Agent <b>驾驶舱</b></span>
     <!-- 版本号钉在标题右下（她 10-25）：init 里从 tauri 拿真实版本填进来 -->
     <span class="ver" id="brand-ver" aria-label="版本号"></span>
@@ -313,7 +314,7 @@
         <span class="count" id="set-hint">改动即时生效并保存在本机</span></div>
       <div class="pagebody">
         <div class="setlayout">
-          <ul class="setnav" id="set-nav"></ul>
+          <ul class="setnav" id="set-nav" aria-label="设置分类"></ul>
           <div class="setbody" id="set-body"></div>
         </div>
       </div>
@@ -604,6 +605,9 @@
 <script src="zcode.js"></script>
 <script src="antigravity.js"></script>
 <script src="usage-dashboard.js"></script>
+<script src="brand.js"></script>
+<script src="legal.js"></script>
+<script src="settings-ui.js"></script>
 <script src="app.js"></script>
 <script src="remote-online.js"></script>
 <script src="proxy-guide.js"></script>

@@ -23,6 +23,10 @@ _paste_parser.js
 # 内部工作交接日志（本地留存，不开源）
 HANDOFF.md
 
+# 内部留存文档（法律底稿、文档维护手册等）。不进公开源码包：
+# export_public_source.py 走 git ls-files，被忽略的路径不会被收录。
+docs/private/
+
 # 调试草稿
 _noserve.py
 
@@ -36,3 +40,12 @@ docs/*.png
 # 界面截图草稿（本地核对用，不入库）
 _real_*.png
 _zoom_*.png
+
+# Local rollback copies, personal configuration and release audits are never source.
+*.bak
+*.pdb
+.env
+.env.*
+!.env.example
+privacy-local/
+release-private/

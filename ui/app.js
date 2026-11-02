@@ -64,6 +64,7 @@ function applyAppearance(a = {}) {
     document.documentElement.style.setProperty('--nav-w-user', `${navWidth(a.nav_w)}px`);
   }
   applyRail(railOn(a));
+  applyBrand(a);
 }
 const NAV_MIN = 170, NAV_MAX = 460, NAV_DEFAULT = 248;
 function navWidth(v) {
@@ -428,6 +429,11 @@ const askText = (msg, def = '', opts = {}) => ask({ msg, input: def, ...opts });
    按钮看起来就是"点了没反应"——2026-10-18 向导那两个按钮正是这么静默失败的
    （真因是 commands.rs 里 CMD_LOCK 重入死锁，已修）。现在统一兜成一条失败提示。 */
 async function run(action, extra = {}) {
+  // 第一次开反代要先过一次风险确认（勾选才放行，之后不再打扰）。
+  // 拦在这里而不是各按钮里：一键反代、面板开关、向导最后一步都走这个出口。
+  if (action === 'proxy_start' && !await ensureProxyConsent()) {
+    return { ok: false, msg: '已取消：未确认反代风险' };
+  }
   let r;
   try {
     r = await invoke('action', { payload: { action, ...extra } });
@@ -523,7 +529,7 @@ function render() {
   if (S.view === 'checkin') { renderCheckin(); loadCheckin(false); }
   // 设置页 4 秒轮询整块重建；侧导菜单拖拽中绝不能重建——面板一换，
   // 落点线和被拖的行当场消失，用户看到的就是"拖到一半没反应"
-  if (S.view === 'settings' && !editingIn('#set-body') && !seDrag) renderSettings();
+  if (S.view === 'settings' && !editingIn('#set-body') && !seDrag && (!['help', 'about'].includes(setSection) || setLast !== setSection || !$('set-body').firstChild)) renderSettings();
   // 账号设置浮窗开着时跟着轮询刷新状态；有未保存改动或光标还在框里就不重绘
   if (S.detail && !S.detail.dirty && !editingIn('#im-body')) renderDetail();
   // 积分明细弹层：只在真的又读了一次数之后重绘。每 4 秒重建 60 多行会把滚动位置顶回顶部
@@ -1883,6 +1889,21 @@ function quotaMiss(q) {
    这里一个 null 都不许落成 0，也不许在 left 缺失时拿 total-left 反推 used——
    AStudio「国庆每日登录星火积分赠送」那种「获得明细」表本来就没有逐笔剩余列，
    反推出来的 5,000 会被画成「已使用 5,000 / 5,000」，等于宣称这一笔已经用完（假话）。 */
+/* 「最近到期」指的是**还有余额**的那一笔里最早到期的日期，
+   不是"还没作废的那一笔里最早到期"——两者差得很实在：AStudio 通用积分 11-02 那包
+   已经被扣光，它到不到期都不影响任何余额，真正要盯的是 11-09 还剩 43 的那包。
+   后端分组那层是这个口径，界面这行必须照抄它，别自己按到期时间再取一遍最早。 */
+function nextUsableExpiry(items) {
+  const dated = (items || []).filter((it) => it.expires_on
+    && it.expires_on !== EXP_NONE && it.expires_on !== '无限期');
+  // 一笔都没给逐笔剩余时（厂商的「获得明细」只给获得数）判不出"用没用完"，退回最早到期
+  if (!dated.some((it) => numv(it.left) != null)) {
+    return dated.map((it) => it.expires_on).sort()[0] || '';
+  }
+  const alive = dated.filter((it) => (numv(it.left) || 0) > 0);
+  return alive.length ? alive.map((it) => it.expires_on).sort()[0] : '';
+}
+
 function quotaGroups(i) {
   const q = i.quota || {};
   const num = numv;
@@ -1933,12 +1954,15 @@ function quotaGroups(i) {
       return vals.length ? vals.reduce((s, v) => s + v, 0) : null;
     };
     const live = g.items.filter((it) => !it.expired);
-    const exp = live.map((it) => it.expires_on).filter((x) => x && x !== EXP_NONE && x !== '无限期').sort()[0] || '';
+    const exp = nextUsableExpiry(live);
+    // 剩余天数必须跟着同一个日期取：各取各的会画出「最近到期 11-09 · 还剩 0 天」
+    // 这种自相矛盾的话（0 天来自 11-02 那笔已经扣光的）
+    const expDay = live.find((it) => it.expires_on === exp);
     return norm({
       ...g, left: sum('left'), total: sum('total'), used: sum('used'),
       live_count: live.length, expired_count: g.items.length - live.length,
       live_left: sum('left'),
-      expires: exp, days_left: live.map((it) => it.days_left).find((x) => x != null) ?? null,
+      expires: exp, days_left: expDay ? expDay.days_left ?? null : null,
     });
   });
 }
@@ -2425,7 +2449,28 @@ function trendCharts(q) {
 // A missing source is explained explicitly; it is not turned into a zero-valued chart.
 function usageTrendPanel(instance) {
   const quota = instance.quota || {};
-  const result = trendCharts(quota);
+  // Preserve both the native account quota history and local token history.
+  // They may differ in unit and attribution, so never add them together.
+  const available = trend => trend && Array.isArray(trend.days) && trend.days.length > 0;
+  const local = available(quota.local_trend) ? quota.local_trend : null;
+  const vendor = available(quota.vendor_trend) ? quota.vendor_trend : null;
+  const distinct = local && vendor && JSON.stringify(local) !== JSON.stringify(vendor);
+  const wanted = S.detail?.trendSource;
+  const selected = wanted === 'vendor' && vendor ? 'vendor' : local ? 'local' : vendor ? 'vendor' : '';
+  const chosen = selected === 'vendor' ? vendor : selected === 'local' ? local : null;
+  const result = trendCharts(chosen ? { ...quota, trend: chosen } : quota);
+  const toggle = distinct ? el('div', { class: 'ctlrow trend-source-switch', role: 'group', aria: { label: '用量数据来源' } },
+    ...[['local', '本机会话记录'], ['vendor', '额度历史']].map(([id, label]) =>
+      btn(label, `sm${selected === id ? ' primary' : ''}`, () => {
+        if (!S.detail) return;
+        S.detail.trendSource = id;
+        S.trendSel = '';
+        renderDetail();
+      }, id === 'local' ? '来自本机模型会话，可能是多个账号共用的历史' : '来自该账号保存的额度或厂商用量历史，单位以来源为准')))
+    : null;
+  const sourceNote = selected === 'local'
+    ? (local.scope === 'device' ? '本机模型会话记录；共用历史无法按账号准确拆分。' : '本机模型会话记录；仅反映此数据目录可读取的内容。')
+    : selected === 'vendor' ? '已保存的额度历史，单位和范围以来源记录为准。' : '';
   const reasonByApp = {
     'codex-desktop': '尚未读到这个账号的本机会话用量；共享历史可能无法按登录账号拆分。',
     'traework-cn': '尚未找到可读取的逐次用量或完整对话记录，当前无法生成趋势。',
@@ -2442,6 +2487,9 @@ function usageTrendPanel(instance) {
   }, '打开统计页并筛选当前 Agent');
   return el('div', { class: 'usage-trend-panel' },
     el('h3', { class: 'subsec' }, '用量统计'),
+    toggle,
+    sourceNote ? el('p', { class: 'qnote' }, sourceNote) : null,
+    quota.local_trend_error ? el('p', { class: 'qnote warn', role: 'status' }, `本地记录读取失败：${quota.local_trend_error}`) : null,
     result || el('p', { class: 'qnote', role: 'status' }, `暂无法展示用量趋势：${reason}`),
     el('div', { class: 'ctlrow' }, open));
 }
@@ -2586,7 +2634,12 @@ function renderQuotaDetail() {
   clear(sum);
   if (shown.length) {
     const exps = shown.map((it) => it.expires_on).filter((x) => x && x !== EXP_NONE && x !== '无限期').sort();
-    const nearest = qdetail.tab === 'live' ? exps[0] : exps[exps.length - 1];
+    // 「最近到期」照抄卡片那一行（g.expires，已经是"还有余额的笔里最早到期"那个口径）。
+    // 早先是这里自己按到期时间取最早一笔，于是已经扣光、正等着作废的包被报成"最近到期"——
+    // 卡片说 11-09、弹窗说 11-02，同一个数两个出处就是这么来的。
+    const nearest = qdetail.tab === 'live'
+      ? (g.expires && g.expires !== EXP_NONE && g.expires !== '—' && g.expires !== '无限期' ? g.expires : '')
+      : exps[exps.length - 1];
     sum.append([
       `${shown.length} 笔`,
       sumLeft != null ? `合计剩 ${nfmt(sumLeft)} ${gu}` : '这一堆没有一笔给出剩余',
@@ -2645,7 +2698,10 @@ function identLine(i) {
   if (i.app === 'codex-desktop' && i.chatgpt_auth) {
     const auth = i.chatgpt_auth;
     const label = auth.has_auth
-      ? auth.mode === 'apikey' ? `API Key 登录${auth.base_url ? ' · ' + auth.base_url : ''}` : `ChatGPT 登录${auth.account ? ' · ' + auth.account : ''}`
+      ? auth.mode === 'apikey'
+        // 协议一眼可见：这张卡到底是以 Codex 原生 Responses 还是 Chat 兼容口在跑
+        ? `API Key 登录${auth.base_url ? ' · ' + auth.base_url : ''}${auth.wire_api === 'chat' ? ' · Chat 协议' : ' · Responses 协议'}`
+        : `ChatGPT 登录${auth.account ? ' · ' + auth.account : ''}`
       : '尚未保存这个账号的登录凭据';
     return el('div', { class: `ident ${auth.has_auth ? 'logged' : 'none'}` }, label);
   }
@@ -3180,6 +3236,7 @@ function proxyKind(appId) {
   if (appId === 'minimax') return 'mm';
   if (appId === 'qwenwork') return 'qw';
   if (appId === 'catpaw') return 'paw';
+  if (appId === 'zcode') return 'zc';
   return '';
 }
 function pxState(appId) {
@@ -3444,15 +3501,12 @@ async function astudioRefreshModels() {
   try {
     const r = await invoke('action', { payload: { action: 'astudio_refresh' } });
     const res = r.result || {};
-    st.live = (res.models || []).map((m) => ({
-      id: m.id, name: m.name, free: m.free, multiplier: m.multiplier,
-    }));
     st.liveError = res.ok ? '' : (res.error || r.msg || '');
   } catch (e) {
     st.liveError = String(e);
   }
   st.refreshing = false;
-  rerenderProxy();
+  await load();
 }
 async function astudioOneClick() {
   const st = pxState('astudio');
@@ -3485,10 +3539,9 @@ function renderAstudioPanel(a, host, appId) {
   if (!a) return;
   const st = pxState(appId);
   const accts = a.accounts || [];
-  let models = (st.live && st.live.length) ? st.live : (a.models || []);
-  if (!models.length) models = [{ id: 'spark-x2.6-4b', name: 'Spark-X2.6-Lite', free: true }];
+  const models = a.models || [];
   if (!models.some((m) => m.id === st.model)) {
-    st.model = (models.find((m) => m.free) || models[0]).id;
+    st.model = (models.find((m) => m.free) || models[0])?.id || '';
   }
   const modelName = pxModelOf(models, st.model)?.name || st.model;
   const inPool = accts.some((x) => inEnabledPool(x.app, x.name));
@@ -3500,7 +3553,7 @@ function renderAstudioPanel(a, host, appId) {
         : '账号还没进任何上游组：点「一键反代」，或到「上游组」把它勾进去',
     }, inPool ? '已配置' : '未配置'),
     btn(st.refreshing ? '读取中…' : '刷新模型', 'sm', astudioRefreshModels,
-      '用登录 Cookie 拉这个账号实时可用的模型清单'),
+      '重新读取 AStudio 为当前账号保存的模型目录'),
     btn(st.busy ? '正在配置…' : (inPool ? '重新配置' : '一键反代'), 'primary sm', astudioOneClick,
       '账号进上游组 → 生成接入密钥 → 启动反代'),
     pxRunBtn(S.data, true),
@@ -3515,11 +3568,11 @@ function renderAstudioPanel(a, host, appId) {
   sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
   const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm',
     () => pxTestAstudio(st), '用选中的模型发一次极小请求');
-  if (st.testing) testBtn.disabled = true;
+  if (st.testing || !models.length) testBtn.disabled = true;
   host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
   host.appendChild(pxTestLine(st));
   host.appendChild(pxIdsRow(appId));
-  host.appendChild(pxNote('下拉里默认是内置清单；点「刷新模型」换成账号实时清单。限免的 spark-x2.6-4b 不扣积分，其余按倍率扣星火积分。'));
+  host.appendChild(pxNote('模型来自当前账号的 AStudio 目录。清单为空时，先在 AStudio 打开模型选择器，再点「刷新模型」。'));
   if (st.liveError) host.appendChild(pxNote(`模型清单：${st.liveError}`, true));
 
   let acctTable;
@@ -3670,6 +3723,7 @@ function renderAgentProxy(d) {
   }
   if (kind === 'a') renderAstudioPanel(d.proxy.astudio, host, S.cur);
   if (kind === 'mm') renderMmPanel(d.proxy.minimax, host, S.cur);
+  if (kind === 'zc') renderZcodeProxyPanel(d.proxy.zcode, host, d);
   if (kind === 'qw') renderQwPanel(d.proxy.qwbridge, host, S.cur);
   if (kind === 'paw') renderPawPanel(d.proxy.pawbridge, host, S.cur);
 }
@@ -4265,11 +4319,14 @@ async function loadProxyModels() {
    实测质量如何（成功率/次数来自反代自己的逐模型计数，规格来自各家目录）。
    每个模型 ID 带 Agent 前缀，复制给客户端就固定指向这一家。 */
 const PX_OWNER_NAME = {
+  zcode: 'ZCode Start Plan',
   workbuddy: 'WorkBuddy', 'workbuddy-intl': 'WorkBuddy 国际版', trae: 'Trae CN',
   qoder: 'Qoder', 'qoder-cn': 'Qoder CN', opencode: 'OpenCode', astudio: 'AStudio',
 };
 
 function pxOwnerAccounts(d, owner) {
+  if (owner === 'zcode') return (d.proxy.zcode?.accounts || [])
+    .map(a => ({ name: a.name, good: a.usable, text: a.text }));
   if (owner === 'workbuddy' || owner === 'workbuddy-intl') {
     return (d.proxy.wbproxy?.accounts || []).filter((a) => a.app === owner)
       .map((a) => ({ name: a.name, good: a.state === 'ok', text: wStateText(a.state) }));
@@ -4454,6 +4511,7 @@ function renderOpenCodeBridge(host, d, compact) {
 
 function guideAccounts(d, sel) {
   if (!sel) return [];
+  if (sel.kind === 'zc') return d.proxy.zcode?.accounts || [];
   if (sel.kind === 'q') {
     return (d.proxy.qproxy?.accounts || [])
       .filter((a) => a.app === sel.app)
@@ -4481,6 +4539,10 @@ const QODER_UPSTREAM = [
 
 function guideModels(d, appId) {
   const kind = proxyKind(appId);
+  if (kind === 'zc') {
+    const models = [...new Map((d.proxy.zcode?.accounts || []).flatMap(a => a.models || []).map(m => [m.id, m])).values()];
+    return { models, error: models.length ? '' : 'ZCode 本机没有 Start Plan 模型，请打开客户端确认套餐后刷新' };
+  }
   if (kind === 'q') {
     const row = (d.proxy.qproxy?.models || []).find((x) => x.app === appId) || {};
     return { models: QODER_UPSTREAM, all: QODER_UPSTREAM, aliases: row.models || [], error: '' };
@@ -4557,6 +4619,11 @@ function guideAgents(d) {
         app: a.id, name: a.name, kind, count: accts.length, usable, blocked: false,
         detail: usable ? `${usable} 个可用` : (accts.length ? '需要登录' : '还没有账号'),
       });
+    } else if (kind === 'zc') {
+      const accts = d.proxy.zcode?.accounts || [];
+      const usable = accts.filter(a => a.usable).length;
+      out.push({ app: a.id, name: a.name, kind, count: accts.length, usable, blocked: false,
+        detail: d.proxy.zcode?.installed ? (usable ? `${usable} 个登录已保存，待实测` : '需要保存登录') : '需要安装本地组件' });
     } else if (kind === 't') {
       const accts = d.proxy.traeproxy?.accounts || [];
       const usable = accts.filter((x) => x.ok).length;
@@ -4636,6 +4703,11 @@ async function guideRecheck(sel) {
 
 function guideTest(sel) {
   if (!sel) return;
+  if (sel.kind === 'zc') {
+    const st = pxState('zcode');
+    st.account = guideAccounts(S.data, sel).find(a => a.usable && (a.models || []).some(m => m.id === st.model))?.name || '';
+    zcodeProxyAction('zcproxy_test', st); return;
+  }
   if (sel.kind === 'q') {
     const accts = (S.data.proxy.qproxy?.accounts || []).filter((a) => a.app === sel.app);
     pxTestQoder(sel.app, accts, pxState(sel.app));
@@ -4683,6 +4755,15 @@ async function guideConnect() {
     if (sel.kind === 'q') r = await invoke('action', { payload: { action: 'qproxy_oneclick', infer: true } });
     else if (sel.kind === 'w') r = await invoke('action', { payload: { action: 'wproxy_oneclick' } });
     else if (sel.kind === 't') r = await invoke('action', { payload: { action: 'trae_oneclick', model } });
+    else if (sel.kind === 'zc') {
+      if (!d.proxy.zcode?.installed) {
+        const setup = await invoke('action', { payload: { action: 'zcproxy_setup', app: 'zcode' } });
+        if (!setup.ok) throw new Error(setup.msg || 'ZCode 组件安装失败');
+      }
+      const name = guideAccounts(d, sel).find(a => a.usable && (a.models || []).some(m => m.id === model))?.name;
+      if (!name) throw new Error('所选模型没有对应的已保存账号');
+      r = await invoke('action', { payload: { action: 'zcproxy_oneclick', app: 'zcode', name } });
+    }
     else r = await guideConnectOpenCode(d);
   } catch (e) {
     r = { ok: false, msg: String(e) };
@@ -5517,6 +5598,8 @@ async function saveDistModal() {
     toast('已有同名接入密钥，换一个名字，避免生成重复的密钥', false);
     return;
   }
+  // 生成分发 Key = 把额度使用权交出去一张，首次先确认风险（与启动反代共用同一次确认）
+  if (isNew && !await ensureProxyConsent()) return;
   distSaving = true;
   const save = $('gd-save');
   const oldText = save.textContent;
@@ -7589,7 +7672,7 @@ async function loadSeedSources() {
 }
 // 第 2 步：读"这台机器现在登的是谁"。认出来了就顺手把基本信息填上、自动进下一步。
 /// 卡名直接当 Windows 文件名用：`< > : " | ? * / \` 和控制字符一律拿掉，
-/// 尾点的空格也去不掉就整体不用。向导最初用打码账号名预填（`masked_account_id@163.com`
+/// 尾点的空格也去不掉就整体不用。向导最初用打码账号名预填（`demo***@example.test`
 /// 这种），里面的 `*` 会让账号文件写不进去（DSH 2026-10-17 实测建卡到一半失败）。
 // 卡名上限跟后端 registry::bad_account_name 的 60 字对齐（两处必须一致，否则界面放过去、后端拒绝）
 const NAME_MAX = 60;
@@ -8237,19 +8320,7 @@ const HELP = [
 /* 帮助与教程：并入 设置 的一个分组（原来它自己占一页，侧栏里点一下才看得到，
    跟「关于」这类内容重复分层）。两个动作按钮也在这里就地绑，不再依赖静态元素。 */
 function renderHelp(body, panel) {
-  body.appendChild(panel('帮助与教程',
-    el('div', { class: 'ctlrow' },
-      btn('重放新手引导', 'primary sm', startTour, '一步一步把主界面指给你看'),
-      btn('重置多开判定', 'sm', () => run('reset_caps'),
-        '清掉实测记录，下次启动账号时重新判定该产品能不能多开'))));
-  for (const sec of HELP) {
-    const box = el('div', { class: 'html' });
-    // 静态内置文案，非用户输入
-    box.innerHTML = sec.h;
-    body.appendChild(el('section', { class: 'panel' }, el('h2', {}, sec.t), box));
-  }
-  body.appendChild(el('div', { class: 'hintline' },
-    '上手顺序：选 Agent → ＋ 添加账号 → 向导登录并读额度。'));
+  renderHelpCenter(body, panel);
 }
 
 /* ---------------- 新手引导 ---------------- */
@@ -9053,19 +9124,13 @@ function renderSettings() {
   const panel = (title, ...rows) => el('section', { class: 'panel' }, el('h2', {}, title), ...rows);
 
   const nav = $('set-nav');
-  if (!nav.firstChild) {
-    for (const [id, label] of SET_SECTIONS) {
-      const b = el('button', { type: 'button' }, label);
-      b.dataset.sec = id;
-      b.addEventListener('click', () => { setSection = id; renderSettings(); });
-      nav.appendChild(el('li', {}, b));
-    }
-  }
+  if (!nav.firstChild) renderSettingsNavigation(nav);
+  settingsPageHeading(body);
 
   if (setSection === 'profile') {
     body.appendChild(panel('个人资料',
       row('昵称', '显示在窗口标题与备份文件名里，方便多机辨认是谁的配置',
-        textCtrl(pr.nickname, '例如 示例用户', (v) => setSetting('profile', 'nickname', v))),
+        textCtrl(pr.nickname, '例如：工作电脑', (v) => setSetting('profile', 'nickname', v))),
       row('备注', '', textCtrl(pr.note, '这台机器的说明', (v) => setSetting('profile', 'note', v), true))));
   }
 
@@ -9091,6 +9156,7 @@ function renderSettings() {
   }
 
   if (setSection === 'appearance') {
+    brandSettings(body, panel, a);
     body.appendChild(panel('外观',
       row('主题', '深色石墨 + 琥珀金；浅色暖纸 + 深琥珀，两套都过了 WCAG AA 对比度',
         segCtrl([['light', '浅色'], ['system', '跟随系统'], ['dark', '深色']], a.theme,
@@ -9314,21 +9380,7 @@ function renderSettings() {
 
   if (setSection === 'help') safe(() => renderHelp(body, panel), '帮助与教程');
 
-  if (setSection === 'about') {
-    body.appendChild(panel('关于',
-    row('版本', '',
-        el('span', { class: 'kv' }, `v${S.data.app_version || '2.0.0'}`)),
-      row('数据位置', '全部只存本机，不随代码上传。要迁到别的盘（或看占了多少地方）去 设置→存储',
-        el('span', { class: 'kv' }, S.data.data_root || '~/.agent-cockpit/')),
-      row('Key 保护', S.data.vault && S.data.vault.has_password
-        ? `加密保管箱 ${S.data.vault.count} 条 · Windows 账户 + 主密码${S.data.vault.locked ? ' · 当前锁定' : ''}`
-        : `加密保管箱 ${S.data.vault ? S.data.vault.count : 0} 条 · Windows 账户绑定（DPAPI），可在 设置→凭据安全 加一层主密码`,
-        actBtn('前往设置', () => { setSection = 'security'; renderSettings(); })),
-      row('仓库', '私有仓库 github.com/shen1950/agent-cockpit',
-        actBtn('复制地址', () => copyText('https://github.com/shen1950/agent-cockpit'))),
-      row('监听地址', '反代与界面只绑回环，不对外网开放',
-        el('span', { class: 'kv' }, `127.0.0.1:${p.port || 8788}`))));
-  }
+  if (setSection === 'about') renderAboutSettings(body, panel);
   restoreScroll(host, setScroll);
 }
 // 本机余额直读：串号时先问一句要不要改绑，绝不静默覆盖另一个账号的数
