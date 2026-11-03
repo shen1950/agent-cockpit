@@ -96,5 +96,8 @@ function renderAboutSettings(body, panel) {
     el('p', { class: 'legal-fine' }, LEGAL_ONE_LINE),
     el('div', { class: 'settings-actions' },
       legalLink('完整免责条款', LEGAL_DOC_PATH),
-      legalLink('反代风险说明', PROXY_DOC_PATH))));
+      legalLink('反代风险说明', PROXY_DOC_PATH),
+      btn('重新查看反代协议', 'sm', async () => {
+        if (await ensureProxyConsent(true)) toast('已重新确认反代协议', true);
+      }, '再看一遍启用反代前需要同意的条款'))));
 }

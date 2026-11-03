@@ -23,6 +23,16 @@ const LEGAL_POINTS = [
 const PROXY_RISK_LINE = '反代只在本机转发你自己的账号凭据，不改变上游的授权与计费规则。'
   + '多数产品条款禁止账号共享或自动化访问，被判定违规时的限流、封号、额度清零等后果由你自行承担，作者不负责。';
 
+/* 首次启用反代时必须逐条同意的协议。每条一句，能读懂、能追责；
+   别改写成「本人已知晓风险」这种什么都没说的空话。 */
+const PROXY_TERMS = [
+  '本软件按「原样」提供，不作任何担保；因使用它产生的后果，作者不承担任何责任。',
+  '反代只在本机转发你自己的请求，用的是你自己已登录的账号凭据与额度，不改变上游的授权与计费规则。',
+  '多开、换号与反代在部分产品上可能违反其用户协议，是否合规由你自行判断并负责。',
+  '若被上游判定为违规使用，由此产生的限流、封号、订阅失效、额度或积分清零等后果由你自行承担。',
+  '分发 Key 等同于你的额度钥匙，请勿外传；也不要把 8788 端口暴露到公网或借给他人使用。',
+];
+
 function openLegalDoc(path = LEGAL_DOC_PATH) {
   if (!window.__TAURI_INTERNALS__) {
     window.open(LEGAL_REPO + path, '_blank', 'noopener');
@@ -67,12 +77,13 @@ function proxyRiskNote() {
 }
 
 /* 首次启用反代前的一次性强确认：必须勾选才能继续。返回 Promise<boolean>。
-   只拦「第一次」——之后由 settings.legal.proxyAccepted 放行，不再打扰。 */
-function ensureProxyConsent() {
-  if (legalProxyAccepted()) return Promise.resolve(true);
+   默认只拦「第一次」——之后由 settings.legal.proxyAccepted 放行，不再打扰。
+   force=true 无视已同意状态再弹一次（设置页的「重新查看协议」用）。 */
+function ensureProxyConsent(force = false) {
+  if (!force && legalProxyAccepted()) return Promise.resolve(true);
   return new Promise((resolve) => {
     const ack = el('input', { type: 'checkbox', id: 'legal-ack' });
-    const ok = el('button', { class: 'btn primary', disabled: true }, '我已了解，启用反代');
+    const ok = el('button', { class: 'btn primary', disabled: true }, '同意并启用反代');
     const cancel = el('button', { class: 'btn' }, '取消');
     const onKey = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); close(false); } };
     function close(value) {
@@ -85,11 +96,10 @@ function ensureProxyConsent() {
     ack.addEventListener('change', () => { ok.disabled = !ack.checked; });
 
     const dialog = el('div', { class: 'dialog legaldialog' },
-      el('h3', {}, '启用反代前，请先确认'),
-      el('p', { class: 'askbody' }, PROXY_RISK_LINE),
-      el('p', { class: 'askbody legal-fine' }, '分发 Key 等同于你的额度钥匙，请勿外传；也不要把 8788 端口暴露到公网。'),
-      el('label', { class: 'legalack' }, ack, el('span', {}, '我已阅读上述说明，并自行承担由此产生的全部后果')),
-      el('div', { class: 'legal-fine' }, legalLink('完整条款', LEGAL_DOC_PATH), ' · ', legalLink('反代风险', PROXY_DOC_PATH)),
+      el('h3', {}, '启用本地反代前，请先同意以下条款'),
+      el('ol', { class: 'legalterms' }, ...PROXY_TERMS.map((text) => el('li', {}, text))),
+      el('label', { class: 'legalack' }, ack, el('span', {}, '我已阅读并同意上述全部条款，自愿承担相应风险')),
+      el('div', { class: 'legal-fine' }, legalLink('完整免责条款', LEGAL_DOC_PATH), ' · ', legalLink('反代风险说明', PROXY_DOC_PATH)),
       el('footer', { class: 'dialogfoot' }, cancel, ok));
     dialog.setAttribute('role', 'dialog');
     dialog.setAttribute('aria-modal', 'true');

@@ -393,6 +393,14 @@ html.rail #btn-nav-toggle::before { content: "\00BB" }
 .se-row.locked { color: var(--text-muted) }
 .se-row .ico { color: var(--text-faint) }
 .se-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.se-eye {
+  margin-left: auto; padding: 4px; width: 24px; height: 24px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; background: transparent; color: var(--text-faint); cursor: pointer;
+}
+.se-eye:hover { color: var(--text) }
+.se-eye:focus-visible { outline: 2px solid var(--accent); border-radius: 4px }
+.se-eye + .se-handle { margin-left: 0 }
 .se-lock { margin-left: auto; color: var(--text-faint); display: inline-flex }
 .se-handle {
   margin-left: auto; display: inline-flex; padding: 5px 4px; border-radius: 5px;
@@ -2215,6 +2223,9 @@ svg.wave { display: block; width: 100%; height: 150px }
 .px-mcard-q.ok { color: var(--ok) }
 .px-mcard-q.warn { color: var(--warn) }
 .px-mcard-q.bad { color: var(--danger) }
+.px-mcard-bottom { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-top: auto }
+.px-mcard-bottom > button { flex-shrink: 0 }
+.px-mcard > .px-testresult { min-width: 0; overflow-wrap: anywhere }
 .gd-outkey code {
   display: block; padding: 6px 8px; border-radius: 6px;
   background: var(--bg-raised); border: 1px solid var(--accent);
@@ -2504,6 +2515,8 @@ table.tbl td.acts > *:last-child { margin-right: 0 }
 .legalabout-item span { color: var(--text-muted) }
 
 .legaldialog { width: min(520px, calc(100vw - 96px)) }
+.legalterms { display: grid; gap: 7px; margin: var(--sp-3) 0 var(--sp-2); padding-left: 20px; font: 400 13px/1.66 var(--font-sans); color: var(--text-muted) }
+.legalterms li::marker { color: var(--warn); font-weight: 650 }
 .legalack { display: flex; align-items: flex-start; gap: var(--sp-2); margin: var(--sp-4) 0 var(--sp-2); font: 400 13px/1.6 var(--font-sans); color: var(--text); cursor: pointer }
 .legalack input { flex-shrink: 0; margin-top: 3px }
 .legal-fine { margin-top: var(--sp-2); font: 400 12px/1.7 var(--font-sans); color: var(--text-muted) }

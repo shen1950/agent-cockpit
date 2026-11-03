@@ -23,7 +23,7 @@ pub struct AppState {
 /// 同一个调用栈上，再拿一次就是自死锁。
 static CMD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn cmd_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn cmd_guard() -> std::sync::MutexGuard<'static, ()> {
     CMD_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -396,7 +396,7 @@ pub fn service_action(handle: &tauri::AppHandle, payload: &Value) -> Result<Valu
     // 所以界面看着是活的。锁只在真正落账的那一段拿。
     // Qoder 的探测/一键也走这条"锁外探测"的路：它们要等上游响应（国内版那条探测最坏 25 秒），
     // 持锁跑就是"点了没反应、别的动作全被挡"——2026-10-20 实测复现过。
-    if act.starts_with("chatgpt_") || app_id == "zcode" || matches!(
+    if act.starts_with("chatgpt_") || act.starts_with("zcproxy_") || app_id == "zcode" || matches!(
         act.as_str(),
         "key_test" | "key_probe_models" | "key_models"
             | "qproxy_probe" | "qproxy_oneclick"
@@ -1299,7 +1299,7 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             let mut renamed = String::new();
             let mut rename_note = String::new();
             // 名字已经等于读到的账号时压根不该走这一步——否则 rename_instance 原地改名会成功，
-            // 于是弹一条「账号名已从「shen1950」改成「shen1950」」的废话（她 10-14 抓到）
+            // 于是弹一条「账号名已从「demo_account_intl」改成「demo_account_intl」」的废话（她 10-14 抓到）
             if acct != name && usable && !taken && (placeholder || bound_here) {
                 let (o, m) = space::rename_instance(app_id, name, &acct);
                 if o {
@@ -2006,6 +2006,27 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             if o { ok(m) } else { err(m) }
         }
 
+        "open_project_link" => {
+            let path = payload["path"].as_str().unwrap_or("");
+            if !["", "/releases", "/releases/latest", "/issues", "/issues/new",
+                "/blob/HEAD/LICENSE", "/blob/HEAD/docs/USER_MANUAL.md",
+                // 法律与反代文档：界面上的「完整条款 / 风险与配置」直接指到这里
+                "/blob/HEAD/docs/LEGAL.md", "/blob/HEAD/docs/PROXY.md"].contains(&path) {
+                return Some(err("不支持的项目链接"));
+            }
+            let mut command = std::process::Command::new("explorer.exe");
+            command.arg(format!("https://github.com/shen1950/agent-cockpit{}", path));
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            match command.spawn() {
+                Ok(_) => ok("已在系统浏览器打开"),
+                Err(e) => err(format!("打开链接失败：{}", e)),
+            }
+        }
+
         "open_data_dir" => {
             let (o, m) = space::open_dir(&reg::base_dir().to_string_lossy());
             if o { ok(m) } else { err(m) }
@@ -2370,6 +2391,18 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
                 ok(k)
             }
         }
+
+        "zcproxy_setup" => match crate::zcproxy::setup() {
+            Ok(result) => json!({"ok":true,"msg":result["msg"],"result":result}), Err(message) => err(message),
+        },
+        "zcproxy_status" => json!({"ok":true,"result":crate::zcproxy::view()}),
+        "zcproxy_oneclick" => match crate::zcproxy::one_click(&st.proxy, payload["name"].as_str().unwrap_or("")) {
+            Ok(result) => json!({"ok":true,"msg":result["msg"],"result":result}), Err(message) => err(message),
+        },
+        "zcproxy_test" => {
+            let result = crate::zcproxy::test(payload["name"].as_str().unwrap_or(""), payload["model"].as_str().unwrap_or(""));
+            json!({"ok":result["ok"],"result":result})
+        },
 
         // ── MiniMax Code（见 mmproxy.rs）──
         // 上游是 Anthropic 协议（/messages），反代这层翻成 OpenAI 形状给客户端用。
@@ -3063,7 +3096,7 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
 }
 
 /// 一份档案"是谁、还在不在用"——用来代替原来那串路径 + MB。
-/// 用户面对 `C:\Users\USER\AppData\Roaming\com.qodercn.app.stable 1153 MB` 是选不出来的，
+/// 用户面对 `C:\Users\Example\AppData\Roaming\com.qodercn.app.stable 1153 MB` 是选不出来的，
 /// 她要的是"这是我天天在用的那份 / 这是那个早不登的旧号 / 这是空目录"。
 /// 只扫顶层目录的修改时间，不做整树遍历（一家 13 万个文件会卡住界面）。
 fn profile_facts(app_id: &str, dir: &Path, name: Option<&str>) -> Value {
