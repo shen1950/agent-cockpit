@@ -1,82 +1,62 @@
-# 第三方声明
+# 第三方组件、参考项目与致谢
 
-## 本项目许可
+核对日期：2026-11-05。许可证按所引用的版本核对；上游以后更改许可，不自动改变历史版本的许可。
 
-AgentCockpit 自身以 **MIT License** 发布，见 [LICENSE](LICENSE)，© 2026 shen1950。
+AgentCockpit 自有代码以 [MIT License](LICENSE) 提供，© 2026 shen1950。第三方代码、运行时、数据和素材仍受各自许可约束。本清单区分**功能参考、改写适配、随包组件和另行安装的组件**；致谢不能代替原许可要求，也不表示上游认可本项目。
 
-本文件列出本项目分发时所包含的第三方组件及其许可信息。**本文件不构成法律意见**；如需就分发合规取得确定性结论，请自行咨询专业法律人士。
+## 重点参考项目
 
-## 运行时依赖（不随本项目分发）
+| 项目与维护者 | 在 AgentCockpit 中的用途 | 参考版本与许可 | 分发边界 |
+|---|---|---|---|
+| **[Cockpit Tools](https://github.com/jlcodes99/cockpit-tools)** · jlcodes99 及贡献者 | Agent 平台登记清单、账号与实例隔离、ChatGPT/Codex 登录流程、本地会话用量展示等功能参考 | [`acc057d1fbc7d85d0aae288fdd2bc73581493d1e` 的 README 许可声明](https://github.com/jlcodes99/cockpit-tools/blob/acc057d1fbc7d85d0aae288fdd2bc73581493d1e/README.md#许可证)：**CC BY-NC-SA 4.0** | 本项目的相关实现位于 `registry.rs`、`chatgpt.rs`、用量模块等；该项目是行为和流程参考，不作为本程序的打包依赖。其代码与资源不能仅加致谢就按本项目 MIT 重新许可 |
+| **[Magpie](https://github.com/yetone/magpie)** · yetone 及贡献者 | Agent 接入本地网关、模型图片能力、视觉代读、上下文/输出/压缩设置、供应商调度与估算计价、路由连线展示 | [`d783df46cbac9021e26a6bd71ca0b55544552eb2` 的 LICENSE](https://github.com/yetone/magpie/blob/d783df46cbac9021e26a6bd71ca0b55544552eb2/LICENSE)：**MIT**，Copyright (c) 2026 yetone | 参考其交互与协议处理方式，在本项目 Rust 网关和原生前端中适配，使用本项目的接入密钥授权及账号结构；不打包 Magpie 应用。原许可完整保存在 [MAGPIE-LICENSE.txt](docs/third-party/MAGPIE-LICENSE.txt) |
+| **[CC Switch](https://github.com/farion1231/cc-switch)** · Jason Young 及贡献者 | CLI 配置切换、官方账号与第三方供应商配置分离、配置恢复与失败处理方式参考 | [LICENSE](https://github.com/farion1231/cc-switch/blob/main/LICENSE)：**MIT**，Copyright (c) 2025 Jason Young | 功能与配置行为参考，不作为本程序的运行时依赖 |
+| **[Our Free Model](https://github.com/Ebony-Vinyl/dsh-our-free-model)** · Ebony-Vinyl 及贡献者 | WorkBuddy、TRAE 等上游协议和图片内容传递方式的参考与交叉核对 | [`e490a98dc01c0fda3dfdaa3fa23ad49bf0acb7ec` 的 LICENSE](https://github.com/Ebony-Vinyl/dsh-our-free-model/blob/e490a98dc01c0fda3dfdaa3fa23ad49bf0acb7ec/LICENSE)：**MIT** | 参考项目。其 vendored channel-pack 有独立版权声明；分发该组件时应保留组件自带的 LICENSE/NOTICE，不能只保留仓库顶层署名 |
+| **[models.dev](https://github.com/anomalyco/models.dev)** · models.dev 贡献者 | 用户主动刷新时取得公开模型能力与价格目录，供本地能力补全和费用估算 | [LICENSE](https://github.com/anomalyco/models.dev/blob/dev/LICENSE)：**MIT**，Copyright (c) 2025 models.dev | 运行时取得并缓存目录数据；不将其视作服务商账单。许可原文见 [MODELS-DEV-LICENSE.txt](docs/third-party/MODELS-DEV-LICENSE.txt) |
 
-| 组件 | 说明 |
-|---|---|
-| **WebView2 Runtime** | 微软组件，Windows 11 自带，Windows 10 需单独安装。本项目不内嵌、不分发该运行时，其使用受微软的许可条款约束 |
-| **Rust 标准库 / MSVC 运行库** | 随 Rust 工具链与 Visual Studio 生成工具提供 |
-| **各 AI Agent 客户端** | 本项目只做启动、隔离与管理，不修改、不重分发任何 Agent 的程序文件 |
+Cockpit Tools 的具体对照入口另见 [ChatGPT 登录适配说明](docs/CHATGPT_LOGIN.md)。Magpie 的参考包括 `internal/agent/` 下的客户端适配与 `internal/gateway/vision.go`；本项目对应 `client_connect.rs`、`model_caps.rs`、`gateway_vision.rs`、`gateway_dispatch.rs`、`gateway_cost.rs` 和网关界面文件。
 
-## Rust 依赖许可分布
+**Cockpit Tools 不是 MIT 项目。** 其所用 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 包含署名、非商业及相同方式共享条件。借鉴功能不等于复制受保护表达；若后续引入其代码、文案、图标等材料，应逐项核对权限、保留署名并注明修改，不能因为重新编写部分代码就断言无需遵守原许可。商业使用该材料应核对上游商业授权要求。本声明不对整个仓库历史作“从未复制任何代码”的保证。
 
-后端依赖锁定在 `src-tauri/Cargo.lock`。当前共 **509 个第三方 crate**，许可分布如下（按数量排序，取前 12 组）：
+## 随程序包含的组件
 
-| 许可表达式 | 数量 |
-|---|---|
-| MIT OR Apache-2.0 | 236 |
-| MIT | 115 |
-| Apache-2.0 OR MIT | 50 |
-| Zlib OR Apache-2.0 OR MIT | 19 |
-| Unicode-3.0 | 18 |
-| MIT/Apache-2.0 | 13 |
-| Unlicense OR MIT | 10 |
-| Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 5 |
-| **MPL-2.0** | **5** |
-| Apache-2.0/MIT | 3 |
-| BSD-3-Clause | 3 |
-| ISC | 3 |
+### CPython 嵌入式运行时
 
-其余 29 个 crate 分散在小规模许可组中，包括 `Apache-2.0`(2)、`Zlib`(2)、`BSD-2-Clause OR Apache-2.0 OR MIT`(2)、`BSD-3-Clause OR Apache-2.0`(2)、`BSD-3-Clause OR MIT OR Apache-2.0`(2)、`CDLA-Permissive-2.0`(2)、`MIT OR Apache-2.0 OR LGPL-2.1-or-later`(2)、`MIT OR Zlib OR Apache-2.0`(2)、`Unlicense/MIT`(2)，以及若干单 crate 组（`0BSD OR MIT OR Apache-2.0`、`BSD-3-Clause AND MIT`、`CC0-1.0 OR MIT-0 OR Apache-2.0` 等）。
+便携程序内含官方 CPython Windows x64 嵌入式归档，用于本地用量采集，首次使用会在数据根解压。归档内的 `LICENSE.txt` 包含 Python Software Foundation 许可及所附第三方库声明，分发和解压时必须保留。版本、来源、文件摘要见 [src-tauri/vendor/README.md](src-tauri/vendor/README.md)。不能把“用户无需安装 Python”表述成“程序不包含第三方运行时”。
 
-**关于 MPL-2.0**：上表中的 5 个 MPL-2.0 crate（`cssparser`、`cssparser-macros`、`dtoa-short`、`option-ext`、`selectors`）来自 HTML 解析依赖链。MPL-2.0 是**文件级**的弱 copyleft：静态链接不会使整个作品受 MPL 约束，但对 MPL 文件本身的修改需按 MPL-2.0 提供源码。本项目未修改这些 crate。
+### Rust 与桌面依赖
 
-### 重新生成这份报告
+锁定清单见 `src-tauri/Cargo.lock`，前端开发工具清单见 `package-lock.json`。Cargo.lock 包含可选依赖及其他平台的包，**锁定条目数不等于最终 EXE 实际包含的包数**。原生前端不在发布时打包整个 `node_modules`。
 
-许可信息从本地 cargo registry 缓存中的 crate 元数据读取，因此反映的是**实际参与编译**的版本。依赖变动后请重新生成：
-
-```bash
-python tools/license_report.py                     # 打印全部分组
-python tools/license_report.py --top 12            # 只看最大的 12 组
-python tools/license_report.py --out LICENSES.md   # 写入文件
-```
-
-脚本只输出包名、版本与 SPDX 表达式，不含任何本机路径。若某个 crate 未在缓存中解包，会被归到 `UNKNOWN` 组——此时先跑一次 `cargo fetch` 再重新生成。
-
-## 主要直接依赖
-
-| Crate | 许可 | 用途 |
+| 主要依赖 | 许可表达式 | 用途 |
 |---|---|---|
-| `tauri` / `tauri-build` | Apache-2.0 OR MIT | 桌面应用框架 |
-| `tauri-plugin-autostart` | Apache-2.0 OR MIT | 开机自启 |
-| `tauri-plugin-notification` | Apache-2.0 OR MIT | 系统通知 |
-| `tauri-plugin-single-instance` | Apache-2.0 OR MIT | 单实例 |
+| `tauri` / `tauri-build` / Tauri 官方插件 | Apache-2.0 OR MIT | 桌面框架、托盘、通知与单实例等 |
 | `serde` / `serde_json` | MIT OR Apache-2.0 | 序列化 |
-| `toml` | MIT OR Apache-2.0 | 配置读写 |
+| `toml` | MIT OR Apache-2.0 | 配置处理 |
 | `sysinfo` | MIT | 进程与系统信息 |
-| `ureq` | MIT OR Apache-2.0 | HTTP 上游请求 |
-| `tiny_http` | MIT OR Apache-2.0 | 本地反代服务端 |
-| `zip` | MIT | 备份打包与恢复 |
-| `image` | MIT OR Apache-2.0 | 图标处理 |
-| `qrcode` | MIT OR Apache-2.0 | 远程配对二维码 |
-| `webview2-com` | MIT | WebView2 cookie 读取 |
-| `windows` | MIT OR Apache-2.0 | Win32 API |
+| `ureq` / `tiny_http` | MIT OR Apache-2.0 | HTTP 客户端与本地服务 |
+| `zip` | MIT | 备份打包 |
+| `image` / `qrcode` | MIT OR Apache-2.0 | 图像与二维码 |
+| `webview2-com` | MIT | WebView2 接口 |
+| `windows` | MIT OR Apache-2.0 | Win32 接口 |
 
-## 参考与致谢
+可运行 `python tools/license_report.py --out LICENSES.md` 生成**精确锁定版本**的许可索引；工具只读取本地缓存，不联网。不在缓存中的版本标为 `UNKNOWN`，使用 `license-file` 的包标为 `LICENSE-FILE`，都需进一步核对；不会拿其他版本的许可替代。该索引不等同于完整许可文本集合，也不是完整的软件物料清单。
 
-- **[farion1231/cc-switch](https://github.com/farion1231/cc-switch)**（MIT）：多平台 CLI 配置切换工具。本项目的「地板 / 独有 / 用户键三分法」「契约摘要」「pending 前滚」等思路受其启发，并沿用其硬规则：官方卡永不参与故障转移、第三方 Key 不写入 `auth.json`、暂存读不出就拒绝操作。
-- **[jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools)**：内置 Agent 登记表的平台清单参照其整理。
+发布者还需保留实际分发依赖的 LICENSE、COPYING、NOTICE 及必要的源码提供信息。部分 HTML 解析依赖采用 MPL-2.0，具体义务应以对应版本原文为准；本项目 MIT 不覆盖这些文件。Rust 标准库、MSVC 与 WebView2 的发布方式同样应以实际构建产物和各自许可核对。
 
-代码未直接复制上述项目；若权利人对署名方式有意见，请通过 [Issue](https://github.com/shen1950/agent-cockpit/issues) 联系，会立即调整。
+## 单独安装的可选组件
 
-## 商标
+| 组件 | 集成方式与许可边界 |
+|---|---|
+| **[zcode-api](https://github.com/TriDefender/zcode-api)** | ZCode Start Plan 可选桥接依赖，固定提交 `37155a5f75f3f2d7bde1b83054c8d6eb2e23a935`；[原 LICENSE](https://github.com/TriDefender/zcode-api/blob/37155a5f75f3f2d7bde1b83054c8d6eb2e23a935/LICENSE) 为 **CC BY-NC-SA 4.0**。由安装脚本另行取得并保留其源码与许可，不是 MIT 组件；不要把含该组件的安装目录、缓存或组合包整体标成“MIT、可任意商用”。来源与摘要见 [ZCode 说明](docs/zcode-start-plan.md) |
+| **AgentFind / agent-memory-suite** | 会话入口连接用户另行安装的本地 AgentFind 服务；本仓库不内嵌该服务源码。使用和另行分发时应核对所安装版本附带的许可，不能据本项目 MIT 推定其授权 |
+| **WebView2 Runtime** | 使用系统已安装的 Microsoft WebView2；安装器如包含下载或引导步骤，需同时遵守对应 Microsoft 条款 |
+| **被管理的 Agent 客户端** | 由用户独立安装并登录。本项目能够读取档案和修改接入配置，不代表取得重分发其程序、图标或商标的许可 |
 
-Qoder、WorkBuddy、TRAE、Cursor、Kiro、Windsurf、Antigravity、GitHub Copilot、Zed、Grok、Claude、ChatGPT、Codex、OpenAI、MiniMax、AStudio、千问、DeepSeek、Marvis、MiMo、CodeBuddy、妙手 等名称与商标归各自所有者所有。
+## 发布时保留的材料
 
-本项目**仅在本机范围内管理这些产品的账号与额度数据**，与上述任何厂商均无隶属、授权、赞助或合作关系。界面中出现的产品名称仅用于标识被管理的程序，不构成商标使用的授权主张，也不代表相关厂商对本项目的认可。
+源码快照及二进制发布应附上本项目 LICENSE、本声明、已引入材料的原版权/许可文本，以及实际分发依赖的必要 NOTICE。可选依赖是否进入安装包必须按最终文件核对，不能只根据“单独进程”判断许可关系。新增移植时记录来源 URL、固定版本、本地对应文件、修改范围及所保留声明。
+
+隐私清理可以替换开发者个人路径、测试身份和秘密数据，**不应删除上游作者的必要版权署名**。公开仓库账号及原许可证中的权利人信息有明确归属用途；如何清理其他发布资料见 [发布隐私检查](docs/PRIVACY_AUDIT.md)。
+
+产品名和商标归各自权利人所有。引用、兼容、署名和致谢均不表示本项目是上述项目的官方版本，或获得其维护者、厂商的赞助与认可。

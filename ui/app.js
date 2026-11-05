@@ -58,6 +58,7 @@ function applyAppearance(a = {}) {
     ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
     : pref;
   document.documentElement.dataset.theme = resolved;
+  $('sessions-frame')?.contentWindow?.postMessage({type: 'cockpit-theme', theme: resolved}, '*');
   document.documentElement.dataset.density = a.density === 'compact' ? 'compact' : 'comfortable';
   document.body.style.zoom = String((a.font_scale || 100) / 100);
   if (!navDrag.active) {
@@ -111,6 +112,8 @@ function ihelp(tip) { return qhelp(tip); }
    悬停有 tooltip 说清是什么；删除一直是红的。SVG 内联，不赌字体里有没有这个字形 */
 const ACT_ICONS = {
   test: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8h3l2-5.5 3 11 2-5.5h3"/></svg>',
+  // 「请求」：纸飞机，比对话气泡更贴「发一条出去」
+  chat: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.2 1.8 1.8 6.9l4.6 1.7 1.7 4.6 6.1-11.4z"/><path d="M6.4 8.6 14.2 1.8"/></svg>',
   edit: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.7 2.3a1.55 1.55 0 0 1 2.2 2.2L5.5 11.9l-3 .8.8-3 7.4-7.4z"/><path d="M2.5 14.4h5.2"/></svg>',
   copy: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.6" y="5.6" width="7.9" height="7.9" rx="1.6"/><path d="M10.4 3.6v-.1A1.9 1.9 0 0 0 8.5 1.6H3.7a1.9 1.9 0 0 0-1.9 1.9v4.8a1.9 1.9 0 0 0 1.9 1.9h.1"/></svg>',
   eye: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/></svg>',
@@ -131,6 +134,10 @@ function keyActTd(site, k) {
       ? el('span', { class: 'muted', title: '正在向站点发请求，等它回来' }, '测试中…')
       : iconBtn('test', () => keyTest(site.id, k.id),
         '测试：向站点的接入点发一次 GET /models，验证这把 Key 还能不能用'),
+    // 「请求」= 真发一条最小对话。模型清单打得通 ≠ key 真能用：
+    // 有的站点 /models 谁问都给（小红书 Dots 就这样），真调用才 403。
+    iconBtn('chat', (e) => keyChat(site.id, k.id, e.currentTarget),
+      '请求：真发一条最小对话（POST /chat/completions），验证上游认不认这把 Key。\n点名一个模型、只回 1 个字，几乎不耗额度'),
     iconBtn('edit', () => openKeyModal(site, k),
       '编辑：名称、来源、密钥与截止日期'),
     iconBtn('copy', () => copyKey(site.id, k.id, k.label || site.name),
@@ -168,6 +175,35 @@ async function keyTest(site, id) {
   } finally {
     KEY_TESTING.delete(sig);
     if (!patchKeyAct(site, id)) renderKeys(S.data);
+  }
+}
+/* 「请求」：真发一条最小对话，看上游到底认不认这把 key。
+   和「测试」分开是因为两件事结论不一样——测试只问「模型清单给不给看」，
+   有的站点谁问都给，于是坏 key 也显示可用（2026-11-05 小红书 Dots 实测）。
+   不落账、不整表重绘：只换这一个按钮的姿态，失败原因原样吐在 toast 里。
+   给 9 秒而不是默认 5.2 秒——上游那句原话常有一整行，5 秒来不及看完。 */
+async function keyChat(siteId, id, btn) {
+  if (btn && btn.dataset.busy === '1') return;
+  const prevTitle = btn ? btn.title : '';
+  if (btn) {
+    btn.dataset.busy = '1';
+    btn.disabled = true;
+    btn.style.opacity = '.45';
+    btn.title = '正在发请求，等上游回话（最多 20 秒）…';
+  }
+  try {
+    const r = await invoke('action', { payload: { action: 'key_chat', site: siteId, id } });
+    toast(r.msg, r.ok, r.ok ? 6000 : 9000);
+  } catch (e) {
+    const msg = String((e && (e.message || e)) || e).slice(0, 200);
+    toast(`这一步没跑通：${msg}`, false, 9000);
+  } finally {
+    if (btn) {
+      btn.dataset.busy = '';
+      btn.disabled = false;
+      btn.style.opacity = '';
+      btn.title = prevTitle;
+    }
   }
 }
 function iconBtn(act, handler, title) {
@@ -370,10 +406,12 @@ function expiryLabel(group) {
 }
 
 /* ---------------- 轻提示 ---------------- */
-function toast(msg, ok = true) {
+/* ms 可调：默认 5.2 秒够看「已保存」这种短话，但上游报错常常一整行，
+   5 秒看不完就消失了——需要久一点的调用方自己传（如「请求」验活）。 */
+function toast(msg, ok = true, ms = 5200) {
   const t = el('div', { class: ok ? '' : 'err' }, msg);
   $('toast').appendChild(t);
-  setTimeout(() => t.remove(), 5200);
+  setTimeout(() => t.remove(), ms);
 }
 
 /* 发布版没有 devtools：渲染出错要当场写在页面上，否则只剩一片空白让人猜 */
@@ -492,6 +530,7 @@ function render() {
   renderNav(d);
   renderViews();
   globalThis.UsageDashboard?.setVisible(S.view === 'usage', invoke);
+  globalThis.GatewayRoutes?.setVisible(S.view === 'proxy', d);
   // 签到状态：整份缓存由 4 秒一轮的 state 带回来。这一页自己那份 S.checkin 只用来
   // 触发刷新，显示一律以 state 里更新鲜的那份为准——否则页面会停在进来那一刻的旧数上。
   const dc = d.checkin || {};
@@ -501,22 +540,19 @@ function render() {
   // 首页不盖侧栏——它就是"从左边挑一个 Agent"的入口。
   document.querySelector('.layout').classList.toggle('full', S.view !== 'agents' && S.view !== 'home');
   $('btn-settings').setAttribute('aria-current', String(S.view === 'settings'));
-  if (S.view === 'home') renderHome(d);
+  if (S.view === 'home') { renderHome(d); renderPerks(d); renderProcs(d); }
   if (S.view === 'agents') {
-    // 卡片/福利/进程这三块每轮都整块重建：清空的那一瞬间 scrollHeight 没了，
-    // 浏览器把 scrollTop 夹回 0——看起来就是"点一下按钮，整个页面跳回最上面"（4 秒轮询同样会跳）
+    // 卡片每轮都整块重建：清空的那一瞬间 scrollHeight 没了，浏览器把 scrollTop 夹回 0——
+    // 看起来就是"点一下按钮，整个页面跳回最上面"（4 秒轮询同样会跳）
+    // （「福利活动」「运行中的进程」已经搬到首页，不再跟着这一页重建）
     const pb = document.querySelector('#view-agents .pagebody');
     if (pb && agentsKey) agentScrolls.set(agentsKey, pb.scrollTop);
     agentsKey = `${S.view}|${S.cur}`;
     const restore = agentScrolls.get(agentsKey) || 0;
     renderToolbar(d);
+    gatewayClient.render(d);
     // 卡片正在拖拽时别重建：整块 clear 会把被拖的卡和目标提示一起抹掉
     if (!cardDrag) renderCards(d);
-    renderPerks(d); renderProcs(d);
-    // 反代面板里挂着模型下拉：下拉弹层开着时（焦点停在 select 上）整块重建会
-    // 把 <select> 从 DOM 里拔掉，WebView2 立刻收起弹层——就是"还没选它自己闪没"。
-    // 焦点在面板里就跳过这一拍，选完或点到别处，下一拍自动恢复。
-    if (!editingIn('#agent-proxy')) renderAgentProxy(d);
     if (pb) restoreScroll(pb, restore);
   }
   // 反代页整页重建，4 秒轮询每拍都走一次：不套护栏就 4 秒跳一次
@@ -539,7 +575,7 @@ function render() {
   }
 }
 
-/* 顶栏「反代 :8788」点谁：最近一次从哪个 Agent 面板开的反代（一键反代 / 向导接通都会记下）。
+/* 顶栏「反代 :8788」点谁：最近一次接通的是哪个 Agent（向导接通时会记下）。
    不记得就回「模型反代」总页面——那里能看到所有上游组，猜一个 Agent 反而会骗人。 */
 function rememberProxyApp(id) {
   S.proxyApp = id;
@@ -557,14 +593,40 @@ function proxyJumpApp(d) {
 function proxyChipGo() {
   const d = S.data;
   if (!d || !d.proxy) return;
-  // 停止：去「模型反代」页自己开；运行中：回到最近接入的 Agent 页
+  // 停止：去「模型反代」页自己开；运行中：回到最近接入的 Agent 页，定位到它的「接入本地网关」
   const app = d.proxy.running ? proxyJumpApp(d) : '';
   if (!app) { S.view = 'proxy'; render(); return; }
   S.view = 'agents';
   S.cur = app;
   render();
-  const panel = $('agent-proxy-panel');
+  const panel = $('gateway-client');
   if (panel) requestAnimationFrame(() => panel.scrollIntoView({ block: 'start' }));
+}
+
+/* 跳到页内某一块（不是只切页面）。
+   切换视图那一拍整页刚重建，布局要到下一帧才算完；首页还会在重建后用旧 scrollTop
+   还原一次滚动（renderHome 里的 restoreScroll，也是 rAF）。所以这里排到两帧之后再滚，
+   否则刚滚过去就被那条还原指令拽回原处——这就是"点了没反应"的来源。
+   滚完再闪一下，眼睛才能立刻落到目标上。 */
+function jumpToPanel(target) {
+  if (!target) return;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (!target.isConnected) return;
+    try { target.scrollIntoView({ block: 'start', behavior: 'smooth' }); }
+    catch { target.scrollIntoView(); }
+    target.classList.remove('jump');
+    void target.offsetWidth;      // 强制重排，同一块连着点两次也要重放动画
+    target.classList.add('jump');
+    setTimeout(() => target.classList.remove('jump'), 1400);
+  }));
+}
+
+/* 顶栏「运行中 N」：回首页并定位到「运行中的进程」那一块。
+   进程表已经统一收到首页，这里必须滚到位置上——只切到首页，人还得自己往下翻。 */
+function runChipGo() {
+  S.view = 'home';
+  render();
+  jumpToPanel($('home-procs'));
 }
 
 function renderChips(d) {
@@ -576,7 +638,8 @@ function renderChips(d) {
   $('c-inst').querySelector('span').textContent = `账号 ${d.stats.instances}`;
   const runChip = $('c-run');
   runChip.querySelector('span').textContent = `运行中 ${d.stats.running}`;
-  runChip.title = `${d.stats.running} 个 Agent 程序在跑（其中 ${d.stats.running_instances} 个是本工具的独立实例）`;
+  runChip.title = `${d.stats.running} 个 Agent 程序在跑（其中 ${d.stats.running_instances} 个是本工具的独立实例）`
+    + '\n点击回首页，定位到「运行中的进程」';
   runChip.classList.toggle('on', d.stats.running > 0);
   const pc = $('c-proxy');
   pc.querySelector('span').textContent = d.proxy.running ? `反代 :${d.proxy.port}` : '反代 停止';
@@ -585,7 +648,7 @@ function renderChips(d) {
     const ja = proxyJumpApp(d);
     const nm = ja ? ((d.apps.find((a) => a.id === ja) || {}).name || ja) : '';
     pc.title = nm
-      ? `反代正在 127.0.0.1:${d.proxy.port} 服务\n点击回到「${nm}」的模型反代`
+      ? `反代正在 127.0.0.1:${d.proxy.port} 服务\n点击回到「${nm}」的接入本地网关`
       : `反代正在 127.0.0.1:${d.proxy.port} 服务\n点击打开「模型反代」`;
   } else {
     pc.title = '反代没在跑\n点击打开「模型反代」';
@@ -805,7 +868,7 @@ function applyNavSort(fromId, toId, after) {
 
 /* 视图切换只换右栏内容：每页自己分「左菜单 + 右内容」，标题栏固定不滚 */
 function renderViews() {
-  for (const v of ['home', 'agents', 'usage', 'collab', 'keys', 'proxy', 'remote', 'checkin', 'settings']) {
+  for (const v of ['home', 'agents', 'sessions', 'usage', 'collab', 'keys', 'proxy', 'remote', 'checkin', 'settings']) {
     $(`view-${v}`).hidden = S.view !== v;
   }
 }
@@ -1039,10 +1102,10 @@ function renderHome(d) {
   if (log.length) {
     host.appendChild(el('section', { class: 'panel' },
       el('header', { class: 'panelhead' }, el('h2', {}, '最近领过的'),
-        qhelp('仅记录本机领取操作。')),
+        qhelp('本机领取与官方客户端手动签到都记在这里。')),
       el('div', { class: 'hlog' }, ...log.map((x) => {
         const t = ciLogTone(x);
-        const cls = t.cls === 'ok' ? 'hlog-ok' : t.cls === 'mid' ? 'hlog-mid' : 'hlog-no';
+        const cls = t.cls === 'ok' ? 'hlog-ok' : t.cls === 'bad' ? 'hlog-no' : 'hlog-mid';
         return el('div', { class: 'hlogrow' },
           el('span', { class: 'hlog-t' }, `${x.at || ''} ${CI_NAMES[x.store] || x.store}`),
           el('span', { class: cls, title: t.word }, t.word));
@@ -1075,11 +1138,18 @@ async function claimAllCheckin() {
     (x) => x.claimable === true && !x.error && x.scope !== 'account');
   let items = pick(S.checkin);
   if (!items.length) {
-    // 手上这份可能是旧的：先强制读一次，再决定要不要领
-    const r = await invoke('action', { payload: { action: 'checkin_refresh' } }).catch(() => null);
-    if (r && r.ok) { S.checkin = r; items = pick(r); }
+    // 手上这份可能是旧的，也可能刚开机还没查回来。刷新现在是**后台跑**（立刻回快照），
+    // 所以不能像以前那样"调一次就拿到新结果"：先让它去刷，再等几秒轮着看。
+    // 最长等 6 秒——查一圈本来就要几秒，等不到就老实说"还没查回来"，别硬领。
+    await invoke('action', { payload: { action: 'checkin_refresh' } }).catch(() => null);
+    for (let i = 0; i < 8 && !items.length; i++) {
+      await new Promise((r) => setTimeout(r, 800));
+      const v = await invoke('action', { payload: { action: 'checkin_view' } }).catch(() => null);
+      if (v && v.ok) { S.checkin = v; items = pick(v); }
+      if (v && v.ok && !v.refreshing) break;
+    }
   }
-  if (!items.length) { toast('今天没有可领的了', true); load(); return; }
+  if (!items.length) { toast('今天没有可领的（或者各家状态还没查回来，稍等一下再点）', true); load(); return; }
   const lines = items.map((x) => {
     const name = x.name || CI_NAMES[x.product] || x.product;
     const what = x.mode === 'travel' ? '派出猫猫（到点了再回来领）'
@@ -1133,13 +1203,19 @@ async function loadCheckin(force) {
   const r = await invoke('action', { payload: { action: force ? 'checkin_refresh' : 'checkin_view' } })
     .catch((e) => ({ ok: false, msg: String(e) }));
   ciLoading = false;
+  // 「刷新状态」现在立刻返回：它只是把后台那轮叫起来，结果由 4 秒一轮的 state 带回来。
+  // 所以提示要改口——不能再说"状态已更新"，那是同步时代的话。
+  const started = !!(r && r.ok && r.refreshing);
   if (r && r.ok) {
     // 别用旧的把新的盖回去：后台刷出来的那份可能比这次返回的还新
     if ((r.fetched_at || 0) >= ((S.checkin || {}).fetched_at || 0)) S.checkin = r;
   } else if (!cur) {
     S.checkin = r || { ok: false, msg: '没读到' };
   }
-  if (force) toast(r && r.ok ? '状态已更新' : `读不到：${(r && r.msg) || '未知'}`, !!(r && r.ok));
+  if (force) {
+    toast(started ? '已开始刷新，结果几秒后自己更新'
+      : (r && r.ok ? '状态已更新' : `读不到：${(r && r.msg) || '未知'}`), !!(r && r.ok));
+  }
   renderCheckin();
 }
 
@@ -1264,7 +1340,9 @@ function ciAction(it, name) {
       ? (step === 'wait'
         ? `猫猫还在路上${it.arrive_at ? `，约 ${it.arrive_at} 到` : ''}，到点了这一格会变成「领取」`
         : '今天这一趟已经领过了，明天再来')
-      : (it.signed_today === true ? '今天这份已经到手了，明天再来' : '现在没有可领的，点了也是白点'))
+      : (it.signed_today === true
+        ? (act ? '今天这个号已经发过对话了，明天再来（积分次日到账）' : '今天这份已经到手了，明天再来')
+        : '现在没有可领的，点了也是白点'))
     : (travel
       ? (step === 'depart' ? '派猫猫出门旅行（写操作）：每天只能派一次，1~4 小时后到，到点了再回来点「领取」'
         : '领取这一趟的旅行奖励（写操作）')
@@ -1344,6 +1422,37 @@ function ciRefreshBtn(it) {
   return b;
 }
 
+/* 「补记」：她自己在官方客户端里签的（或国际版当天在客户端里用过），驾驶舱
+   日志里没有这一笔。点一下补一条日志、标注"非驾驶舱领取"，并把今天记成完成，
+   免得自动领再发一次。旅行猫的派出/领取两步都由驾驶舱管，不在此列。 */
+function ciExternalBtn(it, name) {
+  if (it.pending || it.unreadable || it.error || it.shared) return null;
+  if (it.mode === 'travel') return null;
+  if ((it.scope || 'product') !== 'account' && (S.checkin || {}).items) {
+    // 按账号各记各的产品，产品行上补记说不清是哪个号——只在这家的账号行上给
+    const hasKids = S.checkin.items.some((x) => x.scope === 'account' && x.parent === it.product);
+    if (hasKids) return null;
+  }
+  return btn('补记', 'sm ci-ext', async () => {
+    const yes = await askConfirm(
+      `补记「${name}」今天在官方客户端手动签过吗？\n\n`
+      + '日志会写一条「官方客户端手动签到（非驾驶舱领取）」，并把今天标记为已完成，'
+      + '驾驶舱不会再替这个号重复领。',
+      { title: '补记外部签到' });
+    if (!yes) return;
+    const r = await invoke('action', { payload: {
+      action: 'checkin_external', store: it.product,
+      account: it.scope === 'account' ? (it.account || '') : '',
+    } }).catch((e) => ({ ok: false, msg: String(e) }));
+    if (!r || !r.ok) {
+      toast(`没记上：${(r && (r.msg || r.error)) || '未知原因'}`, false);
+      return;
+    }
+    toast(r.already ? '今天已经记过了' : (r.message || '已补记'), true);
+    loadCheckin(true);
+  }, '我已在官方客户端手动签到：记入日志（标注非驾驶舱领取），并标记今天完成');
+}
+
 /* 卡片上的签到角标。状态是只读的、信息量小，放得下；动作（去领）留在「每日签到」页，
    点角标直接跳那一页。缓存里没这家（不支持签到）就什么都不画——摆个"未查"是噪音 */
 function checkinMark(i) {
@@ -1376,6 +1485,25 @@ const CI_COLS = ['产品', '状态', '连签', '每日', '累计', '活动截止
 
 function ciRule(grid) { grid.appendChild(el('div', { class: 'ci-rule' })); }
 
+/* 产品名/账号名被列宽截断时（邮箱尤其长），悬停给出完整内容。
+   只在真的溢出时才弹——没截断的行不该一碰就冒气泡；气泡复用问号那一套 #qtip，
+   比原生 title 好看、也不用等那一秒。 */
+function ciNameEl(text) {
+  const s = el('span', { class: 'ci-nm', aria: { label: text } }, text);
+  s.addEventListener('mouseenter', () => {
+    if (qtipAnchor || s.scrollWidth <= s.clientWidth + 1) return;
+    qtipShow(s, text, false);
+  });
+  s.addEventListener('mouseleave', () => { if (!qtipAnchor) qtipHide(); });
+  // 点一下也能看全（触屏/鼠标不好停的时候），再点一次收掉
+  s.addEventListener('click', () => {
+    if (qtipAnchor === s) { qtipHide(); return; }
+    if (s.scrollWidth <= s.clientWidth + 1) return;
+    qtipShow(s, text, true);
+  });
+  return s;
+}
+
 function ciCells(grid, it, autoOn, opts) {
   const o = opts || {};
   const name = it.name || CI_NAMES[it.product] || it.product;
@@ -1396,7 +1524,7 @@ function ciCells(grid, it, autoOn, opts) {
     });
     nmRow.appendChild(f);
   }
-  nmRow.appendChild(el('span', { class: 'ci-nm' }, name));
+  nmRow.appendChild(ciNameEl(name));
   if (it.note) nmRow.appendChild(ihelp(it.note));
   if (o.kids) nmRow.appendChild(el('span', { class: 'ci-kids' }, `${o.kids} 个账号`));
   nameCell.appendChild(nmRow);
@@ -1424,7 +1552,10 @@ function ciCells(grid, it, autoOn, opts) {
   grid.appendChild(el('span', { class: 'ci-num', title: it.days_signed ? `本季签了 ${it.days_signed} 天` : '' },
     it.total != null ? `${it.total}` : '—'));
   grid.appendChild(el('span', { class: 'ci-num' }, it.ends_on || '—'));
-  grid.appendChild(el('div', { class: 'ci-act' }, ciAction(it, name)));
+  const actCell = el('div', { class: 'ci-act' }, ciAction(it, name));
+  const extBtn = ciExternalBtn(it, name);
+  if (extBtn) actCell.appendChild(extBtn);
+  grid.appendChild(actCell);
   // 「自动领」「提醒」是**按产品**设的开关，账号行不重复摆——同一个产品摆两排同样的勾，
   // 勾哪一个生效就说不清了。这里写清楚它跟着上面那行走。
   if (o.account) {
@@ -1473,15 +1604,33 @@ async function saveCheckinAuto(store, on) {
 function renderCheckin() {
   const host = $('checkin-body');
   if (!host) return;
-  // 重建会让内容瞬间塌高，外层 pagebody 的 scrollTop 被浏览器夹回 0，先记住再还回去
-  const pb = host.closest('.pagebody');
-  const keep = pb ? pb.scrollTop : 0;
-  clear(host);
   const d = S.checkin;
   const st = (S.data && S.data.settings && S.data.settings.checkin) || {};
   S.checkinAuto = S.checkinAuto || st.auto || {};
   S.checkinMute = S.checkinMute || st.remind_mute || {};
   S.checkinEnabled = st.enabled;
+  // 4 秒一轮的状态报文内容没变就别整页重建：日志列表（.cilogrows）自己有滚动条，
+  // 每次重建都是新元素，scrollTop 归零——往下翻日志时整页每 4 秒闪回一次顶部，
+  // 下面的部分永远翻不到（2026-11-04）。内容真的变了才重建。
+  const sig = JSON.stringify([d && d.items, d && d.state, d && d.placeholder,
+    // ciLoading 不进签名：它只是状态栏的"正在刷新…"字样，跳过重建时那行
+    // 文字会单独更新；进签名会让每次点补记/刷新都白重建一遍
+    d && d.refreshing, st, S.ciLogRange, S.ciFold, S.ciWait,
+    S.checkinAuto, S.checkinMute]);
+  if (sig === S.ciRenderSig && host.firstChild) {
+    const span = host.querySelector('.ci-status');
+    if (span) span.textContent = ciStatusText(d);
+    return;
+  }
+  S.ciRenderSig = sig;
+  // 重建会让内容瞬间塌高，外层 pagebody 的 scrollTop 被浏览器夹回 0，先记住再还回去
+  const pb = host.closest('.pagebody');
+  const keep = pb ? pb.scrollTop : 0;
+  // 日志列表自己的滚动位置同理：重建后按原位放回去。换时间范围由按钮显式清零。
+  const prevLog = host.querySelector('.cilogrows');
+  const logTop = S.ciLogKeep != null ? S.ciLogKeep : (prevLog ? prevLog.scrollTop : 0);
+  S.ciLogKeep = null;
+  clear(host);
   const bar = el('div', { class: 'cibar' },
     el('label', { class: 'cisw' }, (() => {
       const cb = el('input', { type: 'checkbox' });
@@ -1514,11 +1663,7 @@ function renderCheckin() {
       remind_at: /^\d{1,2}:\d{2}$/.test(at.value.trim()) ? at.value.trim() : '10:05',
     });
   }));
-  bar.appendChild(el('span', { class: 'cilab' },
-    d && d.placeholder ? '正在问各家…'
-      : d && d.fetched_at
-        ? `状态查于 ${stampTime(d.fetched_at)}${d.refreshing || ciLoading ? ' · 正在刷新…' : ''}`
-        : '还没查过'));
+  bar.appendChild(el('span', { class: 'cilab ci-status' }, ciStatusText(d)));
   host.appendChild(bar);
   if (!d || !d.ok) {
     host.appendChild(el('div', { class: 'qempty' }, `读不到签到状态：${(d && d.msg) || '没数据'}`));
@@ -1579,8 +1724,19 @@ function renderCheckin() {
   // 平时可以只显示近一天的，但是我要可以选择近几天的"。
   // 所以后端保留 2000 条（每天十来条，够一年），界面按天筛——不再压成"最近 6 条"。
   host.appendChild(ciLogPanel(d));
+  if (logTop > 0) {
+    const nl = host.querySelector('.cilogrows');
+    if (nl) nl.scrollTop = logTop;
+  }
   if (today) host.appendChild(el('div', { class: 'cihint' }, `厂商侧的「今天」按本机日期算：${today}`));
   if (pb) restoreScroll(pb, keep);
+}
+
+function ciStatusText(d) {
+  return d && d.placeholder ? '正在问各家…'
+    : d && d.fetched_at
+      ? `状态查于 ${stampTime(d.fetched_at)}${d.refreshing || ciLoading ? ' · 正在刷新…' : ''}`
+      : '还没查过';
 }
 
 /* 本地日期串 YYYY-MM-DD：和后端 agenthub 报的 `today` / 日志里的 `at` 同一格式，
@@ -1597,6 +1753,11 @@ function localDay(offset = 0) {
    等于把一次成功的派出说成事故（她 2026-10-23 圈的正是这条）。
    签到页日志、首页「最近领过的」、导出 CSV 三处共用这一个判据。 */
 function ciLogTone(x) {
+  // 外部签到：她在官方客户端自己签的（或自动检测到的），不是驾驶舱领的，
+  // 单独一个颜色，跟"领到"的绿、"没领成"的红都分开
+  if (x.source === 'external') {
+    return { cls: 'ext', word: x.message || '官方客户端签到（非驾驶舱领取）' };
+  }
   if (x.claimed === true) {
     return { cls: 'ok', word: `领到${x.credit != null ? ` ${x.credit}` : ''}${x.message ? ` · ${x.message}` : ''}` };
   }
@@ -1634,7 +1795,12 @@ function ciLogPanel(d) {
     head.appendChild(el('button', {
       class: `ci-chip${range === id ? ' on' : ''}`, type: 'button',
       title: id === 'all' ? '台账里保留的全部记录（后端留最近 2000 条）' : `只看${label}`,
-    }, label)).addEventListener('click', () => { S.ciLogRange = id; renderCheckin(); });
+    }, label)).addEventListener('click', () => {
+      S.ciLogRange = id;
+      // 换了时间范围，旧列表的滚动位置对新列表没意义，从头看
+      S.ciLogKeep = 0;
+      renderCheckin();
+    });
   }
   head.appendChild(btn('导出', 'sm', () => ciLogExport(rows), '把当前这几天的记录导成 CSV（Excel 能直接开）'));
   box.appendChild(head);
@@ -1666,7 +1832,7 @@ function ciLogExport(rows) {
   for (const x of rows) {
     lines.push([
       x.at || '', CI_NAMES[x.store] || x.store || '', x.account || '',
-      x.claimed ? '领到' : x.settling ? '已推进（等到账）' : x.already ? '已领过' : '没领成',
+      x.source === 'external' ? '官方客户端签到' : x.claimed ? '领到' : x.settling ? '已推进（等到账）' : x.already ? '已领过' : '没领成',
       x.credit == null ? '' : x.credit,
       (x.error || x.message || '').replace(/[\r\n]+/g, ' '),
     ].map(esc).join(','));
@@ -2706,7 +2872,9 @@ function identLine(i) {
     return el('div', { class: `ident ${auth.has_auth ? 'logged' : 'none'}` }, label);
   }
   const id = i.identity || { state: 'none', label: '' };
-  return el('div', { class: `ident ${id.state}` }, id.label);
+  // elsewhere：登录态不在档案目录里的产品（WorkBuddy 存在系统凭据位置）。
+  // 这种卡没有"没登录"这回事，颜色跟 init 一样走中性，话术后端已经写清楚了。
+  return el('div', { class: `ident ${id.state === 'elsewhere' ? 'init' : id.state}` }, id.label);
 }
 // 「现在用的是哪个号」这一枚标记：能多开/靠 junction 换目录的产品看磁盘（⇄当前账号），
 // 几个账号共用一份档案的产品看客户端登录态（⇄本机登录中）——磁盘记录不会随登录变化。
@@ -2947,6 +3115,11 @@ function card(i, app) {
     if (i.logged_in) {
       primary = btn('▶ 打开', 'primary sm', () => openClient(i.app, i.name),
         `这份档案现在登的就是「${i.name}」，打开就是它。不用换号，也不会动任何进程。`);
+    } else if (i.pack_foreign) {
+      // 这张卡存的其实是另一个号的登录态：切过去只会把别人再登一次，得先找回它自己的
+      primary = btn('找回它的登录态', 'primary sm', () => recoverAuthPack(i.app, i.name),
+        `这张卡里存的是「${(i.quota && i.quota.pack_account) || i.pack_account}」的登录态，不是「${i.name}」。\n`
+        + '从换号前的自动备份里把它自己的登录态找回来；找不到就只能在客户端里登它一次。');
     } else if (app.auth_switch && i.auth_pack) {
       primary = btn('⇄ 切换到此账号', 'primary sm', () => authSwitch(i.app, i.name),
         `把「${i.name}」存过的登录态写回 ${i.app_name} 的档案位置，然后自动重开客户端。\n`
@@ -3243,16 +3416,57 @@ function pxState(appId) {
   if (!S.agentPx[appId]) S.agentPx[appId] = { model: '', test: null, testing: false };
   return S.agentPx[appId];
 }
-function pxHead(title, hint, actions) {
-  return el('div', { class: 'px-head' },
+function pxHead(title, hint, actions, foldKey) {
+  return el('div', { class: `px-head${foldKey && pxFolded(foldKey) ? ' folded' : ''}` },
     el('div', { class: 'px-title' },
       el('b', {}, title),
       hint ? el('span', { class: 'px-hint' }, hint) : null),
     el('span', { class: 'sp' }),
-    ...(actions || []));
+    ...(actions || []),
+    foldKey ? pxFoldBtn(foldKey) : null);
 }
 function pxEmpty(text) { return el('div', { class: 'px-empty' }, text); }
 function pxNote(text, bad) { return el('div', { class: `px-note${bad ? ' bad' : ''}` }, text); }
+
+/* ---------------- 反代总页的收起 / 展开 ----------------
+   密钥与模型动辄几十条，整页往下拖太占地方。三块（反代全景 / 上游组 / 接入密钥）
+   和反代全景里的每个 Agent 分组各给一个按钮，状态只记「哪几块被收起了」，
+   存 localStorage（`cockpit-proxy-fold`），重开驾驶舱还是上次的样子；默认全展开。 */
+const PX_FOLD_KEY = 'cockpit-proxy-fold';
+function pxFoldMap() {
+  const st = S.proxyPage;
+  if (st.foldMap) return st.foldMap;
+  let m = {};
+  try { m = JSON.parse(localStorage.getItem(PX_FOLD_KEY) || '{}') || {}; } catch (e) { m = {}; }
+  if (!m || typeof m !== 'object') m = {};
+  st.foldMap = m;
+  return m;
+}
+function pxFolded(key) { return pxFoldMap()[key] === true; }
+function pxSetFold(key, folded) {
+  const m = pxFoldMap();
+  if (folded) m[key] = true; else delete m[key];
+  try { localStorage.setItem(PX_FOLD_KEY, JSON.stringify(m)); } catch (e) { /* 隐私模式下写不进去就只在本会话生效 */ }
+}
+/* 只记账、不重绘：给「左栏点小节 → 自动展开再滚过去」用 */
+function pxUnfold(key) { pxSetFold(key, false); }
+function pxFoldBtn(key, openText = '展开', foldText = '收起') {
+  const folded = pxFolded(key);
+  return btn(folded ? openText : foldText, 'sm', () => {
+    pxSetFold(key, !folded);
+    rerenderProxy();
+  }, folded ? '展开这一块' : '收起这一块，少占地方（会记住）');
+}
+/* 折叠体：收起时整块不占高度；展开提示写在标题行里，免得收起来后不知道里面是什么 */
+function pxFoldBody(key) {
+  const box = el('div', { class: 'px-foldbody' });
+  box.hidden = pxFolded(key);
+  return box;
+}
+function pxFoldHint(key, hint) {
+  return pxFolded(key) ? `${hint} · 已收起` : hint;
+}
+
 function pxRow(label, value, actions) {
   return el('div', { class: 'px-row' },
     el('span', { class: 'px-k' }, label),
@@ -3264,9 +3478,6 @@ function pxAccountTable(cols, rows) {
   t.appendChild(el('thead', {}, el('tr', {}, ...cols.map((c) => el('th', {}, c)))));
   t.appendChild(el('tbody', {}, ...rows));
   return el('div', { class: 'tablewrap' }, t);
-}
-function pxModelOf(models, id) {
-  return (models || []).find((m) => m.id === id) || null;
 }
 function pxModelLabel(m) {
   return `${m.name && m.name !== m.id ? `${m.name} · ` : ''}${m.id}`;
@@ -3419,589 +3630,6 @@ function pxTestLine(st) {
     el('span', { class: 'px-testbits' }, bits.join(' · ') || (detail || '没有返回详情')),
     detail ? el('div', { class: 'px-testdetail', title: String(detail) }, String(detail).slice(0, 320)) : null);
 }
-function pxKeyAction(kind) {
-  if (kind === 'q') return { get: () => S.qkey, set: (v) => { S.qkey = v; }, reveal: 'qproxy_reveal' };
-  if (kind === 'w') return { get: () => S.wkey, set: (v) => { S.wkey = v; }, reveal: 'wproxy_reveal' };
-  if (kind === 'a') return { get: () => S.akey, set: (v) => { S.akey = v; }, reveal: 'astudio_reveal' };
-  if (kind === 'mm') return { get: () => S.mmkey, set: (v) => { S.mmkey = v; }, reveal: 'minimax_reveal' };
-  if (kind === 'qw') return { get: () => S.qwkey, set: (v) => { S.qwkey = v; }, reveal: 'qwbridge_reveal' };
-  if (kind === 'paw') return { get: () => S.pawkey, set: (v) => { S.pawkey = v; }, reveal: 'pawbridge_reveal' };
-  return { get: () => S.tkey, set: (v) => { S.tkey = v; }, reveal: 'trae_reveal' };
-}
-function pxAccess(d, kind, dist, modelId, modelName) {
-  const base = proxyBase(d);
-  const ka = pxKeyAction(kind);
-  const cached = ka.get();
-    const keyNode = el('code', { class: 'mono' }, cached || dist?.masked || '还没有：点右边「生成密钥」一把搞定');
-  const ensureKey = async () => {
-    if (ka.get()) return ka.get();
-    if (!dist) return '';
-    const r = await invoke('action', { payload: { action: ka.reveal } });
-    if (!r.ok) { toast(r.msg, false); return ''; }
-    ka.set(r.msg);
-    keyNode.textContent = r.msg;
-    return r.msg;
-  };
-  const reveal = dist ? btn(cached ? '复制' : '显示', 'sm', async () => {
-    const key = await ensureKey();
-    if (key) copyText(key);
-  }, '显示完整接入密钥并复制') : null;
-  // 密钥没生成时就地给一个生成入口：调后端的一键接线（ensure_wiring 只补缺的，
-  // 池子和密钥已存在时原样复用），成功后刷新面板把新 key 显示出来。
-  const genKey = !dist ? btn('生成密钥', 'primary sm', async () => {
-    const oc = { paw: 'pawbridge_oneclick', qw: 'qwbridge_oneclick' }[kind];
-    if (!oc) { toast('到「接入密钥」表生成一把，或点面板的「一键反代」', false); return; }
-    toast('正在接线（缺什么补什么，已有的不动）…');
-    try {
-      const r = await invoke('action', { payload: { action: oc } });
-      toast(r.msg || (r.ok ? '已就绪' : '没成'), !!r.ok);
-    } catch (e) {
-      toast(String(e), false);
-    }
-    load();
-  }, '自动建好上游组和接入密钥（已存在的原样复用，不会重复建）；密钥已有时这步只做确认') : null;
-  // 给客户端的 Model 一律带 Agent 前缀（qoder/xxx、workbuddy/xxx、trae/xxx）：
-  // 同名模型不会漂到别家，指向固定在这一家的上游。
-  // 模型一律带 Agent 前缀：glm-5.3-flash / kimi-k3 这些每家都有，裸名会串到别家去。
-  // 反代见到 `owner/模型` 会先按前缀挑上游、再把报文里剥成裸名（见 proxy.rs split_namespaced）。
-  const nsOwner = kind === 't' ? 'trae'
-    : kind === 'a' ? 'astudio'
-    : kind === 'mm' ? 'minimax'
-    : kind === 'paw' ? 'catpaw'
-    : kind === 'qw' ? 'qwenwork'
-    : kind === 'oc' ? 'opencode'
-    : ((kind === 'q' || kind === 'w') ? S.cur : '');
-  const clientModel = modelId && nsOwner ? `${nsOwner}/${modelId}` : (modelId || '');
-  const copyCfg = btn('复制接入配置', 'primary sm', async () => {
-    const key = await ensureKey();
-    const text = `Base URL: ${base}\nModel: ${clientModel || ''}\nAPI Key: ${key || '(未生成)'}`;
-    copyText(text);
-  }, '把地址、模型和密钥一次复制走（Model 带 Agent 前缀，指向固定）');
-  const modelLabel = modelName && modelName !== modelId ? `${modelName} · ${clientModel}` : (clientModel || '还没选');
-  return el('div', { class: 'px-access' },
-    pxRow('接入地址 / Base URL', base, [btn('复制', 'sm', () => copyText(base), '复制接入地址')]),
-    pxRow('推荐模型', modelLabel, clientModel ? [btn('复制', 'sm', () => copyText(clientModel), '复制模型 ID（带 Agent 前缀，指向固定）')] : []),
-    pxRow('接入密钥', keyNode, [reveal, genKey].filter(Boolean)),
-    el('div', { class: 'px-actions' }, copyCfg));
-}
-
-/* ---------------- AStudio（讯飞星火）反代面板 ----------------
-   上游是讯飞云端 model-gateway（OpenAI 兼容，不需要协议翻译），
-   令牌读 astron-session.json 的 modelBearerToken。面板结构和 Qoder/WorkBuddy 一致：
-   头部（配置态 + 刷新模型 + 一键反代 + 启停）→ 接入信息 → 模型下拉 + 测试 → 模型ID → 账号表。 */
-function astudioModelLabel(m) {
-  const tag = m.free ? '（限免）' : (m.multiplier ? `（${m.multiplier}）` : '');
-  return `${m.name && m.name !== m.id ? `${m.name} · ` : ''}${m.id}${tag}`;
-}
-async function astudioRefreshModels() {
-  const st = pxState('astudio');
-  if (st.refreshing) return;
-  st.refreshing = true;
-  rerenderProxy();
-  try {
-    const r = await invoke('action', { payload: { action: 'astudio_refresh' } });
-    const res = r.result || {};
-    st.liveError = res.ok ? '' : (res.error || r.msg || '');
-  } catch (e) {
-    st.liveError = String(e);
-  }
-  st.refreshing = false;
-  await load();
-}
-async function astudioOneClick() {
-  const st = pxState('astudio');
-  if (st.busy) return;
-  st.busy = true;
-  rerenderProxy();
-  try {
-    const r = await invoke('action', { payload: { action: 'astudio_oneclick' } });
-    st.test = r.ok ? { ok: true, msg: r.msg } : { ok: false, error: r.msg };
-    await load();
-  } catch (e) {
-    st.test = { ok: false, error: String(e) };
-  }
-  st.busy = false;
-  rerenderProxy();
-}
-async function pxTestAstudio(st) {
-  st.testing = true;
-  rerenderProxy();
-  try {
-    const r = await invoke('action', { payload: { action: 'astudio_test', model: st.model } });
-    st.test = r.result || { ok: false, error: r.msg };
-  } catch (e) {
-    st.test = { ok: false, error: String(e) };
-  }
-  st.testing = false;
-  rerenderProxy();
-}
-function renderAstudioPanel(a, host, appId) {
-  if (!a) return;
-  const st = pxState(appId);
-  const accts = a.accounts || [];
-  const models = a.models || [];
-  if (!models.some((m) => m.id === st.model)) {
-    st.model = (models.find((m) => m.free) || models[0])?.id || '';
-  }
-  const modelName = pxModelOf(models, st.model)?.name || st.model;
-  const inPool = accts.some((x) => inEnabledPool(x.app, x.name));
-  host.appendChild(pxHead('AStudio 模型', '', [
-    el('span', {
-      class: `tag ${inPool ? 'swap' : ''}`.trim(),
-      title: inPool
-        ? '账号在启用的上游组里：反代一开，带授权的 key 就能调它'
-        : '账号还没进任何上游组：点「一键反代」，或到「上游组」把它勾进去',
-    }, inPool ? '已配置' : '未配置'),
-    btn(st.refreshing ? '读取中…' : '刷新模型', 'sm', astudioRefreshModels,
-      '重新读取 AStudio 为当前账号保存的模型目录'),
-    btn(st.busy ? '正在配置…' : (inPool ? '重新配置' : '一键反代'), 'primary sm', astudioOneClick,
-      '账号进上游组 → 生成接入密钥 → 启动反代'),
-    pxRunBtn(S.data, true),
-  ].filter(Boolean)));
-  if (st.busy) { const b = host.querySelector('button.primary'); if (b) b.disabled = true; }
-
-  host.appendChild(pxAccess(S.data, 'a', a.dist, st.model, modelName));
-
-  const sel = el('select', { class: 'px-select' });
-  for (const m of models) sel.appendChild(el('option', { value: m.id }, astudioModelLabel(m)));
-  sel.value = st.model;
-  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
-  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm',
-    () => pxTestAstudio(st), '用选中的模型发一次极小请求');
-  if (st.testing || !models.length) testBtn.disabled = true;
-  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
-  host.appendChild(pxTestLine(st));
-  host.appendChild(pxIdsRow(appId));
-  host.appendChild(pxNote('模型来自当前账号的 AStudio 目录。清单为空时，先在 AStudio 打开模型选择器，再点「刷新模型」。'));
-  if (st.liveError) host.appendChild(pxNote(`模型清单：${st.liveError}`, true));
-
-  let acctTable;
-  if (!accts.length) {
-    acctTable = pxEmpty('还没有 AStudio 账号。先在账号页建一个，或把现在登录的那份收进来。');
-  } else {
-    const rows = accts.map((x) => el('tr', {},
-      el('td', {}, el('b', {}, x.name)),
-      el('td', {}, chip(x.text || x.state || '—', x.usable ? 'swap' : 'expired')),
-      el('td', { class: 'mono muted' }, `${x.masked || '—'}${x.from ? `（${x.from}）` : ''}`),
-      el('td', {}, x.in_pool ? '已进上游组' : '未进上游组')));
-    acctTable = pxAccountTable(['账号', '令牌状态', '模型令牌', '上游组'], rows);
-  }
-  host.appendChild(acctTable);
-}
-
-/* ---------------- MiniMax Code 反代面板 ----------------
-   上游是 **Anthropic 协议**（POST /messages + Anthropic SSE 事件），不是 OpenAI 形状：
-   驾驶舱这层把客户端发来的 OpenAI 请求翻成 Anthropic、把流翻回 OpenAI chunk（见 mmproxy.rs）。
-   令牌是 OAuth（refresh token 轮换制），整机一份登录态，所以没有「每个账号各读各的」。 */
-async function minimaxOneClick() {
-  const st = pxState('minimax');
-  if (st.busy) return;
-  st.busy = true;
-  rerenderProxy();
-  try {
-    const r = await invoke('action', { payload: { action: 'minimax_oneclick' } });
-    st.test = r.ok ? { ok: true, msg: r.msg } : { ok: false, error: r.msg };
-    await load();
-  } catch (e) {
-    st.test = { ok: false, error: String(e) };
-  }
-  st.busy = false;
-  rerenderProxy();
-}
-async function minimaxRefreshToken() {
-  const st = pxState('minimax');
-  if (st.refreshing) return;
-  st.refreshing = true;
-  rerenderProxy();
-  try {
-    const r = await invoke('action', { payload: { action: 'minimax_refresh' } });
-    st.test = { ok: !!r.ok, msg: r.msg, error: r.ok ? '' : r.msg };
-    await load();
-  } catch (e) {
-    st.test = { ok: false, error: String(e) };
-  }
-  st.refreshing = false;
-  rerenderProxy();
-}
-async function pxTestMinimax(st) {
-  st.testing = true;
-  rerenderProxy();
-  try {
-    const r = await invoke('action', { payload: { action: 'minimax_test', model: st.model } });
-    st.test = r.result || { ok: false, error: r.msg };
-  } catch (e) {
-    st.test = { ok: false, error: String(e) };
-  }
-  st.testing = false;
-  rerenderProxy();
-}
-function renderMmPanel(a, host, appId) {
-  if (!a) return;
-  const st = pxState(appId || 'minimax');
-  const accts = a.accounts || [];
-  let models = (a.models && a.models.length) ? a.models
-    : [{ id: 'MiniMax-M3.1-Flash', name: 'M3.1-Flash（订阅限免）', free: true }];
-  if (!models.some((m) => m.id === st.model)) {
-    st.model = (models.find((m) => m.free) || models[0]).id;
-  }
-  const modelName = pxModelOf(models, st.model)?.name || st.model;
-  const inPool = accts.some((x) => inEnabledPool(x.app, x.name)) || !!(a.pool && a.dist);
-  const tokenBad = a.token_state === 'no_login' || a.token_state === 'expired';
-  host.appendChild(pxHead('MiniMax Code 模型',
-    '', [
-    el('span', {
-      class: `tag ${tokenBad ? 'expired' : 'swap'}`.trim(),
-      title: a.token_text || '',
-    }, tokenBad ? (a.token_state === 'no_login' ? '未登录' : '令牌过期') : '令牌可读'),
-    el('span', {
-      class: `tag ${inPool ? 'swap' : ''}`.trim(),
-      title: inPool
-        ? '账号在启用的上游组里：反代一开，带授权的 key 就能调它'
-        : '账号还没进任何上游组：点「一键反代」，或到「上游组」把它勾进去',
-    }, inPool ? '已配置' : '未配置'),
-    btn(st.refreshing ? '刷新中…' : '刷新令牌', 'sm', minimaxRefreshToken,
-      '令牌过期才真的去换（refresh token 是轮换制，换一次旧的立刻作废，不能反复试）'),
-    btn(st.busy ? '正在配置…' : (inPool ? '重新配置' : '一键反代'), 'primary sm', minimaxOneClick,
-      '账号进上游组 → 生成接入密钥 → 启动反代'),
-    pxRunBtn(S.data, true),
-  ].filter(Boolean)));
-  if (st.busy) { const b = host.querySelector('button.primary'); if (b) b.disabled = true; }
-
-  host.appendChild(pxAccess(S.data, 'mm', a.dist, st.model, modelName));
-
-  const sel = el('select', { class: 'px-select' });
-  for (const m of models) sel.appendChild(el('option', { value: m.id }, pxMmModelLabel(m)));
-  sel.value = st.model;
-  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
-  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm',
-    () => pxTestMinimax(st), '用选中的模型发一次极小请求（约 10 token）');
-  if (st.testing) testBtn.disabled = true;
-  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
-  host.appendChild(pxTestLine(st));
-  host.appendChild(pxIdsRow(appId || 'minimax'));
-  host.appendChild(pxNote(
-    '上游没有 /models 接口，下拉里的清单取自客户端自己的白名单（M3.1-Flash 订阅限免、M3 / M2.7 按积分扣）。'
-    + 'access token 寿命按小时算，反代会在到期前 60 秒自动换新并写回 auth.json；'
-    + '只有整族令牌被服务端撤销时才需要重新打开 MiniMax Code 登录一次。'));
-  if (tokenBad) host.appendChild(pxNote(a.token_text || '令牌不可用', true));
-
-  let acctTable;
-  if (!accts.length) {
-    acctTable = pxEmpty('还没有 MiniMax Code 账号。到账号页建一个（它会认 ~/.minimax 这份登录态）。');
-  } else {
-    const rows = accts.map((x) => el('tr', {},
-      el('td', {}, el('b', {}, x.name)),
-      el('td', {}, chip(x.text || x.state || '—', x.usable ? 'swap' : 'expired')),
-      el('td', { class: 'mono muted' }, `${x.masked || '—'}${x.remain_min ? `（剩 ${x.remain_min} 分钟）` : ''}`),
-      el('td', {}, x.in_pool ? '已进上游组' : '未进上游组')));
-    acctTable = pxAccountTable(['账号', '令牌状态', 'OAuth 令牌', '上游组'], rows);
-  }
-  host.appendChild(acctTable);
-}
-function pxMmModelLabel(m) {
-  const tag = m.free ? '（限免）' : (m.reasoning ? '（带思考）' : '');
-  const ctx = m.context_window ? ` · ${Math.round(m.context_window / 1000)}K` : '';
-  return `${m.name && m.name !== m.id ? `${m.name} · ` : ''}${m.id}${tag}${ctx}`;
-}
-
-function renderAgentProxy(d) {
-  const panel = $('agent-proxy-panel');
-  const host = $('agent-proxy');
-  if (!panel || !host) return;
-  const kind = proxyKind(S.cur);
-  if (!kind) { panel.hidden = true; clear(host); return; }
-  panel.hidden = false;
-  clear(host);
-  const app = d.apps.find((a) => a.id === S.cur);
-  $('agent-proxy-sub').textContent = app ? `${app.name} 的模型接入与测试` : '这个 Agent 的模型接入与测试';
-  if (kind === 'q') renderQproxyPanel(d.proxy.qproxy, host, S.cur);
-  if (kind === 't') renderTraePanel(d.proxy.traeproxy, host);
-  if (kind === 'w') renderWproxyPanel(d.proxy.wbproxy, host, S.cur);
-  if (kind === 'oc') {
-    renderOpenCodeBridge(host, d, true);
-    if (!S.proxyPage.bridge && !S.proxyPage.bridgeLoading) loadOpenCodeModels(false);
-  }
-  if (kind === 'a') renderAstudioPanel(d.proxy.astudio, host, S.cur);
-  if (kind === 'mm') renderMmPanel(d.proxy.minimax, host, S.cur);
-  if (kind === 'zc') renderZcodeProxyPanel(d.proxy.zcode, host, d);
-  if (kind === 'qw') renderQwPanel(d.proxy.qwbridge, host, S.cur);
-  if (kind === 'paw') renderPawPanel(d.proxy.pawbridge, host, S.cur);
-}
-
-/* 千问办公：本地桥（qwenwork-bridge）跑在 127.0.0.1:8765，用桌面端积分。
-   摆法和 Trae 面板一致：抬头（状态 + 一键反代 + 启停）→ 接入三行 → 模型+测试 → 模型ID → 账号表。
-   一键从"没配过"走到"客户端能调"：起桥 → 接线（上游组/接入密钥缺才建）→ 起反代；
-   桥就算没跑，反代收到请求也会自己把它拉起来（自愈），不用人管。 */
-function renderQwPanel(q, host, appId) {
-  if (!q) return;
-  const id = appId || 'qwenwork';
-  const st = pxState(id);
-  const up = !!q.running;
-  const models = (q.models && q.models.length) ? q.models : [{ id: 'flash', name: '标准' }];
-  if (!models.some((m) => m.id === st.model)) st.model = models[0].id;
-  const modelName = pxModelOf(models, st.model)?.name || st.model;
-  const inPool = !!q.in_pool;
-  // 端口在监听但不是自家的桥：把话摆在明处，别让人对着「桥没开」排查半天（后端 view 有就亮）
-  if (q.port_conflict) host.appendChild(pxNote(q.port_conflict_msg || '千问桥端口被其它程序占用', true));
-  host.appendChild(pxHead('千问办公 模型',
-    '读桌面端登录态，走网页版 chat-ws（不需要客户端签名）', [
-      el('span', {
-        class: `tag ${inPool ? 'swap' : ''}`.trim(),
-        title: inPool
-          ? '已在上游组里：反代一开，带接入密钥的客户端就能用这些积分'
-          : '还没进上游组：点「一键反代」会自动接线',
-      }, inPool ? '已配置' : '未配置'),
-      el('span', {
-        class: `tag ${up ? '' : 'off'}`.trim(),
-        title: up ? `127.0.0.1:${q.port} 在监听` : '桥没启动：点「一键反代」会拉起来；反代收到请求也会自愈拉起',
-      }, up ? '桥在跑' : '桥没开'),
-      btn('刷新', 'sm', () => load(), '重读一次账号与桥状态'),
-      btn('重新探测', 'sm', () => qwProbe(), '重新读桥的模型清单和登录态'),
-      btn(S.qwbusy ? '正在就绪…' : '一键反代', 'primary sm', qwOneClick,
-        '一个按钮走完：验登录态 → 起桥 → 接线（上游组/接入密钥缺才建）→ 起反代'),
-      pxRunBtn(S.data, true),
-    ].filter(Boolean)));
-  if (S.qwbusy) { const b = host.querySelector('button.primary'); if (b) b.disabled = true; }
-
-  host.appendChild(pxAccess(S.data, 'qw', q.dist, st.model, modelName));
-
-  const sel = el('select', { class: 'px-select' });
-  for (const m of models) sel.appendChild(el('option', { value: m.id }, pxModelLabel(m)));
-  sel.value = st.model;
-  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
-  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm', () => pxTestQw(st),
-    '用选中的模型发一次极小请求，确认积分真的能花出去');
-  if (st.testing) testBtn.disabled = true;
-  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
-  host.appendChild(pxTestLine(st));
-
-  host.appendChild(pxIdsRow(id));
-
-  const probeCell = (a) => {
-    const pr = (st.probe && st.probe.name === a.name) ? st.probe : null;
-    if (pr && pr.testing) {
-      const b = btn('探活中…', 'sm', () => {}, '正在发一次极小请求');
-      b.disabled = true;
-      return b;
-    }
-    const mark = pr
-      ? (pr.ok ? chip(`✓ ${((pr.ms || 0) / 1000).toFixed(1)}s`, 'swap') : chip('✗ 失败', 'expired'))
-      : null;
-    return el('span', { class: 'px-acts' }, mark,
-      btn('探活', 'sm', () => pxProbeQw(st, a.name), '发一次极小请求，确认这个号现在真能出字'));
-  };
-  const rows = (q.accounts || []).map((a) => el('tr', {},
-    el('td', {}, a.name),
-    el('td', {}, a.region || '国内'),
-    el('td', {}, el('span', { class: `chip ${a.state === 'ok' ? 'swap' : 'off'}` },
-      a.text || (a.state === 'ok' ? '可用' : '桥没开'))),
-    el('td', {},
-      a.token_mask ? `${a.token_mask} · ${a.token_days >= 0 ? `${a.token_days} 天` : '到期未知'}` : '—',
-      a.token_exp ? el('span', { class: 'px-k', title: a.token_exp }) : null),
-    el('td', {}, a.left != null ? `${Number(a.left).toFixed(2)} 积分` : '—',
-      a.expires_on ? el('span', { class: 'px-k', title: `积分到期 ${a.expires_on}` }) : null),
-    el('td', {}, `${a.calls || 0} 次`),
-    el('td', {}, probeCell(a))));
-  if (!rows.length) {
-    host.appendChild(pxEmpty('还没有千问办公账号。先在账号页建一个，再回来起桥。'));
-  } else {
-    host.appendChild(pxAccountTable(['账号', '区域', '状态', '令牌 · 到期', '积分', '调用', ''], rows));
-  }
-}
-
-async function qwOneClick() {
-  if (S.qwbusy) return;
-  S.qwbusy = true;
-  rerenderProxy();
-  toast('正在就绪千问办公：起桥 → 接线 → 起反代…');
-  let r;
-  try {
-    r = await invoke('action', { payload: { action: 'qwbridge_oneclick' } });
-  } catch (e) {
-    toast(`一键反代没跑通：${e}`, false);
-    S.qwbusy = false;
-    load();
-    return;
-  }
-  if (r.ok && S.cur) rememberProxyApp(S.cur);
-  const steps = Array.isArray(r.steps) && r.steps.length ? `（${r.steps.join(' → ')}）` : '';
-  toast((r.msg || (r.ok ? '已就绪' : '还差一步')) + steps, !!r.ok);
-  S.qwbusy = false;
-  load();
-}
-
-async function qwProbe() {
-  try {
-    const r = await invoke('action', { payload: { action: 'qwbridge_probe' } });
-    const v = r.result || {};
-    toast(v.running ? `桥在跑 · ${(v.models || []).length} 个模型 · ${v.accounts?.length || 0} 个号`
-      : '桥没在跑：先点「启动桥」', !!v.running);
-  } catch (e) {
-    toast(String(e), false);
-  }
-  load();
-}
-
-async function pxTestQw(st) {
-  st.testing = true;
-  rerenderProxy();
-  try {
-    const r = await invoke('action', { payload: { action: 'qwbridge_test', model: st.model } });
-    st.test = r.result || { ok: false, error: r.msg };
-  } catch (e) {
-    st.test = { ok: false, error: String(e) };
-  }
-  st.testing = false;
-  rerenderProxy();
-}
-
-/* 行内探活：结果就地写在那一行，别再往上面那行公共测试结果里塞（塞了看不出是哪次点的） */
-async function pxProbeQw(st, name) {
-  st.probe = { name, testing: true };
-  rerenderProxy();
-  try {
-    const r = await invoke('action', { payload: { action: 'qwbridge_test', model: st.model } });
-    const t = r.result || { ok: false, error: r.msg };
-    st.probe = { name, testing: false, ok: !!t.ok, ms: t.ms || 0, error: t.error || '' };
-  } catch (e) {
-    st.probe = { name, testing: false, ok: false, ms: 0, error: String(e) };
-  }
-  rerenderProxy();
-}
-
-/* 妙手：进程内云端直连（2026-10-26 起）。反代自己带着 ~/.meituan-catpaw/auth.json 的
-   accessToken 打妙手云端，**不需要妙手桌面端在跑**，也没有 8789 桥进程。
-   唯一要妙手窗口的时刻是令牌过期后的重登（passport 不给 refresh_token）。
-   摆法和 Trae 面板一致：抬头（状态 + 一键反代 + 启停）→ 接入三行 → 模型+测试 → 模型ID → 账号表。 */
-function renderPawPanel(p, host, appId) {
-  if (!p) return;
-  const id = appId || 'catpaw';
-  const st = pxState(id);
-  const ready = !!p.ready;
-  const models = (p.models && p.models.length) ? p.models : [{ id: 'LongCat-2.0', name: 'LongCat-2.0' }];
-  if (!models.some((m) => m.id === st.model)) st.model = models[0].id;
-  const modelName = pxModelOf(models, st.model)?.name || st.model;
-  const inPool = !!p.in_pool;
-  const busy = !!S.pawBusy;
-  // 8788 是本机共用的那个监听口：登录态好了但它没开，顶栏就还写着「反代停止」。
-  const portOn = !!(((S.data || {}).proxy) || {}).running;
-  const allUp = ready && portOn;
-
-  const main = allUp
-    ? btn(busy ? '处理中…' : '重新探测', 'primary sm', () => pawOneClick(),
-        '再验一遍令牌、接线与反代端口，缺哪样补哪样')
-    : btn(busy ? '启动中…' : '一键反代', 'primary sm', () => pawOneClick(),
-        '一个按钮走完：验令牌 → 接线（上游组/接入密钥缺才建）→ 起反代。不需要妙手在跑');
-  if (busy) main.disabled = true;
-
-  host.appendChild(pxHead('妙手 模型',
-    '云端直连（nocode.cn + ai.catpaw.meituan.com），用妙手积分，妙手桌面端不用开', [
-      el('span', {
-        class: `tag ${inPool ? 'swap' : ''}`.trim(),
-        title: inPool
-          ? '已在上游组里：反代一开，带接入密钥的客户端就能用这些积分'
-          : '还没进上游组：点「一键反代」会自动接线',
-      }, inPool ? '已配置' : '未配置'),
-      el('span', {
-        class: `tag ${ready ? 'swap' : 'expired'}`.trim(),
-        title: p.token_msg || (ready ? 'accessToken 有效' : ''),
-      }, ready ? '登录态可用' : '登录态不可用'),
-      el('span', {
-        class: 'tag',
-        title: '反代进程内直连妙手云端，不再经过命名管道和 8789 桥',
-      }, '云端直连'),
-      btn('刷新', 'sm', () => load(), '重读一次状态'),
-      btn('重新探测', 'sm', () => pawProbe(), '再验一遍令牌（顺带读余额）'),
-      main,
-      pxRunBtn(S.data, true),
-    ].filter(Boolean)));
-
-  // 只在缺的那一步说话；余额读到就顺带报一句
-  if (!ready) {
-    const tip = p.state === 'need_login'
-      ? `${p.text || '登录态失效'}：点「一键反代」会把妙手窗口拉起来让你重登。`
-      : (p.text || '');
-    host.appendChild(pxNote(tip, p.state === 'need_login'));
-  } else if (!portOn) {
-    host.appendChild(pxNote('登录态可用，但反代端口 8788 没开：点「一键反代」把它打开。', false));
-  } else if (!inPool) {
-    host.appendChild(pxNote('登录态可用，但还没进上游组：点「一键反代」自动接线。', false));
-  } else if (p.balance != null) {
-    host.appendChild(pxNote(`余额 ${Number(p.balance).toFixed(2)} 积分。一轮对话按模型倍率扣，实测约 1.3 积分/轮起。`));
-  }
-
-  host.appendChild(pxAccess(S.data, 'paw', p.dist, st.model, modelName));
-
-  const sel = el('select', { class: 'px-select' });
-  for (const m of models) sel.appendChild(el('option', { value: m.id }, pxModelLabel(m)));
-  sel.value = st.model;
-  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
-  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm', () => pxTestPaw(st),
-    '发一次极小请求验证整条链。耗时看模型：LongCat-2.0 走完整 agent 运行时，一轮 60~120 秒是正常的；GLM-5.3-Flash 系约 15 秒。测试中别重复点。');
-  if (st.testing) testBtn.disabled = true;
-  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
-  host.appendChild(pxTestLine(st));
-
-  host.appendChild(pxIdsRow(id));
-
-  const rows = (p.accounts || []).map((a) => el('tr', {},
-    el('td', {}, a.name),
-    el('td', {}, a.region || '国内'),
-    el('td', {}, el('span', { class: `chip ${a.state === 'ok' ? 'swap' : 'off'}` }, a.text || (a.state === 'ok' ? '可用' : '登录失效'))),
-    el('td', {}, a.token_mask || '—',
-      a.token_age_h != null ? el('span', { class: 'px-k' }, ` · 令牌 ${a.token_age_h} 小时前写入`) : null),
-    el('td', {}, `${a.calls || 0} 次`),
-    el('td', {}, btn(st.testing ? '探活中…' : '探活', 'sm', () => pxTestPaw(st),
-      '发一次极小请求，确认这个号现在真能出字'))));
-  if (!rows.length) host.appendChild(pxEmpty('还没读到妙手的登录态：点「一键反代」，令牌缺失时它会把妙手打开让你登录。'));
-  else host.appendChild(pxAccountTable(['账号', '区域', '状态', '身份', '调用', ''], rows));
-}
-
-async function pawOneClick() {
-  if (S.pawBusy) return;
-  S.pawBusy = true;
-  rerenderProxy();
-  let ok = false;
-  let msg = '还差一步';
-  let steps = [];
-  try {
-    const r = await invoke('action', { payload: { action: 'pawbridge_oneclick' } });
-    ok = !!r.ok;
-    msg = r.msg || (ok ? '反代已可用' : '还差一步');
-    steps = Array.isArray(r.steps) ? r.steps.slice() : [];
-  } catch (e) {
-    msg = String(e);
-  }
-  if (ok && S.cur) rememberProxyApp(S.cur);
-  S.pawBusy = false;
-  toast(msg + (steps.length ? `（${steps.join(' → ')}）` : ''), ok);
-  load();
-}
-
-async function pawProbe() {
-  try {
-    const r = await invoke('action', { payload: { action: 'pawbridge_probe' } });
-    const v = r.result || {};
-    toast(v.ready ? `可用 · ${v.accounts?.length || 0} 个号` : (v.text || '还差一步'), !!v.ready);
-  } catch (e) {
-    toast(String(e), false);
-  }
-  load();
-}
-
-async function pxTestPaw(st) {
-  st.testing = true;
-  rerenderProxy();
-  try {
-    const r = await invoke('action', { payload: { action: 'pawbridge_test', model: st.model } });
-    st.test = r.result || { ok: false, error: r.msg };
-  } catch (e) {
-    st.test = { ok: false, error: String(e) };
-  }
-  st.testing = false;
-  rerenderProxy();
-}
-
 async function pxTestQoder(appId, accts, st) {
   const a = accts.find((x) => x.usable) || accts[0];
   if (!a) { toast('没有可测的账号', false); return; }
@@ -4047,211 +3675,14 @@ async function pxTestTrae(accts, st) {
   rerenderProxy();
 }
 
-function renderQproxyPanel(q, host, appId) {
-  if (!q) return;
-  if (!q.dist) S.qkey = '';
-  const accts = (q.accounts || []).filter((a) => a.app === appId);
-  const mrow = (q.models || []).find((x) => x.app === appId) || {};
-  let models = mrow.models || [];
-  if (!models.length) models = [{ id: 'auto', name: 'Auto', free: true }];
-  const st = pxState(appId);
-  if (!models.some((m) => m.id === st.model)) st.model = models.find((m) => m.id === 'auto')?.id || models[0].id;
-  const modelName = pxModelOf(models, st.model)?.name || st.model;
-  const inPool = accts.some((a) => inEnabledPool(a.app, a.name));
-  const title = appId === 'qoder-cn' ? 'Qoder CN 模型' : 'Qoder 模型';
-  host.appendChild(pxHead(title, '读取 auth.v1.dat 的令牌，走官方模型网关', [
-    el('span', {
-      class: `tag ${inPool ? 'swap' : ''}`.trim(),
-      title: inPool
-        ? '账号在启用的上游组里：反代一开，带授权的 key 就能调它'
-        : '账号还没进任何上游组：到「上游组」把它勾进去',
-    }, inPool ? '已配置' : '未配置'),
-    btn('刷新', 'sm', () => load(), '重新读账号状态和模型目录'),
-    btn(S.qbusy ? '正在探测…' : (inPool ? '重新探测' : '开启反代'), 'primary sm', qproxyOneClick,
-      '探测账号 → 启动反代；归组和选 key 在「上游组」「接入密钥」表里做'),
-    pxRunBtn(S.data, true),
-  ].filter(Boolean)));
-  if (S.qbusy) host.querySelector('button.primary').disabled = true;
-
-  host.appendChild(pxAccess(S.data, 'q', q.dist, st.model, modelName));
-
-  let acctTable;
-  if (!accts.length) {
-    acctTable = pxEmpty('还没有 Qoder / Qoder CN 账号。先在账号页建一个，或把现在登录的那份收进来。');
-  } else {
-    const rows = accts.map((a) => el('tr', {},
-      el('td', {}, el('b', {}, a.name)),
-      el('td', {}, a.region_label || '—'),
-      el('td', {}, a.cn && a.cn.bridge_running
-        ? chip('走本地桥', 'swap')
-        : chip(a.text || a.state || '—', a.usable ? 'swap' : 'expired')),
-      el('td', {}, `${a.masked || '—'}${a.days_left == null ? '' : (a.days_left >= 0 ? ` · ${a.days_left} 天` : ' · 已过期')}`),
-      el('td', {}, `${a.calls || 0} 次 · ${a.ok || 0}/${a.fail || 0}`),
-      el('td', { class: 'acts' },
-        btn('探测', 'sm', () => run('qproxy_probe', {
-          app: a.app, name: a.name, infer: false, deep: false, model: st.model,
-        }), '只验令牌，不花积分'),
-        a.cn && !a.cn.logged_in
-          ? btn('登录 CLI', 'primary sm', () => cnLogin(a.name),
-              '设备码登录一次；之后用官方运行时起桥')
-          : null,
-        a.cn && a.cn.logged_in && !a.cn.bridge_running
-          ? btn('起桥', 'primary sm', () => cnBridge(a.name, true),
-              '用 Qoder CN 客户端自己起本地桥（仅 127.0.0.1:18211）')
-          : null,
-        a.cn && a.cn.bridge_running
-          ? btn('停桥', 'danger sm', () => cnBridge(a.name, false), '停掉本地桥')
-          : null)));
-    acctTable = pxAccountTable(['账号', '区域', '状态', '令牌 / 到期', '调用', ''], rows);
-  }
-
-  const sel = el('select', { class: 'px-select' });
-  for (const m of models) sel.appendChild(el('option', { value: m.id }, pxModelLabel(m)));
-  sel.value = st.model;
-  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
-  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm', () => pxTestQoder(appId, accts, st), '用选中的模型发一次极小请求');
-  if (st.testing) testBtn.disabled = true;
-  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
-  host.appendChild(pxTestLine(st));
-  host.appendChild(pxIdsRow(appId));
-  host.appendChild(pxNote('模型 ID 来自 Qoder 客户端缓存；部分模型只对特定套餐开放，以「测试所选模型」的结果为准。'));
-  host.appendChild(acctTable);
-  if (mrow.error) host.appendChild(pxNote(`模型目录：${mrow.error}。先只给 auto，开一次 Qoder 刷新缓存后再看。`, true));
-  if (appId === 'qoder-cn') host.appendChild(pxNote('国内版直连要官方客户端签名，探测会如实返回 signature_required。已登录 CLI 的账号点「起桥」，走 Qoder CN 客户端自己那条路（签名它自己做），之后到「上游组」把它的本地桥勾进去。'));
-}
-
-function renderWproxyPanel(w, host, appId) {
-  if (!w) return;
-  if (!w.dist) S.wkey = '';
-  if (!w.secret || !w.secret.present) {
-    host.appendChild(pxHead('WorkBuddy 模型', '国内版 + 国际版，一区一个号', []));
-    host.appendChild(pxEmpty('还差一把解密密钥。先从本机 agenthub 导入一次，存进本机保管箱。'));
-    host.appendChild(el('div', { class: 'px-actions' }, btn('导入密钥', 'primary sm', wImportSecret,
-      '从本机 agenthub 读一次解密密钥，DPAPI 加密保存')));
-    return;
-  }
-  const accts = (w.accounts || []).filter((a) => a.app === appId);
-  const mrow = (w.models || []).find((x) => x.app === appId) || {};
-  // 不按免费/收费筛选：能反代的 Agent 一律读全量模型
-  const models = mrow.all || mrow.free || [];
-  const st = pxState(appId);
-  if (!models.some((m) => m.id === st.model)) st.model = models[0]?.id || '';
-  const modelName = pxModelOf(models, st.model)?.name || st.model;
-  const inPool = accts.some((a) => inEnabledPool(a.app, a.name));
-  host.appendChild(pxHead('WorkBuddy 模型', '读登录态，走官方 /v2/chat/completions', [
-    el('span', {
-      class: `tag ${inPool ? 'swap' : ''}`.trim(),
-      title: inPool
-        ? '账号在启用的上游组里：反代一开，带授权的 key 就能调它'
-        : '账号还没进任何上游组：到「上游组」把它勾进去',
-    }, inPool ? '已配置' : '未配置'),
-    btn('刷新', 'sm', () => load(), '重新读登录态和模型目录'),
-    btn(S.wbusy ? '正在探测…' : (inPool ? '重新探测' : '开启反代'), 'primary sm', wproxyOneClick,
-      '探测账号 → 启动反代；归组和选 key 在「上游组」「接入密钥」表里做'),
-    pxRunBtn(S.data, true),
-  ].filter(Boolean)));
-  if (S.wbusy) host.querySelector('button.primary').disabled = true;
-
-  host.appendChild(pxAccess(S.data, 'w', w.dist, st.model, modelName));
-
-  let acctTable;
-  if (!accts.length) {
-    acctTable = pxEmpty('这个区域还没有 WorkBuddy 账号。');
-  } else {
-    const rows = accts.map((a) => el('tr', {},
-      el('td', {}, el('b', {}, a.name)),
-      el('td', {}, a.region_label || '—'),
-      el('td', {}, chip(wStateText(a.state), a.state === 'ok' ? 'swap' : 'expired')),
-      el('td', {}, `${a.masked || '—'}${a.expires_days == null ? '' : (a.expires_days >= 0 ? ` · ${a.expires_days} 天` : ' · 已过期')}`),
-      el('td', {}, `今日 ${Number(a.today_credit || 0).toFixed(2)} 积分 / ${a.today_tokens || 0} token`),
-      el('td', {}, `${a.calls || 0} 次 · ${a.ok || 0}/${a.fail || 0}`),
-      el('td', { class: 'acts' }, btn('探活', 'sm', () => run('wproxy_probe', { app: a.app, name: a.name }),
-        '只打额度接口，不花积分'))));
-    acctTable = pxAccountTable(['账号', '区域', '状态', '令牌 / 到期', '今日', '调用', ''], rows);
-  }
-
-  if (!models.length) {
-    host.appendChild(pxNote('这个区域没有可用模型。开一次 WorkBuddy 让它拉 /v3/config。', true));
-  } else {
-    const sel = el('select', { class: 'px-select' });
-    for (const m of models) sel.appendChild(el('option', { value: m.id }, pxModelLabel(m)));
-    sel.value = st.model;
-    sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
-    const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm', () => pxTestWb(appId, accts, st),
-      '用选中的模型发一次极小补全，会显示实际积分');
-    if (st.testing) testBtn.disabled = true;
-    host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
-    host.appendChild(pxTestLine(st));
-    host.appendChild(pxIdsRow(appId));
-  }
-  host.appendChild(acctTable);
-  if (mrow.error) host.appendChild(pxNote(`模型目录：${mrow.error}`, true));
-}
-
-function renderTraePanel(t, host) {
-  if (!t) return;
-  if (!t.dist) S.tkey = '';
-  const accts = t.accounts || [];
-  const models = t.models || [];
-  const st = pxState('traework-cn');
-  if (!models.some((m) => m.id === st.model)) {
-    st.model = models.find((m) => m.id === 'glm-5.3-flash')?.id || models[0]?.id || 'glm-5.3-flash';
-  }
-  const modelName = pxModelOf(models, st.model)?.id || st.model;
-  const inPool = accts.some((a) => inEnabledPool(a.app, a.name));
-  host.appendChild(pxHead('Trae 模型', `出口 IP ${t.egress_ip || '—'} 是闸门，4011 不是限流`, [
-    el('span', {
-      class: `tag ${inPool ? 'swap' : ''}`.trim(),
-      title: inPool
-        ? '账号在启用的上游组里：反代一开，带授权的 key 就能调它'
-        : '账号还没进任何上游组：到「上游组」把它勾进去',
-    }, inPool ? '已配置' : '未配置'),
-    btn('刷新', 'sm', () => run('trae_refresh'), '读令牌、模型目录，重算出口 IP'),
-    btn(inPool ? '重新探测' : '开启反代', 'primary sm', traeOneClick,
-      '探测账号 → 启动反代；归组和选 key 在「上游组」「接入密钥」表里做'),
-    pxRunBtn(S.data, true),
-  ].filter(Boolean)));
-  host.appendChild(pxAccess(S.data, 't', t.dist, st.model, modelName));
-  let acctTable;
-  if (!accts.length) {
-    acctTable = pxEmpty('没有找到 Trae 的登录档案。');
-  } else {
-    const rows = accts.map((a) => el('tr', {},
-      el('td', {}, el('b', {}, a.name)),
-      el('td', {}, chip(a.ok ? '令牌可读' : (a.ready ? '读不到' : '未刷新'), a.ok ? 'swap' : 'expired')),
-      el('td', {}, a.token_tail || '—'),
-      el('td', {}, a.user_id ? `uid ${a.user_id}` : '—'),
-      el('td', {}, a.hours_left == null ? '—' : (a.hours_left >= 0 ? `${Math.round(a.hours_left / 24 * 10) / 10} 天` : '已过期'))));
-    acctTable = pxAccountTable(['账号', '状态', '令牌', 'uid', '到期'], rows);
-  }
-  const sel = el('select', { class: 'px-select' });
-  for (const m of models) sel.appendChild(el('option', { value: m.id }, `${m.id} · ${m.channel || '—'}`));
-  if (!models.length) sel.appendChild(el('option', { value: st.model }, st.model));
-  sel.value = st.model;
-  sel.addEventListener('change', () => { st.model = sel.value; rerenderProxy(); });
-  const testBtn = btn(st.testing ? '测试中…' : '测试所选模型', 'primary sm', () => pxTestTrae(accts, st),
-    '花几个积分，验证翻译 + 出口 IP + 真模型整条链');
-  if (st.testing) testBtn.disabled = true;
-  host.appendChild(el('div', { class: 'px-modelrow' }, el('span', { class: 'px-k' }, '模型'), sel, testBtn));
-  host.appendChild(pxTestLine(st));
-  host.appendChild(pxIdsRow('traework-cn'));
-  if (!t.models_ready) {
-    host.appendChild(pxNote('模型目录还没加载，点「刷新」读一次 state.vscdb。', true));
-  }
-  host.appendChild(acctTable);
-}
-
 function rerenderProxy() {
   // 她的老毛病（二·续十三在 renderKeys 修过一轮）：面板整体重建会改页面总长度，
   // 清空的一瞬间 scrollHeight 塌掉、scrollTop 被浏览器夹回去，内容回来后没人放回原位——
   // 表现就是点「获取模型ID / 展开全部」之后页面莫名往上错，得重新滚回来。
   // 容器要挑对：「模型反代」页的 .pagebody 被 overflow-y:hidden 锁着（CSS 1317），
   // 真正在滚的是右栏 .setbody——早先这里拿 .pagebody，等于保持了个 0。
-  const box = S.view === 'proxy' ? scrollerIn('proxy') : document.querySelector('#view-agents .pagebody');
-  keepScroll(box, () => {
-    if (S.view === 'proxy') renderProxyPage(S.data);
-    else if (S.view === 'agents') renderAgentProxy(S.data);
-  });
+  if (S.view !== 'proxy') return;
+  keepScroll(scrollerIn('proxy'), () => renderProxyPage(S.data));
 }
 
 /* 「获取模型ID / 展开全部」这类只动「模型 ID」一块的状态，走定点替换：
@@ -4259,8 +3690,7 @@ function rerenderProxy() {
    锚定失效、页面往上错一截（2.10 的 二·续十三 同类）。只换 .px-ids 一个节点，
    面板里下面的账号表活下来，锚定自动补偿，她的位置一动不动。 */
 function replacePxIds(appId) {
-  const scope = S.view === 'agents' ? '#agent-proxy' : '#view-proxy';
-  const old = document.querySelector(`${scope} .px-ids[data-pxids="${appId}"]`);
+  const old = document.querySelector(`#view-proxy .px-ids[data-pxids="${appId}"]`);
   if (!old) { rerenderProxy(); return; }
   old.replaceWith(pxIdsRow(appId));
 }
@@ -4356,7 +3786,77 @@ function pxQualityLine(m) {
   return { text: `实测 ${m.calls} 次 · 成功率 ${rate}%`, cls };
 }
 
-function pxModelCard(m) {
+const pxModelTests = new Map();
+
+async function pxTestModelCard(m, owner) {
+  if (pxModelTests.get(m.id)?.testing) return;
+  const st = { testing: true, test: null };
+  pxModelTests.set(m.id, st);
+  rerenderProxy();
+  const started = Date.now();
+  try {
+    const prefix = `${owner}/`;
+    const model = m.id.startsWith(prefix) ? m.id.slice(prefix.length) : m.id;
+    const actions = {
+      astudio: 'astudio_test', minimax: 'minimax_test', opencode: 'opencode_test',
+      qwenwork: 'qwbridge_test', catpaw: 'pawbridge_test', zcode: 'zcproxy_test',
+      qoder: 'qproxy_probe', 'qoder-cn': 'qproxy_probe',
+      workbuddy: 'wproxy_test', 'workbuddy-intl': 'wproxy_test', trae: 'trae_probe',
+    };
+    const action = actions[owner];
+    if (!action) throw new Error('该提供方暂不支持模型测试');
+    const payload = { action, model };
+    if (['zcode', 'qoder', 'qoder-cn', 'workbuddy', 'workbuddy-intl', 'trae'].includes(owner)) {
+      const accounts = pxOwnerAccounts(S.data, owner);
+      const account = accounts.find((a) => a.good) || accounts[0];
+      if (!account) throw new Error('没有可测的账号，请先配置账号');
+      payload.name = account.name;
+      payload.app = owner === 'trae' ? 'traework-cn' : owner;
+      if (action === 'qproxy_probe') Object.assign(payload, { infer: true, deep: false });
+    }
+    const r = await invoke('action', { payload });
+    st.test = r.result || { ok: false, error: r.msg || '没有返回测试结果' };
+    if (!st.test.ok && !st.test.error) st.test.error = r.msg || st.test.text || '模型测试失败';
+    if (st.test.ms == null) st.test.ms = Date.now() - started;
+  } catch (e) {
+    st.test = { ok: false, error: String(e), ms: Date.now() - started };
+  } finally {
+    st.testing = false;
+    rerenderProxy();
+    // 这次测试也要出现在「实测 N 次 · 成功率 X%」里。后端把结果记进同一份
+    // proxymodel.json，所以重拉一次全景才有新计数；先本地 +1 兜住网络慢的那几秒。
+    bumpModelStatLocal(m.id, !!(st.test && st.test.ok));
+    refreshModelStats();
+  }
+}
+
+/* 本地先记一笔：只影响这一屏，后端回包后由 refreshModelStats 用它做为准 */
+function bumpModelStatLocal(id, ok) {
+  const groups = (S.proxyPage.models && S.proxyPage.models.groups) || [];
+  for (const g of groups) {
+    for (const m of g.models || []) {
+      if (m.id !== id) continue;
+      m.calls = (m.calls || 0) + 1;
+      m.ok = (m.ok || 0) + (ok ? 1 : 0);
+      m.fail = m.calls - m.ok;
+    }
+  }
+}
+
+/* 悄悄重读一次「反代全景」（不动 modelsLoading、不闪「正在汇总」），把实测计数换成后端真值 */
+async function refreshModelStats() {
+  const st = S.proxyPage;
+  if (!st.models || st.modelsLoading) return;
+  try {
+    const r = await invoke('action', { payload: { action: 'proxy_models_list' } });
+    const v = typeof r.msg === 'string' ? JSON.parse(r.msg) : r;
+    if (!v || !v.groups) return;
+    st.models = v;
+    rerenderProxy();
+  } catch (e) { /* 计数没刷上不影响这次测试结果的展示 */ }
+}
+
+function pxModelCard(m, owner) {
   const bits = [];
   if (m.context_window) bits.push(ctxLabel(m.context_window));
   if (m.tools) bits.push('工具');
@@ -4366,13 +3866,19 @@ function pxModelCard(m) {
   else if (m.multiplier) bits.push(m.multiplier);
   if (m.channel) bits.push(`通道 ${m.channel}`);
   const q = pxQualityLine(m);
+  const st = pxModelTests.get(m.id);
+  const testBtn = btn(st?.testing ? '测试中…' : '测试', 'sm',
+    () => pxTestModelCard(m, owner), '向这个模型发一次极小请求，验证是否可用');
+  testBtn.disabled = !!st?.testing;
   return el('div', { class: 'px-mcard' },
     el('div', { class: 'px-mcard-top' },
       el('code', { class: 'mono', title: m.id }, m.id),
       el('span', { class: 'sp' }),
       btn('复制', 'sm', () => copyText(m.id), '复制这个模型 ID（带 Agent 前缀）')),
     bits.length ? el('div', { class: 'px-mcard-specs' }, bits.join(' · ')) : null,
-    el('div', { class: `px-mcard-q ${q.cls}` }, q.text));
+    el('div', { class: 'px-mcard-bottom' },
+      el('div', { class: `px-mcard-q ${q.cls}` }, q.text), testBtn),
+    st ? pxTestLine(st) : null);
 }
 
 function renderProxyModels(host, d) {
@@ -4382,7 +3888,10 @@ function renderProxyModels(host, d) {
       () => loadProxyModels(), '把所有上游组当前能调的模型与账号状态列出来'),
   ];
   secs.push(pxRunBtn(d));
-  host.appendChild(pxHead('反代全景', '谁在反代里 · 能调哪些模型 · 实测跑得怎么样（模型 ID 带 Agent 前缀，指向固定）', secs));
+  host.appendChild(pxHead('反代全景',
+    pxFoldHint('models', '谁在反代里 · 能调哪些模型 · 实测跑得怎么样（模型 ID 带 Agent 前缀，指向固定）'),
+    secs, 'models'));
+  host.classList.toggle('px-folded', pxFolded('models'));
   host.appendChild(pxRow('接入地址 / Base URL', proxyBase(d),
     [btn('复制', 'sm', () => copyText(proxyBase(d)), '复制反代地址')]));
   if (st.modelsLoading) {
@@ -4408,17 +3917,20 @@ function renderProxyModels(host, d) {
     const models = g.models || [];
     allIds.push(...models.map((m) => m.id));
     const accts = pxOwnerAccounts(d, g.owner);
+    const gkey = `g:${g.owner}`;
     const head = el('div', { class: 'px-modelgroup-head' },
       el('b', {}, PX_OWNER_NAME[g.owner] || g.owner),
-      el('span', { class: 'muted' }, `${models.length} 个模型`),
+      el('span', { class: 'muted' }, `${models.length} 个模型${pxFolded(gkey) ? ' · 已收起' : ''}`),
       ...(accts.length
         ? accts.map((a) => chip(`${a.name}${a.text ? ` · ${a.text}` : ''}`, a.good ? 'swap' : 'expired'))
         : []),
       el('span', { class: 'sp' }),
-      btn('复制本组', 'sm', () => copyText(models.map((m) => m.id).join('\n')), '复制这组全部模型 ID（带 Agent 前缀）'));
+      btn('复制本组', 'sm', () => copyText(models.map((m) => m.id).join('\n')), '复制这组全部模型 ID（带 Agent 前缀）'),
+      pxFoldBtn(gkey));
     wrap.appendChild(head);
     const grid = el('div', { class: 'px-mgrid' });
-    for (const m of models) grid.appendChild(pxModelCard(m));
+    grid.hidden = pxFolded(gkey);
+    for (const m of models) grid.appendChild(pxModelCard(m, g.owner));
     wrap.appendChild(grid);
   }
   host.appendChild(wrap);
@@ -4851,16 +4363,18 @@ function renderGuide(d) {
   const stepNo = phase === 'done' ? 5 : ({ agent: 1, login: 2, model: 3, connect: 4 }[phase] || 1);
   const base = proxyBase(d);
   const card = el('section', { class: 'panel guide-card' });
-  card.appendChild(el('div', { class: 'guide-head' },
+  const head = el('div', { class: 'guide-head' },
     el('div', { class: 'guide-title' },
       el('b', {}, '一键接入'),
       el('span', { class: 'guide-sub' },
         `${agents.length} 个可接入 Agent`)),
-    el('span', { class: 'sp' }),
     chip(d.proxy.running ? '反代运行中' : '反代未启动', d.proxy.running ? 'swap' : 'expired'),
     pxRunBtn(d),
-    el('code', { class: 'mono guide-base', title: base }, base),
-    btn('复制', 'sm', () => copyText(base), '复制当前机器的反代地址')));
+    el('code', { class: 'mono guide-base', title: base }, base));
+  const headActions = el('div', { class: 'guide-actions' },
+    btn('复制', 'sm', () => copyText(base), '复制当前机器的反代地址'));
+  head.append(el('span', { class: 'sp' }), headActions);
+  card.appendChild(head);
 
   const steps = [['1', '选 Agent'], ['2', '确认账号'], ['3', '选模型'], ['4', '一键接通']];
   const prog = el('div', { class: 'guide-progress' });
@@ -4931,8 +4445,8 @@ function renderGuide(d) {
         copyText(cfg);
       }, '把地址、模型和 Key 一次复制'),
       btn('测试一下', 'sm', () => guideTest(cur), '发一次极小请求'),
-      btn('查看高级', 'sm', () => document.querySelector('#proxy-groups')?.scrollIntoView({ block: 'start' }),
-        '查看上游组、接入密钥和请求日志')));
+      btn('查看高级', 'sm', () => document.querySelector('#proxy-suppliers')?.scrollIntoView({ block: 'start' }),
+        '查看供应商、请求日志和高级设置')));
     const doneTest = cur?.kind === 'oc'
       ? { test: S.proxyPage.bridgeTest, testing: S.proxyPage.bridgeTesting }
       : pxState(r.app);
@@ -5090,16 +4604,17 @@ function renderGuide(d) {
 function renderProxyPage(d) {
   if (!d || !$('view-proxy')) return;
   const p = d.proxy || {};
-  const pools = p.pools || [];
   const dist = p.dist || [];
-  if ($('proxy-count')) $('proxy-count').textContent = `${pools.length} 个上游组 · ${dist.length} 把接入密钥`;
+  if ($('proxy-count')) $('proxy-count').textContent = `${(p.providers || []).length} 个供应商 · ${dist.length} 把接入密钥`;
   // 一键接入 / 模型列表 / 本地桥三块里都有模型下拉：下拉弹层开着时重建对应块
   // 会把它闪没。焦点停在哪一块就只跳过那一拍，组表、密钥表、请求日志照常刷新。
   if (!editingIn('#proxy-guide')) renderGuide(d);
   const mh = $('proxy-models');
   if (mh && !editingIn('#proxy-models')) { clear(mh); renderProxyModels(mh, d); }
-  renderProxyGroups(d);
-  renderProxyKeys(d);
+  if ($('proxy-suppliers') && !editingIn('#proxy-suppliers')) {
+    window.supplierPage ??= gatewaySuppliers.create($('proxy-suppliers'), { id: S.cur, data: d });
+    window.supplierPage.load();
+  }
   const bh = $('proxy-bridge');
   if (bh && !editingIn('#proxy-bridge')) { clear(bh); renderOpenCodeBridge(bh, d, false); }
   if (!S.proxyPage.bridge && !S.proxyPage.bridgeLoading) loadOpenCodeModels(false);
@@ -5107,98 +4622,6 @@ function renderProxyPage(d) {
   renderProxyAdvanced(d);
 }
 
-function renderProxyGroups(d) {
-  const host = $('proxy-groups');
-  if (!host) return;
-  clear(host);
-  const sec = el('section', { class: 'panel' });
-  const pools = d.proxy.pools || [];
-  sec.appendChild(pxHead('上游组', '哪个 Agent 的账号或 API 台账里的 Key 归到哪个组', [
-    btn('＋ 新建上游组', 'primary sm', () => openPoolModal(null), '把要参与分流的账号 / Key 归到一个组'),
-  ]));
-  if (!pools.length) {
-    sec.appendChild(pxEmpty('还没有上游组。新建一个，把账号或 API 台账里的 Key 勾进来。'));
-    host.appendChild(sec);
-    return;
-  }
-  const t = el('table', { class: 'tbl px-groups-tbl' });
-  t.appendChild(el('thead', {}, el('tr', {}, ...['名称', '成员', '状态', '操作'].map((h) => el('th', {}, h)))));
-  const tb = el('tbody');
-  for (const g of pools) {
-    const total = (g.members || []).length;
-    const live = g.live ?? 0;
-    tb.appendChild(el('tr', {},
-      el('td', {}, el('b', {}, g.name || '未命名')),
-      el('td', {},
-        el('div', {}, `可用 ${live}/${total}`),
-        (g.labels || []).length
-          ? el('div', { class: 'muted px-grouplabels', title: (g.labels || []).join('、') },
-            (g.labels || []).join('、'))
-          : null),
-      el('td', {}, chip(g.enabled === false ? '停用' : '启用', g.enabled === false ? 'expired' : 'swap')),
-      el('td', { class: 'acts' },
-        iconBtn('edit', () => openPoolModal(g), '改名字、增删成员'),
-        iconBtn('trash', async () => {
-          if (await askConfirm(`删除上游组「${g.name}」？\n引用它的接入密钥会自动去掉这个组。`,
-            { danger: true, okText: '删除上游组' })) {
-            run('proxy_pool_delete', { id: g.id });
-          }
-        }, '删掉这个上游组'))));
-  }
-  t.appendChild(tb);
-  sec.appendChild(el('div', { class: 'tablewrap' }, t));
-  host.appendChild(sec);
-}
-
-function renderProxyKeys(d) {
-  const host = $('proxy-keys');
-  if (!host) return;
-  clear(host);
-  const sec = el('section', { class: 'panel' });
-  const dist = d.proxy.dist || [];
-  const pools = d.proxy.pools || [];
-  const pname = (id) => (pools.find((x) => x.id === id) || {}).name || '（组已删）';
-  sec.appendChild(pxHead('接入密钥', '每个密钥只放行它被授权的上游组', [
-    btn('＋ 生成接入密钥', 'primary sm', () => openDistModal(null), '生成一个能对外接入的密钥，指定它只能走哪些上游组'),
-  ]));
-  if (!dist.length) {
-    sec.appendChild(pxEmpty('还没有接入密钥。生成一把，勾选允许走哪些上游组，再填到客户端的 API Key 位置。'));
-    host.appendChild(sec);
-    return;
-  }
-  const t = el('table', { class: 'tbl px-keys-tbl' });
-  t.appendChild(el('thead', {}, el('tr', {},
-    ...['名称', '密钥', '授权上游组', '最近使用', '状态', '操作'].map((h) => el('th', {}, h)))));
-  const tb = el('tbody');
-  for (const k of dist) {
-    const ids = k.pools || [];
-    tb.appendChild(el('tr', {},
-      el('td', {}, el('b', {}, k.name || '未命名'),
-        el('span', { class: 'muted' }, k.calls ? ` · ${k.calls} 次` : '')),
-      // flex 容器必须放在 td 里面的 div 上：display:flex 的 td 会被踢出表格布局，
-      // 列宽立刻和表头脱节（"条条线线对不齐"的根因）
-      el('td', {}, el('div', { class: 'px-keycell' },
-        el('code', { class: 'mono', id: `gwkey-${k.id}` }, k.masked || '—'),
-        iconBtn('eye', () => revealDist(k), '显示完整密钥'),
-        iconBtn('copy', () => copyDist(k), '复制完整密钥'))),
-      el('td', {}, ids.length ? ids.map(pname).join('、') : '全部上游组'),
-      el('td', { title: k.last_used ? stampTime(k.last_used) : '' }, k.last_used ? pxShortTime(k.last_used) : '—'),
-      el('td', {}, chip(k.enabled ? '在用' : '停用', k.enabled ? 'swap' : 'expired')),
-      el('td', {}, el('div', { class: 'acts' },
-        iconBtn('plug', () => run('proxy_dist_toggle', { id: k.id }),
-          k.enabled ? '停用：用它的人会立刻被拒' : '启用：重新放行'),
-        iconBtn('edit', () => openDistModal(k), '改名字、授权组、状态'),
-        iconBtn('trash', async () => {
-          if (await askConfirm(`删除接入密钥「${k.name}」？\n正在用它的人会立刻被拒。不可恢复。`,
-            { danger: true, okText: '删除' })) {
-            run('proxy_dist_delete', { id: k.id });
-          }
-        }, '彻底删掉这个密钥')))));
-  }
-  t.appendChild(tb);
-  sec.appendChild(el('div', { class: 'tablewrap' }, t));
-  host.appendChild(sec);
-}
 
 function pxShortTime(sec) {
   const d = new Date(Number(sec) * 1000);
@@ -5278,111 +4701,6 @@ async function wImportSecret() {
   if (r.ok) load();
 }
 
-async function wproxyOneClick() {
-  if (S.wbusy) return;
-  S.wbusy = true;
-  rerenderProxy();
-  toast('正在探活 WorkBuddy 两个账号…（几秒）');
-  let r;
-  try {
-    r = await invoke('action', { payload: { action: 'wproxy_oneclick' } });
-  } catch (e) {
-    toast(`一键反代没跑通：${e}`, false);
-    S.wbusy = false;
-    load();
-    return;
-  }
-  S.wbusy = false;
-  if (r.need === 'secret') {
-    toast(r.msg || '还没导入密钥', false);
-    load();
-    return;
-  }
-  if (r.ok && r.result && r.result.key) S.wkey = r.result.key;
-  if (r.ok && S.cur) rememberProxyApp(S.cur);
-  const skipped = (r.result && r.result.skipped) || [];
-  if (skipped.length) {
-    toast(`${r.msg}\n跳过：${skipped.map((s) => `${s.app}/${s.name}：${s.why || s.state}`).join('；')}`, !!r.ok);
-  } else {
-    toast(r.msg || '跑完了', !!r.ok);
-  }
-  load();
-}
-
-/* ---------------- Qoder / Qoder CN 模型反代 ----------------
-   令牌在产品自己的 auth.v1.dat 里（qproxy.rs 解），反代直连官方的 /model/v1/chat/completions。
-   国内版的推理通道要官方客户端签名，纯 HTTP 打不通——这里只把状态如实摆出来，不给假上游。 */
-async function qproxyOneClick() {
-  if (S.qbusy) return;
-  S.qbusy = true;
-  rerenderProxy();
-  toast('正在探测 Qoder 账号…（几秒）');
-  let r;
-  try {
-    r = await invoke('action', { payload: { action: 'qproxy_oneclick', infer: true } });
-  } catch (e) {
-    toast(`一键反代没跑通：${e}`, false);
-    S.qbusy = false;
-    load();
-    return;
-  }
-  if (r.ok && r.result && r.result.key) S.qkey = r.result.key;
-  if (r.ok && S.cur) rememberProxyApp(S.cur);
-  S.qbusy = false;
-  toast(r.msg, r.ok);
-  load();
-}
-
-/* Qoder CN 的两步：给 CLI 登录一次 → 起本地桥（官方运行时，签名它自己做） */
-async function cnLogin(name) {
-  let r;
-  try {
-    r = await invoke('action', { payload: { action: 'qproxy_cn_login', name } });
-  } catch (e) {
-    toast(`登录没跑通：${e}`, false);
-    return;
-  }
-  const url = r && r.result && r.result.url;
-  if (url) {
-    copyText(url);
-    toast('授权链接已复制，在浏览器里打开并确认授权，回来刷新一次');
-  } else {
-    toast(r.msg || '看数据目录里的登录日志', !!(r && r.ok));
-  }
-  load();
-}
-
-async function cnBridge(name, on) {
-  let r;
-  try {
-    r = await invoke('action', { payload: { action: 'qproxy_cn_bridge', name, on } });
-  } catch (e) {
-    toast(`起桥没跑通：${e}`, false);
-    return;
-  }
-  toast(r.msg, r.ok);
-  load();
-}
-
-/* ---------------- Trae CN 模型反代 ----------------
-   与 Qoder 那栏的关键差别：对话端点要求 `X-User-Real-IP` = 本机出口 IP，
-   缺了或填错一律回 SSE code 4011（文案写着 rate limit，是假话，不是限流）。
-   所以这里把出口 IP 直接摆出来；换网络后 4011 先看它。 */
-async function traeOneClick() {
-  const model = pxState('traework-cn').model || 'glm-5.3-flash';
-  let r;
-  try {
-    r = await invoke('action', { payload: { action: 'trae_oneclick', model } });
-  } catch (e) {
-    toast(`一键反代没跑通：${e}`, false);
-    return;
-  }
-  if (r.ok && r.result && r.result.key) S.tkey = r.result.key;
-  if (r.ok && S.cur) rememberProxyApp(S.cur);
-  toast(r.msg, r.ok);
-  load();
-}
-
 /* ---------------- 模型反代的接入密钥与上游组 ----------------
    来源（某个 Agent 的某个账号 / 台账里的某个 Key）→ 上游组 → 接入密钥。
    请求带着接入密钥进来，反代只在它被授权的上游组里挑上游，并把 Authorization 换成该上游自己的凭据。 */
@@ -5427,123 +4745,13 @@ function inEnabledPool(app, name) {
     (g) => g.enabled !== false && (g.members || []).some((m) => srcs.includes(m.src)));
 }
 
-/* ---- 上游组编辑弹窗 ---- */
-let poolEditing = null;
-function openPoolModal(g) {
-  poolEditing = {
-    id: g?.id || '', name: g?.name || '',
-    enabled: g?.enabled !== false,
-    // 深拷一份成员：改弹窗里的勾选不该立刻影响外面已渲染的卡片
-    members: (g?.members || []).map((m) => ({ ...m })),
-  };
-  $('gp-title').textContent = g ? `编辑上游组 · ${g.name || '未命名'}` : '新建上游组';
-  $('gp-name').value = poolEditing.name;
-  $('gp-en').value = poolEditing.enabled ? '1' : '0';
-  renderPoolMembers();
-  $('gpmodal').hidden = false;
-  $('gp-name').focus();
-}
-function closePoolModal() { $('gpmodal').hidden = true; poolEditing = null; }
-
-function renderPoolMembers() {
-  const host = $('gp-members');
-  clear(host);
-  const mem = (S.data?.proxy?.members) || { instances: [], keys: [] };
-  const has = (src) => (poolEditing.members || []).some((m) => m.src === src);
-  const baseOf = (src) => ((poolEditing.members || []).find((m) => m.src === src) || {}).base_url || '';
-  const toggle = (src, on) => {
-    const list = poolEditing.members || (poolEditing.members = []);
-    const i = list.findIndex((m) => m.src === src);
-    if (on && i < 0) list.push({ src, base_url: '', enabled: true });
-    if (!on && i >= 0) list.splice(i, 1);
-    updatePoolCount();
-  };
-  const setBase = (src, v) => {
-    const m = (poolEditing.members || []).find((x) => x.src === src);
-    if (m) m.base_url = v;
-  };
-
-  if (!mem.instances.length && !mem.keys.length) {
-    host.appendChild(el('div', { class: 'gwempty' },
-      '还没有可选的来源：先在左侧给某个 Agent 建个账号并把 Token 填上，或在「密钥管理」里登记一个 Key。'));
-    return;
-  }
-  if (mem.instances.length) {
-    host.appendChild(el('div', { class: 'gpg' }, 'Agent 账号'));
-    for (const m of mem.instances) {
-      host.appendChild(poolRow({
-        src: m.src,
-        label: `${m.app_name} / ${m.instance}${m.bridge ? ' · 本地桥' : ''}`,
-        bad: !m.has_token ? '该账号还没登记 Token，勾了也用不上' : '',
-        checked: has(m.src),
-        base: baseOf(m.src),
-        onToggle: (v) => toggle(m.src, v),
-        onBase: (v) => setBase(m.src, v),
-      }));
-    }
-  }
-  if (mem.keys.length) {
-    host.appendChild(el('div', { class: 'gpg' }, 'API 台账里的 Key'));
-    for (const m of mem.keys) {
-      host.appendChild(poolRow({
-        src: m.src,
-        label: `${m.site_name} / ${m.label || '（未命名）'}`,
-        sub: m.masked || '',
-        checked: has(m.src),
-        base: baseOf(m.src),
-        onToggle: (v) => toggle(m.src, v),
-        onBase: (v) => setBase(m.src, v),
-      }));
-    }
-  }
-  updatePoolCount();
-}
-
-function poolRow(o) {
-  const cb = el('input', { type: 'checkbox', class: 'gpmem-cb' });
-  cb.checked = !!o.checked;
-  cb.addEventListener('change', () => o.onToggle(cb.checked));
-  const name = el('span', { class: 'gpmem-name', title: o.bad || o.label }, o.label);
-  name.addEventListener('click', () => { cb.checked = !cb.checked; o.onToggle(cb.checked); });
-  const base = el('input', {
-    class: 'gpmem-base', placeholder: '上游地址（留空＝全局）',
-    autocomplete: 'off', spellcheck: 'false',
-  });
-  base.value = o.base || '';
-  base.addEventListener('input', () => o.onBase(base.value.trim()));
-  return el('div', { class: `gpmem${o.bad ? ' warn' : ''}` },
-    cb, name,
-    o.sub ? el('code', { class: 'mono gpmem-sub' }, o.sub) : null,
-    o.bad ? el('span', { class: 'tag expired', title: o.bad }, '不可用') : null,
-    base);
-}
-
-function updatePoolCount() {
-  const n = (poolEditing?.members || []).length;
-  const c = $('gp-count');
-  if (c) c.textContent = n ? `已勾 ${n} 个来源` : '没勾来源 → 保存后是个空上游组';
-}
-
-function savePoolModal() {
-  const item = {
-    id: poolEditing.id || '',
-    name: $('gp-name').value.trim(),
-    enabled: $('gp-en').value === '1',
-    members: poolEditing.members || [],
-  };
-  if (!item.name) { toast('上游组名不能为空', false); return; }
-  run('proxy_pool_upsert', { item });
-  closePoolModal();
-}
-
 /* ---- 接入密钥编辑弹窗 ---- */
 let distEditing = null;
 let distSaving = false;
 function openDistModal(k) {
-  // 新建时默认把全部启用的上游组勾上：多数时候一把 key 就是要走所有组，
+  // 新建时默认把全部启用的供应商勾上：多数时候一把 key 就是要走所有供应商，
   // 少勾了要回头编辑；想收紧的人自己去掉勾更顺手。
-  const defaultPools = k ? (k.pools || [])
-    : (S.data?.proxy?.pools || []).filter((g) => g.enabled !== false).map((g) => g.id);
+  const defaultPools = k ? (k.pools || []) : [];
   distEditing = { id: k?.id || '', name: k?.name || '', enabled: k?.enabled !== false, pools: [...defaultPools] };
   $('gd-title').textContent = k ? `编辑接入密钥 · ${k.name || '未命名'}` : '生成接入密钥';
   $('gd-name').value = distEditing.name;
@@ -5559,27 +4767,37 @@ function closeDistModal() { $('gdmodal').hidden = true; distEditing = null; }
 function renderDistPools() {
   const host = $('gd-pools');
   clear(host);
-  const pools = (S.data?.proxy?.pools) || [];
-  if (!pools.length) {
-    host.appendChild(el('div', { class: 'gwempty' }, '还没有上游组。先新建一个上游组，再回来给它授权。'));
+  const poolIds = new Set(distEditing.pools || []);
+  const providers = [];
+  const off = S.data?.proxy?.sources_off || [];
+  const usedSources = new Set((S.data?.proxy?.pools || []).flatMap((pool) => (pool.members || []).map((member) => member.src)));
+  for (const member of [...(S.data?.proxy?.members?.instances || []), ...(S.data?.proxy?.members?.keys || [])])
+    providers.push({
+      id: member.src, name: member.label ? `${member.site_name || member.app_name}/${member.label}`
+        : member.instance ? `${member.app_name}/${member.instance}` : (member.site_name || member.app_name),
+      off: member.off ?? off.includes(member.src), live: usedSources.has(member.src),
+    });
+  if (!providers.length) {
+    host.appendChild(el('div', { class: 'gwempty' }, '还没有可选供应商。先在账号页或密钥页登记可用来源。'));
     return;
   }
-  host.appendChild(el('div', { class: 'gpg' }, '允许走哪些上游组（一个都不勾 = 全部启用的上游组）'));
-  for (const g of pools) {
+  host.appendChild(el('div', { class: 'gpg' }, '允许走哪些供应商（一个都不勾 = 全部启用的供应商）'));
+  for (const provider of providers) {
+    if (provider.off) continue;
     const cb = el('input', { type: 'checkbox', class: 'gpmem-cb' });
-    cb.checked = distEditing.pools.includes(g.id);
+    cb.checked = poolIds.has(provider.id);
     cb.addEventListener('change', () => {
       const list = distEditing.pools;
-      const i = list.indexOf(g.id);
-      if (cb.checked && i < 0) list.push(g.id);
+      const i = list.indexOf(provider.id);
+      if (cb.checked && i < 0) list.push(provider.id);
       if (!cb.checked && i >= 0) list.splice(i, 1);
     });
-    const name = el('span', { class: 'gpmem-name' }, g.name || '未命名');
+    const name = el('span', { class: 'gpmem-name' }, provider.name || '未命名');
     name.addEventListener('click', () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
     host.appendChild(el('div', { class: 'gpmem' },
       cb, name,
-      el('span', { class: 'tag' }, `可用 ${g.live ?? 0}/${(g.members || []).length}`),
-      g.enabled === false ? el('span', { class: 'tag expired' }, '上游组已停用') : null));
+      el('span', { class: 'tag' }, provider.live ? '可用' : '未接入组'),
+      !provider.live ? el('span', { class: 'tag expired' }, '当前不可用') : null));
   }
 }
 
@@ -6119,6 +5337,12 @@ function renderKeyNav(d) {
 /* key 行只留五列：接入点和模型清单挂在站点上，额度也挂在站点上（见 siteQuotaTxt）。
    操作列照 LongCat 的 API Keys 那样用图标，悬停 tooltip 说明；顺序按她点名的：
    测试 / 编辑 / 复制 / 接入 / 删除 */
+/// 列表里那一小撮宽度只够放域名：完整路径留给悬停，别让人为了看走哪个地址去点编辑
+function keyBaseHost(u) {
+  const s = String(u || '').trim();
+  try { return new URL(s).host || s; } catch { return s; }
+}
+
 function keyRow(site, k) {
   const sig = keySelSig(site.id, k.id);
   const cb = el('input', { type: 'checkbox', class: 'ksel-cb' });
@@ -6132,16 +5356,19 @@ function keyRow(site, k) {
   actTd.appendChild(rowDot);
   const tr = el('tr', { class: keySel().has(sig) ? 'sel' : '', data: { sdgt: 'key', kid: k.id } },
     el('td', { class: 'k-sel' }, cb),
-    el('td', { class: 't', title: k.note || k.label || '' }, k.label || el('span', { class: 'muted' }, '未命名')),
+    // 名称列放不下时靠省略号收尾（.tbl td 统一规则），悬停必须给全名——
+    // 以前 title 只挂备注，有备注的反而看不到全名，等于截断了还查不到
+    el('td', { class: 't', title: [k.label, k.note].filter(Boolean).join('\n') },
+      k.label || el('span', { class: 'muted' }, '未命名')),
     el('td', { class: 't', title: k.source || '' }, k.source || el('span', { class: 'muted' }, '—')),
     el('td', { class: 'k-key', title: '点「复制」取全文' },
       el('span', { class: 'mono' }, k.masked || '—'),
       k.use_in_proxy ? chip('进反代', 'swap') : null,
       // 站点没配 base url 也能测通的就是这种：key 自带接入点（base_for 优先用它），
-      // 悬停把地址露出来，别让人对着「可用」找半天是哪个地址在通
+      // 标签上直接露出域名，别让人对着「可用」猜是哪个地址在通；全路径仍在悬停里
       k.base_url ? el('span', {
-        class: 'tag', title: `这条密钥自带接入点：${k.base_url}\n站点没配接入点时，测试与调用都走它`,
-      }, '自带接入点') : null),
+        class: 'tag', title: `这条密钥自己带接入点：${k.base_url}\n它优先于站点里配的地址，测试和调用都走它`,
+      }, `自带 · ${keyBaseHost(k.base_url)}`) : null),
     el('td', {}, expChip(k)),
     el('td', {}, k.last_status ? chip(k.last_status === 'ok' ? '可用' : '失败', k.last_status) : chip('未测', '')),
     actTd);
@@ -6597,19 +5824,59 @@ function renderDetail() {
   if (shared) {
     const pack = i.auth_pack;
     runRows.push(...sub('换到这个账号 / 换回去', '一次只登一个号的产品，切号就是这一件事。'));
+    // 这张卡存的包到底是谁的：后端按"包里的账号名正对着另一张卡"判定（pack_foreign）。
+    // 这种情况点「切换到此账号」写回去还是原来那个号，必须当场说清，
+    // 并给一条把真身找回来的路——换号前的自动备份里有。
+    // 两个位置都读：这个字段早先挂在 quota 底下，挪到顶层后老版本内核仍然只发 quota 里那份。
+    const packOther = !!(i.pack_foreign || (i.quota && i.quota.pack_foreign));
+    const packAcct = i.pack_account || (i.quota && i.quota.pack_account) || '';
     runRows.push(row('切换账号',
       i.logged_in
         ? `这份档案现在登的就是「${name}」，不用切。`
-        : pack
-          ? `${a.name} 存过这个号的登录态（收在 ${stampTime(pack.at)}）。点「切换到此账号」依次是：`
-            + '收好当前号的登录态 → 结束客户端 → 把这份写回档案位置 → 重新打开。'
-            + '客户端只在启动时读这份文件，所以这一次重启是必要的；换完这张卡会自己标成「本机登录中」。'
-          : `这个号还没存过登录态。${a.name} 几个账号共用默认位置那一份档案，所以先在程序里退出登录、登它一次——`
-            + '登进来驾驶舱会自动收下这份登录态（约 45 秒内），以后来回切都是一键。',
+        : packOther
+          ? `这张卡里存的是「${packAcct}」的登录态，不是「${name}」——写回去只会把「${packAcct}」再登一次。`
+            + '先用「找回它的登录态」把它自己的登录态从换号备份里取回来；找不到就在客户端里退出登录、登它一次。'
+          : pack
+            ? `${a.name} 存过这个号的登录态（收在 ${stampTime(pack.at)}）。点「切换到此账号」依次是：`
+              + '收好当前号的登录态 → 结束客户端 → 把这份写回档案位置 → 重新打开。'
+              + '客户端只在启动时读这份文件，所以这一次重启是必要的；换完这张卡会自己标成「本机登录中」。'
+            : `这个号还没存过登录态。${a.name} 几个账号共用默认位置那一份档案，所以先在程序里退出登录、登它一次——`
+              + '登进来驾驶舱会自动收下这份登录态（约 45 秒内），以后来回切都是一键。',
       i.logged_in ? chip('本机登录中', 'official')
-        : a.auth_switch && pack
-          ? btn('⇄ 切换到此账号', 'primary sm', () => authSwitch(app, name), '写回这个号存过的登录态，并自动重开客户端')
-          : btn('启动客户端', 'primary sm', () => openClient(app, name), '只把程序打开，不做任何换号动作')));
+        : packOther
+          ? btn('找回它的登录态', 'primary sm', () => recoverAuthPack(app, name), '从换号前的自动备份里把这个号自己的登录态找回来')
+          : a.auth_switch && pack
+            ? btn('⇄ 切换到此账号', 'primary sm', () => authSwitch(app, name), '写回这个号存过的登录态，并自动重开客户端')
+            : btn('启动客户端', 'primary sm', () => openClient(app, name), '只把程序打开，不做任何换号动作')));
+    // 这个程序下的其它账号：一次只登一个号，所以"切到谁"应当在一处就能选完，
+    // 不必先退出去点另一张卡、再进它的设置。
+    const mates = (S.data.instances || []).filter((x) => x.app === app && x.name !== name);
+    if (mates.length) {
+      const mv = (a.machine && a.machine.value) || {};
+      const list = el('div', { class: 'ctlrow wrap' });
+      for (const m of mates) {
+        const mp = m.auth_pack;
+        const foreign = !!(m.pack_foreign || (m.quota && m.quota.pack_foreign));
+        const mAcct = m.pack_account || (m.quota && m.quota.pack_account) || '';
+        const hint = m.logged_in
+          ? `这份档案现在登的就是「${m.name}」`
+          : foreign
+            ? `「${m.name}」那张卡里存的是「${mAcct}」的登录态，切不过去；先回它那张卡点「找回它的登录态」`
+            : mp
+              ? `把「${m.name}」存过的登录态写回 ${a.name}，并自动重开客户端`
+              : `「${m.name}」还没存过登录态：先在客户端里登它一次，驾驶舱会自动收下`;
+        list.appendChild(btn(`⇄ 切到「${m.name}」`, 'sm', () => {
+          if (m.logged_in) { toast(`现在登的就是「${m.name}」`, true); return; }
+          if (foreign) { toast(`「${m.name}」存的是「${mAcct}」的登录态，先回那张卡把它自己的登录态找回来`, false); return; }
+          if (!mp) { openClient(app, m.name); return; }
+          authSwitch(app, m.name);
+        }, hint));
+      }
+      runRows.push(row('切到别的账号',
+        `这个程序的其它账号都在这里${mv.account ? `（现在登的是「${mv.account}」）` : ''}。`
+        + '一次只登一个号，所以切过去＝把那个号存过的登录态写回档案并重启一次客户端。',
+        list));
+    }
   } else if (a.swap_ok) {
     // 标题是"还原"时描述必须讲还原，别一套话术挂在两个相反的动作上
     runRows.push(row(i.swapped ? '还原默认档案' : '设为当前账号（换号）',
@@ -6639,6 +5906,8 @@ function renderDetail() {
       btn('改名', 'sm', () => renameAccount(app, name))),
     ...sub('登录与档案', '这个号现在登没登、这份档案从哪来——换号、删号之前先看这两行。'),
     row('登录状态', i.app === 'codex-desktop' ? '读取这个账号自己的登录凭据。'
+      : i.identity && i.identity.state === 'elsewhere'
+      ? '这个产品的登录态不在档案目录里（WorkBuddy 存在系统凭据位置），这一行只说档案建没建起来；现在登的是谁看上方「本机登录」'
       : i.identity && i.identity.state === 'logged'
       ? '已检测到登录痕迹，可以直接用'
       : '还没检测到登录：换号切到空目录会让程序显示未登录甚至黑屏，属正常，登录一次即可',
@@ -6930,6 +6199,15 @@ function openKeyModal(site, k) {
   // 也能点旁边的「选日期」从日历里挑。存的时候统一归一化。
   $('k-exp').value = k?.expires_on || '';
   $('k-note').value = k?.note || '';
+  // 接入点：站点默认那个当地灰提示，这条 key 自己要覆盖才填进来。
+  // 老数据里 key 上留着的地址（列表里打「自带接入点」的那种）在这里原样露出来，
+  // 点「跟随站点」就清空——清了不影响能用，反而是以后站点换地址它能跟着换。
+  const home = siteHomeBase(site);
+  const baseEl = $('k-base');
+  if (baseEl) {
+    baseEl.value = k?.base_url || '';
+    baseEl.placeholder = home ? `留空 = 跟随站点：${home}` : '留空 = 跟随站点（站点还没配接入点）';
+  }
   $('kmodal').hidden = false;
   $('k-label').focus();
   if (k) {
@@ -6953,6 +6231,17 @@ function bindExpPicker() {
   });
   native.addEventListener('change', () => {
     if (native.value) text.value = native.value;
+  });
+}
+/// 「跟随站点」按钮：清掉这条密钥自己的接入点，改回用站点配的那一个。
+/// 只清表单里的值，点保存才落盘——不要点一下就偷偷写文件。
+function bindBaseReset() {
+  const btn = $('k-base-reset');
+  const inp = $('k-base');
+  if (!btn || !inp) return;
+  btn.addEventListener('click', () => {
+    inp.value = '';
+    inp.focus();
   });
 }
 /// 站点默认接入点：挂在站点上的那几个里挑 OpenAI 兼容口，没有再退回任一个；
@@ -7041,7 +6330,8 @@ function kmRenderCands() {
       el('span', { class: 'kmcand-i' }, String(i + 1)),
       inp,
       el('span', { class: 'kmcand-k mono', title: c.key }, kmMask(c.key)),
-      c.base_url ? el('span', { class: 'kmcand-b', title: c.base_url }, '自带接入点') : null,
+      c.base_url ? el('span', { class: 'kmcand-b', title: c.base_url },
+        `自带 · ${keyBaseHost(c.base_url)}`) : null,
       c.expires_on ? el('span', { class: 'kmcand-e' }, `截止 ${c.expires_on}`) : null,
       el('button', {
         class: 'iconbtn danger', type: 'button', title: '去掉这条，不保存', 'aria-label': '去掉',
@@ -7115,13 +6405,17 @@ function normExpDate(s) {
 function collectKeyItem() {
   const id = keyEditing.key.id || `k${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
   const old = keyEditing.key || {};
-  // 额度（总额度/剩余）、模型清单、余额接口、接入点覆盖这些都不在这张表单里了：
-  // 额度与接入点归站点，老数据里 key 自带的那份原样透传给后端，别在保存时被空值冲掉
+  // 额度（总额度/剩余）、模型清单、余额接口归站点，老数据里 key 自带的那份原样透传，
+  // 别在保存时被空值冲掉。接入点这一格例外：它是看得见、改得动的，留空就等于「跟随站点」。
+  // 这里不替她自动清「和站点填得一模一样」的地址——清不清由「跟随站点」那颗按钮决定，
+  // 静默改掉会让列表里的标签莫名消失，比留一条冗余更难解释。
+  const baseEl = $('k-base');
+  const ownBase = baseEl ? baseEl.value.trim() : (old.base_url || '');
   return {
     id,                                   // 空 id = 新建；同 id = 覆盖更新
     label: $('k-label').value.trim(),
     source: $('k-source').value.trim(),
-    base_url: old.base_url || '',
+    base_url: ownBase,
     key: $('k-key').value.trim(),
     models_list: old.models_list || '',
     total: old.total ?? null,
@@ -8303,7 +7597,7 @@ const HELP = [
   {
     t: 'API 与模型反代',
     h: `<p>「密钥管理」管各家官网与中转站的密钥：Base URL、密钥原文、额度与截止日期，一键 <code>GET /v1/models</code> 测试。页顶「快速登记」可整段粘贴或贴截图，站点、端点、密钥与名称当场建好。</p>
-      <p>模型反代在 <code>127.0.0.1:8788</code> 做 OpenAI 兼容转发：账号/Key 先归到「上游组」，再生成「接入密钥」（<code>ac-…</code>）给客户端。每个 Agent 的详情页可以选模型、测试和复制接入信息；全局的上游组、接入密钥与日志在「模型反代」页。</p>`,
+      <p>模型反代在 <code>127.0.0.1:8788</code> 做 OpenAI 兼容转发：账号/Key 先归到「上游组」，再生成「接入密钥」（<code>ac-…</code>）给客户端。每个 Agent 的详情页只留「接入本地网关」——把那个客户端指到本机网关；挑模型、逐个测试、看实测成功率，以及上游组、接入密钥与日志，都在「模型反代」页。</p>`,
   },
   {
     t: '程序收录与数据存放',
@@ -8332,7 +7626,7 @@ const TOUR = [
   { t: '账号设置', s: '#cards', x: '「账号设置」管账号信息，点额度进「额度与用量」；左侧六组：账号信息、额度与用量、运行与换号、目录与数据、凭据与反代、删除账号。' },
   { t: '添加账号', s: '#btn-new', x: '六步：登录方式 → 登录 → 基本信息 → 数据来源 → 额度 → 确认建卡。' },
   { t: '临期提醒', s: 'header', x: '顶栏「临期 N」汇总 30 天内到期的额度（7 天内标红），点开看明细；7 天内启动时弹一次。' },
-  { t: 'Key 与反代', s: '#viewlist', x: '「密钥管理」管官网与中转站 Key；模型反代在 127.0.0.1:8788，账号归到上游组后生成接入密钥给客户端。每个 Agent 的模型测试在自己的详情页。' },
+  { t: 'Key 与反代', s: '#viewlist', x: '「密钥管理」管官网与中转站 Key；模型反代在 127.0.0.1:8788，账号归到上游组后生成接入密钥给客户端。每个 Agent 页只留「接入本地网关」，挑模型与实测在「模型反代 → 反代全景」里。' },
 ];
 function startTour() {
   S.tour = { i: 0 };
@@ -8396,6 +7690,7 @@ let setLast = '';
 
 async function setSetting(section, key, value) {
   lastSettingsWrite = Date.now();
+  S.data.settings[section] ||= {};
   S.data.settings[section][key] = value;
   applyAppearance(S.data.settings.appearance);
   const r = await invoke('set_settings', { patch: { [section]: { [key]: value } } });
@@ -8403,6 +7698,21 @@ async function setSetting(section, key, value) {
   applyAppearance(r.appearance);
   schedulePoll();
   renderSettings();
+}
+
+async function setDesktopSetting(key, value) {
+  await setSetting('desktop_companion', key, value);
+  await window.__TAURI__.event?.emit('companion-settings-changed', S.data.settings.desktop_companion);
+}
+
+async function setDesktopWindow(kind, enabled) {
+  await setDesktopSetting(kind, enabled);
+  try {
+    await invoke('desktop_companion', {op: enabled ? 'show' : 'close', p: {kind}});
+  } catch (error) {
+    await setDesktopSetting(kind, !enabled);
+    toast(String(error), false);
+  }
 }
 
 /* 设置页的一行：标题 + 说明上下堆叠在左，控件贴右（跟 Qoder 的设置行一个思路）。
@@ -8861,7 +8171,8 @@ function menuEditor(key, pool, inLabel) {
    也可以跨栏（拖进左栏 = 出现在侧栏上，拖回右栏 = 收进弹层）。落盘：
    side_visible（侧栏上的项，按序）+ side_menu（收进「更多」的项，按序）。 */
 function sideMenuEditor() {
-  const { vis, more } = sideMenuSplit();
+  const { vis, more } = sideMenuSplit(true);
+  const hidden = Array.isArray(S.data?.settings?.appearance?.side_hidden) ? S.data.settings.appearance.side_hidden : [];
   const wrap = el('div', { class: 'se-wrap' });
   const mkPanel = (cap, panelKey) => {
     const list = el('div', { class: 'se-list' });
@@ -8880,6 +8191,18 @@ function sideMenuEditor() {
   const dragRow = (id, panelKey) => {
     const row = el('div', { class: 'se-row', data: { id } },
       menuIcon(id), el('span', { class: 'se-name' }, SIDE_MENU_ITEMS[id][0]));
+    const isHidden = hidden.includes(id);
+    const eye = el('button', {type: 'button', class: 'se-eye', title: isHidden ? '显示这个入口' : '隐藏这个入口',
+      aria: {label: (isHidden ? '显示' : '隐藏') + SIDE_MENU_ITEMS[id][0], pressed: String(!isHidden)}});
+    eye.innerHTML = isHidden
+      ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 3l18 18M10.6 10.6a2 2 0 002.8 2.8M6.5 6.5C4 8 2.5 10 2 12c1.5 4 5.4 7 10 7 1.5 0 3-.3 4.3-.9M9 5.3A10 10 0 0112 5c4.6 0 8.5 3 10 7-.5 1.3-1.4 2.5-2.5 3.6"/></svg>'
+      : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M2 12c1.5-4 5.4-7 10-7s8.5 3 10 7c-1.5 4-5.4 7-10 7S3.5 16 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+    if (isHidden) row.style.opacity = '0.55';
+    eye.addEventListener('click', async () => {
+      await setSetting('appearance', 'side_hidden', isHidden ? hidden.filter(x => x !== id) : [...hidden, id]);
+      renderViewlist();
+    });
+    row.appendChild(eye);
     const handle = el('span', { class: 'se-handle', title: '拖动排序或跨栏' });
     handle.innerHTML = MENU_ICONS.dots;
     row.appendChild(handle);
@@ -8965,8 +8288,8 @@ function startRowDrag(e, id, fromPanel, rowEl, A, B) {
     rowEl.classList.remove('dragging');
     seDrag = null;
     if (!target || (target.panel === fromPanel && target.before === id)) { renderSettings(); return; }
-    const vis = sideMenuSplit().vis.slice();
-    const more = sideMenuSplit().more.slice();
+    const vis = sideMenuSplit(true).vis.slice();
+    const more = sideMenuSplit(true).more.slice();
     const src = fromPanel === 'side' ? vis : more;
     const i = src.indexOf(id);
     if (i >= 0) src.splice(i, 1);
@@ -9157,6 +8480,16 @@ function renderSettings() {
 
   if (setSection === 'appearance') {
     brandSettings(body, panel, a);
+    const desktop = st.desktop_companion || {};
+    body.appendChild(panel('桌面助手',
+      row('悬浮球', '在桌面显示圆形入口，可自由拖动', switchCtrl(desktop.orb, v => setDesktopWindow('orb', v))),
+      row('桌宠', '在桌面显示小伙伴，可自由拖动', switchCtrl(desktop.pet, v => setDesktopWindow('pet', v))),
+      row('提醒卡片', '显示积分、会话和待办，靠近屏幕边缘可收起', switchCtrl(desktop.panel, v => setDesktopWindow('panel', v))),
+      row('语音播报', '播报新提醒和到期的待办', switchCtrl(desktop.voice, v => setDesktopSetting('voice', v))),
+      row('等待选择时唤起应用', 'Agent 需要选择时尝试打开对应应用', switchCtrl(desktop.focus, v => setDesktopSetting('focus', v))),
+      row('固定展开提醒卡片', '开启后卡片保持展开', switchCtrl(desktop.pin, v => setDesktopSetting('pin', v))),
+      row('贴边提示条', '收起后在屏幕边缘留一个可见的提示标签；关闭时只留 3px 细缝，靠近边缘悬停即可展开', switchCtrl(desktop.edge_hint, v => setDesktopSetting('edge_hint', v))),
+      row('桌面助手颜色', '选择桌面助手的深浅色', segCtrl([['system','跟随系统'],['light','浅色'],['dark','深色']], desktop.theme || 'system', v => setDesktopSetting('theme', v)))));
     body.appendChild(panel('外观',
       row('主题', '深色石墨 + 琥珀金；浅色暖纸 + 深琥珀，两套都过了 WCAG AA 对比度',
         segCtrl([['light', '浅色'], ['system', '跟随系统'], ['dark', '深色']], a.theme,
@@ -9518,7 +8851,11 @@ async function aiRecognize(kind, dataUrl) {
       app: S.cur || '', title: j.title || '', detail: j.detail || '',
       ends_on: j.ends_on || '', daily: !!j.daily, url: '',
     } };
-    renderPerks(S.data);
+    // 「福利活动」现在只在首页：人在别的页贴的图，得先把页面切回首页、再把表单滚到眼前，
+    // 否则表单一字不差地填好了，人却在一块看不见的地方——跟"贴图没反应"没法区分。
+    S.view = 'home';
+    render();
+    jumpToPanel($('perks-list')?.querySelector('.perkform') || $('perks-panel'));
     toast('识别好了，核对一下再保存', true);
     return;
   }
@@ -9931,6 +9268,20 @@ async function authSwitch(app, name) {
   const r = await run('auth_switch', { app, name });
   return !!r.ok;
 }
+// 从换号前的自动备份里找回某个号自己的登录态。
+// 共用一份档案的产品上，一次误收包会把 A 的登录态顶成 B 的，A 那张卡从此"存的是别人"，
+// 点切换写回去还是 B（表现成"切不动"）。备份里 A 的真身还在，解一下就能认出来。
+async function recoverAuthPack(app, name) {
+  const a = S.data.apps.find((x) => x.id === app) || {};
+  if (!await askConfirm(
+    `从换号备份里找回「${name}」自己的登录态？\n\n`
+    + '驾驶舱每次换号前都会把当时那份登录文件留一份备份；这里逐份解开看是哪个号的，'
+    + `只把属于「${name}」的那份收回来。\n不动当前客户端里的登录文件，也不用关程序。`,
+    { title: '找回登录态', okText: '找回' })) return false;
+  const r = await run('auth_recover', { app, name });
+  if (r.ok) load();
+  return !!r.ok;
+}
 // 把早期 adopt 搬进数据根的档案搬回程序自己的位置（同盘改名，不复制）
 async function rehomeAccount(app, name) {
   const i = S.data.instances.find((x) => x.app === app && x.name === name);
@@ -10012,22 +9363,29 @@ function pxRunBtn(d, onlyStop) {
 }
 
 /* 侧栏菜单 / 弹层 / 编辑器共用的图标：内联 SVG（照 ACT_ICONS 的规矩，不赌字体字形）。
-   她点名"所有这几个选项的小图标都重新设计，尤其是那三个点"——文本的 ···/◎/⇢ 在
-   等宽字体里又小又偏，全部换成线性稿（gear 用 24 网格的 Lucide 齿轮缩过来）。 */
+   这套是一族线性稿：除 gear / dots 外全部画在 16 网格上，stroke 1.5、圆头圆角、
+   内容收在 2~14 的键线框里，同一个 .ico 容器（15px）下粗细和视觉重量一致。
+   gear 是 24 网格的 Lucide 齿轮，stroke 2.25 折算下来正好也是 1.5px。
+   settings 是弹层「设置」行用的 id，跟侧栏的 gear 同形；menuEdit 是「编辑侧导菜单」
+   专用的列表+铅笔，不能跟 appearance（外观/主题）混用——以前就是混用才被她点名。 */
 const MENU_ICONS = {
-  usage: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.5v11h11M5.5 10V7M8.5 10V4M11.5 10V6"/></svg>',
-  home: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 7.3 8 3.2l5.2 4.1"/><path d="M4.4 6.6V13h7.2V6.6"/><path d="M6.7 13V9.4h2.6V13"/></svg>',
-  more: '<svg viewBox="0 0 16 16" fill="currentColor" stroke="none"><circle cx="3.4" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="12.6" cy="8" r="1.5"/></svg>',
-  gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
-  collab: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.2h9.4M10.2 3l2.2 2.2-2.2 2.2"/><path d="M13 10.8H3.6M5.8 8.6 3.6 10.8l2.2 2.2"/></svg>',
-  keys: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="11" r="2.7"/><path d="M6.9 9.1 13 3M10.2 5.8l2 2M12 4l2 2"/></svg>',
-  proxy: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 8h10M9.8 5.2 12.9 8l-3.1 2.8"/></svg>',
-  checkin: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M5.3 8.3l1.9 1.9 3.5-4"/></svg>',
-  remote: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="1.8" width="6" height="12.4" rx="1.4"/><path d="M7.2 12.4h1.6"/></svg>',
-  appearance: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 2a6 6 0 0 1 0 12Z" fill="currentColor" stroke="none"/></svg>',
-  logs: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5.6 4h7.8M5.6 8h7.8M5.6 12h7.8"/><circle cx="2.7" cy="4" r=".5" fill="currentColor" stroke="none"/><circle cx="2.7" cy="8" r=".5" fill="currentColor" stroke="none"/><circle cx="2.7" cy="12" r=".5" fill="currentColor" stroke="none"/></svg>',
-  help: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M6.3 6.3a1.8 1.8 0 1 1 2.7 1.9c-.6.4-1 .7-1 1.5"/><circle cx="8" cy="11.6" r=".5" fill="currentColor" stroke="none"/></svg>',
-  lock: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7.2" width="8" height="6" rx="1.5"/><path d="M5.5 7.2V5.6a2.5 2.5 0 0 1 5 0v1.6"/></svg>',
+  sessions: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 4.7v5.5c0 .9-.7 1.7-1.6 1.7H6.2L3 14.3V4.7C3 3.8 3.8 3 4.7 3h7.1c.9 0 1.7.8 1.7 1.7Z"/><circle cx="5.7" cy="7.5" r=".55" fill="currentColor" stroke="none"/><circle cx="8" cy="7.5" r=".55" fill="currentColor" stroke="none"/><circle cx="10.3" cy="7.5" r=".55" fill="currentColor" stroke="none"/></svg>',
+  companion: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="5.5"/><circle cx="6.1" cy="6.9" r=".55" fill="currentColor" stroke="none"/><circle cx="9.9" cy="6.9" r=".55" fill="currentColor" stroke="none"/><path d="M5.8 9.6c1.3 1.2 3.1 1.2 4.4 0"/></svg>',
+  usage: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.7 2.7v10.6h10.6"/><path d="M5.7 10.5V7.3M8.7 10.5V4.3M11.7 10.5V6.3"/></svg>',
+  home: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.7 7.5 8 3.3l5.3 4.2"/><path d="M4.4 6.7v6.2h7.2V6.7"/><path d="M6.7 12.9V9.6h2.6v3.3"/></svg>',
+  more: '<svg viewBox="0 0 16 16" fill="currentColor" stroke="none"><circle cx="3.6" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="12.4" cy="8" r="1.4"/></svg>',
+  gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
+  settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
+  collab: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="4.7" r="2.7"/><path d="M12.1 14.3v-1.3a2.7 2.7 0 0 0-2.7-2.7H4.1a2.7 2.7 0 0 0-2.7 2.7v1.3"/><path d="M11.5 2.4a2.7 2.7 0 0 1 0 5.2"/><path d="M15.1 14.3v-1.3a2.7 2.7 0 0 0-2-2.6"/></svg>',
+  keys: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="10.9" r="2.6"/><path d="M6.9 9 12.9 3.1"/><path d="M10.2 5.8l1.9 1.9M12 4l1.9 1.9"/></svg>',
+  proxy: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 8h5.4"/><circle cx="9.7" cy="8" r="1.7"/><path d="M11.4 8h2.5"/><path d="M12.4 6.2 14.2 8l-1.8 1.8"/></svg>',
+  checkin: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.7" y="3.5" width="10.6" height="9.2" rx="1.7"/><path d="M5.4 2.1v2.4M10.6 2.1v2.4M2.7 6.6h10.6"/><path d="M5.6 9.7l1.8 1.8 3.2-3.2"/></svg>',
+  remote: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4.7" y="1.9" width="6.6" height="12.2" rx="1.6"/><path d="M7.3 11.9h1.4"/></svg>',
+  appearance: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="5.8"/><path d="M8 2.2a5.8 5.8 0 0 1 0 11.6Z" fill="currentColor" stroke="none"/></svg>',
+  menuEdit: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 4h5.4M2.6 7.2h5.4M2.6 10.4h3.4"/><path d="M12 6.7l1.6 1.6-5.2 5.2h-1.6v-1.6l5.2-5.2Z"/></svg>',
+  logs: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.3" y="3.1" width="11.4" height="9.8" rx="1.6"/><path d="M4.9 6.5l2 1.9-2 1.9"/><path d="M8.7 10.3h2.9"/></svg>',
+  help: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.7"/><path d="M6.1 6a2 2 0 0 1 3.9.7c0 1.3-2 2-2 2"/><circle cx="8" cy="11.4" r=".55" fill="currentColor" stroke="none"/></svg>',
+  lock: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.9" y="7.2" width="8.2" height="6" rx="1.5"/><path d="M5.5 7.2V5.6a2.5 2.5 0 0 1 5 0v1.6"/><circle cx="8" cy="10.2" r=".55" fill="currentColor" stroke="none"/></svg>',
   dots: '<svg viewBox="0 0 8 14" width="8" height="14" fill="currentColor" stroke="none"><circle cx="2" cy="2" r="1.2"/><circle cx="6" cy="2" r="1.2"/><circle cx="2" cy="7" r="1.2"/><circle cx="6" cy="7" r="1.2"/><circle cx="2" cy="12" r="1.2"/><circle cx="6" cy="12" r="1.2"/></svg>',
 };
 function menuIcon(id) {
@@ -10039,6 +9397,8 @@ function menuIcon(id) {
    （设置页分组入口）。哪些项出现在侧栏上、哪些收进「更多」、按什么顺序，
    在 设置 → 外观 的「侧导菜单」里按住行尾六个点拖（Qoder 的「编辑侧导菜单」那套）。 */
 const SIDE_MENU_ITEMS = {
+  sessions: ['会话看板', () => cockpitSessions.open()],
+  companion: ['桌面助手', () => { setSection = 'appearance'; S.view = 'settings'; }],
   usage: ['用量统计', () => { S.view = 'usage'; }],
   collab: ['协作', () => { S.view = 'collab'; ensureCollab(false); }],
   keys: ['密钥管理', () => { S.view = 'keys'; }],
@@ -10061,7 +9421,7 @@ function menuIds(key, pool) {
 }
 /* 侧栏上的项（side_visible，按序插在「首页」和「更多」之间）与收进「更多」的项
    （side_menu）的划分；两边都没有的候选项收进「更多」，保证并集完整、互不重复。 */
-function sideMenuSplit() {
+function sideMenuSplit(includeHidden = false) {
   const ok = (id) => !!SIDE_MENU_ITEMS[id];
   const a = S.data?.settings?.appearance || {};
   const vis = (Array.isArray(a.side_visible) ? a.side_visible : []).filter(ok);
@@ -10070,7 +9430,8 @@ function sideMenuSplit() {
   for (const id of Object.keys(SIDE_MENU_ITEMS)) {
     if (!vis.includes(id) && !more.includes(id)) more.push(id);
   }
-  return { vis, more };
+  const hidden = Array.isArray(a.side_hidden) ? a.side_hidden : [];
+  return includeHidden ? { vis, more } : { vis: vis.filter(id => !hidden.includes(id)), more: more.filter(id => !hidden.includes(id)) };
 }
 let sidePop = null;
 let seDrag = null;   // 编辑器正在拖拽时别重建面板/侧栏（4 秒轮询会掐断拖拽）
@@ -10125,6 +9486,7 @@ function renderViewlist() {
       S.view = view;
       render();
       if (view === 'collab') ensureCollab(false);
+      if (view === 'sessions') cockpitSessions.open();
     });
     return el('li', {}, b);
   };
@@ -10144,7 +9506,7 @@ function renderViewlist() {
   ul.appendChild(popRow('btn-more-menu', 'more', '更多', () => {
     const items = sideMenuSplit().more.map((id) => [id, SIDE_MENU_ITEMS[id][0], SIDE_MENU_ITEMS[id][1]]);
     items.push({ sep: true });
-    items.push(['appearance', '编辑侧导菜单', () => { setSection = 'appearance'; S.view = 'settings'; }]);
+    items.push(['menuEdit', '编辑侧导菜单', () => { setSection = 'appearance'; S.view = 'settings'; }]);
     return items;
   }));
   ul.appendChild(popRow('btn-gear-menu', 'gear', '设置', () => {
@@ -10192,6 +9554,7 @@ function bind() {
   $('c-alerts').addEventListener('click', showAlerts);
   bindCtx();
   $('btn-new').addEventListener('click', openWizard);
+  cockpitSessions.bind();
   $('btn-scan').addEventListener('click', () => run('rescan'));
   $('btn-inv').addEventListener('click', async () => {
     const b = $('btn-inv');
@@ -10255,12 +9618,18 @@ function bind() {
   document.querySelectorAll('#proxy-nav [data-sec]').forEach((b) => {
     b.addEventListener('click', () => {
       const map = {
-        guide: 'proxy-guide', models: 'proxy-models', groups: 'proxy-groups',
-        keys: 'proxy-keys', bridge: 'proxy-bridge', logs: 'proxy-logs', advanced: 'proxy-advanced',
+        guide: 'proxy-guide', routes: 'proxy-routes', models: 'proxy-models', suppliers: 'proxy-suppliers',
+        bridge: 'proxy-bridge', logs: 'proxy-logs', advanced: 'proxy-advanced',
       };
-      const target = $(map[b.dataset.sec]);
+      const sec = b.dataset.sec;
+      // 左栏点小节：这一块要是被收起了，先展开再滚过去——否则滚过去是个空标题
+      if (['models'].includes(sec) && pxFolded(sec)) {
+        pxUnfold(sec);
+        renderProxyPage(S.data);
+      }
+      const target = $(map[sec]);
       if (!target) return;
-      if (b.dataset.sec === 'logs' || b.dataset.sec === 'advanced') target.open = true;
+      if (sec === 'logs' || sec === 'advanced') target.open = true;
       target.scrollIntoView({ block: 'start' });
       document.querySelectorAll('#proxy-nav [data-sec]').forEach((x) => {
         x.setAttribute('aria-current', String(x === b));
@@ -10268,10 +9637,6 @@ function bind() {
     });
   });
   $('p-btn').addEventListener('click', proxyToggle);
-  $('gp-cancel').addEventListener('click', closePoolModal);
-  $('gp-save').addEventListener('click', savePoolModal);
-  $('gpmodal').addEventListener('click', (e) => { if (e.target.id === 'gpmodal') closePoolModal(); });
-  $('gp-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') savePoolModal(); });
   $('gd-cancel').addEventListener('click', closeDistModal);
   $('gd-save').addEventListener('click', saveDistModal);
   $('gdmodal').addEventListener('click', (e) => { if (e.target.id === 'gdmodal') closeDistModal(); });
@@ -10289,6 +9654,12 @@ function bind() {
   $('btn-keys-batch').addEventListener('click', () => openKeyBatch('all'));
   $('btn-checkin-refresh').addEventListener('click', () => loadCheckin(true));
   $('c-checkin').addEventListener('click', () => { S.view = 'checkin'; render(); });
+  $('c-run').addEventListener('click', runChipGo);
+  $('c-run').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    runChipGo();
+  });
   $('c-proxy').addEventListener('click', proxyChipGo);
   $('c-proxy').addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
@@ -10308,6 +9679,7 @@ function bind() {
     (e) => { if (e.key === 'Enter') saveSiteModal(); }));
   $('km-cancel').addEventListener('click', closeKeyModal);
   bindExpPicker();
+  bindBaseReset();
   // 弹窗里的快速识别：展开 / 识别 / 截图 / 收起
   $('km-quick').addEventListener('click', () => {
     const box = $('km-quick-box');
@@ -10397,7 +9769,6 @@ function bind() {
       else if (!$('wizard').hidden) closeWizard();
       else if (!$('imodal').hidden) closeDetail();
       else if (!$('amodal').hidden) $('amodal').hidden = true;
-      else if (!$('gpmodal').hidden) closePoolModal();
       else if (!$('gdmodal').hidden) closeDistModal();
       else if (!$('kmodal').hidden) closeKeyModal();
       else if (!$('injmodal').hidden) $('injmodal').hidden = true;
@@ -10434,6 +9805,31 @@ async function init() {
   } catch { /* 旧桥没有 app 模块：留着空 */ }
   bind();
   await load();
+  if (window.__TAURI__.event?.listen) {
+    await window.__TAURI__.event.listen('companion-navigate', event => {
+      const target = event.payload || {};
+      if (target.view === 'sessions') cockpitSessions.open('', target.sid || '');
+      if (target.view === 'settings') {setSection = 'appearance'; S.view = 'settings'; render();}
+      if (target.view === 'account' && target.app && target.name) {
+        S.cur = target.app; S.view = 'agents'; render(); openDetail(target.app, target.name, 'quota');
+      }
+    });
+    for (const [eventName, enabled] of [['companion-opened', true], ['companion-closed', false]]) {
+      await window.__TAURI__.event.listen(eventName, event => {
+        const kind = event.payload?.kind;
+        if (['orb', 'pet', 'panel'].includes(kind) && !!S.data?.settings?.desktop_companion?.[kind] !== enabled) {
+          setDesktopSetting(kind, enabled).catch(e => toast(String(e), false));
+        }
+      });
+    }
+    await window.__TAURI__.event.listen('companion-pin-changed', event => {
+      setDesktopSetting('pin', !!event.payload?.pin).catch(e => toast(String(e), false));
+    });
+    const desktop = S.data.settings.desktop_companion || {};
+    for (const kind of ['orb', 'pet', 'panel']) {
+      if (desktop[kind]) invoke('desktop_companion', {op:'show', p:{kind}}).catch(e => toast(String(e), false));
+    }
+  }
   // 主题搬进设置后，把旧版存在 localStorage 里的偏好迁移过来，别让默认值盖掉用户的选择
   const legacy = localStorage.getItem('cockpit-theme');
   if (legacy) {

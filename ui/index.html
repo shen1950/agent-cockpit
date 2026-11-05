@@ -7,6 +7,10 @@
 <link rel="stylesheet" href="styles.css">
 <link rel="stylesheet" href="usage-dashboard.css">
 <link rel="stylesheet" href="settings-ui.css">
+<link rel="stylesheet" href="client-connect.css">
+<link rel="stylesheet" href="gateway-provider.css">
+<link rel="stylesheet" href="gateway-suppliers.css">
+<link rel="stylesheet" href="gateway-routes.css">
 </head>
 <body>
 <header class="topbar" data-tauri-drag-region>
@@ -26,7 +30,7 @@
   <div class="stats">
     <span class="chip" id="c-agents"><i class="dot"></i><span>—</span></span>
     <span class="chip" id="c-inst"><i class="dot"></i><span>—</span></span>
-    <span class="chip" id="c-run"><i class="dot"></i><span>—</span></span>
+    <span class="chip" id="c-run" role="button" tabindex="0"><i class="dot"></i><span>—</span></span>
     <span class="chip" id="c-proxy" role="button" tabindex="0"><i class="dot"></i><span>—</span></span>
     <span class="chip expiring" id="c-alerts" hidden title="临期积分明细"><i class="dot"></i><span>—</span></span>
     <span class="chip" id="c-checkin" hidden title="今天还能领的"><i class="dot"></i><span>—</span></span>
@@ -85,6 +89,40 @@
       </div>
       <div class="pagebody">
         <div id="home-body" class="homepad"></div>
+        <!-- 福利活动 + 运行中的进程：这两块原来都挂在每个 Agent 的账号页底部，同一份内容
+             在 8 个 Agent 页里各出现一遍；现在统一收到首页这一处。
+             顶栏「运行中 N」定位到进程表，贴图识别福利时定位到福利活动。
+             放在 #home-body 外面是有意的：首页每 4 秒整块重建一次 home-body，
+             这两块留在外面就不会跟着重建，滚动位置和"正要点结束全部"的手感都不会被顶掉。 -->
+        <div class="homepad homeextra">
+          <section class="panel" id="perks-panel" aria-label="福利活动">
+            <header class="panelhead">
+              <h2>福利活动</h2>
+              <span class="sub">限时免费 / 每日赠送 · 手动登记，过期自动收起</span>
+            </header>
+            <div id="perks-list"></div>
+          </section>
+
+          <section class="panel" id="home-procs" aria-label="运行中的进程">
+            <header class="panelhead">
+              <h2>运行中的进程</h2>
+              <span class="sub">实例级精确匹配 · 每 4 秒自动刷新<i id="c-fresh"></i></span>
+            </header>
+            <div class="tablewrap">
+              <table class="tbl">
+                <thead>
+                  <tr>
+                    <th class="col-app">Agent</th>
+                    <th class="col-detail">详情</th>
+                    <th class="col-pid">PID</th>
+                    <th class="col-act"></th>
+                  </tr>
+                </thead>
+                <tbody id="procs"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
       </div>
     </div>
 
@@ -95,6 +133,7 @@
         <span class="count" id="cur-count"></span>
         <span class="pill" id="cur-cap"></span>
         <span class="sp"></span>
+        <button class="btn" id="btn-agent-sessions">查看会话</button>
         <button class="btn primary" id="btn-new">＋ 添加账号</button>
         <button class="btn" id="btn-hide" title="把误收的程序从列表里隐藏（不会卸载，可在设置里恢复）">隐藏程序</button>
         <button class="btn" id="btn-forget" title="移除这条已卸载程序的记录（账号目录原样保留）" hidden>清理记录</button>
@@ -104,42 +143,18 @@
       <div class="hintline" id="cur-hint" hidden></div>
       <div class="cards" id="cards"></div>
 
-      <section class="panel" id="perks-panel">
-        <header class="panelhead">
-          <h2>福利活动</h2>
-          <span class="sub">限时免费 / 每日赠送 · 手动登记，过期自动收起</span>
-        </header>
-        <div id="perks-list"></div>
-      </section>
-
-      <section class="panel">
-        <header class="panelhead">
-          <h2>运行中的进程</h2>
-          <span class="sub">实例级精确匹配 · 每 4 秒自动刷新<i id="c-fresh"></i></span>
-        </header>
-        <div class="tablewrap">
-          <table class="tbl">
-            <thead>
-              <tr>
-                <th class="col-app">Agent</th>
-                <th class="col-detail">详情</th>
-                <th class="col-pid">PID</th>
-                <th class="col-act"></th>
-              </tr>
-            </thead>
-            <tbody id="procs"></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="panel" id="agent-proxy-panel" hidden>
-        <header class="panelhead">
-          <h2>模型反代</h2>
-          <span class="sub" id="agent-proxy-sub">这个 Agent 的模型接入与测试</span>
-        </header>
-        <div id="agent-proxy"></div>
-      </section>
+      <section class="panel gateway-client" id="gateway-client" aria-label="接入本地网关"></section>
       </div><!-- /pagebody -->
+    </div>
+
+    <div id="view-sessions" class="view" hidden>
+      <div class="toolbar">
+        <button class="btn sm" id="sessions-back">← 返回</button>
+        <h1>会话看板</h1><span class="count">AgentFind</span><span class="sp"></span>
+        <button class="btn" id="sessions-retry">重新连接</button>
+      </div>
+      <div id="sessions-notice" role="status" class="hintline"></div>
+      <iframe id="sessions-frame" title="AgentFind 本机会话" sandbox="allow-scripts allow-same-origin allow-modals" allow="clipboard-write" hidden></iframe>
     </div>
 
     <div id="view-usage" class="view" hidden>
@@ -229,9 +244,9 @@
         <div class="setlayout">
           <ul class="setnav" id="proxy-nav">
             <li><button data-sec="guide" aria-current="true">反代接入引导</button></li>
+            <li><button data-sec="routes">实时路由</button></li>
             <li><button data-sec="models">反代全景</button></li>
-            <li><button data-sec="groups">上游组</button></li>
-            <li><button data-sec="keys">接入密钥</button></li>
+            <li><button data-sec="suppliers">供应商</button></li>
             <li><button data-sec="bridge">本地桥</button></li>
             <li class="sep"></li>
             <li><button data-sec="logs">请求日志</button></li>
@@ -239,9 +254,9 @@
           </ul>
           <div class="setbody">
             <div id="proxy-guide"></div>
+            <section id="proxy-routes" class="panel gateway-routes" aria-label="实时路由"></section>
             <div id="proxy-models"></div>
-            <div id="proxy-groups"></div>
-            <div id="proxy-keys"></div>
+            <div id="proxy-suppliers" class="gateway-suppliers"></div>
             <div id="proxy-bridge"></div>
             <details class="panel proxy-fold" id="proxy-logs">
               <summary>请求日志</summary>
@@ -423,8 +438,9 @@
 </div>
 
 <!-- ================= key 编辑弹窗 =================
-     只留这条 key 自己的东西：名称、来源、Key 原文、截止日期、备注。
-     额度（总额度/剩余）挂在站点上，在「修改站点」里填；接入点和模型清单也归站点。 -->
+     这条 key 自己的东西：名称、来源、Key 原文、截止日期、备注；
+     接入点默认归站点（「修改站点」里那几行），这里多一格只在
+     「这条 key 要走别的地址」时填，留空就是跟随站点。 -->
 <div class="modal" id="kmodal" hidden>
   <div class="dialog wide" role="dialog" aria-modal="true">
     <h3 id="km-title">添加密钥</h3>
@@ -452,6 +468,14 @@
       <input id="k-source" placeholder="这条 key 从哪来的，如 官方申请 / 群里分享（可留空）" autocomplete="off">
       <label for="k-key">密钥</label>
       <input id="k-key" type="password" placeholder="sk-..." autocomplete="off">
+      <!-- 接入点默认归站点；这里只在“这条密钥要单独走别的地址”时才填。
+           老数据里 key 自带的那个地址原样显示出来，点「跟随站点」就清掉。 -->
+      <label for="k-base">接入点</label>
+      <div class="fieldexp">
+        <input id="k-base" placeholder="留空 = 跟随站点" autocomplete="off" spellcheck="false">
+        <button class="btn sm" id="k-base-reset" type="button"
+          title="清掉这条密钥自己的接入点，改回用站点里配的那一个">跟随站点</button>
+      </div>
       <label for="k-exp">截止日期</label>
       <div class="fieldexp">
         <input id="k-exp" placeholder="如 2026-12-31（留空表示未填）" autocomplete="off" spellcheck="false">
@@ -500,33 +524,6 @@
   </div>
 </div>
 
-<!-- ================= 反代：上游组编辑弹窗 ================= -->
-<div class="modal" id="gpmodal" hidden>
-  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="gp-title">
-    <h3 id="gp-title">新建上游组</h3>
-    <div class="fields">
-      <label for="gp-name">上游组名</label>
-      <input id="gp-name" placeholder="如 Qoder 上游组 / WorkBuddy 上游组 / 备用线路" autocomplete="off">
-      <label for="gp-en">启用</label>
-      <select id="gp-en">
-        <option value="1">启用（参与分流）</option>
-        <option value="0">停用（先留着不参与）</option>
-      </select>
-    </div>
-    <p class="askbody" style="margin-top:12px">
-      勾进来的来源按策略轮流使用。Agent 账号要有 Token，API Key 用台账里登记的地址；
-      单个成员可单独指定上游，留空用全局上游。
-    </p>
-    <div class="memlist" id="gp-members"></div>
-    <footer class="dialogfoot">
-      <span class="kv" id="gp-count"></span>
-      <span class="sp"></span>
-      <button class="btn" id="gp-cancel">取消</button>
-      <button class="btn primary" id="gp-save">保存上游组</button>
-    </footer>
-  </div>
-</div>
-
 <!-- ================= 反代：接入密钥编辑弹窗 ================= -->
 <div class="modal" id="gdmodal" hidden>
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="gd-title">
@@ -541,7 +538,7 @@
       </select>
     </div>
     <p class="askbody" style="margin-top:12px">
-      生成后复制到客户端的 API Key 位置，地址用本机反代地址；一个上游组都不勾即走所有启用的上游组。
+      生成后复制到客户端的 API Key 位置，地址用本机反代地址；一个供应商都不勾即走所有启用的供应商。
     </p>
     <div class="memlist" id="gd-pools"></div>
     <div class="keyout" id="gd-out" hidden></div>
@@ -608,6 +605,10 @@
 <script src="brand.js"></script>
 <script src="legal.js"></script>
 <script src="settings-ui.js"></script>
+<script src="gateway-provider.js"></script>
+<script src="gateway-suppliers.js"></script>
+<script src="client-connect.js"></script>
+<script src="gateway-routes.js"></script>
 <script src="app.js"></script>
 <script src="remote-online.js"></script>
 <script src="proxy-guide.js"></script>

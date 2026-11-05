@@ -4,7 +4,7 @@
 const now = Date.now() / 1000;
 const inst = (app, app_name, name, kind, running, procs, q, extra = {}) => ({
   app, app_name, kind, name, running, procs,
-  workdir: 'D:\\Claude\\agent-cockpit-workspace',
+  workdir: 'D:\\Projects\\Example',
   created: '2026-09-28',
   swapped: false,
   identity: running
@@ -33,7 +33,7 @@ function wbTrend() {
     peak_date: '2026-09-09',
     from: rows[0][0],
     to: rows[rows.length - 1][0],
-    db: 'C:\\Users\\USER\\.workbuddy\\workbuddy.db',
+    db: 'C:\\Users\\Example\\.workbuddy\\workbuddy.db',
     days: rows.map((r) => ({ date: r[0], credits: r[1], sessions: r[2] })),
   };
 }
@@ -143,10 +143,10 @@ const DATA = {
       isolatable: false,
       local_quota: true, web_quota: true, auth_switch: true,
       machine: { known: true, refreshing: false, value: {
-        ok: true, account: 'shen1950', user_id: '22222222-2222-2222-2222-222222222222',
+        ok: true, account: 'demo_account_b', user_id: '00000000-0000-4000-8000-000000000002',
         user_type: 'personal_standard', left: 1751, total: 2400, expires_on: '未给出',
-        source: 'server', auth_from: 'C:\\Users\\USER\\AppData\\Roaming\\com.qodercn.app.stable\\auth.v1.dat',
-        profile_dir: 'C:\\Users\\USER\\AppData\\Roaming\\com.qodercn.app.stable' } } },
+        source: 'server', auth_from: 'C:\\Users\\Example\\AppData\\Roaming\\com.qodercn.app.stable\\auth.v1.dat',
+        profile_dir: 'C:\\Users\\Example\\AppData\\Roaming\\com.qodercn.app.stable' } } },
     { id: 'qoder-cn-ide', name: 'Qoder CN IDE', kind: 'electron', installed: true, swapped: '', swap_ok: true },
     { id: 'workbuddy', name: 'WorkBuddy', kind: 'electron', installed: true, swapped: '', swap_ok: true },
     { id: 'traework-cn', name: 'TRAE CN', kind: 'electron', installed: true, swapped: '', swap_ok: true },
@@ -162,8 +162,8 @@ const DATA = {
     // 只有当机器上只剩旧 VS Code 壳那份 8 月的 state.vscdb 时才会长成账号1 这样
     inst('qoder', 'Qoder', '账号1', 'electron', true, 12, {
       total: 500, left: 500, expires_on: '2026-08-28', days_left: -41,
-      local_account: 'Brilliant Liare〈rl1950790741@163.com〉',
-      auth_from: 'C:\\Users\\USER\\AppData\\Roaming\\Qoder\\User\\globalStorage\\state.vscdb',
+      local_account: '示例账号〈demo@example.test〉',
+      auth_from: 'C:\\Users\\Example\\AppData\\Roaming\\Qoder\\User\\globalStorage\\state.vscdb',
       source: 'local-cache', stale: true,
       live_error: 'HTTP 401 {"code": "TOKEN_EXPIRE", "message": "token is not active"}',
       fetched_at: now - 700,
@@ -175,28 +175,28 @@ const DATA = {
     inst('qoder', 'Qoder', '账号2', 'electron', false, 0, {
       total: 1200, left: 1200, expires_on: '无限期', days_left: null,
       source: 'server',
-      auth_from: 'C:\\Users\\USER\\AppData\\Roaming\\com.qoder.app.stable\\auth.v1.dat',
+      auth_from: 'C:\\Users\\Example\\AppData\\Roaming\\com.qoder.app.stable\\auth.v1.dat',
     }),
     // 演示"本机已经换成另一个号"：这张卡已让位，只留历史额度。
     // 明细是两小时前从官网读回来的 24 笔，本机那条接口只有两个汇总数——守卫让它只刷汇总数，
     // 不许把明细压回一行，所以这里就是修完之后卡片该长的样子（大字新、明细旧且自己说明）
     inst('qoder-cn', 'Qoder CN', '账号1', 'electron', false, 0, {
       total: 4100, left: 4000, expires_on: '2026-10-20', days_left: 9, quota_url: true, fetched_at: now - 5000,
-      local_account: 'exampleuser_b', user_id: '019e0000-0000-0000-0000-000000000001',
+      local_account: 'demo_account_a', user_id: '019e0000-0000-0000-0000-000000000001',
       bound_mismatch: true, source: 'server',
       groups: webGroups(), detail_source: 'web', detail_at: now - 2 * 3600, detail_stale: true,
-    }, { released: true, released_to: 'shen1950', origin: 'adopt', app_running: true,
+    }, { released: true, released_to: 'demo_account_b', origin: 'adopt', app_running: true,
       auth_pack: {
-        at: now - 7200, account: 'exampleuser_b',
+        at: now - 7200, account: 'demo_account_a',
         user_id: '019e0000-0000-0000-0000-000000000001',
-        dir: 'C:\\Users\\USER\\AppData\\Roaming\\com.qodercn.app.stable',
+        dir: 'C:\\Users\\Example\\AppData\\Roaming\\com.qodercn.app.stable',
         files: [{ name: 'auth.v1.dat', bytes: 414 }],
       } }),
     // 演示官网逐资源包读数：三个大组 + 组内逐笔各带自己的到期时间
     // 共用一份档案的产品：整棵进程树记在"现在登着的那个号"头上，不是磁盘换号记录里那个
-    inst('qoder-cn', 'Qoder CN', 'shen1950', 'electron', true, 8, {
+    inst('qoder-cn', 'Qoder CN', 'demo_account_b', 'electron', true, 8, {
       total: 2400, left: 1751, expires_on: '2026-10-24 21:13', days_left: 13,
-      local_account: 'shen1950', user_id: '22222222-2222-2222-2222-222222222222',
+      local_account: 'demo_account_b', user_id: '00000000-0000-4000-8000-000000000002',
       source: 'web', plan_name: '体验版', fetched_at: now - 60,
       groups: webGroups(), detail_source: 'web', detail_at: now - 60, trend: qoderTrend(),
     }),
@@ -204,15 +204,15 @@ const DATA = {
     inst('workbuddy', 'WorkBuddy', '账号1', 'electron', false, 0, {
       total: 4943, left: 4194.84000019, expires_on: '2026-10-19', days_left: 8,
       source: 'server', fetched_at: now - 900, plan_name: '体验版',
-      local_account: 'ExampleAccount',
-      auth_from: 'C:\\Users\\USER\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info',
+      local_account: 'demo_account_c',
+      auth_from: 'C:\\Users\\Example\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info',
       groups: wbGroups(), trend: wbTrend(),
     }),
     inst('traework-cn', 'TRAE CN', '账号1', 'electron', true, 6, { total: 800, left: 760, expires_on: '2026-11-02', days_left: 32 }),
     // 演示：这个账号的数据是"接管"进来的（对话与记忆都在里面）
     inst('zcode', 'ZCode', '账号1', 'electron', false, 0, {}, {
       origin: 'adopt',
-      seeded_from: 'C:\\Users\\USER\\.zcode.cockpit-original',
+      seeded_from: 'C:\\Users\\Example\\.zcode.cockpit-original',
     }),
     inst('codex', 'Codex CLI', '账号1', 'cli', true, 1, { total: 100, left: 63, expires_on: '2026-10-30', days_left: 29, has_token: true }, {
       usage: { input: 48_210_533, output: 3_102_884, cached: 39_551_200, reasoning: 1_830_117, total: 51_313_417, files: 63 },
@@ -222,7 +222,7 @@ const DATA = {
   procs: [
     { app: 'Qoder', app_id: 'qoder', detail: '12 个进程（含渲染/GPU 子进程）', pids: '8400,11200,21276,24404,24500,29496', count: 12 },
     { app: 'Qoder CN', app_id: 'qoder-cn', detail: '8 个进程（含渲染/GPU 子进程）', pids: '3011,3020,3155,3400', count: 8 },
-    { app: 'Codex CLI / 账号1', app_id: 'codex', detail: 'D:\\Claude\\agent-cockpit-workspace', pids: '17820', count: 1 },
+    { app: 'Codex CLI / 账号1', app_id: 'codex', detail: 'D:\\Projects\\Example', pids: '17820', count: 1 },
   ],
   alerts: [
     // 旧缓存不产生"临期"提醒（后端 state.rs 里 quota_stale 会跳过），所以这里也不列 Qoder
@@ -259,7 +259,7 @@ const DATA = {
           last_error: '', in_pool: true, usable: true,
         },
         {
-          app: 'qoder-cn', app_name: 'Qoder CN', name: 'exampleuser_b', region: 'cn', region_label: '国内版',
+          app: 'qoder-cn', app_name: 'Qoder CN', name: 'demo_account_a', region: 'cn', region_label: '国内版',
           state: 'signature_required', text: '要官方客户端签名（纯 HTTP 打不通）',
           detail: '{"code":"101","message":"Signature invalid"}', masked: 'dt-w9…0Acg',
           expires_at: '2026-11-18T13:35:43Z', days_left: 29, latency_ms: 161,
@@ -274,8 +274,8 @@ const DATA = {
       pool_name: 'WorkBuddy 上游组', dist_name: 'WorkBuddy 接入',
       dist: { id: 'dk-wb', name: 'WorkBuddy 接入', masked: 'ac-b523••••4560', calls: 10 },
       accounts: [
-        { app: 'workbuddy', app_name: 'WorkBuddy', name: 'ExampleAccount', region: 'cn', region_label: '国内版', state: 'ok', masked: 'wb-du••••k3', user: 'ExampleAccount', expires_days: 27, today_credit: 0, today_tokens: 78, today_calls: 6, calls: 6, ok: 6, fail: 0, in_pool: true },
-        { app: 'workbuddy-intl', app_name: 'WorkBuddy 国际版', name: 'shen1950', region: 'global', region_label: '国际版', state: 'ok', masked: 'wb-sh••••9a', user: 'shen1950', expires_days: 362, today_credit: 0, today_tokens: 0, today_calls: 4, calls: 4, ok: 4, fail: 0, in_pool: true },
+        { app: 'workbuddy', app_name: 'WorkBuddy', name: 'demo_account_c', region: 'cn', region_label: '国内版', state: 'ok', masked: 'wb-du••••k3', user: 'demo_account_c', expires_days: 27, today_credit: 0, today_tokens: 78, today_calls: 6, calls: 6, ok: 6, fail: 0, in_pool: true },
+        { app: 'workbuddy-intl', app_name: 'WorkBuddy 国际版', name: 'demo_account_b', region: 'global', region_label: '国际版', state: 'ok', masked: 'wb-sh••••9a', user: 'demo_account_b', expires_days: 362, today_credit: 0, today_tokens: 0, today_calls: 4, calls: 4, ok: 4, fail: 0, in_pool: true },
       ],
       models: [
         { app: 'workbuddy', region: 'cn', region_label: '国内版', allow_paid: false, fetched_at: Math.floor(now) - 3600, error: null,
@@ -303,7 +303,7 @@ const DATA = {
       base_url: 'http://127.0.0.1:8788/v1', port: 8788,
       dist: { id: 'dk-trae', name: 'Trae 接入', masked: 'ac-8fc2••••1d3e', calls: 3 },
       accounts: [
-        { app: 'traework-cn', app_name: 'TRAE CN', name: 'shen1950', ok: true, ready: true, token_tail: '…7f2a', user_id: '21498320', hours_left: 120 },
+        { app: 'traework-cn', app_name: 'TRAE CN', name: 'demo_account_b', ok: true, ready: true, token_tail: '…7f2a', user_id: '12345678', hours_left: 120 },
       ],
       models: [
         { id: 'glm-5.3-flash', channel: 'solo_agent' },
@@ -313,7 +313,8 @@ const DATA = {
       ],
       models_ready: true, model_source_mtime: Date.now() - 86400000, egress_ip: '10.100.174.71',
     },
-    /* 反代编制：来源 → 上游组 → 接入密钥 */
+    /* 反代编制：供应商 → 接入密钥 */
+    sources_off: [],
     pools: [
       {
         id: 'gp-1', name: '主力池', enabled: true, live: 2, labels: ['Qoder/账号1', 'Qoder/账号2'],
@@ -360,6 +361,7 @@ const DATA = {
         { src: 'key:p-longcat/k-lc-3', site_id: 'p-longcat', site_name: 'Longcat', base_url: 'https://api.longcat.chat/anthropic', label: 'Anthropic 格式接入', masked: 'sk-lc-••••3333' },
       ],
     },
+    mockPolicies: {},
     logs: [
       { ts: '23:41:08', method: 'POST', path: '/v1/chat/completions', model: 'gpt-4o-mini', status: 200, account: 'Qoder/账号1', pool: '主力池', via: '给 Pot（主力池）' },
       { ts: '23:40:52', method: 'POST', path: '/v1/chat/completions', model: 'gpt-4o', status: 429, account: 'Codex CLI/账号1', pool: '主力池', via: '给 Pot（主力池）' },
@@ -481,7 +483,7 @@ DATA.settings = {
 };
 /* 六家今天的状态：2026-10-12 用本机凭据只读查到的真实返回，不是编的样例 */
 const CI_ITEMS = [
-  { product: 'workbuddy', account: 'ExampleAccount', supported: true, auto: true, activity_on: true,
+  { product: 'workbuddy', account: 'demo_account_c', supported: true, auto: true, activity_on: true,
     signed_today: true, claimable: false, streak: 13, reward: 100, today_credit: 100,
     total: 1300, days_signed: 13, ends_on: '2026-10-15', unit: '积分',
     source: 'https://www.codebuddy.cn/v2/billing/meter/checkin-activity-status' },
@@ -496,7 +498,7 @@ const CI_ITEMS = [
       claim: '领取', wait_badge: '猫猫在路上', done_act: '今天已领完',
       arrive_badge: '猫猫到了，待领取', home_badge: '猫猫在家，可派出' },
     note: '1~4 小时一趟、每天一趟；先派、到点再领。今天已领过一趟（领的可能是昨晚那趟），眼前这趟照领不误' },
-  { product: 'workbuddy-intl', account: 'shen1950', supported: true, auto: true, activity_on: true,
+  { product: 'workbuddy-intl', account: 'demo_account_b', supported: true, auto: true, activity_on: true,
     mode: 'activity', signed_today: false, claimable: true, streak: 0, reward: 30, unit: '积分',
     words: { done: '今天已到账', go: '今天还没到账', act: '发一句对话', done_act: '今天已领完' },
     note: '30 积分/天是服务端按天结算的基础权益（历史发放时刻 00:20~08:02 不等）' },
@@ -519,10 +521,10 @@ const CI_ITEMS = [
   // 账号级子行（`scope:"account"` + `parent`）：只有"每个号都留着自己那份登录态"的
   // 产品才有——现在 Qoder 系与 WorkBuddy 系。后端在 refresh 里按账号各查一次，
   // 前端把 scope!=="account" 的当产品行，其余挂到它 parent 底下。
-  { product: 'qoder-cn', scope: 'account', parent: 'qoder-cn', account: 'shen1950',
+  { product: 'qoder-cn', scope: 'account', parent: 'qoder-cn', account: 'demo_account_b',
     supported: true, auto: false, activity_on: true, signed_today: true, claimable: false,
     streak: 3, reward: 100, unit: '积分', ends_on: '2026-11-15 11:23' },
-  { product: 'qoder-cn', scope: 'account', parent: 'qoder-cn', account: 'exampleuser_b',
+  { product: 'qoder-cn', scope: 'account', parent: 'qoder-cn', account: 'demo_account_a',
     supported: true, auto: true, activity_on: true, signed_today: false, claimable: true,
     streak: 5, reward: 100, unit: '积分', ends_on: '2026-11-14 11:32' },
   { product: 'qoder', supported: true, auto: false, activity_on: false, signed_today: null,
@@ -571,14 +573,14 @@ DATA.checkin = {
         error: claimed || extra === 'already' ? null : '服务端回了「今天已签」，状态里没变',
         model: store === 'workbuddy-activity' ? 'step-5-preview' : null,
       });
-      push(0, 'workbuddy', true, 100, 'ExampleAccount');
+      push(0, 'workbuddy', true, 100, 'demo_account_c');
       push(0, 'workbuddy-activity', true, null, '', '');
       push(0, 'minimax', false, null, '', 'already');
-      push(1, 'qoder-cn', true, 100, 'exampleuser_b');
+      push(1, 'qoder-cn', true, 100, 'demo_account_a');
       push(2, 'trae-cn', false, null, '', 'fail');
-      push(4, 'qoder-cn', true, 100, 'shen1950');
+      push(4, 'qoder-cn', true, 100, 'demo_account_b');
       push(9, 'minimax', true, 400, '');
-      push(21, 'workbuddy', true, 100, 'ExampleAccount');
+      push(21, 'workbuddy', true, 100, 'demo_account_c');
       push(45, 'astudio', true, 100, '');
       return rows;
     })() },
@@ -587,7 +589,7 @@ DATA.checkin = {
 DATA.alljob = {
   running: false, done: 9, total: 9, current: '', ok: 8, fail: 1,
   started_at: Date.now() / 1000 - 120, finished_at: Date.now() / 1000 - 90,
-  log: [{ app: 'Qoder CN', name: 'exampleuser_b', ok: false,
+  log: [{ app: 'Qoder CN', name: 'demo_account_a', ok: false,
     msg: '这个号的官网会话还没登录：先在驾驶舱打开的官网窗口里登录一次' }],
 };
 /* 真后端是按 app id 去缓存里查这家再挂到实例上（state.rs 的 checkin::for_app），
@@ -607,7 +609,7 @@ DATA.instances.forEach((i) => {
 DATA.app_version = '2.0.0';
 
 DATA.backups = [
-  { file: 'workbuddy__ExampleAccount__20261002-160701.zip', app: 'workbuddy', account: 'ExampleAccount', bytes: 184549376, mb: 176.0, at: '2026-10-02 16:07' },
+  { file: 'workbuddy__demo_account_c__20261002-160701.zip', app: 'workbuddy', account: 'demo_account_c', bytes: 184549376, mb: 176.0, at: '2026-10-02 16:07' },
   { file: 'traework-cn__账号1__20261002-155822.zip', app: 'traework-cn', account: '账号1', bytes: 21495808, mb: 20.5, at: '2026-10-02 15:58' },
 ];
 
@@ -806,6 +808,37 @@ window.__TAURI__ = {
         if (p.action === 'proxy_dist_reveal') {
           return Promise.resolve({ ok: true, msg: 'ac-3f2a1111222233334444555566669c41' });
         }
+        if (p.action === 'proxy_source_toggle') {
+          const off = DATA.proxy.sources_off || (DATA.proxy.sources_off = []);
+          const i = off.indexOf(p.src);
+          if (i >= 0) off.splice(i, 1); else off.push(p.src);
+          for (const m of (DATA.proxy.members?.instances || [])) m.off = off.includes(m.src);
+          for (const m of (DATA.proxy.members?.keys || [])) m.off = off.includes(m.src);
+          return Promise.resolve({ ok: true, msg: i >= 0 ? '已启用来源' : '已停用来源' });
+        }
+        if (p.action === 'proxy_providers') {
+          const members = DATA.proxy.members || { instances: [], keys: [] };
+          const providers = [...(members.instances || []), ...(members.keys || [])].map((m, index) => ({
+            id: 'pv-mock-' + index, src: m.src, name: m.label ? `${m.site_name || m.app_name}/${m.label}`
+              : m.instance ? `${m.app_name}/${m.instance}` : (m.site_name || m.app_name),
+            kind: m.site_name ? 'key' : 'instance', app: m.app, app_name: m.app_name || m.site_name,
+            site_name: m.site_name || '', label: m.label || '', masked: m.masked || '',
+            has_token: m.has_token !== false, off: !!m.off, bridge: !!m.bridge,
+          }));
+          return Promise.resolve({ ok: true, msg: JSON.stringify({ providers }) });
+        }
+        if (p.action === 'proxy_provider_toggle') {
+          const members = DATA.proxy.members || { instances: [], keys: [] };
+          const rows = [...(members.instances || []), ...(members.keys || [])];
+          const off = DATA.proxy.sources_off || (DATA.proxy.sources_off = []);
+          const target = rows[(String(p.id).split('-').pop() | 0)];
+          if (!target) return Promise.resolve({ ok: false, msg: '没找到这个供应商' });
+          const index = off.indexOf(target.src);
+          if (index >= 0) off.splice(index, 1); else off.push(target.src);
+          rows.forEach((row) => { row.off = off.includes(row.src); });
+          return Promise.resolve({ ok: true, msg: index >= 0 ? '已启用供应商' : '已停用供应商' });
+        }
+        if (p.action === 'proxy_provider_save') return Promise.resolve({ ok: true, msg: '已保存供应商' });
         if (p.action === 'proxy_dist_create') {
           const key = 'ac-' + Math.random().toString(16).slice(2).padEnd(32, '0').slice(0, 32);
           DATA.proxy.dist.push({ id: 'dk-' + Date.now(), name: p.item.name, masked: `${key.slice(0, 6)}••••${key.slice(-4)}`, pools: p.item.pools || [], enabled: true, calls: 0, last_used: 0 });
@@ -885,18 +918,18 @@ window.__TAURI__ = {
         const id = args.payload.app;
         return Promise.resolve({
           ok: true, recommend: id === 'zcode' ? 'adopt' : 'copy',
-          default_claimed_by: id === 'qoder-cn' ? 'exampleuser_b' : '',
+          default_claimed_by: id === 'qoder-cn' ? 'demo_account_a' : '',
           recommend_from: id === 'zcode'
-            ? 'C:\\Users\\USER\\.zcode.cockpit-original'
-            : 'C:\\Users\\USER\\.agent-cockpit\\instances\\zcode\\账号1',
+            ? 'C:\\Users\\Example\\.zcode.cockpit-original'
+            : 'C:\\Users\\Example\\.agent-cockpit\\instances\\zcode\\账号1',
           sources: [
             { origin: 'adopt', kind: 'profile', title: '你一直在用的那份', label: '本机的原有档案',
-              path: 'C:\\Users\\USER\\.zcode.cockpit-original',
+              path: 'C:\\Users\\Example\\.zcode.cockpit-original',
               junction: false, has_data: true, mb: 268,
-              facts: { who: 'demo132', last_used: '2026-10-11 13:22', files: 1842, is_default: true, claimed_by: id === 'qoder-cn' ? 'exampleuser_b' : '' },
+              facts: { who: 'demo_account_d', last_used: '2026-10-11 13:22', files: 1842, is_default: true, claimed_by: id === 'qoder-cn' ? 'demo_account_a' : '' },
               note: '程序现在打开的就是这一份' },
             { origin: 'copy', kind: 'instance', title: '账号「账号1」', label: '已有账号「账号1」', name: '账号1',
-              path: 'C:\\Users\\USER\\.agent-cockpit\\instances\\zcode\\账号1',
+              path: 'C:\\Users\\Example\\.agent-cockpit\\instances\\zcode\\账号1',
               junction: false, has_data: true, mb: 12,
               facts: { who: '', last_used: '2026-10-06 21:04', files: 96, is_default: false, claimed_by: '账号1' },
               note: '复制一份过来：对话与记忆都带过来，它本身不动' },
@@ -905,10 +938,10 @@ window.__TAURI__ = {
       }
       if (cmd === 'action' && args.payload?.action === 'machine_login') {
         return Promise.resolve({
-          ok: true, account: 'shen1950', user_id: '22222222-2222-2222-2222-222222222222',
+          ok: true, account: 'demo_account_b', user_id: '00000000-0000-4000-8000-000000000002',
           user_type: 'personal_standard', left: 1751, total: 2400, expires_on: '未给出',
           source: 'server', stale: false, live_error: '',
-          auth_from: 'C:\\Users\\USER\\AppData\\Roaming\\com.qodercn.app.stable\\auth.v1.dat',
+          auth_from: 'C:\\Users\\Example\\AppData\\Roaming\\com.qodercn.app.stable\\auth.v1.dat',
           portions: [
             { label: '主额度', left: 0, total: 0, expires_on: '无限期', category: '套餐基础积分' },
             { label: '平台奖励积分·平台赠送', left: 1751, total: 2400, expires_on: '2026-10-24 21:13', category: '平台奖励积分' },
@@ -927,7 +960,7 @@ window.__TAURI__ = {
         }
         return Promise.resolve({
           ok: true, source: 'server', need_login: true, detail_error: '这个号的官网会话还没登录',
-          msg: '读到「ExampleAccount」：剩 4194.84 / 4943 credits，到期 未给出\n\n'
+          msg: '读到「demo_account_c」：剩 4194.84 / 4943 credits，到期 未给出\n\n'
             + '这一轮的逐包额度和各自的到期时间没读到：这个号的官网会话还没登录\n'
             + '点「去登录」，在弹出的窗口里登这个号的阿里云账号（只登一次），之后每次刷新都直接补齐。',
         });
@@ -937,7 +970,7 @@ window.__TAURI__ = {
         return Promise.resolve({
           ok: true,
           data: {
-            ok: true, user_id: '22222222-2222-2222-2222-222222222222', account: 'shen1950',
+            ok: true, user_id: '00000000-0000-4000-8000-000000000002', account: 'demo_account_b',
             plan: 'PLAN_TIER_FREE', plan_name: '体验版', plan_expire: '无限期',
             left: 1751, total: 2400, used: 649, quota_key: 'big_model_credits',
             page: 'https://qoder.com.cn/account/usage',
@@ -1014,3 +1047,37 @@ window.__TAURI__ = {
     },
   },
 };
+
+const baseInvoke = window.__TAURI__.core.invoke;
+const gatewayInvoke = (cmd, args = {}) => {
+  {
+    const argsValue = args;
+    if (cmd === 'client_gateway') {
+      const op = args.op;
+      const app = args.app;
+      if (op === 'status') return Promise.resolve({ supported: app !== 'unsupported', managed: false, connected: false });
+      if (op === 'models') {
+        const details = [
+          { id: 'mock/vision', owned_by: 'mock', native_vision: true, native_image_transport: true, context_window: 1000000, max_output_tokens: 64000 },
+          { id: 'mock/text', owned_by: 'mock', native_vision: false, native_image_transport: false, vision_model: 'mock/vision' },
+        ];
+        return Promise.resolve({ models: details.map((row) => row.id), details, policies: DATA.proxy.mockPolicies || {} });
+      }
+      if (op === 'save_policy') {
+        DATA.proxy.mockPolicies ||= {};
+        DATA.proxy.mockPolicies[args.model] = args.policy || {};
+        return Promise.resolve({ ok: true });
+      }
+      if (op === 'provider_info') return Promise.resolve({
+        rule: { concurrency: 0, accounts: 0, rpm: 0, queue_limit: 0, queue_wait: 0, fallbacks: [], order: 'listed', multiplier: null, free: false, periods: [] },
+        price: null, groups: [], effective: null,
+        summary: { requests: 0, priced: 0, usd: 0, missing_usage: 0, missing_price: 0 },
+      });
+      if (op === 'save_provider') return Promise.resolve({ ok: true });
+      return Promise.resolve({ ok: true });
+    }
+    return baseInvoke(cmd, args);
+  }
+};
+window.__TAURI__.core.invoke = gatewayInvoke;
+window.invoke = gatewayInvoke;
