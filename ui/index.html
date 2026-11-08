@@ -89,11 +89,13 @@
       </div>
       <div class="pagebody">
         <div id="home-body" class="homepad"></div>
-        <!-- 福利活动 + 运行中的进程：这两块原来都挂在每个 Agent 的账号页底部，同一份内容
-             在 8 个 Agent 页里各出现一遍；现在统一收到首页这一处。
+        <!-- 福利活动 → 临期积分/今日待领取 → 运行中的进程：这三块原来都挂在每个 Agent 的
+             账号页底部，同一份内容在 8 个 Agent 页里各出现一遍；现在统一收到首页这一处。
              顶栏「运行中 N」定位到进程表，贴图识别福利时定位到福利活动。
              放在 #home-body 外面是有意的：首页每 4 秒整块重建一次 home-body，
-             这两块留在外面就不会跟着重建，滚动位置和"正要点结束全部"的手感都不会被顶掉。 -->
+             这几块留在外面就不会跟着重建，滚动位置和"正要点结束全部"的手感都不会被顶掉。
+             #home-cols 里那两块（临期 / 待领取）由 renderHome 填，顺序按她 11-05 晚的要求排：
+             今日待办 → 统计磁贴 → 我的 Agent → 福利活动 → 临期/待领取 → 运行中的进程。 -->
         <div class="homepad homeextra">
           <section class="panel" id="perks-panel" aria-label="福利活动">
             <header class="panelhead">
@@ -102,6 +104,8 @@
             </header>
             <div id="perks-list"></div>
           </section>
+
+          <div id="home-cols" class="hcols"></div>
 
           <section class="panel" id="home-procs" aria-label="运行中的进程">
             <header class="panelhead">
@@ -491,6 +495,39 @@
       <button class="btn" id="km-test">测试</button>
       <button class="btn" id="km-next" title="存下这条，接着清空表单再登记同站点的下一个密钥">保存并再加一个</button>
       <button class="btn primary" id="km-save">保存</button>
+    </footer>
+  </div>
+</div>
+
+
+<!-- ================= 编辑积分包（改名 / 截止日期 / 备注；自定义包再加总额与剩余） ================= -->
+<div class="modal" id="qpmodal" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="qp-title">
+    <h3 id="qp-title">编辑积分包</h3>
+    <div class="fields">
+      <label for="qp-name">名称</label>
+      <input id="qp-name" autocomplete="off" spellcheck="false">
+      <label for="qp-date" id="qp-date-label">截止日期</label>
+      <div class="fieldexp" id="qp-date-row">
+        <input id="qp-date" placeholder="2026-12-31 或 2026-12-31 23:59" autocomplete="off" spellcheck="false">
+        <button class="btn sm" id="qp-date-pick" type="button" title="从日历里选一个日期和时间">选日期</button>
+      </div>
+      <label for="qp-total" id="qp-total-label">总额</label>
+      <input id="qp-total" autocomplete="off" inputmode="decimal">
+      <label for="qp-left" id="qp-left-label">剩余</label>
+      <input id="qp-left" autocomplete="off" inputmode="decimal">
+      <label for="qp-note">备注</label>
+      <input id="qp-note" autocomplete="off">
+    </div>
+    <!-- 只留一句最必要的说明（原日期是多少、留空会怎样）；它是一行小字，不是又一个盒子 -->
+    <p class="qphint" id="qp-hint"></p>
+    <!-- 截止日期是"日期时间"：原生控件用 datetime-local，选出来的值带时刻（积分按到点作废） -->
+    <input id="qp-native" type="datetime-local" aria-hidden="true" tabindex="-1">
+    <footer class="dialogfoot">
+      <button class="btn danger" id="qp-del" hidden>删除这个包</button>
+      <span class="sp"></span>
+      <button class="btn" id="qp-cancel">取消</button>
+      <button class="btn primary" id="qp-save">保存</button>
     </footer>
   </div>
 </div>

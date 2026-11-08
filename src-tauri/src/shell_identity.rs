@@ -1,5 +1,5 @@
 //! Keep our windows and shortcuts out of a parent's Windows Store taskbar group.
-pub const APP_ID: &str = "com.demo.agent-cockpit";
+pub const APP_ID: &str = "io.agentcockpit.desktop";
 
 #[cfg(windows)]
 mod platform {

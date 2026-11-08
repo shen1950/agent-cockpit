@@ -42,6 +42,13 @@ pub const LOCAL_STORES: &[(&str, &str)] = &[
     // 注意这个号**没有 refresh_token**，令牌一过期官方自己的日志就是 refresh_unsupported、
     // 还会把 auth.json 清成空——所以读不到时如实报错，别显示成 0 积分。
     ("catpaw", "catpaw"),
+    // 商汤小浣熊（2026-11-05 实测）：登录态明文 ~/.office-raccoon/agent/config/auth.json，
+    // access_token 是 HS256 JWT（iss=xiaohuanxiong.com/iam，sub=pu-… 即平台用户 id）；
+    // agenthub 用 /points/v1/balance + /points/v1/bills + /auth/v1/user_info 读
+    // 可用积分、每日/活动/充值分档、逐笔到期日与昵称（手机号打码）。
+    // 每日 300 积分；当天登录过桌面客户端的那笔有效期 7 天。
+    // 登录态就在档案目录里，所以**不**进 falls_back_to_default：按账号目录读得到各自的号。
+    ("raccoon", "raccoon"),
 ];
 
 pub fn store_for(app_id: &str) -> Option<&'static str> {
@@ -280,6 +287,31 @@ pub fn fetch_for_account(store: &str, data_dir: &str) -> Result<Quota, String> {
         Some(p) => fetch(store, Some(p.as_str())),
         None => fetch(store, None),
     }
+}
+
+/// WorkBuddy credentials live outside the shared profile. Always read the named
+/// card's saved envelope, and verify the response before exposing any balances.
+pub fn fetch_for_instance(store: &str, app_id: &str, meta: &Value) -> Result<Quota, String> {
+    if !matches!(store, "workbuddy" | "workbuddy-intl") {
+        return fetch_for_account(store, meta["data_dir"].as_str().unwrap_or(""));
+    }
+    let name = meta["name"].as_str().unwrap_or("");
+    let expected = meta["quota_user_id"].as_str().unwrap_or("");
+    if let Some((account, uid)) = crate::authpack::live_identity(app_id) {
+        if uid == expected { crate::authpack::capture_current(app_id,
+            if account.is_empty() { meta["quota_account"].as_str().unwrap_or(name) } else { &account }, &uid); }
+    }
+    let dir = crate::authpack::materialize(app_id, name)?;
+    let leaf = if store == "workbuddy-intl" { "workbuddy-desktop-ai.info" } else { "workbuddy-desktop.info" };
+    let file = dir.join(leaf);
+    let result = if file.is_file() { fetch(store, Some(&file.to_string_lossy())) }
+        else { Err("账号登录包缺少凭据文件，未回退到其他账号".into()) };
+    crate::authpack::drop_profile(&dir);
+    let q = result?;
+    if expected.is_empty() || q.user_id != expected {
+        return Err("登录包返回的身份与账号卡片不一致，未写入额度".into());
+    }
+    Ok(q)
 }
 
 /// 跑 `agenthub quota --json <store>` 并把结果结构化。

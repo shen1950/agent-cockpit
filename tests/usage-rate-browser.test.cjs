@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
-const { chromium } = require('D:/npm-global/node_modules/@playwright/mcp/node_modules/playwright');
+const { chromium } = require('playwright');
 
 const root = path.resolve(__dirname, '../ui');
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -53,7 +53,8 @@ test('long-range chart uses recorded buckets, filtered scope and updates focused
         history: [{ timestamp: now - 20, tokens_per_minute: rate, exact_tokens_per_minute: rate, estimated_tokens_per_minute: 0 }] });
       const payload = { generated_at: now, sources, monitor: { samples: 2, interval_seconds: 30, ...sample(9),
         by_source: { codex: sample(9) }, by_app_source: { desktop: sample(35) }, by_selected_source: { desktop: sample(60) } } };
-      invoke = async command => command === 'usage_dashboard' ? payload : { ok: true };
+      window.rateTestPayload = payload;
+      invoke = async command => command === 'usage_dashboard' ? window.rateTestPayload : { ok: true };
       S.view = 'usage'; render();
     });
     await page.waitForSelector('#ud-rate-range');
@@ -72,6 +73,9 @@ test('long-range chart uses recorded buckets, filtered scope and updates focused
     }, value);
     const scroller = page.locator('#view-usage .pagebody');
     await scroller.evaluate(el => { el.scrollTop = el.scrollHeight; });
+    // Focusing a control outside the viewport may legitimately scroll it into
+    // view. Measure the position after focus, just before the user changes it.
+    await page.$eval('#ud-rate-range', control => control.focus());
     const before = await scroller.evaluate(el => el.scrollTop);
     assert.ok(before > 0, 'fixture must scroll');
     assert.equal(await changeRange('7d'), 'ud-rate-range', 'range retains focus after changing');
@@ -79,10 +83,45 @@ test('long-range chart uses recorded buckets, filtered scope and updates focused
     assert.equal(await points.count(), 1, '7-day view aggregates both buckets into their hour immediately');
     assert.match(await points.nth(0).getAttribute('aria-label'), /平均 105 Token\/分钟/);
     assert.ok(Math.abs((await scroller.evaluate(el => el.scrollTop)) - before) <= 2, 'range change keeps scroll');
+    // A scroll and a selection can happen before the browser delivers its
+    // asynchronous scroll event; preserve the actual position in that case.
+    const immediateScroll = await page.$eval('#ud-rate-range', control => {
+      const scroller = control.closest('.pagebody');
+      scroller.scrollTop = Math.max(1, scroller.scrollTop - 35);
+      const before = scroller.scrollTop;
+      control.value = '24h'; control.dispatchEvent(new Event('change', { bubbles: true }));
+      return { before, after: scroller.scrollTop };
+    });
+    assert.ok(Math.abs(immediateScroll.after - immediateScroll.before) <= 2, 'immediate range change keeps latest scroll');
     assert.equal(await changeRange('30d'), 'ud-rate-range');
     assert.match(await page.locator('.ud-rate-chart .ud-rate-point').first().getAttribute('aria-label'), /平均 4\.38 Token\/分钟/);
     assert.equal(await changeRange('live'), 'ud-rate-range');
     assert.match(await page.locator('.ud-rate-chart .ud-rate-point').first().getAttribute('aria-label'), /9 Token\/分钟/);
+
+    // A focused selector must not suppress background snapshots: update the
+    // plotted rate and timestamp while preserving the user's focus and scroll.
+    await page.waitForTimeout(50);
+    await page.evaluate(() => {
+      window.usageRedraws = 0;
+      window.usageObserver = new MutationObserver(records => { window.usageRedraws += records.length; });
+      window.usageObserver.observe(document.getElementById('ud-body'), { childList: true });
+    });
+    const selectedScroll = await scroller.evaluate(el => el.scrollTop);
+    await page.evaluate(async () => {
+      const next = window.rateTestPayload;
+      const point = { timestamp: Date.now() / 1000, tokens_per_minute: 99,
+        exact_tokens_per_minute: 99, estimated_tokens_per_minute: 0 };
+      next.generated_at += 120;
+      next.monitor.tokens_per_minute = 99;
+      next.monitor.exact_tokens_per_minute = 99;
+      next.monitor.history = [point];
+      await UsageDashboard.refresh(false);
+    });
+    assert.match(await page.locator('.ud-rate-chart .ud-rate-point').first().getAttribute('aria-label'), /99 Token\/分钟/);
+    assert.equal(await page.evaluate(() => document.activeElement?.id), 'ud-rate-range');
+    assert.ok(Math.abs((await scroller.evaluate(el => el.scrollTop)) - selectedScroll) <= 2, 'background refresh keeps scroll');
+    await page.waitForTimeout(100);
+    assert.ok(await page.evaluate(() => { window.usageObserver.disconnect(); return window.usageRedraws <= 2; }), 'restoring select focus does not cause a repaint loop');
 
     await page.selectOption('#ud-agent', 'codex-desktop');
     assert.match(await page.locator('.ud-rate-chart .ud-rate-point').first().getAttribute('aria-label'), /35 Token\/分钟/);

@@ -22,7 +22,11 @@ Cockpit Tools 的具体对照入口另见 [ChatGPT 登录适配说明](docs/CHAT
 
 ### CPython 嵌入式运行时
 
-便携程序内含官方 CPython Windows x64 嵌入式归档，用于本地用量采集，首次使用会在数据根解压。归档内的 `LICENSE.txt` 包含 Python Software Foundation 许可及所附第三方库声明，分发和解压时必须保留。版本、来源、文件摘要见 [src-tauri/vendor/README.md](src-tauri/vendor/README.md)。不能把“用户无需安装 Python”表述成“程序不包含第三方运行时”。
+便携程序内含官方 CPython Windows x64 嵌入式归档，用于本地用量采集与会话索引，首次使用会在数据根解压。归档内的 `LICENSE.txt` 包含 Python Software Foundation 许可及所附第三方库声明，分发和解压时必须保留。版本、来源、文件摘要见 [src-tauri/vendor/README.md](src-tauri/vendor/README.md)。不能把“用户无需安装 Python”表述成“程序不包含第三方运行时”。
+
+### AgentFind 会话索引服务
+
+会话看板的本地索引服务源码位于 `src-tauri/scripts/agentfind.py`，编译进可执行文件，首次使用时释放到驾驶舱数据目录，并以同一便携包内的 CPython 运行时启动；无需另行安装 AgentFind 或系统 Python。该文件为本项目自有代码，以 [MIT License](LICENSE) 提供，© 2026 shen1950；同一份源码也在 [shen1950/agent-memory-suite](https://github.com/shen1950/agent-memory-suite) 以 MIT 公开。索引数据默认保存在 `~/.agentfind`，只读扫描本机会话记录，不修改原始文件。
 
 ### Rust 与桌面依赖
 
@@ -49,7 +53,6 @@ Cockpit Tools 的具体对照入口另见 [ChatGPT 登录适配说明](docs/CHAT
 | 组件 | 集成方式与许可边界 |
 |---|---|
 | **[zcode-api](https://github.com/TriDefender/zcode-api)** | ZCode Start Plan 可选桥接依赖，固定提交 `37155a5f75f3f2d7bde1b83054c8d6eb2e23a935`；[原 LICENSE](https://github.com/TriDefender/zcode-api/blob/37155a5f75f3f2d7bde1b83054c8d6eb2e23a935/LICENSE) 为 **CC BY-NC-SA 4.0**。由安装脚本另行取得并保留其源码与许可，不是 MIT 组件；不要把含该组件的安装目录、缓存或组合包整体标成“MIT、可任意商用”。来源与摘要见 [ZCode 说明](docs/zcode-start-plan.md) |
-| **AgentFind / agent-memory-suite** | 会话入口连接用户另行安装的本地 AgentFind 服务；本仓库不内嵌该服务源码。使用和另行分发时应核对所安装版本附带的许可，不能据本项目 MIT 推定其授权 |
 | **WebView2 Runtime** | 使用系统已安装的 Microsoft WebView2；安装器如包含下载或引导步骤，需同时遵守对应 Microsoft 条款 |
 | **被管理的 Agent 客户端** | 由用户独立安装并登录。本项目能够读取档案和修改接入配置，不代表取得重分发其程序、图标或商标的许可 |
 

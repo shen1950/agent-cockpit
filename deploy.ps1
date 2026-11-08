@@ -12,6 +12,14 @@ if (Test-Path $target) {
     Move-Item -Path $target -Destination $bak -Force
 }
 Copy-Item -Path $src -Destination $target -Force
+$adapterSource = Join-Path $root 'src-tauri\target\release\codex-shared-resume.exe'
+if (-not (Test-Path -LiteralPath $adapterSource)) { throw 'Shared resume adapter build is missing' }
+foreach ($directory in @($bin, (Join-Path $env:USERPROFILE '.agent-cockpit\bin'))) {
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    $adapterTarget = Join-Path $directory 'codex-shared-resume.exe'
+    if (Test-Path -LiteralPath $adapterTarget) { Move-Item -LiteralPath $adapterTarget -Destination ($adapterTarget + '.bak-' + $stamp) }
+    Copy-Item -LiteralPath $adapterSource -Destination $adapterTarget
+}
 
 Get-Process -Name AgentCockpit -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 400

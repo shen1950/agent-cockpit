@@ -63,9 +63,9 @@ pub fn apps() -> Vec<AppDef> {
             &["D:/LenovoSoftstore/Install/WorkBuddy/WorkBuddy.exe"], "", Some(".workbuddy"), false),
         // WorkBuddy 国际版是**独立的一份安装**，不是国内版的另一张卡。2026-10-11 磁盘证据：
         //   国内版  D:\LenovoSoftstore\Install\WorkBuddy\WorkBuddy.exe（FileVersion 5.7.7，ProductName "WorkBuddy"），
-        //           站点 www.workbuddy.cn，档案 ~\.workbuddy（账号 ExampleAccount，用户目录 00000000-…）
+        //           站点 www.workbuddy.cn，档案 ~\.workbuddy（账号 demo_account_cn，用户目录 示例用户 A）
         //   国际版  D:\Artificial_Intelligence\WorkBuddyAI\WorkBuddyAI.exe（FileVersion 5.7.6，ProductName "WorkBuddy AI"），
-        //           站点 www.workbuddy.ai，档案 ~\.workbuddy-ai（账号 shen1950，用户目录 11111111-…）
+        //           站点 www.workbuddy.ai，档案 ~\.workbuddy-ai（账号 demo_account_intl，用户目录 示例用户 B）
         // 两份安装各自有 204,585,0xx 字节的 exe，只差那一个 "AI" 后缀——是两个安装、两套档案，程序同源。
         // 登录态也各存各的：%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\ 下
         //   国内版 workbuddy-desktop.info / 国际版 workbuddy-desktop-ai.info。
@@ -84,8 +84,15 @@ pub fn apps() -> Vec<AppDef> {
             Some("D:/Artificial_Intelligence/AStudio Data/userdata"), false),
         // MiniMax Code：OAuth 令牌落 ~/.minimax/auth/<env>/<region>/mcode-public/。
         // 家目录就是 ~/.minimax，单实例产品，整目录换号。
+        // exe 三处候选：只登 D:/Artificial_Intelligence 会漏掉联想软件商店的默认落点——
+        // 本机实际装在 E:/LenovoSoftstore/Install/MiniMaxCode（卸载项图标可证），
+        // 一旦认不到就判 installed=false：侧栏名字被 .missing 打到 --text-faint、
+        // 详情页报「未找到可执行文件」，但额度/登录态照常能读（走 ~/.minimax 的令牌），
+        // 于是会出现"右边一切正常、只有名字灰"的怪相。顺带补 Electron 的 per-user 默认位置。
         curated("minimax", "MiniMax Code", "electron",
-            &["D:/Artificial_Intelligence/MiniMax Code/MiniMax Code.exe"], "", Some(".minimax"), false),
+            &["E:/LenovoSoftstore/Install/MiniMaxCode/MiniMax Code.exe",
+              "D:/Artificial_Intelligence/MiniMax Code/MiniMax Code.exe",
+              "{LOCALAPPDATA}/Programs/MiniMax Code/MiniMax Code.exe"], "", Some(".minimax"), false),
         // TRAE CN（原 TraeWork）：2026-10-11 官方升级改了名，安装目录
         // TRAE SOLO CN → Trae CN，登录档案也跟着搬（%APPDATA%\Trae CN，migration-job.json
         // 记录了迁移；加密格式没变，仍是 byteCrypto）。exe 与档案候选都留两段：
@@ -121,8 +128,14 @@ pub fn apps() -> Vec<AppDef> {
         // 档案候选里两段：家目录（令牌与 desk 工作区）在前，Electron userData 在后，
         // resolve_profile 挑真有登录数据的那个。
         // isolatable=false：未实测 --user-data-dir 隔离性，先按不可多开处理。
+        // 2026-11-06 官方升级换装：Inno Setup 新布局装到 CatPaw\Apps\妙手\ 并把旧目录整个删了，
+        // 只认旧路径就断了（详情页报「未找到可执行文件」，额度/登录态走 ~/.meituan-catpaw
+        // 照常能读，跟 exe 在不在无关）。候选加一条 Apps 布局的通配兜底（glob_best 取
+        // 修改时间最新的那个）；本机另建了目录联接 D:\Artificial_Intelligence\妙手 →
+        // CatPaw\Apps\妙手，旧路径这条平时也能直接命中。
         curated("catpaw", "妙手", "electron",
-            &["D:/Artificial_Intelligence/妙手/妙手.exe"], "",
+            &["D:/Artificial_Intelligence/妙手/妙手.exe",
+              "D:/Artificial_Intelligence/CatPaw/Apps/*/妙手.exe"], "",
             Some(".meituan-catpaw|{APPDATA}/catpaw-moon"), false),
         // DeepSeek Harness：Electron（同目录有 resources.pak+locales，实测）。
         // 登录态是明文 ~/.dsh/.credentials.yaml（grant deepseek-account-platform/default 的 token），
@@ -207,6 +220,29 @@ pub fn apps() -> Vec<AppDef> {
             &["{LOCALAPPDATA}/Programs/Coze/Coze.exe",
               "D:/Artificial_Intelligence/Coze/Coze.exe"], "",
             Some("{APPDATA}/Coze"), false),
+        // 商汤小浣熊（@raccoon/office-desktop，SenseTime 办公小浣熊）：Electron
+        // （LICENSE.electron.txt + resources.pak + locales 实测在），2026-11-05 本机实测：
+        //   安装  D:\Artificial_Intelligence\@raccoonoffice-desktop\商汤小浣熊.exe
+        //   档案  ~/.office-raccoon（产品里 PROFILE_DIRECTORY='office-raccoon' +
+        //         WINDOWS_PROFILE_DIRECTORY='.office-raccoon'；mac/linux 才落在
+        //         %APPDATA%\office-raccoon，所以候选里两处都留着，由 has_login_data 钉住）
+        //   布局  agent/config/auth.json（登录态，BOX_AGENT_CONFIG_DIR）
+        //         user-data/（Chromium：Network/Cookies、Local Storage、local-chat.sqlite3）
+        //         workspace/  logs/
+        // 登录态是**明文** JSON：access_token 为 HS256 JWT（iss=xiaohuanxiong.com/iam，
+        // sub=pu-… 即平台用户 id），另有 refresh_token / office_identity / office_org_name。
+        // 直读走 agenthub 的 raccoon store（再调 /api/iam/v1/account 把 id 换成名字）。
+        // 额度：桌面端没有"会员/套餐余额"这类接口，但积分读得到（/points/v1/balance 与
+        // /points/v1/bills 给可用积分、每日/活动/充值分档与逐笔到期日）；每天 300，当天
+        // 登录过桌面客户端的那笔有效期 7 天。签到见 agenthub 的 ci_raccoon。
+        // isolatable=false：账号不在 user-data 里（agent/config 是独立的），只给
+        // --user-data-dir 起第二个实例会跟第一个共用同一个登录，等于没隔离；
+        // 它自带的 `--client-profile <目录>` 才是真多开开关（目录里要有
+        // .raccoon-lab-client.json 标记），驾驶舱还没接这条，先按仅换号登记。
+        curated("raccoon", "商汤小浣熊", "electron",
+            &["{LOCALAPPDATA}/Programs/@raccoonoffice-desktop/商汤小浣熊.exe",
+              "D:/Artificial_Intelligence/@raccoonoffice-desktop/商汤小浣熊.exe"], "",
+            Some(".office-raccoon|{APPDATA}/office-raccoon"), false),
         curated("cursor", "Cursor", "electron",
             &["{LOCALAPPDATA}/Programs/cursor/Cursor.exe",
               "{LOCALAPPDATA}/Programs/Cursor/Cursor.exe",
@@ -235,14 +271,19 @@ pub fn apps() -> Vec<AppDef> {
             &["{LOCALAPPDATA}/Programs/Grok Bot/Grok Bot.exe",
               "D:/Artificial_Intelligence/Grok Bot/Grok Bot.exe"], "",
             Some("{APPDATA}/Grok Bot|.grok"), true),
+        // CodeBuddy 有两个落点：登录态在 Electron userData `{APPDATA}\CodeBuddy`，
+        // 而 CLI 内核的会话（`projects\<cwd>\*.jsonl`，逐条带 usage.inputTokens/
+        // outputTokens/totalTokens）写在运行时家目录 `~\.codebuddy`。
+        // 家目录放候选**末尾**：resolve_profile 的 first 仍是 userData，换号行为不变；
+        // 但 worth_showing 会看见家目录里的 projects/，桌面端没装时也认得出"本机还在用"。
         curated("codebuddy", "CodeBuddy", "electron",
             &["{LOCALAPPDATA}/Programs/CodeBuddy/CodeBuddy.exe",
               "{PROGRAMFILES}/CodeBuddy/CodeBuddy.exe"], "",
-            Some("{APPDATA}/CodeBuddy"), true),
+            Some("{APPDATA}/CodeBuddy|.codebuddy"), true),
         curated("codebuddy-cn", "CodeBuddy CN", "electron",
             &["{LOCALAPPDATA}/Programs/CodeBuddy CN/CodeBuddy CN.exe",
               "{PROGRAMFILES}/CodeBuddy CN/CodeBuddy CN.exe"], "",
-            Some("{APPDATA}/CodeBuddy CN"), true),
+            Some("{APPDATA}/CodeBuddy CN|.codebuddy-cn"), true),
         curated("trae", "Trae", "electron",
             &["{LOCALAPPDATA}/Programs/Trae/Trae.exe", "{PROGRAMFILES}/Trae/Trae.exe"], "",
             Some("{APPDATA}/Trae"), true),
@@ -663,11 +704,26 @@ fn worth_showing(a: &AppDef) -> bool {
     if resolve_exe(a).is_some() {
         return true;
     }
-    std::fs::read_dir(instances_dir(&a.id))
+    if std::fs::read_dir(instances_dir(&a.id))
         .map(|rd| {
             rd.filter_map(|e| e.ok()).any(|e| {
                 e.path().extension().map(|x| x == "json").unwrap_or(false)
             })
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    // 没有 exe 也可能是"本机还在用"：CLI 内核型产品把会话写在运行时家目录
+    // （CodeBuddy 的 ~\.codebuddy\projects），桌面端卸了/没装都不影响这些记录存在。
+    // 只认 projects/ 这一种明确形态，别的候选目录（{APPDATA}\xxx）普遍存在，不能当判据。
+    a.profile
+        .as_deref()
+        .map(|spec| {
+            spec.split('|')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .any(|one| one_profile(one).join("projects").is_dir())
         })
         .unwrap_or(false)
 }
@@ -705,6 +761,7 @@ pub fn short_name(app_id: &str) -> &'static str {
         // 2026-10-16 补齐的那批：首字母会撞（T/C/Q 各三家），所以都留两三个字母
         "antigravity" => "AG",
         "coze" => "CZ",
+        "raccoon" => "小浣熊",
         "cursor" => "CU",
         "kiro" => "KI",
         "windsurf" => "WS",
@@ -1210,12 +1267,16 @@ fn resolve_profile_in(spec: &str, instances: &Path) -> Option<PathBuf> {
 ///     ——dsh 的 profile 是 `.dsh|{APPDATA}/@deepseek-ai/dsh-desktop` 两候选，
 ///     靠这条把解析钉在真档案 ~/.dsh 上；
 ///   Marvis `mobile_address.json`（明文 access_token，就在 .marvis symlink 的目标里）。
+///   商汤小浣熊 `agent/config/auth.json`（明文 access_token，档案根下就是登录态）；
+///     旧版布局把 agent 家目录放在 `~/.box-agent`，那份也一并认。
 pub fn has_login_data(dir: &Path) -> bool {
     dir.join("auth.v1.dat").is_file()
         || dir.join("auth-v2.dat").is_file()
         || dir.join("astron-session.json").is_file()
         || dir.join(".credentials.yaml").is_file()
         || dir.join("mobile_address.json").is_file()
+        || dir.join("agent").join("config").join("auth.json").is_file()
+        || dir.join(".box-agent").join("config").join("auth.json").is_file()
         || (dir.join("Local State").is_file()
             && dir.join("User").join("globalStorage").join("state.vscdb").is_file())
         || minimax_credential_files(dir).next().is_some()
@@ -1478,7 +1539,7 @@ pub fn find_instance(app_id: &str, name: &str) -> Option<Value> {
 
 /// 账号名直接当文件名用（`instances/<产品>/<名字>.json`），Windows 文件名禁用的
 /// 字符必须一票否决：`< > : " | ? *` 加控制字符，尾部的点和空格也不行。
-/// 以前只挡了 `/ \ : ..`——向导拿打码账号名（`masked_account_id@163.com` 这种带 `*` 的）
+/// 以前只挡了 `/ \ : ..`——向导拿打码账号名（`demo***@example.test` 这种带 `*` 的）
 /// 预填卡名时直接漏过去，写盘那步又被 `let _ =` 吞掉，卡"建好了"、磁盘上没有，
 /// 下一步换号才报"实例不存在"（DSH 2026-10-17 实测）。返回 None＝名字可以用。
 pub fn bad_account_name(name: &str) -> Option<String> {
@@ -1500,7 +1561,7 @@ pub fn bad_account_name(name: &str) -> Option<String> {
     if n.ends_with('.') || n.ends_with(' ') {
         return Some("结尾不能是点或空格".to_string());
     }
-    // 60 字：够放下「昵称 + 邮箱」这种向导自动预填的名字（Example User A〈exampleuser_a@gmail.com〉
+    // 60 字：够放下「昵称 + 邮箱」这种向导自动预填的名字（Demo User〈demo@example.test〉
     // 这类 46 字），又不至于把 instances\<产品>\<名字>.json 顶到 MAX_PATH。
     // 40 字那会儿连向导自己预填的名字都过不去——建卡弹「名字太长」，而名字根本是它填的。
     if n.chars().count() > 60 {
@@ -1672,6 +1733,51 @@ mod tests {
         assert_eq!(ok["a"], json!(1));
     }
 
+    /// 商汤小浣熊：档案候选是 `~/.office-raccoon` 与 mac/linux 那层 `office-raccoon`，
+    /// 登录态在 `agent/config/auth.json`。认不出这条就会漂到空候选上，
+    /// 加账号向导又变回"这个程序的登录态驾驶舱读不到"。
+    #[test]
+    fn raccoon_profile_is_pinned_by_its_auth_json() {
+        let tmp = std::env::temp_dir().join("cockpit-raccoon-profile-test");
+        let _ = fs::remove_dir_all(&tmp);
+        let windows_root = tmp.join(".office-raccoon");
+        let roaming_root = tmp.join("Roaming").join("office-raccoon");
+        fs::create_dir_all(&windows_root).unwrap();
+        fs::create_dir_all(&roaming_root).unwrap();
+        let instances = tmp.join("instances");
+        fs::create_dir_all(&instances).unwrap();
+        let spec = format!(
+            "{}|{}",
+            windows_root.to_string_lossy(),
+            roaming_root.to_string_lossy()
+        );
+        // 两边都空：按候选顺序落到第一个，别给 None（新建账号要用）
+        assert_eq!(
+            resolve_profile_in(&spec, &instances).as_deref(),
+            Some(windows_root.as_path())
+        );
+        // 只有 Windows 那份有登录态 → 必须钉在它上面
+        let cfg = windows_root.join("agent").join("config");
+        fs::create_dir_all(&cfg).unwrap();
+        fs::write(cfg.join("auth.json"), "{}").unwrap();
+        assert!(has_login_data(&windows_root));
+        assert!(!has_login_data(&roaming_root));
+        assert_eq!(
+            resolve_profile_in(&spec, &instances).as_deref(),
+            Some(windows_root.as_path())
+        );
+    }
+
+    /// 收录了产品却没有直读通道，等于把"读不到登录态"再演一遍：两处登记必须同时存在
+    #[test]
+    fn raccoon_is_curated_and_readable() {
+        let def = app_def("raccoon").expect("商汤小浣熊必须在内置登记表里");
+        assert_eq!(def.name, "商汤小浣熊");
+        assert!(def.profile.is_some(), "没登记档案目录就换不了号");
+        assert!(!def.discovered, "内置条目不该被当成自动发现");
+        assert_eq!(crate::local_quota::store_for("raccoon"), Some("raccoon"));
+    }
+
     /// adopt（沿用原有档案）把默认目录搬走后，junction 目标必须还是那个空出来的位置，
     /// 不能漂到同产品另一个"还有登录数据"的旧壳目录上
     #[test]
@@ -1740,17 +1846,17 @@ mod tests {
     fn account_candidates_cover_junction_case() {
         let tmp = std::env::temp_dir().join("cockpit-cand-test");
         let _ = fs::create_dir_all(&tmp);
-        let dir = tmp.join("ExampleAccount");
+        let dir = tmp.join("demo_account_cn");
         let _ = fs::create_dir_all(&dir);
-        let meta = json!({ "name": "ExampleAccount", "data_dir": dir.to_string_lossy() });
+        let meta = json!({ "name": "demo_account_cn", "data_dir": dir.to_string_lossy() });
 
         // 未换号：只有账号目录本身
         let c = account_candidates("workbuddy", &meta, &json!({}));
-        assert!(c.iter().any(|s| s.ends_with("duckdeity")), "应含账号目录: {:?}", c);
+        assert!(c.iter().any(|s| s.ends_with("demo_account_cn")), "应含账号目录: {:?}", c);
         assert!(c.iter().all(|s| !s.contains(".workbuddy")), "未换号不该含默认档案");
 
         // 已换号：默认档案目录也要进候选（进程命令行里出现的是它）
-        let swaps = json!({ "workbuddy": { "instance": "ExampleAccount" } });
+        let swaps = json!({ "workbuddy": { "instance": "demo_account_cn" } });
         let c2 = account_candidates("workbuddy", &meta, &swaps);
         assert!(
             c2.iter().any(|s| s.contains(".workbuddy")),
@@ -2061,10 +2167,10 @@ mod tests {
         let inst = Path::new(r"C:\Users\x\.agent-cockpit\instances");
         let zcode = inst.join("zcode");
         assert_eq!(
-            instance_name_under(&zcode.join("shen1950"), &zcode).as_deref(),
-            Some("shen1950")
+            instance_name_under(&zcode.join("demo_account_intl"), &zcode).as_deref(),
+            Some("demo_account_intl")
         );
-        assert_eq!(instance_name_under(&inst.join("workbuddy/ExampleAccount"), &zcode), None);
+        assert_eq!(instance_name_under(&inst.join("workbuddy/demo_account_cn"), &zcode), None);
         assert_eq!(instance_name_under(Path::new("D:\\Somewhere\\Else"), &zcode), None);
         assert_eq!(instance_name_under(&zcode, &zcode), None, "产品目录本身不是账号");
     }
@@ -2202,7 +2308,7 @@ mod tests {
     /// 早先 workbuddy-intl 的 profile 整条抄了国内版的 .workbuddy，于是两张卡
     /// 指向同一份档案，自动发现又把真正的 .workbuddy-ai 收成 auto-workbuddyai，
     /// 用户因此看到"两条 WorkBuddy"。这条钉死判据：两者 profile 不同、
-    /// 国际版的档案目录就是 .workbuddy-ai（账号用户目录 11111111-… 确实在它下面）。
+    /// 国际版的档案目录就是 .workbuddy-ai（账号用户目录 示例用户 B 确实在它下面）。
     #[test]
     fn workbuddy_intl_and_domestic_have_separate_profiles() {
         let dom = app_def("workbuddy").expect("workbuddy 该在 curated 里");

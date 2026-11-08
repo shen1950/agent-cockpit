@@ -1,4 +1,4 @@
-//! Match real Electron document windows, including ones hidden by Close-to-tray.
+//! Match real Electron document windows without reviving hidden windows externally.
 //! A titled notification helper is not a client window. Never use the process'
 //! MainWindowHandle: Windows often chooses that helper after the real window hides.
 
@@ -114,13 +114,14 @@ pub fn visible(pids: &[u32]) -> bool {
     native::windows(pids).iter().any(|w| w.visible && document_window(w, pids))
 }
 
-/// Show this account's existing real window. Return false only when it is gone;
-/// the caller can then ask Electron's profile-scoped singleton to create it again.
+/// Focus an already visible window. Hidden Electron windows must be reopened by
+/// the client's own profile-scoped activation, which restores its internal state.
 pub fn restore(pids: &[u32]) -> bool {
-    let mut windows = native::windows(pids);
-    // Prefer the visible document if an app temporarily has multiple windows.
-    windows.sort_by_key(|w| !w.visible);
-    windows.iter().filter(|w| document_window(w, pids)).any(|w| native::show(w, pids))
+    native::windows(pids).iter().filter(|w| restorable_window(w, pids)).any(|w| native::show(w, pids))
+}
+
+fn restorable_window(w: &Window, pids: &[u32]) -> bool {
+    w.visible && document_window(w, pids)
 }
 
 /// Only compiled into the explicitly opted-in real-window smoke test. Close
@@ -139,9 +140,12 @@ mod tests {
             ex_style: 0x0024_0100, class: "Chrome_WidgetWin_1".into(), title: "ChatGPT".into() }
     }
     #[test]
-    fn hidden_real_window_is_restorable_but_notification_and_ipc_windows_are_not() {
+    fn hidden_real_window_requires_client_activation() {
         let mut w = example();
         assert!(document_window(&w, &[42]));
+        assert!(!restorable_window(&w, &[42]));
+        w.visible = true;
+        assert!(restorable_window(&w, &[42]));
         assert!(!document_window(&w, &[43]));
         w.ex_style = 0x0020_0088;
         assert!(!document_window(&w, &[42]));

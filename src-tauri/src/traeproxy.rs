@@ -272,8 +272,12 @@ pub fn model_list(channels: &Value) -> Vec<Value> {
                 "object": "model",
                 "owned_by": "trae",
                 "channel": ch,
+                "name": m["display_name"].clone(),
                 "context_window": m["context_window"].clone(),
                 "max_tokens": m["max_tokens"].clone(),
+                "max_output_tokens": m["max_tokens"].as_u64().filter(|n| *n > 0)
+                    .map(|n| n.min(MAX_OUT as u64)),
+                "vision": m["multimodal"].as_bool(),
                 "thinking": m["thinking"].clone(),
                 "multimodal": m["multimodal"].clone(),
             }));

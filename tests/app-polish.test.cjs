@@ -8,7 +8,9 @@ function fixture(view='settings'){
   const context={S:{view},DESC_INLINE_MAX:120,el:(tag,attrs,...children)=>({tag,...attrs,children:children.flat().filter(x=>x!=null&&x!==false)}),qhelp:text=>({tag:'help',text})};
   vm.createContext(context);
   for(const name of ['row','rowWide']){
-    const body=source.match(new RegExp(`function ${name}\\(label, desc, ctl\\) \\{[\\s\\S]*?\\n\\}`));
+    // 参数表按名字截到右括号：rowWide 现在多一个可选的 domId（给"跳到这一块"当锚点），
+    // 写死 (label, desc, ctl) 会一条都匹配不上
+    const body=source.match(new RegExp(`function ${name}\\(label, desc, ctl[^)]*\\) \\{[\\s\\S]*?\\n\\}`));
     assert.ok(body);vm.runInContext(body[0],context);
   }
   return context;

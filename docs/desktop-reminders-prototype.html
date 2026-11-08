@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentCockpit · 桌面提醒交互预览</title><link rel="stylesheet" href="reminder-prototype.css">
+<header><div class="eyebrow">AGENTCOCKPIT / DESKTOP LAB</div><h1>随手放，靠边藏。</h1>
+<p>拖动卡片标题栏或整个悬浮球。靠近可用边缘时自动吸附，悬停展开。</p>
+<div class="controls"><div class="segmented"><button id="both" class="active">同时预览</button><button id="panelOnly">提醒浮窗</button><button id="petOnly">圆形悬浮球</button></div>
+<label>模拟任务栏 <select id="taskbarSide" aria-label="模拟任务栏位置"><option value="bottom">下方</option><option value="top">上方</option><option value="left">左侧</option><option value="right">右侧</option></select></label>
+<label><input type="checkbox" id="hint"> 贴边提示条</label>
+<button id="theme">切换深浅色</button><button id="empty">查看空状态</button><button id="reset">重置位置</button></div></header>
+<main class="desktop" id="desktop" aria-label="桌面模拟区域">
+<div class="watermark"><strong>给桌面留一点呼吸感</strong><span>自由拖动 · 四边吸附 · 任务栏避让</span></div>
+<section class="panel floating" id="panel" aria-label="每日提醒浮窗">
+<div class="bar" id="panelHandle" tabindex="0" aria-label="拖动提醒浮窗，方向键微调位置"><img draggable="false" src="../ui/brand-light.png" alt=""><strong>每日提醒</strong><button class="icon-button" id="pin" title="固定展开" aria-label="固定展开" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h8l-1 7 4 4v3H5v-3l4-4-1-7ZM12 17v5"/></svg></button><button class="icon-button close-button" id="panelClose" title="关闭提醒浮窗" aria-label="关闭提醒浮窗"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+<div class="sub" id="summary">今天 / 24 小时内 · 2 个账号</div>
+<div class="items" id="items">
+<article class="item"><div class="item-title"><b>Qoder</b><span>工作账号</span></div><div class="amount">320 <small>积分</small></div><div class="expiry urgent">还有 2 小时到期</div><small>体验资源包 · 刚刚更新</small><button class="go">查看账号 ↗</button></article>
+<article class="item"><div class="item-title"><b>WorkBuddy</b><span>备用账号</span></div><div class="amount">150 <small>credits</small></div><div class="expiry">今天到期</div><small>平台未提供具体时间 · 5 分钟前更新</small><button class="go">查看账号 ↗</button></article>
+</div><div class="foot"><button id="later">稍后 1 小时</button><button id="mute">今天静音</button></div></section>
+<button class="edge-tab" id="edge" aria-label="展开临期提醒" hidden><span class="tab-count">2</span><span>提醒</span></button>
+<div class="bubble" id="bubble"><div class="bubble-title"><strong>有积分快到期了</strong><button id="dismiss" aria-label="关闭气泡">×</button></div><p id="bubbleText">工作账号还有 320 积分，预计 2 小时后到期。</p><button id="petOpen">查看提醒 ↗</button></div>
+<div class="orb floating" id="pet"><button class="orb-body" id="petHandle" aria-label="圆形悬浮球，拖动移动，点击查看提醒，方向键微调"><span class="orb-face"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M32 6L7 51Q5 56 11 54L26 44L23 38L14 44L30 16L29 28H35L34 16L50 44L41 38L38 44L53 54Q59 56 57 51Z" fill="currentColor"/><circle cx="32" cy="35" r="7" fill="currentColor"/></svg></span><span class="badge">2</span></button><button class="icon-button close-button orb-close" id="petClose" title="关闭悬浮球" aria-label="关闭悬浮球"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+<button class="edge-tab orb-tab" id="petEdge" aria-label="展开悬浮球" hidden>◉</button>
+<div class="taskbar" id="taskbar" data-side="bottom">任务栏 · 此边不吸附</div><div class="snap-guide" id="snapGuide" hidden></div>
+</main><footer><span id="status" role="status">交互预览：虚构数据，拖动范围为模拟桌面；尚未创建系统桌面窗口。</span><a href="desktop-pet-concepts.md">桌宠创意与绘制提示词 ↗</a></footer><script src="reminder-prototype.js"></script></html>
+

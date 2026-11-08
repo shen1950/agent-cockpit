@@ -259,6 +259,26 @@ pub fn read_auth(dir: &Path) -> Result<Cred, String> {
     Ok(c)
 }
 
+/// 读一段**任意** v10 信封（不必在当前档案目录里）——解密要用的主密钥从给定目录借。
+/// 用途：判断一份历史备份到底是"哪个号"的登录态。备份目录里只有 auth.v1.dat、
+/// 没有 `Local State`，但主密钥在同一台机器同一个 Windows 账户下是稳定的，借来即可。
+pub fn read_auth_blob_with_key(local_state_dir: &Path, blob: &[u8]) -> Result<Cred, String> {
+    if blob.len() < 15 + 16 || &blob[..3] != b"v10" {
+        return Err("不是 v10 信封（格式可能变了）".into());
+    }
+    let key = master_key(&local_state_dir.join("Local State"))?;
+    let plain = gcm_open(&key, &blob[3..15], &blob[15..], &[])
+        .ok_or_else(|| "解不开（主密钥和密文不配对）".to_string())?;
+    let v: Value = serde_json::from_slice(&plain).map_err(|e| format!("登录态不是 JSON：{e}"))?;
+    Ok(Cred {
+        token: v["token"].as_str().unwrap_or("").trim().to_string(),
+        expires_at: v["expiresAt"].as_str().unwrap_or("").to_string(),
+        user_id: v["user"]["id"].as_str().unwrap_or("").to_string(),
+        user_name: v["user"]["name"].as_str().unwrap_or("").to_string(),
+        from: String::new(),
+    })
+}
+
 pub fn days_left(iso: &str) -> Option<i64> {
     let t = chrono::DateTime::parse_from_rfc3339(iso.trim()).ok()?;
     let secs = t.timestamp() - chrono::Local::now().timestamp();
@@ -615,7 +635,7 @@ pub fn note_by_base(base_url: &str, status: u16, ms: u64, label: &str) {
     } else {
         return;
     };
-    // label 形如 "Qoder/exampleuser_b"
+    // label 形如 "Qoder/demo_account"
     let (app_name, name) = match label.split_once('/') {
         Some(x) => x,
         None => return,
@@ -728,6 +748,8 @@ fn parse_models(arr: &Value) -> Value {
             "free": price <= 0.0,
             "reasoning": m["reasoningSupported"].as_bool().unwrap_or(false),
             "context": m["maxInputTokens"].as_u64().unwrap_or(0),
+            "max_output_tokens": m["maxOutputTokens"].as_u64(),
+            "vision": m["multiModalSupported"].as_bool(),
             "default": m["isDefault"].as_bool().unwrap_or(false),
         }));
     }
@@ -1715,7 +1737,7 @@ data: {"code":"invalid_model_error","message":"Unsupported model \"DeepSeek-Flas
     #[test]
     #[ignore]
     fn real_cn_bridge_serves_a_completion() {
-        let name = "exampleuser_b";
+        let name = "demo_account";
         assert!(cn_logged_in(name), "这个 CN 账号还没给 CLI 登录过");
         let (ok, msg) = cn_bridge_start(name);
         assert!(ok, "起桥失败：{}", msg);
@@ -1766,7 +1788,7 @@ data: {"code":"invalid_model_error","message":"Unsupported model \"DeepSeek-Flas
                 }
             }
         }
-        let name = "exampleuser_b";
+        let name = "demo_account";
         assert!(cn_logged_in(name), "这个 CN 账号还没给 CLI 登录过");
         assert!(cn_bridge_start(name).0, "起桥失败");
 

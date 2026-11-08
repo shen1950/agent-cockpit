@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 struct Cache {
     document: Value,
     profiles: HashMap<String, Value>,
+    profile_errors: HashMap<String, String>,
     previous: BTreeMap<String, (f64, f64)>,
     sampled_at: f64,
     sampled_day: String,
@@ -134,18 +135,35 @@ fn profile_key(app: &str, dir: &Path) -> String { format!("{app}|{}", path_key(d
 
 /// Runtime histories may live separately from the Electron login profile.
 /// Only the native profile maps to the shared history, never an arbitrary account copy.
-fn history_dir(app: &str, profile: &Path, native: Option<&Path>) -> PathBuf {
-    if native.map(path_key).as_deref() != Some(path_key(profile).as_str()) {
-        return profile.to_path_buf();
-    }
-    let relative = match app {
+/// These products keep their CLI kernel's sessions in the runtime home directory
+/// (`projects\<cwd>\*.jsonl`), not in the Electron userData that holds the login.
+fn native_history_relative(app: &str) -> Option<&'static str> {
+    match app {
         "qoder" => Some(".qoder"),
         "qoder-cn" => Some(".qoder-cn"),
         "qwenwork" => Some(".qwenworkcn"),
         "traework-cn" => Some(".trae-cn"),
+        "codebuddy" => Some(".codebuddy"),
+        "codebuddy-cn" => Some(".codebuddy-cn"),
         _ => None,
-    };
-    relative.map(|p| crate::registry::home().join(p)).unwrap_or_else(|| profile.to_path_buf())
+    }
+}
+
+fn history_dir(app: &str, profile: &Path, native: Option<&Path>) -> PathBuf {
+    if native.map(path_key).as_deref() != Some(path_key(profile).as_str()) {
+        return profile.to_path_buf();
+    }
+    native_history_relative(app)
+        .map(|p| crate::registry::home().join(p))
+        .unwrap_or_else(|| profile.to_path_buf())
+}
+
+/// 桌面端没装、或登录档案还没生成时，运行时家目录里的 projects/ 仍然是
+/// 唯一可读的用量来源。只在目录真实存在时才回落，绝不凭空造一条共享记录。
+fn native_history_home(app: &str) -> Option<PathBuf> {
+    native_history_relative(app)
+        .map(|p| crate::registry::home().join(p))
+        .filter(|p| p.is_dir())
 }
 
 fn account_history_dir(app: &str, profile: &Path, native: Option<&Path>, meta: &Value) -> PathBuf {
@@ -368,13 +386,21 @@ fn deduplicate_sources(sources: &mut [Value]) {
     }
 }
 
-fn collect_sources() -> (Vec<Value>, HashMap<String, Value>) {
+fn collect_sources() -> (Vec<Value>, HashMap<String, Value>, HashMap<String, String>) {
     let mut sources = Vec::new();
     let mut profiles = HashMap::new();
+    let mut profile_errors = HashMap::new();
     let mut seen = HashSet::new();
     let mut billing_seen = HashSet::new();
+    // 反代账本：客户端本身不留带 token 的会话（TRAE CN 的库是加密的、妙手日志没有用量），
+    // 但经驾驶舱反代出去的调用都记在 gateway-usage.jsonl，带上游回报的 usage。
+    let ledger = crate::proxy_ledger::by_app();
     for app in crate::registry::all_apps() {
-        let native = crate::registry::profile_dir(&app.id);
+        // 登录档案目录不存在时回落到运行时家目录：CodeBuddy 这类产品桌面端没装，
+        // 会话仍留在 ~\.codebuddy\projects，不能因此判定"没有用量"。
+        let native = crate::registry::profile_dir(&app.id)
+            .filter(|p| p.is_dir())
+            .or_else(|| native_history_home(&app.id));
         let mut accounts = crate::registry::load_instances(&app.id);
         // The native profile is also useful before it has been registered as an account.
         if let Some(dir) = native.as_ref().filter(|p| p.is_dir()) {
@@ -394,8 +420,17 @@ fn collect_sources() -> (Vec<Value>, HashMap<String, Value>) {
             let dir = account_history_dir(&app.id, profile, native.as_deref(), &meta);
             let key = profile_key(&app.id, &dir);
             // Same canonical directory, including junction aliases, is counted once.
+            let mut local_error = None;
             let local = if let Some(t) = profiles.get(&key).cloned() { Some(t) }
-                else { crate::usage::collect(if app.id == "codex-desktop" { "chatgpt" } else { &app.id }, &dir.to_string_lossy()) };
+                else { match crate::usage::collect_with_error(if app.id == "codex-desktop" { "chatgpt" } else { &app.id }, &dir.to_string_lossy()) {
+                    Ok(t) => t,
+                    Err(reason) => {
+                        profile_errors.insert(key.clone(), reason.clone());
+                        profile_errors.insert(profile_key(&app.id, profile), reason.clone());
+                        local_error = Some(reason);
+                        None
+                    }
+                }};
             let has_tokens = local.as_ref().map(|v| v["days"].as_array().map(|d| !d.is_empty()).unwrap_or(false)).unwrap_or(false);
             if let Some(mut t) = local.filter(|_| has_tokens) {
                 if app.id == "codex-desktop" || native.as_deref().map(path_key) == Some(path_key(profile)) {
@@ -445,13 +480,15 @@ fn collect_sources() -> (Vec<Value>, HashMap<String, Value>) {
                 }
                 sources.push(s);
             }
-            if !has_tokens && trend["days"].as_array().map(|d| d.is_empty()).unwrap_or(true) {
+            if !has_tokens && !ledger.contains_key(&app.id)
+                && (local_error.is_some() || trend["days"].as_array().map(|d| d.is_empty()).unwrap_or(true)) {
                 sources.push(json!({"id":format!("{}|unavailable|{}",app.id,instance), "app_id":app.id,
                     "app_name":app.name,"instance_id":instance,"instance_name":instance,"unit":"tokens",
-                    "days":[],"status":"unavailable","count_in_total":false,"reason":unavailable_reason(&app.id)}));
+                    "days":[],"status":"unavailable","count_in_total":false,
+                    "reason":local_error.unwrap_or_else(||unavailable_reason(&app.id).to_string())}));
             }
         }
-        if sources.len() == start {
+        if sources.len() == start && !ledger.contains_key(&app.id) {
             sources.push(json!({"id":format!("{}|unavailable", app.id), "app_id":app.id,
                 "app_name":app.name, "instance_id":"", "instance_name":"", "unit":"tokens",
                 "days":[], "status":"unavailable", "count_in_total":false,
@@ -468,6 +505,28 @@ fn collect_sources() -> (Vec<Value>, HashMap<String, Value>) {
             }
         }
     }
+    // 反代账本作为补充来源：客户端自己没留 token 记录的 Agent，这里能给出
+    // 「经驾驶舱反代」那部分真实用量。已有本地会话记录的 Agent 只保留查看，
+    // 免得同一次调用被算两遍。
+    for (app_id, records) in &ledger {
+        let Some(def) = crate::registry::app_def(app_id) else { continue; };
+        let has_local = sources.iter().any(|s| s["app_id"] == app_id.as_str()
+            && s["status"] == "ready" && s["count_in_total"] != false);
+        let mut source = json!({
+            "id": format!("{app_id}|proxy-ledger"),
+            "app_id": app_id, "app_name": def.name,
+            "instance_id": "驾驶舱反代", "instance_name": "驾驶舱反代",
+            "unit": "tokens", "days": [], "status": "ready", "scope": "device",
+            "source": "驾驶舱反代账本",
+            "coverage": "驾驶舱反代链路上游回报的 usage，按调用逐笔累计；不含该客户端直连厂商的那部分。",
+            "count_in_total": !has_local,
+            "_records": records,
+        });
+        if has_local {
+            source["reason"] = json!("已有本地会话记录，反代通道的调用仅保留查看，不重复计入总量。");
+        }
+        sources.push(source);
+    }
     prepare_narrow_views(&mut sources);
     deduplicate_sources(&mut sources);
     for (profile, trend) in profiles.iter_mut() {
@@ -476,7 +535,7 @@ fn collect_sources() -> (Vec<Value>, HashMap<String, Value>) {
         let _ = profile;
         if let Some(obj) = trend.as_object_mut() { obj.remove("_records"); }
     }
-    (sources, profiles)
+    (sources, profiles, profile_errors)
 }
 
 fn totals_by_source(sources: &[Value], today: &str) -> BTreeMap<String, (f64, f64)> {
@@ -571,7 +630,7 @@ pub fn snapshot(force: bool) -> Value {
         let c = cache().lock().unwrap();
         if !force && now() - c.sampled_at < 15.0 { return c.document.clone(); }
     }
-    let (sources, profiles) = collect_sources();
+    let (sources, profiles, profile_errors) = collect_sources();
     let timestamp = now();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let totals = totals_by_source(&sources, &today);
@@ -610,6 +669,7 @@ pub fn snapshot(force: bool) -> Value {
             "sample_retention_seconds":SAMPLE_RETENTION_SECONDS,"sample_max_per_source":SAMPLE_MAX_PER_SOURCE,
             "note":"消耗速率来自两次本地日志采样的增量，可能受延迟落盘影响。回复平均吞吐只统计有耗时的请求，包含首字等待。"}});
     c.profiles = profiles;
+    c.profile_errors = profile_errors;
     c.previous = totals;
     c.previous_app = app_totals;
     c.previous_selected = selected_totals;
@@ -625,6 +685,16 @@ pub fn snapshot(force: bool) -> Value {
 pub fn trend_for(app: &str, dir: &str) -> Option<Value> {
     if dir.trim().is_empty() { return None; }
     cache().lock().ok()?.profiles.get(&profile_key(app, Path::new(dir))).cloned()
+}
+
+/// Separate actual read failures from the absence of usage records. Returned
+/// messages contain no local paths, credentials, or conversation text.
+pub fn error_for(app: &str, dir: &str) -> Option<String> {
+    if dir.trim().is_empty() { return None; }
+    cache().lock().ok()?.profile_errors.get(&profile_key(app, Path::new(dir))).cloned()
+}
+pub fn reason_for(app: &str, dir: &str) -> String {
+    error_for(app, dir).unwrap_or_else(|| unavailable_reason(app).to_string())
 }
 
 /// The desktop continues observing local histories while its window is in the tray.

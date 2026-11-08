@@ -360,6 +360,7 @@ fn write_lnk(exe: &Path, lnk: &Path) -> Result<(), String> {
             return Err(format!("创建目录失败 {parent:?}：{e}"));
         }
     }
+    let icon = crate::brand::icon_path().unwrap_or_else(|| exe.to_path_buf());
     let l = lnk.to_string_lossy();
     let e = exe.to_string_lossy();
     let w = exe.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
@@ -376,7 +377,7 @@ fn write_lnk(exe: &Path, lnk: &Path) -> Result<(), String> {
          $s.Description = 'Agent Cockpit (portable)'\n\
          $s.Save()\n\
          if (Test-Path -LiteralPath '{}') {{ 'DONE' }} else {{ 'FAIL' }}",
-        ps_quote(&l), ps_quote(&e), ps_quote(&w), ps_quote(&e), ps_quote(&l)
+        ps_quote(&l), ps_quote(&e), ps_quote(&w), ps_quote(&icon.to_string_lossy()), ps_quote(&l)
     );
     match run_ps(&script) {
         Ok(o) if o.lines().any(|x| x.trim() == "DONE") => crate::shell_identity::shortcut(lnk),
@@ -386,6 +387,25 @@ fn write_lnk(exe: &Path, lnk: &Path) -> Result<(), String> {
 }
 
 /// 生成/覆盖快捷方式。开始菜单一次写两条：中文名的正式项 + 英文名的搜索别名。
+pub fn refresh_brand_icons() -> Result<(), String> {
+    let t = gather()?;
+    let Some(icon) = crate::brand::icon_path() else { return Ok(()); };
+    let mut links = vec![t.desktop.clone(), t.start.clone(), start_alias_of(&t.start)];
+    let pinned = appdata_dir(&home_dir()).join("Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar");
+    if let Ok(entries) = std::fs::read_dir(pinned) {
+        links.extend(entries.flatten().map(|e| e.path()).filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lnk"))));
+    }
+    links.retain(|p| p.is_file());
+    let targets = read_targets(&links)?;
+    for (link, target) in links.iter().zip(targets) {
+        if !is_our_target(&target, &t.exe) { continue; }
+        // Change only the icon; preserve existing shortcut arguments and properties.
+        run_ps(&format!("$sh = New-Object -ComObject WScript.Shell; $s = $sh.CreateShortcut('{}'); $s.IconLocation = '{},0'; $s.Save()",
+            ps_quote(&link.to_string_lossy()), ps_quote(&icon.to_string_lossy())))?;
+    }
+    Ok(())
+}
+
 pub fn create(kind: &str) -> Value {
     // 先验 kind 再 gather：gather 要起 PowerShell，非法请求不该为它付子进程的钱
     if !matches!(kind, "desktop" | "startmenu") {
@@ -592,15 +612,15 @@ mod tests {
 
     #[test]
     fn only_exact_target_counts_as_ours() {
-        let exe = Path::new("D:\\Claude\\bin\\AgentCockpit.exe");
+        let exe = Path::new("D:\\Projects\\bin\\AgentCockpit.exe");
         // 大小写、分隔符差异 Windows 视为同一路径，必须认账
-        assert!(is_our_target("d:\\claude\\bin\\agentcockpit.EXE", exe));
-        assert!(is_our_target("D:/Claude/bin/AgentCockpit.exe", exe));
-        assert!(is_our_target("  \"D:\\Claude\\bin\\AgentCockpit.exe\" ", exe));
+        assert!(is_our_target("d:\\projects\\bin\\agentcockpit.EXE", exe));
+        assert!(is_our_target("D:/Projects/bin/AgentCockpit.exe", exe));
+        assert!(is_our_target("  \"D:\\Projects\\bin\\AgentCockpit.exe\" ", exe));
         // 同名不同目录、前缀相同的兄弟程序、空串一律拒绝——删除判据宁可错杀不可放行
         assert!(!is_our_target("C:\\other\\AgentCockpit.exe", exe));
-        assert!(!is_our_target("D:\\Claude\\bin\\AgentCockpit.exe.bak", exe));
-        assert!(!is_our_target("D:\\Claude\\bin\\AgentCockpit2.exe", exe));
+        assert!(!is_our_target("D:\\Projects\\bin\\AgentCockpit.exe.bak", exe));
+        assert!(!is_our_target("D:\\Projects\\bin\\AgentCockpit2.exe", exe));
         assert!(!is_our_target("", exe));
     }
 

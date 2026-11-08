@@ -852,6 +852,110 @@ pub fn probe(base_url: &str, key: &str) -> (bool, String, usize) {
     }
 }
 
+/// 从上游的错误体里抠一句人话出来。各家写法不一：OpenAI 是 error.message，
+/// 网关是 message / detail / title，抠不到就原样截一段，总比只报 HTTP 403 强。
+fn upstream_hint(body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let pick = |p: &[&str]| -> String {
+        let mut cur = &v;
+        for k in p {
+            cur = &cur[*k];
+        }
+        cur.as_str().unwrap_or("").trim().to_string()
+    };
+    let mut said = String::new();
+    for path in [
+        &["error", "message"][..],
+        &["error", "detail"][..],
+        &["error", "type"][..],
+        &["detail"][..],
+        &["message"][..],
+        &["error_type"][..],
+        &["title"][..],
+    ] {
+        let s = pick(path);
+        if s.is_empty() || said.contains(&s) {
+            continue;
+        }
+        if !said.is_empty() {
+            said.push_str(" / ");
+        }
+        said.push_str(&s);
+        if said.chars().count() > 160 {
+            break;
+        }
+    }
+    if said.is_empty() {
+        said = body.trim().chars().take(120).collect();
+    }
+    let said: String = said.chars().take(160).collect();
+    if said.is_empty() { String::new() } else { format!("；上游说：{said}") }
+}
+
+/// 真发一条最小对话，验这把 key 到底能不能用。
+///
+/// 为什么需要它：`probe()` 打的是 `.../models`，有的站点这个接口**不校验 key**
+/// （谁问都给模型清单），于是一把根本用不了的 key 也会显示「可用」——小红书 Dots
+/// 就是这么骗过测试的（2026-11-05 实测：假 key 与不带 key 都返回 200，真发对话才 403）。
+/// 只有真发一次 `POST /chat/completions` 才知道上游认不认这把 key。
+///
+/// 返回 (可用?, 说明)。说明里带耗时和上游原话，失败时能一眼看出是 401 不认 key、
+/// 403 不让调，还是地址压根不是 OpenAI 兼容口。
+pub fn chat_probe(base_url: &str, key: &str, model: &str) -> (bool, String) {
+    let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
+    let url = match chat_url(base) {
+        Some(u) => u,
+        None => return (false, "未填 Base URL".into()),
+    };
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "ping" }],
+        "max_tokens": 1,
+        "stream": false,
+    });
+    let t0 = std::time::Instant::now();
+    let mut req = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .set("Content-Type", "application/json");
+    if !key.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", key));
+        // Anthropic 系的口认 x-api-key 不认 Bearer；多带一个头对 OpenAI 系没影响
+        req = req.set("x-api-key", key);
+    }
+    match req.send_json(body) {
+        Ok(resp) => {
+            let ms = t0.elapsed().as_millis();
+            let txt = resp.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
+            let said = v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .replace(['\n', '\r'], " ");
+            let said: String = said.trim().chars().take(40).collect();
+            let msg = if said.is_empty() {
+                format!("真请求通过（{}ms）：上游收下了这把 key（模型 {model}）", ms)
+            } else {
+                format!("真请求通过（{}ms）：模型 {model} 回了「{said}」", ms)
+            };
+            (true, msg)
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let txt = resp.into_string().unwrap_or_default();
+            let hint = upstream_hint(&txt);
+            let extra = match code {
+                400 => "：请求被拒，通常是模型名这个接入点不认",
+                401 => "：这把 key 上游不认（鉴权失败）",
+                403 => "：上游认得出 key，但不允许它调这个模型",
+                404 => "：这个地址没有 /chat/completions，可能不是 OpenAI 兼容口",
+                429 => "：限流，或这把 key 的额度用完了",
+                _ => "",
+            };
+            (false, format!("真请求失败（HTTP {code}{extra}）{hint}"))
+        }
+        Err(e) => (false, friendly_net_err(&e, 20)),
+    }
+}
+
 /// 网络错误翻译成人话：超时（Windows 上表现为 os error 10060）要说清
 /// "等久了没连上"，别把系统错误号原样怼到脸上
 pub fn friendly_net_err(e: &ureq::Error, secs: u64) -> String {
@@ -950,6 +1054,24 @@ fn models_url(base_url: &str) -> Option<String> {
         format!("{base}/models")
     } else {
         format!("{base}/v1/models")
+    })
+}
+
+/// 真请求打的地址：和 models_url 一套规矩（先剥动作后缀，再按有没有版本尾巴补）
+fn chat_url(base_url: &str) -> Option<String> {
+    let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+    let has_version_tail = ["/v1", "/v1beta", "/v1beta1", "/v4"]
+        .iter()
+        .any(|s| base.ends_with(s));
+    Some(if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else if has_version_tail {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
     })
 }
 
@@ -1166,6 +1288,41 @@ mod tests {
     /// 接入点挂在站点上：一个站常有 OpenAI / Anthropic / DashScope 三种口，
     /// 默认取 OpenAI 兼容那个，key 自己填了才覆盖
     #[test]
+    /// 真请求的地址：跟 models_url 同一套归一规则，别再叠一层动作后缀
+    #[test]
+    fn chat_url_normalizes_the_same_way() {
+        assert_eq!(
+            chat_url("https://api.senseaudio.cn/v1").as_deref(),
+            Some("https://api.senseaudio.cn/v1/chat/completions")
+        );
+        assert_eq!(
+            chat_url("https://note3-prev-api.askdiandian.com").as_deref(),
+            Some("https://note3-prev-api.askdiandian.com/v1/chat/completions")
+        );
+        assert_eq!(
+            chat_url("https://x.example.com/v1/chat/completions").as_deref(),
+            Some("https://x.example.com/v1/chat/completions")
+        );
+        assert_eq!(chat_url("   ").as_deref(), None);
+    }
+
+    /// 上游报错的写法五花八门：网关一套、OpenAI 一套，抠不出 JSON 时也得截一段给看。
+    /// 只有「HTTP 403」三个字等于没说——她要的是「到底谁不放行」。
+    #[test]
+    fn upstream_hint_reads_both_error_shapes() {
+        let gateway = r#"{"title":"Request processing error","status":403,"detail":"The request could not be completed.","error_type":"governance.dots_platform_key_not_allowed"}"#;
+        let h = upstream_hint(gateway);
+        assert!(h.contains("could not be completed"), "网关 detail 要认: {h}");
+        assert!(h.contains("dots_platform_key_not_allowed"), "错误类型要认: {h}");
+
+        let openai = r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error"}}"#;
+        let h = upstream_hint(openai);
+        assert!(h.contains("Incorrect API key provided"), "OpenAI 形状要认: {h}");
+
+        assert!(upstream_hint("plain text boom").contains("plain text boom"));
+        assert_eq!(upstream_hint(""), "");
+    }
+
     fn base_url_prefers_the_key_override_then_the_site_openai_entry() {
         let site = json!({
             "models_list": "a, b",

@@ -145,6 +145,24 @@ test('historical rates use timestamped buckets, selected scope and no fabricated
   assert.equal(usage.historicalRates([], { now }).points.length, 0);
 });
 
+test('historical rate windows never include a bucket starting before the selected window', () => {
+  const now = 1800000100;
+  const start = now - 86400;
+  const sourceRow = source('a', 'tokens', [], { status: 'ready', historical_5m: [
+    { timestamp: start - 100, exact_tokens: 900000, events: 1 },
+    { timestamp: start + 200, exact_tokens: 1500, events: 1 },
+  ] });
+  const points = usage.historicalRates(normalized([sourceRow]), { range: '24h', now }).points;
+  assert.equal(points.length, 1);
+  assert.equal(points[0].exact, 1500);
+  assert.equal(points[0].rate, 300);
+});
+
+test('heatmap describes missing data as unknown and preserves a real zero', () => {
+  assert.equal(usage.heatTooltip('2026-10-01', undefined), '2026-10-01\n没有采集记录');
+  assert.match(usage.heatTooltip('2026-10-01', { exact: 0, estimated: 0 }), /实测 0 Token/);
+});
+
 test('per-Agent and per-source live rates select their own accounting views', () => {
   const sources = normalized([source('desktop', 'tokens', [], { status: 'ready', app_id: 'chatgpt' })]);
   const row = value => ({ tokens_per_minute: value, exact_tokens_per_minute: value, estimated_tokens_per_minute: 0, history: [] });

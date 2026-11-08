@@ -4,7 +4,7 @@
 
 ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![框架](https://img.shields.io/badge/framework-Tauri%202-orange) ![语言](https://img.shields.io/badge/rust-2021-red) ![许可](https://img.shields.io/badge/license-MIT-green)
 
-Tauri 2 桌面应用（Rust 后端 + WebView2 前端），提供单文件便携版。用量采集运行时随程序内置，无需单独安装 Python；首次使用时会在驾驶舱数据目录解压运行时。程序不依赖 Electron，关窗后会驻留系统托盘继续监控额度。
+Tauri 2 桌面应用（Rust 后端 + WebView2 前端），提供单文件便携版。用量采集与会话索引运行时随程序内置，无需单独安装 Python 或 AgentFind；首次使用时会在驾驶舱数据目录解压运行时。程序不依赖 Electron，关窗后会驻留系统托盘继续监控额度。
 
 **直接下载**：[Releases](https://github.com/shen1950/agent-cockpit/releases) 里有免安装便携版和 NSIS 安装包，下载即用，不必自己编译。
 
@@ -54,6 +54,7 @@ Tauri 2 桌面应用（Rust 后端 + WebView2 前端），提供单文件便携�
 | 快速登记 | 粘贴任意排版文本或截图 → 本机规则优先解析（离线、零 token）→ 多模态模型兜底 → 核对后落盘 |
 | AI 识别 | 文本/截图两条通道分开配模型；识别全程有进度反馈，同时只跑一次，重复请求直接挡掉 |
 | 本地网关 | 供应商列表 + 接入密钥；可选择目标 Agent 接入，配置图片能力、上下文/输出/压缩阈值、供应商排队与备用模型，查看实际请求路由与费用估算 |
+| 会话看板 | 内置 AgentFind 索引本机各 Agent 的会话记录，按关键词 / 项目 / 日期 / 产物文件名反查「何时 · 哪个产品 · 哪个项目 · 哪场对话」，可一键跳回原应用；无需另行安装服务 |
 | 凭据保护 | 保管箱使用 DPAPI + 可选主密码；客户端配置、备份、剪贴板可能另含凭据副本，见隐私说明 |
 | 数据治理 | 数据根搬家 / 回滚、可再生大文件去重、本机 Agent 盘点 |
 

@@ -681,6 +681,14 @@ pub fn delete_backup(file: &str) -> (bool, String) {
 
 /// 账号改名：同步改数据目录、档案 json 与换号记录
 pub fn rename_instance(app_id: &str, from: &str, to: &str) -> (bool, String) {
+    rename_instance_impl(app_id, from, to, true)
+}
+
+pub fn rename_instance_auto(app_id: &str, from: &str, to: &str) -> (bool, String) {
+    rename_instance_impl(app_id, from, to, false)
+}
+
+fn rename_instance_impl(app_id: &str, from: &str, to: &str, manual: bool) -> (bool, String) {
     if app_id == crate::chatgpt::APP { return (false, "请使用ChatGPT专用改名入口，资料目录保持原位。".into()); }
     let to = to.trim();
     if to.is_empty() {
@@ -696,6 +704,12 @@ pub fn rename_instance(app_id: &str, from: &str, to: &str) -> (bool, String) {
         Some(m) => m,
         None => return (false, "账号不存在".into()),
     };
+    if find_instance(app_id, to).is_some() {
+        return (false, "已经有同名账号，未改名".into());
+    }
+    if let Err(e) = crate::authpack::copy_for_rename(app_id, from, to) {
+        return (false, e);
+    }
     // 只有"这个账号正被 junction 挂成默认档案"时，把数据目录挪走才会留下断链；
     // 那也只是不让挪目录，昵称照样该让人改（见下面的 movable）
     let swapped_here = swaps_of(&load_config())
@@ -711,7 +725,11 @@ pub fn rename_instance(app_id: &str, from: &str, to: &str) -> (bool, String) {
     // 操作（Windows 不许改名正被程序打开的目录，junction 指着它时挪走还会留断链）。
     // 所以目录能顺手改就改，改不动就留着旧路径说清楚——别为了目录名拒绝人改昵称。
     let mut dir_note = String::new();
-    if old_dir != new_dir {
+    // Only isolated account directories owned by Cockpit may follow a card name.
+    // Native/shared profiles must stay at the vendor's fixed path, even when closed.
+    let owns_directory = rename_moves_directory(&old_dir, &reg::instances_dir(app_id))
+        && !reg::is_in_place(app_id, &old_dir) && !reg::shares_one_profile(app_id);
+    if owns_directory && old_dir != new_dir {
         if new_dir.exists() {
             return (false, format!("已存在同名账号目录「{}」，先换个名字", to));
         }
@@ -727,6 +745,8 @@ pub fn rename_instance(app_id: &str, from: &str, to: &str) -> (bool, String) {
         }
     }
     meta["name"] = serde_json::json!(to);
+    meta["name_customized"] = serde_json::json!(manual);
+    if !manual { meta["auto_account_name"] = serde_json::json!(to); }
     save_instance(app_id, &meta);
     if let Some(f) = meta["_file"].as_str() {
         let _ = fs::remove_file(f);
@@ -738,10 +758,22 @@ pub fn rename_instance(app_id: &str, from: &str, to: &str) -> (bool, String) {
         }
     }
     crate::registry::save_config(&cfg);
+    crate::checkin::rename_account(app_id, from, to);
+    for mut other in reg::load_instances(app_id) {
+        if other["released_to"].as_str() == Some(from) {
+            other["released_to"] = serde_json::json!(to);
+            save_instance(app_id, &other);
+        }
+    }
     (
         true,
         format!("已把「{}」改名为「{}」{}", from, to, dir_note),
     )
+}
+
+fn rename_moves_directory(dir: &Path, instances: &Path) -> bool {
+    dir.parent().map(|p| rel_norm(&p.to_string_lossy()) == rel_norm(&instances.to_string_lossy()))
+        .unwrap_or(false)
 }
 
 /// 所有配了共享层的产品都过一遍
@@ -755,6 +787,14 @@ pub fn dedup_all() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_never_moves_native_or_shared_workbuddy_profiles() {
+        let root = Path::new("C:/Users/test/.agent-cockpit/instances/workbuddy-intl");
+        assert!(!rename_moves_directory(Path::new("C:/Users/test/.workbuddy-ai"), root));
+        assert!(!rename_moves_directory(Path::new("C:/Users/test/friendly-name"), root));
+        assert!(rename_moves_directory(&root.join("isolated-account"), root));
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(name);

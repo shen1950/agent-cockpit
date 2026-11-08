@@ -1,13 +1,20 @@
 [package]
 name = "agent-cockpit"
-version = "2.3.0"
+version = "2.4.0"
 description = "Agent 驾驶舱：国内 AI Agent 多开 / 额度过期提醒 / 本地反代"
 edition = "2021"
+# src/bin/codex-shared-resume.rs 是第二个 bin 目标；不指明主程序 tauri build 会报
+# 「failed to find main binary」（干净克隆 L4 验收时暴露）。
+default-run = "agent-cockpit"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+image = { version = "0.25", default-features = false }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
@@ -15,6 +22,8 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "=0.8.2"
+toml_edit = "=0.20.2"
+tempfile = "3"
 sysinfo = "0.33"
 ureq = { version = "2.12", features = ["json"] }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }

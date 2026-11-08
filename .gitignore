@@ -6,7 +6,8 @@ __pycache__/
 *.spec
 build/
 dist/
-bin/
+# 根目录 bin/ 是部署输出；锚定到根，别吞掉 src-tauri/src/bin/ 的 cargo bin 目标
+/bin/
 installer/
 
 # 日志
@@ -30,6 +31,10 @@ docs/private/
 # 调试草稿
 _noserve.py
 
+# 一次性本机修复脚本（含真实账号信息，仅本地留存，不进公开仓库）
+tools/qcn_identity_repair.py
+tools/workbuddy-repair.ps1
+
 # 界面预览图（本地留存，发布时作为 Release 附件）
 docs/*.png
 .agent-sync/
@@ -49,3 +54,6 @@ _zoom_*.png
 !.env.example
 privacy-local/
 release-private/
+
+# Playwright 运行产物
+test-results/

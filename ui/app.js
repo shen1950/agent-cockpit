@@ -22,6 +22,11 @@ const S = {
   keySel: null,
   // 签到页领取日志的时间范围：today / d7 / d30 / all（默认只看今天）
   ciLogRange: 'today',
+  // 领取日志的表头筛选（WPS 打勾清单那意思）：三个都是数组，[] = 不筛，
+  // 勾几个筛几个（她 2026-11-08 要的多选）
+  ciLogDay: [],    // 具体哪几天（表头「时间」列的筛选）
+  ciLogKind: [],   // 日志类型：签到成功 / 积分到账 / 已签未到 / 没领成 …
+  ciLogWho: [],    // Agent · 账号
   // 模型反代：每个 Agent 选中的模型 / 最近一次测试结果
   agentPx: {},
   // 最近一次从哪个 Agent 面板开启反代：顶栏「反代 :8788」点击时回到那一页。
@@ -308,6 +313,20 @@ function builtinIcon(a) {
   const key = `${a.id} ${a.name}`;
   for (const [re, svg] of BUILTIN_ICONS) if (re.test(key)) return svg;
   return '';
+}
+
+/* 程序图标节点：内置品牌 SVG > 后端从 exe 提取的 PNG > 名字缩写占位。
+   内置的排第一是因为后端对没有图标的 exe 会拿到 Windows 那张"空白文档"默认图。
+   侧栏和首页卡片共用这一套，免得两边对同一个程序长成两个样子。 */
+function appIconNode(a) {
+  const bisvg = builtinIcon(a);
+  if (bisvg) {
+    const s = el('span', { class: 'fav svg', title: a.name });
+    s.innerHTML = bisvg;
+    return s;
+  }
+  if (a.icon) return el('img', { class: 'fav', src: a.icon, alt: '', width: 18, height: 18 });
+  return el('span', { class: 'fav none' }, (a.short || a.name || '?').slice(0, 2));
 }
 
 /* 说明按需查看。远程控制页由另一项任务维护，保留其现有行内说明。 */
@@ -604,20 +623,24 @@ function proxyChipGo() {
 }
 
 /* 跳到页内某一块（不是只切页面）。
+   target 可以直接给元素，也可以给选择器——后者在真正滚动的那一帧才去找，
+   这样"先把视图切过去、目标要等这次 render 才画出来"的入口也能用。
    切换视图那一拍整页刚重建，布局要到下一帧才算完；首页还会在重建后用旧 scrollTop
    还原一次滚动（renderHome 里的 restoreScroll，也是 rAF）。所以这里排到两帧之后再滚，
    否则刚滚过去就被那条还原指令拽回原处——这就是"点了没反应"的来源。
    滚完再闪一下，眼睛才能立刻落到目标上。 */
 function jumpToPanel(target) {
   if (!target) return;
+  const pick = () => (typeof target === 'string' ? document.querySelector(target) : target);
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    if (!target.isConnected) return;
-    try { target.scrollIntoView({ block: 'start', behavior: 'smooth' }); }
-    catch { target.scrollIntoView(); }
-    target.classList.remove('jump');
-    void target.offsetWidth;      // 强制重排，同一块连着点两次也要重放动画
-    target.classList.add('jump');
-    setTimeout(() => target.classList.remove('jump'), 1400);
+    const node = pick();
+    if (!node || !node.isConnected) return;
+    try { node.scrollIntoView({ block: 'start', behavior: 'smooth' }); }
+    catch { node.scrollIntoView(); }
+    node.classList.remove('jump');
+    void node.offsetWidth;      // 强制重排，同一块连着点两次也要重放动画
+    node.classList.add('jump');
+    setTimeout(() => node.classList.remove('jump'), 1400);
   }));
 }
 
@@ -692,6 +715,8 @@ function expiringText(alerts) {
     if (a.left != null && !dup) tail.push(`共剩 ${nfmt(a.left)}${unit}`);
     // 厂商不给逐笔剩余（如 AStudio 的获得明细）时只报总量，别让它看起来像"作废 0"
     if (a.exp_left == null && a.exp_left_unknown) tail.push('最早那笔没给逐笔剩余');
+    // 日期是自己填的：提醒里点一句，别让人把这句当成厂商口径
+    if (a.expires_manual) tail.push('到期日是你自己填的');
     const tot = tail.length ? `（${tail.join('，')}）` : '';
     return `「${a.app}/${a.name}」${a.label ? ` · ${a.label}` : ''}${at}${tot} · ${expText(a.days)}`;
   }).join('\n');
@@ -745,16 +770,8 @@ function renderNav(d) {
       ? (loggedName ? { name: loggedName, tag: '本机登录中' }
         : (!a.local_quota ? { name: a.swapped, tag: '当前账号' } : { name: '', tag: '' }))
       : { name: a.swapped, tag: '当前账号' };
-    // 图标优先级：内置品牌 SVG > 后端从 exe 提取的 PNG > 名字缩写占位。
-    // 内置的排第一是因为后端对没有图标的 exe 会拿到 Windows 那张"空白文档"默认图，
-    // 认不全的品牌才轮到它。
-    const bisvg = builtinIcon(a);
-    const icon = bisvg
-      ? el('span', { class: 'fav svg', title: a.name })
-      : a.icon
-        ? el('img', { class: 'fav', src: a.icon, alt: '', width: 18, height: 18 })
-        : el('span', { class: 'fav none' }, (a.short || a.name[0]).slice(0, 2));
-    if (bisvg) icon.innerHTML = bisvg;
+    // 图标优先级：内置品牌 SVG > 后端从 exe 提取的 PNG > 名字缩写占位（见 appIconNode）
+    const icon = appIconNode(a);
     const b = el('button', {
       class: `nav-btn${n ? ' counted' : ''}${running ? ' running' : ''}${a.installed ? '' : ' missing'}`,
       data: { app: a.id },
@@ -901,44 +918,6 @@ function homeStat(label, value, sub, cls) {
     sub ? el('span', { class: 'hstat-s' }, sub) : null);
 }
 
-/* 按 Agent 汇总可读余额。
-   不同 Agent 的积分/代币单位不一样，不能跨 Agent 相加；同一个 Agent 内按单位分别汇总。 */
-function homeBalances(d) {
-  const apps = d.apps || [];
-  const order = new Map(apps.map((a, idx) => [a.id, idx]));
-  const alerts = d.alerts || [];
-  const map = new Map();
-  for (const i of d.instances || []) {
-    const q = i.quota;
-    if (!q) continue;
-    let groups = (q.groups || [])
-      .map((g) => ({ left: numv(g.left), unit: g.unit }))
-      .filter((g) => g.left != null);
-    if (!groups.length) {
-      const left = numv(q.left);
-      if (left == null) continue;
-      const fallback = (alerts.find((a) => a.app_id === i.app) || {}).unit || 'credits';
-      groups = [{ left, unit: fallback }];
-    }
-    if (!map.has(i.app)) {
-      const app = apps.find((a) => a.id === i.app) || {};
-      map.set(i.app, {
-        id: i.app, name: app.name || i.app_name || i.app,
-        accounts: new Set(), units: new Map(),
-      });
-    }
-    const row = map.get(i.app);
-    row.accounts.add(i.name);
-    for (const g of groups) {
-      const unit = utxt(g.unit);
-      row.units.set(unit, (row.units.get(unit) || 0) + (g.left || 0));
-    }
-  }
-  return [...map.values()]
-    .filter((r) => r.accounts.size && r.units.size)
-    .sort((a, b) => (order.get(a.id) ?? 999) - (order.get(b.id) ?? 999));
-}
-
 function renderHome(d) {
   const host = $('home-body');
   if (!host) return;
@@ -967,7 +946,7 @@ function renderHome(d) {
 
   const hero = el('div', { class: 'hhero' },
     el('div', { class: 'hhero-t' },
-      el('h2', {}, '今天要处理的事'),
+      el('h2', {}, '今日待办'),
       el('p', { class: 'hhero-sub' }, todo.length ? todo.join(' · ') : '暂无待办')),
     el('div', { class: 'hhero-b' },
       btn(running ? '↻ 正在刷新…' : '↻ 一键刷新全部额度', 'primary lg', () => refreshAllQuota(),
@@ -1007,36 +986,11 @@ function renderHome(d) {
       chk.placeholder ? '正在读状态' : (claimable.length ? `${claimable.length} 家还能领` : '都领完了'),
       claimable.length ? 'go' : '')));
 
-  // ②b 按 Agent 看余额：不跨 Agent 求和，避免把不同汇率/单位的数字硬加在一起
-  const balances = homeBalances(d);
-  const btable = el('table', { class: 'tbl homebals' });
-  btable.appendChild(el('thead', {}, el('tr', {},
-    ...['Agent', '账号', '可读余额', '临期', '操作'].map((h) => el('th', {}, h)))));
-  const btbody = el('tbody');
-  for (const r of balances) {
-    const unitText = [...r.units.entries()]
-      .map(([u, v]) => `${nfmt(v)} ${u}`)
-      .join(' · ');
-    const ac = alerts.filter((a) => a.app_id === r.id).length;
-    btbody.appendChild(el('tr', {},
-      el('td', {}, el('b', {}, r.name)),
-      el('td', {}, `${r.accounts.size} 个`),
-      el('td', { class: 'hbal', title: unitText }, unitText),
-      el('td', {}, ac ? `${ac} 笔` : '—'),
-      el('td', { class: 'acts' },
-        btn('查看', 'sm', () => homeGo(r.id), '进这个 Agent 的账号页'))));
-  }
-  btable.appendChild(btbody);
-  host.appendChild(el('section', { class: 'panel' },
-    el('header', { class: 'panelhead' },
-      el('h2', {}, '按 Agent 看余额'),
-      qhelp('按产品汇总可读取的余额，不跨产品或计量单位相加。')),
-    balances.length
-      ? el('div', { class: 'tablewrap' }, btable)
-      : el('p', { class: 'qempty' }, '还没有读到可比较的余额；先点上方「一键刷新全部额度」。')));
-
-  // ③ 两栏：临期积分 / 今天还能领
-  const cols = el('div', { class: 'hcols' });
+  // ③ 两栏：临期积分 / 今日待领取。
+  //    容器在 #home-body **外面**（index.html 里 #home-cols），夹在「福利活动」和「运行中的进程」
+  //    之间——她 11-05 晚定的首页顺序：今日待办 → 统计磁贴 → 我的 Agent → 福利活动 →
+  //    临期/待领取 → 运行中的进程。所以这里只往容器里填，不再 append 到 home-body 末尾。
+  const cols = $('home-cols');
   const acard = el('section', { class: 'panel' },
     el('header', { class: 'panelhead' }, el('h2', {}, '临期积分'),
       alerts.length ? null : el('span', { class: 'sub' }, '30 天内无到期额度')),
@@ -1051,7 +1005,7 @@ function renderHome(d) {
             el('span', { class: `hrow-x ${expCls(a.days, false)}` }, expText(a.days))))
         : [el('p', { class: 'qempty' }, '没有临期的积分。')])));
   const ccard = el('section', { class: 'panel' },
-    el('header', { class: 'panelhead' }, el('h2', {}, '今天还能领的'),
+    el('header', { class: 'panelhead' }, el('h2', {}, '今日待领取'),
       el('span', { class: 'sub' }, chk.fetched_at ? `状态查于 ${stampTime(chk.fetched_at)}` : '还没查到')),
     el('div', { class: 'hlist' },
       ...(claimable.length
@@ -1063,54 +1017,89 @@ function renderHome(d) {
             el('span', { class: 'hrow-r' }, x.reward != null ? `${x.reward} ${x.unit || '积分'}` : '—'),
             el('span', { class: 'hrow-x go' }, ciActionWord(x))))
         : [el('p', { class: 'qempty' }, chk.placeholder ? '正在问各家今天的状态…' : '今天没有可领的了。')])));
-  cols.appendChild(acard);
-  cols.appendChild(ccard);
-  host.appendChild(cols);
+  if (cols) {
+    clear(cols);
+    cols.appendChild(acard);
+    cols.appendChild(ccard);
+  }
 
-  // ④ 我的 Agent 一行一个
-  // 每一项都要自己包一层 span：flex 容器里连着几段裸文本会被合成**一个**匿名项，
-  // 中间的 gap 就不生效了（第一版就是这样，"运行中2 个账号可多开"糊成一团）
-  const ciWord = { done: '已签', claimable: '可领', off: '活动未开', error: '读不到' };
-  const rows = (d.apps || []).filter((a) => !a.hidden).map((a) => {
+  // ④ 我的 Agent：平铺成一片紧凑卡片，一块矩形＝一个程序，不留空。
+  //    左边图标 + 名字（第二行是能力标和当前账号），右边三列「运行 / 账号 / 签到」挤成一行。
+  //    档案、临期不再占卡面（她 11-05："档案和临期可以省略了"），要看的都在悬停提示里；
+  //    临期只在真有的时候多挂一个小角标，没有就一个字都不占。
+  //    开没开同时用两处说：名字前的圆点（同侧栏那套绿点/灰点）+ 整块边框的流光绿
+  //    （CSS .hacard.on），扫一眼就知道谁开着。
+  // 卡面用的短词：那一格只有 44px，"活动未开""状态未知"会顶到隔壁的「账号」列。
+  // 完整说法留给悬停提示（signTip 用的是这张表之外的原文）。
+  const ciWord = { done: '已签', claimable: '可领', off: '未开', error: '读不到' };
+  const apps = (d.apps || []).filter((a) => !a.hidden);
+  let runningApps = 0;
+  const cards = apps.map((a) => {
     const insts = (d.instances || []).filter((i) => i.app === a.id);
     const mv = (a.machine && a.machine.value) || {};
     const logged = a.shared_profile
       ? (insts.find((x) => x.logged_in)?.name || (mv.ok ? mv.account || '' : ''))
       : (a.swapped || '');
-    const run = insts.some((i) => i.running) || (d.procs || []).some((p) => p.app_id === a.id && (p.windows ?? 1) > 0);
+    const run = insts.some((i) => i.running)
+      || (d.procs || []).some((p) => p.app_id === a.id && (p.windows ?? 1) > 0);
+    if (run) runningApps += 1;
     const aAlerts = alerts.filter((x) => x.app_id === a.id).length;
     const ci = insts.map((i) => i.checkin).find((c) => c && c.state);
-    const tags = [
-      run ? '运行中' : '未运行',
-      a.id === 'claude-desktop' ? '' : insts.length ? `${insts.length} 个账号` : '还没有账号',
-      a.id === 'claude-desktop' ? '桌面客户端' : a.isolatable ? '可多开' : (a.shared_profile ? '共用一份档案' : '仅可换号'),
-      logged ? `当前：${logged}` : '',
-      aAlerts ? `${aAlerts} 笔临期` : '',
-      ci ? `签到：${ciWord[ci.state] || '状态未知'}${ci.reward != null ? ` · 每日 ${ci.reward}` : ''}` : '',
-      a.installed ? '' : '可执行文件已不存在',
-    ].filter(Boolean);
-    return el('button', { class: 'hagent', type: 'button', onclick: () => homeGo(a.id) },
-      el('span', { class: 'hagent-n' }, a.name),
-      el('span', { class: 'hagent-t' }, ...tags.map((t) => el('span', {}, t))));
+    // 桌面客户端不是"多开/换号"那套，单独说一句（跟账号页 topbar 上的能力标一致）
+    const desktop = a.id === 'claude-desktop';
+    const cap = desktop ? '客户端' : a.kind === 'cli' ? '终端' : a.isolatable ? '多开' : '换号';
+    // 档案不占卡面（她 11-05："档案和临期可以省略了"）：这一列拿掉之后，
+    // 名字能多分到 ~85px，长名字（DeepSeek Harness / Claude Code CLI）才不用截断。
+    const archive = desktop ? '桌面客户端' : !insts.length ? '没有账号' : a.shared_profile ? '共用一份档案' : '各自独立档案';
+    // 签到：卡上只放状态，每日额度挂在悬停提示里（那一格只有 ~30px 宽）
+    const sign = ci ? (ciWord[ci.state] || '未知') : '—';
+    const signTip = ci && ci.reward != null ? `${sign} · 每日 ${ci.reward}` : sign;
+    // 卡面第二行：能力标在左、账号数/签到在右，一行挤满——她 11-06：
+    // "列宽砍一半，两列变四列都绰绰有余"。右侧那两列竖排标签在 170px 卡宽里塞不下。
+    const meta = el('span', { class: 'hacard-meta' },
+      el('span', { class: 'hm' }, insts.length ? `${insts.length} 账号` : '没账号'),
+      sign === '—' ? null : el('span', {
+        class: `hm${ci.state === 'claimable' ? ' go' : ''}`, title: signTip,
+      }, sign));
+    const glow = run ? el('span', { class: 'hacard-glow', 'aria-hidden': 'true' }) : null;
+    if (glow) {
+      glow.innerHTML = '<svg><rect pathLength="100"/><rect class="comet" pathLength="100"/></svg>';
+    }
+    return el('button', {
+      class: `hacard${run ? ' on' : ''}${a.installed ? '' : ' missing'}`,
+      type: 'button',
+      onclick: () => homeGo(a.id),
+      title: `${a.name}\n${run ? '有窗口在跑' : '没在跑'}`
+        + (desktop ? ' · 桌面客户端' : ` · ${a.isolatable ? '可多开' : '仅可换号'}`)
+        + `\n${insts.length ? `${insts.length} 个账号` : '还没有账号'} · 档案${archive}`
+        + (logged ? `\n当前登录：${logged}` : '')
+        + (aAlerts ? `\n${aAlerts} 笔临期` : '')
+        + (a.installed ? '' : '\n可执行文件已不存在'),
+    },
+      // 运行中的流光：一圈绿边 + 一颗沿边框匀速跑的亮点。
+      // 用 SVG 的 stroke-dashoffset 而不是"转一块锥形渐变"——锥形渐变在宽扁的矩形上
+      // 沿长边飞快、沿短边几乎停住，就是她说的"一会加速一会减速"。
+      // pathLength="100" 把整条周长归一化成 100，dasharray 6 94 就是"6% 亮、94% 暗"，
+      // 动画位移 -100 正好一圈接上，不管卡片多宽多高，速度都是每秒 100/2.6 ≈ 38% 周长。
+      glow,
+      el('span', { class: 'hacard-l' },
+        appIconNode(a),
+        el('span', { class: 'hacard-id' },
+          el('span', { class: 'hacard-n' },
+            el('i', { class: 'hacard-dot', 'aria-hidden': 'true' }),
+            el('span', { class: 'hacard-nm', title: a.name }, a.name),
+            aAlerts ? el('i', { class: 'hacard-alert', title: `${aAlerts} 笔临期` }, String(aAlerts)) : null),
+          el('span', { class: 'hacard-sub' },
+            el('span', { class: 'hacard-cap' }, cap),
+            meta))));
   });
   host.appendChild(el('section', { class: 'panel' },
-    el('header', { class: 'panelhead' }, el('h2', {}, '我的 Agent')),
-    el('div', { class: 'hlist' }, ...(rows.length ? rows : [el('p', { class: 'qempty' }, '还没有收录任何程序。')]))));
-
-  // ⑤ 最近领过的
-  const log = (((chk.state || {}).log) || []).slice(-6).reverse();
-  if (log.length) {
-    host.appendChild(el('section', { class: 'panel' },
-      el('header', { class: 'panelhead' }, el('h2', {}, '最近领过的'),
-        qhelp('本机领取与官方客户端手动签到都记在这里。')),
-      el('div', { class: 'hlog' }, ...log.map((x) => {
-        const t = ciLogTone(x);
-        const cls = t.cls === 'ok' ? 'hlog-ok' : t.cls === 'bad' ? 'hlog-no' : 'hlog-mid';
-        return el('div', { class: 'hlogrow' },
-          el('span', { class: 'hlog-t' }, `${x.at || ''} ${CI_NAMES[x.store] || x.store}`),
-          el('span', { class: cls, title: t.word }, t.word));
-      }))));
-  }
+    el('header', { class: 'panelhead' },
+      el('h2', {}, '我的 Agent'),
+      apps.length ? el('span', { class: 'sub' },
+        `${runningApps} 个在跑 · 共 ${apps.length} 个程序`) : null),
+    el('div', { class: 'hagents' },
+      ...(cards.length ? cards : [el('p', { class: 'qempty' }, '还没有收录任何程序。')]))));
 
   if (pb) restoreScroll(pb, keep);
 }
@@ -1482,6 +1471,7 @@ async function saveCheckinMute(store, muted) {
    列宽只在 .citab 里定义一次，所以"每日多少积分""今天不用领"这些同类内容必然落在同一列。
    以前每行自己 flex 排，一家少个字段整行就错位——你圈出来的就是这个。 */
 const CI_COLS = ['产品', '状态', '连签', '每日', '累计', '活动截止', '操作', '自动领', '提醒', '刷新'];
+const CI_PAST_SHOWN = 10;
 
 function ciRule(grid) { grid.appendChild(el('div', { class: 'ci-rule' })); }
 
@@ -1616,7 +1606,9 @@ function renderCheckin() {
     // ciLoading 不进签名：它只是状态栏的"正在刷新…"字样，跳过重建时那行
     // 文字会单独更新；进签名会让每次点补记/刷新都白重建一遍
     d && d.refreshing, st, S.ciLogRange, S.ciFold, S.ciWait,
-    S.checkinAuto, S.checkinMute]);
+    // 表头筛选状态必须进签名：她 2026-11-08 选了筛选值页面纹丝不动——
+    // 签名没算它，renderCheckin 以为"内容没变"直接跳过重建，筛选落不到列表上
+    S.ciLogDay, S.ciLogKind, S.ciLogWho, S.checkinAuto, S.checkinMute]);
   if (sig === S.ciRenderSig && host.firstChild) {
     const span = host.querySelector('.ci-status');
     if (span) span.textContent = ciStatusText(d);
@@ -1711,13 +1703,28 @@ function renderCheckin() {
   }
   host.appendChild(grid);
   // 还在等它到账的那几家：写明白"在等什么、等了多久"，别让她以为忘了
-  const pend = Object.values((d.state && d.state.pending) || {});
+  // 等得最久的排最前
+  const pend = Object.values((d.state && d.state.pending) || {})
+    .sort((a, b) => String(a.today || '').localeCompare(String(b.today || '')));
   if (pend.length) {
     host.appendChild(el('div', { class: 'cipend' },
       el('b', {}, '正在等到账',
         ihelp('服务端按天批量发放、时刻不固定；驾驶舱每几分钟替你查一次，到账会在这里提示。')),
-      ...pend.map((p) => el('span', { class: 'cihit' },
-        `${p.label || p.today || ''}：${p.expect || '今天这份积分'}还没到账`))));
+      ...pend.map((p) => el('span', { class: 'cihit' }, ciPendText(p)))));
+  }
+  // 到期没等来的那几笔：厂商第 3 天才发是常事，不能因为停止回读就连"欠过哪天"都不留话
+  // （2026-11-06 她定的这条）。这一段只陈述事实，不画成出错。
+  const past = ((d.state && d.state.expired) || [])
+    .slice().sort((a, b) => (b.dropped_at || 0) - (a.dropped_at || 0));
+  if (past.length) {
+    const show = past.slice(0, CI_PAST_SHOWN);
+    host.appendChild(el('div', { class: 'cipend past' },
+      el('b', {}, '已停止追踪',
+        ihelp('超过等待上限（国际版 48 小时）驾驶舱就不再每几分钟回读这一笔。厂商晚发照样会进账，'
+          + '只是到账提示不再弹；这里留着的是它欠的是哪一天、什么时候收的手。')),
+      ...show.map((p) => el('span', { class: 'cihit' }, ciPastText(p))),
+      ...(past.length > show.length
+        ? [el('span', { class: 'cihit' }, `另有 ${past.length - show.length} 条更早的`)] : [])));
   }
   // 领取日志：默认只看今天，可切近 7 / 30 天 / 全部，也能导出。
   // 她 2026-10-17："这部分可以直接改成日志，有时候我要查看很多天前的记录，能帮我保留吗，
@@ -1748,26 +1755,181 @@ function localDay(offset = 0) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+/* 活跃日念成"今天/昨天/前天"，再往前直接报日期 */
+function ciDayWord(dateStr) {
+  if (!dateStr) return '';
+  if (dateStr === localDay(0)) return '今天';
+  if (dateStr === localDay(1)) return '昨天';
+  if (dateStr === localDay(2)) return '前天';
+  return `${Number(dateStr.slice(5, 7))}月${Number(dateStr.slice(8, 10))}日`;
+}
+
+/* 「正在等到账」那一行。expect 是厂商给的相对说法（"今天这份积分"），照抄的话
+   同一个号欠着两天就长成两行一模一样的字，看不出到底在等哪天（2026-11-06 她圈的这两条）。
+   日期一律按 pending.today 现算，expect 只保留日期词后面那截（"这份积分""这 30 积分"）。 */
+const CI_REL_DAY_WORDS = ['今天', '今日', '昨天', '昨日', '前天'];
+function ciExpectPhrase(p, day) {
+  const exp = p.expect || '这份积分';
+  const hit = CI_REL_DAY_WORDS.find((w) => exp.startsWith(w));
+  return `${day}${hit ? '' : '的'}${hit ? exp.slice(hit.length) : exp}`;
+}
+function ciPendText(p) {
+  const label = p.label || p.today || '';
+  const day = ciDayWord(p.today);
+  if (!day) return `${label}：${p.expect || '这份积分'}还没到账`;
+  return `${label}：${ciExpectPhrase(p, day)}还没到账`;
+}
+
+/* 到期没等来的那一行：不再占着「正在等」那一段，但欠的是哪天、盯到什么时候收手要留着 */
+function ciPastText(p) {
+  const label = p.label || p.today || '';
+  const day = ciDayWord(p.today);
+  const phrase = day ? ciExpectPhrase(p, day) : (p.expect || '这份积分');
+  const until = p.deadline ? `（盯到 ${stampTime(p.deadline).slice(5)}）` : '';
+  return `${label}：${phrase}至今未到账${until}`;
+}
+
+/* 领取日志一行属于哪一类。三档颜色之外还要分「积分到账」和「已签未到」——
+   两者都是 settling，老条目只能按消息文案认（到账了/到账的 = 到账），
+   新条目带 arrived 标记（check_arrivals 写的），筛类型和配色共用这一个判据。 */
+function ciLogKind(x) {
+  if (x.source === 'external') return 'ext';
+  if (x.source === 'auto-stop') return 'stop';
+  if (x.claimed === true) return 'ok';
+  if (x.settling === true) {
+    if (x.arrived === true || /到账了|到账的/.test(x.message || '')) return 'arrived';
+    return 'pending';
+  }
+  if (x.already === true) return 'already';
+  return 'bad';
+}
+/* 筛选下拉里的类型清单，顺序就是常用度 */
+const CI_LOG_KINDS = [
+  ['ok', '签到成功（领到）'],
+  ['arrived', '积分到账'],
+  ['pending', '已签未到（等到账）'],
+  ['bad', '没领成'],
+  ['ext', '官方客户端签到'],
+  ['already', '已领过'],
+  ['stop', '自动签到停止重试'],
+];
+
 /* 领取日志一行该说什么、什么颜色。三档，不是两档：
    旅行猫那种「这一步做成了、奖励要等猫回来」的 settling，画成红色「没领成」
    等于把一次成功的派出说成事故（她 2026-10-23 圈的正是这条）。
-   签到页日志、首页「最近领过的」、导出 CSV 三处共用这一个判据。 */
+   签到页日志、导出 CSV 两处共用这一个判据（首页那块「最近领过的」已按她 11-05 的要求撤掉）。 */
 function ciLogTone(x) {
+  const k = ciLogKind(x);
   // 外部签到：她在官方客户端自己签的（或自动检测到的），不是驾驶舱领的，
   // 单独一个颜色，跟"领到"的绿、"没领成"的红都分开
-  if (x.source === 'external') {
+  if (k === 'ext') {
     return { cls: 'ext', word: x.message || '官方客户端签到（非驾驶舱领取）' };
   }
-  if (x.claimed === true) {
+  if (k === 'stop') {
+    return { cls: 'mid', word: x.message || '自动签到已停止重试' };
+  }
+  if (k === 'ok') {
     return { cls: 'ok', word: `领到${x.credit != null ? ` ${x.credit}` : ''}${x.message ? ` · ${x.message}` : ''}` };
   }
-  if (x.settling === true) return { cls: 'mid', word: x.message || '已经推进了一步，等它到账' };
-  if (x.already === true) return { cls: 'mid', word: '今天已领过' };
+  if (k === 'arrived' || k === 'pending') return { cls: 'mid', word: x.message || '已经推进了一步，等它到账' };
+  if (k === 'already') return { cls: 'mid', word: '今天已领过' };
   const why = x.error || x.message;
   return { cls: 'bad', word: `没领成${why ? `：${why}` : ''}` };
 }
 
-/* 领取日志面板：今天 / 近 7 天 / 近 30 天 / 全部 + 导出 CSV */
+/* 这一行的「Agent · 账号」称呼，筛选下拉和行显示共用一个写法 */
+function ciLogWho(x) {
+  const name = CI_NAMES[x.store] || x.store || '—';
+  return x.account ? `${name} · ${x.account}` : name;
+}
+
+/* 表头筛选的弹层：挂在 body 上用 fixed 定位——日志框 overflow:hidden 会裁掉
+   绝对定位的子元素。WPS 式打勾清单：点一行勾一行、菜单**不关**，表格在背后跟着变；
+   「全部」一勾 = 这一列不筛。点别处收起。
+   她 2026-11-08 报的两条都在这修：类别要能多选；菜单自己的滚动条一滚菜单就没了——
+   那是关菜单的滚动监听连菜单内部的滚动也当成"外面滚了"，现在分清楚：滚在菜单里不动。 */
+let ciLogMenuFor = null;   // 当前开着菜单的列（day / kind / who），没有就 null
+function ciLogMenuPop(anchor, menuId, title, items, getSel, onPick) {
+  document.querySelectorAll('.cilogmenu').forEach((p) => p.remove());
+  ciLogMenuFor = menuId;
+  const paint = () => {
+    const sel = getSel();
+    for (const b of pop.querySelectorAll('button')) {
+      const on = b.dataset.v === '' ? sel.length === 0 : sel.includes(b.dataset.v);
+      b.classList.toggle('on', on);
+      b.querySelector('.cm-mark').textContent = on ? '✓' : '';
+    }
+  };
+  const pop = el('div', { class: 'cilogmenu' },
+    el('div', { class: 'cm-title' }, title),
+    ...items.map(([v, label, n]) => el('button', {
+      type: 'button', class: '', data: { v },
+    },
+      el('span', { class: 'cm-mark' }, ''),
+      el('span', { class: 'cm-label' }, label),
+      el('span', { class: 'cm-n' }, n == null ? '' : String(n)))));
+  document.body.appendChild(pop);
+  paint();
+  // 贴着表头单元格拉开；贴边放不下就往回收
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8))}px`;
+  pop.style.top = `${Math.max(8, Math.min(r.bottom + 4, window.innerHeight - pop.offsetHeight - 8))}px`;
+  const close = () => {
+    if (!pop.isConnected) return;
+    pop.remove();
+    document.removeEventListener('click', onDoc, true);
+    window.removeEventListener('scroll', onScroll, true);
+    ciLogMenuFor = null;
+  };
+  const onDoc = (e) => {
+    if (pop.contains(e.target)) return;
+    if (e.target && e.target.closest && e.target.closest('.cl-h')) return;
+    close();
+  };
+  const onScroll = (e) => {
+    if (pop.contains(e.target)) return;   // 菜单里滚：就是在翻清单，不动
+    // 日志列表自己的滚动也不关：表头和弹层都不在滚动区里，位置不会错，
+    // 她要边筛边对着底下的行看
+    if (e.target && e.target.classList && e.target.classList.contains('cilogrows')) return;
+    close();
+  };
+  pop.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    e.stopPropagation();
+    const sel = new Set(getSel());
+    if (b.dataset.v === '') {
+      sel.clear();                        // 「全部」= 这一列不筛
+    } else if (sel.has(b.dataset.v)) {
+      sel.delete(b.dataset.v);
+    } else {
+      sel.add(b.dataset.v);
+    }
+    paint();
+    onPick([...sel]);
+  });
+  setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+  window.addEventListener('scroll', onScroll, true);
+}
+
+/* 表头单元格：列名（筛着的时候后面跟选中的值）+ 小三角。点了弹打勾清单 */
+function ciLogColHead(label, active, menuId, tip, items, getSel, onPick) {
+  const cell = el('span', { class: `cl-h${active ? ' on' : ''}`, title: tip },
+    el('span', { class: 'cl-h-l' }, active ? `${label} · ${active}` : label),
+    el('span', { class: 'cl-h-c' }, '▾'));
+  cell.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (ciLogMenuFor === menuId) {
+      ciLogMenuFor = null;
+      document.querySelectorAll('.cilogmenu').forEach((p) => p.remove());
+      return;
+    }
+    ciLogMenuPop(cell, menuId, `按${label}筛（可多选，点了立刻生效）`, items, getSel, onPick);
+  });
+  return cell;
+}
+
+/* 领取日志面板：今天 / 近 7 天 / 近 30 天 / 全部 + 按类型/按 Agent 筛选 + 导出 CSV */
 const CI_LOG_RANGES = [
   ['today', '今天', 0],
   ['d7', '近 7 天', 6],
@@ -1784,12 +1946,36 @@ function ciLogPanel(d) {
   const range = S.ciLogRange || 'today';
   const def = CI_LOG_RANGES.find((x) => x[0] === range) || CI_LOG_RANGES[0];
   const from = def[2] == null ? '' : localDay(def[2]);
-  const rows = from ? all.filter((x) => (x.at || '') >= from) : all;
+  const ranged = from ? all.filter((x) => (x.at || '') >= from) : all;
+  // 表头筛选（她 2026-11-08 要的 WPS 表格那意思）：三列表头各带小三角——
+  // 时间筛具体某天、Agent·账号筛号、结果筛类型；各列计数互不管对方筛到哪
+  const dayCount = new Map();
+  const kindCount = new Map();
+  const whoCount = new Map();
+  for (const x of ranged) {
+    const d0 = x.at || '';
+    dayCount.set(d0, (dayCount.get(d0) || 0) + 1);
+    const k = ciLogKind(x);
+    kindCount.set(k, (kindCount.get(k) || 0) + 1);
+    const w = ciLogWho(x);
+    whoCount.set(w, (whoCount.get(w) || 0) + 1);
+  }
+  // 存着的筛选值在这批记录里已经没有对应项时（比如切回了「今天」）就地清掉，
+  // 别让表头亮着、列表却筛着个看不见的值。三个都是数组：[] = 不筛
+  if (S.ciLogDay.length) S.ciLogDay = S.ciLogDay.filter((d0) => dayCount.has(d0));
+  if (S.ciLogKind.length) S.ciLogKind = S.ciLogKind.filter((k) => kindCount.has(k));
+  if (S.ciLogWho.length) S.ciLogWho = S.ciLogWho.filter((w) => whoCount.has(w));
+  const rows = ranged.filter((x) =>
+    (!S.ciLogDay.length || S.ciLogDay.includes(x.at || ''))
+    && (!S.ciLogKind.length || S.ciLogKind.includes(ciLogKind(x)))
+    && (!S.ciLogWho.length || S.ciLogWho.includes(ciLogWho(x))));
 
   const box = el('section', { class: 'cilogbox' });
   const head = el('div', { class: 'ciloghead' },
     el('b', {}, '领取日志'),
-    el('span', { class: 'kv' }, rows.length ? `${rows.length} 条${from ? `（${from} 起）` : ''}` : '这段时间没有记录'));
+    el('span', { class: 'kv' }, rows.length
+      ? `${rows.length} 条${(S.ciLogDay.length || S.ciLogKind.length || S.ciLogWho.length) ? `（筛自 ${ranged.length}）` : from ? `（${from} 起）` : ''}`
+      : (ranged.length ? '这几个筛选条件下没有记录' : '这段时间没有记录')));
   head.appendChild(el('span', { class: 'sp' }));
   for (const [id, label] of CI_LOG_RANGES) {
     head.appendChild(el('button', {
@@ -1802,22 +1988,60 @@ function ciLogPanel(d) {
       renderCheckin();
     });
   }
-  head.appendChild(btn('导出', 'sm', () => ciLogExport(rows), '把当前这几天的记录导成 CSV（Excel 能直接开）'));
+  head.appendChild(btn('导出', 'sm', () => ciLogExport(rows), '把当前这几天的记录导成 CSV（Excel 能直接开），存哪了会写明白'));
   box.appendChild(head);
 
+  // 表头行：三列各带一个小三角，点了弹值清单——她要的"在原来的表头每一项上加下拉"，
+  // 列宽跟下面的数据行用同一套 class，对得齐
+  if (all.length) {
+    const dayItems = [['', '全部', ranged.length],
+      ...[...dayCount.keys()].sort((a, b) => b.localeCompare(a))
+        .map((d0) => [d0, ciDayWord(d0), dayCount.get(d0)])];
+    const kindItems = [['', '全部', ranged.length],
+      ...CI_LOG_KINDS.filter(([k]) => kindCount.has(k))
+        .map(([k, label]) => [k, label, kindCount.get(k)])];
+    const whoItems = [['', '全部', ranged.length],
+      ...[...whoCount.keys()].sort((a, b) => a.localeCompare(b, 'zh'))
+        .map((w) => [w, w, whoCount.get(w)])];
+    const kindLabel = (k) => (CI_LOG_KINDS.find(([x]) => x === k) || [k, k])[1];
+    // 表头上亮着的摘要：选一个显示它自己，选多个显示「已选 N 项」
+    const sum = (arr, one) => (arr.length === 0 ? ''
+      : arr.length === 1 ? one(arr[0]) : `已选 ${arr.length} 项`);
+    const cols = el('div', { class: 'cilogcols' },
+      el('span', { class: 'cl-t' }, ciLogColHead('时间',
+        sum(S.ciLogDay, ciDayWord), 'day',
+        '按具体某一天筛，可多选（上面的「今天 / 近 7 天…」管范围）',
+        dayItems, () => S.ciLogDay,
+        (vals) => { S.ciLogDay = vals; S.ciLogKeep = 0; renderCheckin(); })),
+      el('span', { class: 'cl-who' }, ciLogColHead('Agent · 账号',
+        sum(S.ciLogWho, (w) => w), 'who',
+        '按 Agent（账号）筛，可多选；选项后面是条数',
+        whoItems, () => S.ciLogWho,
+        (vals) => { S.ciLogWho = vals; S.ciLogKeep = 0; renderCheckin(); })),
+      el('span', { class: 'cl-r' }, ciLogColHead('结果',
+        sum(S.ciLogKind, kindLabel), 'kind',
+        '按结果类型筛，可多选：签到成功 / 积分到账 / 没领成…',
+        kindItems, () => S.ciLogKind,
+        (vals) => { S.ciLogKind = vals; S.ciLogKeep = 0; renderCheckin(); })));
+    box.appendChild(cols);
+  }
+
   if (!rows.length) {
-    box.appendChild(el('div', { class: 'qempty' }, all.length
-      ? '这几天没有领取记录，换个时间段看看（或点「全部」）。'
-      : '还没有领取记录：领过一次之后这里会逐条记下来。'));
+    box.appendChild(el('div', { class: 'qempty' }, ranged.length
+      ? '筛选条件下一条都没有：点表头的小三角换一个值，或选「全部」。'
+      : all.length
+        ? '这几天没有领取记录，换个时间段看看（或点「全部」）。'
+        : '还没有领取记录：领过一次之后这里会逐条记下来。'));
     return box;
   }
   const list = el('div', { class: 'cilogrows' });
   for (const x of rows) {
-    const name = CI_NAMES[x.store] || x.store || '—';
-    const who = x.account ? `${name} · ${x.account}` : name;
+    const who = ciLogWho(x);
     const t = ciLogTone(x);
+    // 老条目没有 at_time（只有日期），新条目精确到秒——有就一起显示
+    const when = x.at_time ? `${x.at || ''} ${x.at_time}`.trim() : (x.at || '—');
     list.appendChild(el('div', { class: 'cilogrow' },
-      el('span', { class: 'cl-t' }, x.at || '—'),
+      el('span', { class: 'cl-t' }, when),
       el('span', { class: 'cl-who', title: who }, who),
       el('span', { class: `cl-r ${t.cls}`, title: t.word }, t.word)));
   }
@@ -1825,25 +2049,38 @@ function ciLogPanel(d) {
   return box;
 }
 
-function ciLogExport(rows) {
+/* 导出领取日志。以前走 WebView2 的匿名下载（blob + a.click），文件落进系统下载
+   目录，界面只说"已导出 82 条"——她根本不知道文件在哪（2026-11-08 她报的第 2 条）。
+   现在交给后端写：存进「下载」文件夹、把完整路径报回来标清楚，还能一键打开所在文件夹。
+   CSV 在这里拼（含转义），BOM 由后端补——Excel 打开中文不乱码。 */
+async function ciLogExport(rows) {
   if (!rows.length) { toast('这段时间没有记录', false); return; }
   const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
-  const lines = ['日期,产品,账号,结果,积分,说明'];
+  const lines = ['日期,时间,产品,账号,结果,积分,说明'];
   for (const x of rows) {
     lines.push([
-      x.at || '', CI_NAMES[x.store] || x.store || '', x.account || '',
-      x.source === 'external' ? '官方客户端签到' : x.claimed ? '领到' : x.settling ? '已推进（等到账）' : x.already ? '已领过' : '没领成',
+      x.at || '', x.at_time || '', CI_NAMES[x.store] || x.store || '', x.account || '',
+      x.source === 'external' ? '官方客户端签到'
+        : x.source === 'auto-stop' ? '自动签到停止重试'
+        : x.claimed ? '领到' : x.settling ? '已推进（等到账）' : x.already ? '已领过' : '没领成',
       x.credit == null ? '' : x.credit,
       (x.error || x.message || '').replace(/[\r\n]+/g, ' '),
     ].map(esc).join(','));
   }
-  // 带 BOM：Excel 打开中文不乱码
-  const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
-  const a = el('a', { href: URL.createObjectURL(blob), download: `领取日志-${localDay()}.csv` });
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-  toast(`已导出 ${rows.length} 条`);
+  let r;
+  try {
+    r = await invoke('action', { payload: { action: 'checkin_export', csv: lines.join('\r\n') } });
+  } catch (e) {
+    toast(`导出没跑通：${String((e && (e.message || e)) || e).slice(0, 160)}`, false);
+    return;
+  }
+  if (!r || r.ok !== true) { toast((r && r.msg) || '导出没跑通', false); return; }
+  // 路径要挂得住：15 秒的 toast 之外再给一个不自动消失的框，能一键打开文件夹
+  toast(r.msg, true, 15000);
+  if (await askConfirm(`CSV 存到了：\n${r.path}\n\n同名文件按天覆盖：今天再导几次都是这一份。`,
+    { title: '已导出领取日志', okText: '打开所在文件夹' })) {
+    invoke('action', { payload: { action: 'reveal_dir', dir: r.dir } }).catch(() => null);
+  }
 }
 
 /* ---------------- 协作（AgentHub 工作流看板 iframe） ---------------- */
@@ -2033,6 +2270,8 @@ function scopeTag(g) {
 
 /* 一档里 total、left、逐笔全是空或 0：这一行没话可说，不占地方 */
 function quotaHasData(g) {
+  // 自己加的包哪怕只填了名字也该显示：她登记的就是"有这一份额度"，把它滤掉等于白登记
+  if (g.custom) return true;
   return !!((g.total != null && g.total !== 0) || (g.left != null && g.left !== 0)
     || (g.items || []).length || (g.live_count || 0) || (g.expired_count || 0));
 }
@@ -2095,7 +2334,8 @@ function quotaGroups(i) {
     const hasExp = q.expires_on && q.expires_on !== EXP_NONE && q.expires_on !== '无限期';
     if (left == null && total == null && !hasExp) return [];
     return [norm({
-      name: '积分', unit: q.unit || 'credits', left, total, used: diff(total, left),
+      name: '积分', orig: '积分', gid: 'g:积分', unit: q.unit || 'credits',
+      left, total, used: diff(total, left),
       live_count: 1, expired_count: 0, expires: hasExp ? q.expires_on : EXP_NONE,
       days_left: q.days_left, items: [],
     })];
@@ -2110,6 +2350,8 @@ function quotaGroups(i) {
       left: c.left, total: c.total,
       used: c.used != null ? c.used : (c.total != null && c.left != null ? Math.max(0, c.total - c.left) : null),
       unit: c.unit || 'credits', expires_on: c.expires_on || '', days_left: c.days_left,
+      // 这个日期是不是自己填的：没有这一位，明细里就分不出"厂商给的"和"我记的"
+      expires_manual: !!c.expires_manual,
       expired: c.days_left != null && c.days_left < 0,
     });
   }
@@ -2125,7 +2367,8 @@ function quotaGroups(i) {
     // 这种自相矛盾的话（0 天来自 11-02 那笔已经扣光的）
     const expDay = live.find((it) => it.expires_on === exp);
     return norm({
-      ...g, left: sum('left'), total: sum('total'), used: sum('used'),
+      ...g, orig: g.name, gid: `g:${g.name}`,
+      left: sum('left'), total: sum('total'), used: sum('used'),
       live_count: live.length, expired_count: g.items.length - live.length,
       live_left: sum('left'),
       expires: exp, days_left: expDay ? expDay.days_left ?? null : null,
@@ -2660,6 +2903,175 @@ function usageTrendPanel(instance) {
     el('div', { class: 'ctlrow' }, open));
 }
 
+/* ---------------- 积分包编辑（改名 / 截止日期 / 备注，以及手工加一个包） ----------------
+   厂商给的档名不一定认得（Qoder 官网把一类资源包统称「其他」），也不总给到期日。
+   这两件事只有本人知道，所以每档右上角挂一个铅笔：弹窗照「编辑密钥」那样只列字段
+   （名称 / 截止日期 / 备注；自己加的包再加总额与剩余），点保存才落盘。
+   写 ~/.agent-cockpit/expiry.json，只在本机生效，厂商那份读数一个字节不动。 */
+function expiryHas(s) {
+  return !!s && s !== EXP_NONE && s !== '无限期' && s !== '—';
+}
+/* 弹窗状态：`kind` 有三种
+     group  —— 改厂商给的**外层**档（只能改名 / 备注；外层到期日是逐笔算出来的，手填没意义）
+     item   —— 改**内层**某一笔（改名 / 截止日期 / 备注，这才是她真需要的那层）
+     custom —— 自己加的包（三项 + 总额 + 剩余，可删）
+   `key` 是写回用的稳定键：g:<原档名> / i:<pid> / c:<id>。 */
+let qpEditing = null;
+function qpDateOnly(s) {
+  const m = String(s || '').match(/\d{4}-\d{2}-\d{2}/);
+  return m ? m[0] : '';
+}
+/* 外层档的编辑：只有名称与备注。到期日是逐笔算出来的汇总，改它等于改一个派生值——
+   真要改日期，去「查看明细」里改那一笔（每一笔各自有日期，那才是有意义的那个）。 */
+function openPackModal(inst, g) {
+  const custom = !!g.custom;
+  // 外层档没有逐笔（厂商只给汇总数）时，它自己就是唯一那一笔，日期必须能填；
+  // 有逐笔的档则不给填——那个日期是逐笔算出来的汇总，手填只会把"最近到期"顶掉。
+  const hasItems = !custom && (g.items || []).length > 0;
+  qpEditing = {
+    inst,
+    kind: custom ? 'custom' : 'group',
+    key: g.gid || `g:${g.orig || g.name}`,
+    customId: g.custom_id || '',
+    orig: g.orig || g.name,
+    dateable: !hasItems,
+  };
+  $('qp-title').textContent = custom ? '编辑自己加的积分包' : `编辑积分档 · ${g.orig || g.name}`;
+  $('qp-name').value = g.name || '';
+  $('qp-date').value = expiryHas(g.expires) ? String(g.expires).slice(0, 16) : '';
+  $('qp-note').value = g.note || '';
+  $('qp-total').value = custom && numv(g.total) != null ? String(g.total) : '';
+  $('qp-left').value = custom && numv(g.left) != null ? String(g.left) : '';
+  const dateOn = custom || !hasItems;
+  // 隐藏时连标签一起收掉：只藏输入框会留下一个空着的「截止日期」格子，看着像坏了
+  $('qp-date').hidden = !dateOn;
+  $('qp-date-pick').hidden = !dateOn;
+  $('qp-date-label').hidden = !dateOn;
+  $('qp-date-row').hidden = !dateOn;
+  for (const id of ['qp-total', 'qp-left', 'qp-total-label', 'qp-left-label']) {
+    $(id).hidden = !custom;
+  }
+  $('qp-del').hidden = !custom;
+  $('qp-hint').textContent = custom
+    ? '总额与剩余按你填的算，留空则只显示名字。'
+    : hasItems
+      ? `这一档有 ${(g.items || []).length} 笔，各自的截止日期到「查看明细」里改。`
+      : '这一档厂商只给了汇总数。';
+  $('qpmodal').hidden = false;
+  $('qp-name').focus();
+}
+/* 内层某一笔的编辑：名称 / 截止日期 / 备注三样全给（这一层才是她真正要改的东西）。
+   `it.pid` 是这一笔的身份键——同一档里 30 多笔全叫「平台赠送」，只能靠它认人。 */
+function openItemModal(inst, group, it) {
+  qpEditing = {
+    inst, kind: 'item',
+    key: it.iid || (it.pid ? `i:${it.pid}` : `i:${group.orig || group.name}:${it.orig || it.label}`),
+    customId: '',
+    orig: it.orig || it.label,
+    group: group.name,
+  };
+  $('qp-title').textContent = `编辑积分包 · ${it.label || ''}`;
+  $('qp-name').value = it.label || '';
+  $('qp-date').value = expiryHas(it.expires_on) ? String(it.expires_on).slice(0, 16) : '';
+  $('qp-note').value = it.detail || '';
+  $('qp-total').value = '';
+  $('qp-left').value = '';
+  // 这一笔的数（剩多少 / 共多少）是厂商口径，不给手改；只有自己加的包才手填
+  for (const id of ['qp-total', 'qp-left', 'qp-total-label', 'qp-left-label']) {
+    $(id).hidden = true;
+  }
+  $('qp-date').hidden = false;
+  $('qp-date-pick').hidden = false;
+  $('qp-date-label').hidden = false;
+  $('qp-date-row').hidden = false;
+  $('qp-del').hidden = true;
+  const vendor = expiryHas(it.expires_vendor) ? String(it.expires_vendor).slice(0, 16) : '';
+  $('qp-hint').textContent = vendor ? `厂商原给的到期日 ${vendor}，留空即回到它。` : '';
+  $('qpmodal').hidden = false;
+  $('qp-name').focus();
+}
+function closePackModal() {
+  qpEditing = null;
+  $('qpmodal').hidden = true;
+}
+/* 表单值 → 一条覆盖。三项都空 = 恢复成厂商原样（后端 upsert 会删掉这条）。 */
+async function savePackModal() {
+  const e = qpEditing;
+  if (!e) return;
+  const label = $('qp-name').value.trim();
+  const date = $('qp-date').value.trim();
+  const note = $('qp-note').value.trim();
+  if (e.kind === 'custom') {
+    if (!label) { toast('名称不能为空', false); $('qp-name').focus(); return; }
+    const r = await invoke('action', {
+      payload: {
+        action: 'quota_pack_custom', app: e.inst.app, name: e.inst.name,
+        id: e.customId, label, total: $('qp-total').value.trim(),
+        left: $('qp-left').value.trim(), date, note,
+      },
+    }).catch((x) => ({ ok: false, msg: String(x) }));
+    toast((r && (r.msg || r.err)) || '没存上', !!(r && r.ok));
+    if (!r || !r.ok) return;
+  } else {
+    // 外层档与内层笔走同一条动作：`key` 已经说明改的是谁（g:<原档名> / i:<pid>）。
+    // 外层档的 date 恒为空——它的到期日是逐笔汇总出来的，手填一个只会把汇总顶掉。
+    const r = await invoke('action', {
+      payload: {
+        action: 'quota_pack_save', app: e.inst.app, name: e.inst.name,
+        key: e.key, label, date: e.kind === 'item' || e.dateable ? date : '', note,
+      },
+    }).catch((x) => ({ ok: false, msg: String(x) }));
+    toast((r && (r.msg || r.err)) || '没存上', !!(r && r.ok));
+    if (!r || !r.ok) return;
+  }
+  closePackModal();
+  await load();
+  // 明细弹层开着的时候改了名：那一层是按"档名"找组的，不同步过去会当场找不到组、
+  // 弹窗自己关掉——她只是改个名字，不该把正在看的明细也关掉
+  if (S.qdetail) {
+    if (e.kind === 'group' && (S.qdetail.group === e.orig || S.qdetail.group === e.key)) {
+      S.qdetail.group = label || e.orig;
+    }
+    renderQuotaDetail();
+  }
+}
+async function deletePackModal() {
+  const e = qpEditing;
+  if (!e || e.kind !== 'custom') return;
+  if (!await askConfirm(`删除自己加的「${$('qp-name').value.trim() || '这个包'}」？\n厂商报的积分不受影响。`,
+    { danger: true, okText: '删除', title: '删除积分包' })) return;
+  const r = await invoke('action', {
+    payload: { action: 'quota_pack_custom', app: e.inst.app, name: e.inst.name, id: e.customId, delete: true },
+  }).catch((x) => ({ ok: false, msg: String(x) }));
+  toast((r && (r.msg || r.err)) || '没删成', !!(r && r.ok));
+  if (!r || !r.ok) return;
+  closePackModal();
+  await load();
+  if (S.qdetail) renderQuotaDetail();
+}
+/// 「选日期」：借隐藏的原生 datetime-local 弹日历+时间（和密钥弹窗同一套做法）。
+/// 回填的是 `YYYY-MM-DDTHH:MM` 里的那两段拼成 `YYYY-MM-DD HH:MM`——后端只认这种写法。
+/// 选日期时原生控件默认给 00:00，而积分是"当天整天还能用"，所以时刻留空更准；
+/// 她要在日历里挑具体时刻，就把那个时刻原样带上去。
+function bindPackDatePicker() {
+  const native = $('qp-native');
+  const text = $('qp-date');
+  const pick = $('qp-date-pick');
+  if (!native || !text || !pick) return;
+  pick.addEventListener('click', () => {
+    const d = qpDateOnly(text.value);
+    const t = String(text.value || '').match(/\d{1,2}:\d{2}/);
+    if (d) native.value = t ? `${d}T${t[0].padStart(5, '0')}` : `${d}T00:00`;
+    try { native.showPicker(); } catch { native.focus(); }
+  });
+  native.addEventListener('change', () => {
+    if (!native.value) return;
+    const [d, t] = native.value.split('T');
+    // 只挑了日期（时刻是默认 00:00）→ 写成纯日期，和后端"到日即当天 23:59 作废"同一口径
+    text.value = !t || t === '00:00' ? d : `${d} ${t}`;
+  });
+}
+
 /* 账号设置里的「积分明细」整块：总览 + 每档一行 + 查看明细。版式照 WorkBuddy 官方。 */
 function quotaPanel(i) {
   const q = i.quota || {};
@@ -2668,6 +3080,9 @@ function quotaPanel(i) {
   if (!groups.length) {
     // 一档都没有：明说读不到（带后端给的原因），不摆 0
     wrap.appendChild(el('div', { class: 'qempty', title: String(q.live_error || '').trim() }, quotaMiss(q)));
+    wrap.appendChild(el('div', { class: 'qgadd' },
+      btn('＋ 添加积分包', 'sm', () => openPackModal(i, { custom: true, custom_id: '', name: '', gid: 'c:' }),
+        '这个产品读不到任何额度：可以自己登记一条（名称、总额、剩余与截止日期）')));
     wrap.appendChild(usageTrendPanel(i));
     return wrap;
   }
@@ -2733,11 +3148,19 @@ function quotaPanel(i) {
       (g.items || []).length
         ? btn('查看明细 ›', 'sm', () => openQuotaDetail(i, g),
           '这一档里的每一笔资源包，各自什么时候到期、用了多少')
-        : el('span', { class: 'qgcount' }, '官方接口只给汇总数，没有逐笔'));
+        : el('span', { class: 'qgcount' },
+          g.custom ? '自己加的包，没有逐笔明细' : '官方接口只给汇总数，没有逐笔'));
     wrap.appendChild(el('div', { class: 'qgroup' },
       el('div', { class: 'qghead' },
-        el('b', { class: 'qgname' }, g.name, scopeTag(g)),
+        el('b', { class: 'qgname' }, g.name, scopeTag(g),
+          // 改过名 / 自己加的包要标出来：不标就分不清哪句是厂商口径、哪句是自己记的
+          g.renamed ? el('em', { class: 'qtag', title: `厂商原名「${g.orig || ''}」，显示名是你改的` }, '改名') : null,
+          g.custom ? el('em', { class: 'qtag', title: '这一档是你自己加的，厂商读数里没有它' }, '自建') : null),
         when,
+        g.expires_manual ? el('em', { class: 'qmanual-tag', title: '这个截止日期是你自己填的，不是厂商接口给的' }, '自填') : null,
+        // 编辑入口：照密钥列表那样一枚铅笔，别在行内再铺一排字
+        pctG ? null : iconBtn('edit', () => openPackModal(i, g),
+          '编辑：名称、截止日期与备注（自己加的包还能改总额与剩余）'),
         el('span', { class: 'qgstat' }, gp != null
           ? (pctG ? `剩余 ${pctTxt(gp)}`
             : `已用 ${nfmt(g.used)} / ${nfmt(g.total)} ${gu}　剩余 ${pctTxt(gp)}`)
@@ -2745,8 +3168,13 @@ function quotaPanel(i) {
       uPct != null ? el('div', { class: 'cbar', title: `已用 ${nfmt(g.used)} / 共 ${nfmt(g.total)} ${gu}（剩 ${nfmt(g.left)}）` },
         el('b', { style: `width:${uPct}%` })) : null,
       g.scope ? el('div', { class: 'qgscope' }, `这一档只用于：${g.scope}`) : null,
+      g.note ? el('div', { class: 'qgscope' }, g.note) : null,
       pctG ? null : foot));
   }
+  // 「＋ 添加积分包」：厂商不报的那份额度自己登记一条（名字、总额、剩余、截止日）
+  wrap.appendChild(el('div', { class: 'qgadd' },
+    btn('＋ 添加积分包', 'sm', () => openPackModal(i, { custom: true, custom_id: '', name: '', gid: 'c:' }),
+      '厂商不报的额度自己登记一条：名称、总额、剩余与截止日期，和厂商那几档一起显示、一起提醒')));
   wrap.appendChild(usageTrendPanel(i));
   return wrap;
 }
@@ -2833,11 +3261,20 @@ function renderQuotaDetail() {
     list.appendChild(el('div', { class: 'qitem' },
       el('div', { class: 'qitop' },
         el('b', {}, it.label || g.name),
+        // 改过名的笔标出来：这一笔厂商原名叫什么，悬停就能看到
+        it.renamed ? el('em', { class: 'qtag', title: `厂商原名「${it.orig || ''}」，显示名是你改的` }, '改名') : null,
         it.detail ? el('span', { class: 'qtag' }, it.detail) : null,
-        it.pool && it.pool !== it.label ? el('span', { class: 'qtag', title: it.pool }, it.pool.replace(/^资源包\s*/, '')) : null),
+        it.pool && it.pool !== it.label ? el('span', { class: 'qtag', title: it.pool }, it.pool.replace(/^资源包\s*/, '')) : null,
+        // 这一笔自己的铅笔：内层每一笔的名字与截止日期都在这儿改
+        iconBtn('edit', () => openItemModal(inst, g, it),
+          '编辑这一笔：名称、截止日期与备注')),
       el('div', { class: 'qimid' },
         el('span', {}, `到期时间 ${it.expires_on ? dtxt(it.expires_on) : EXP_NONE}`),
         it.days_left != null ? el('span', { class: expCls(it.days_left, stale) }, expText(it.days_left)) : null,
+        it.expires_manual ? el('em', {
+          class: 'qmanual-tag',
+          title: it.expires_vendor ? `你自己改的（厂商原给 ${it.expires_vendor}）` : '这个截止日期是你自己填的',
+        }, '自填') : null,
         el('span', { class: 'qistat' }, l == null && t == null ? '官方没给出数值'
           : l == null ? `获得 ${nfmt(t)} ${iu}`
             : t == null ? `剩 ${nfmt(l)} ${iu}（没给总额）`
@@ -4749,8 +5186,6 @@ function inEnabledPool(app, name) {
 let distEditing = null;
 let distSaving = false;
 function openDistModal(k) {
-  // 新建时默认把全部启用的供应商勾上：多数时候一把 key 就是要走所有供应商，
-  // 少勾了要回头编辑；想收紧的人自己去掉勾更顺手。
   const defaultPools = k ? (k.pools || []) : [];
   distEditing = { id: k?.id || '', name: k?.name || '', enabled: k?.enabled !== false, pools: [...defaultPools] };
   $('gd-title').textContent = k ? `编辑接入密钥 · ${k.name || '未命名'}` : '生成接入密钥';
@@ -4767,37 +5202,37 @@ function closeDistModal() { $('gdmodal').hidden = true; distEditing = null; }
 function renderDistPools() {
   const host = $('gd-pools');
   clear(host);
-  const poolIds = new Set(distEditing.pools || []);
-  const providers = [];
-  const off = S.data?.proxy?.sources_off || [];
-  const usedSources = new Set((S.data?.proxy?.pools || []).flatMap((pool) => (pool.members || []).map((member) => member.src)));
-  for (const member of [...(S.data?.proxy?.members?.instances || []), ...(S.data?.proxy?.members?.keys || [])])
-    providers.push({
-      id: member.src, name: member.label ? `${member.site_name || member.app_name}/${member.label}`
-        : member.instance ? `${member.app_name}/${member.instance}` : (member.site_name || member.app_name),
-      off: member.off ?? off.includes(member.src), live: usedSources.has(member.src),
-    });
-  if (!providers.length) {
-    host.appendChild(el('div', { class: 'gwempty' }, '还没有可选供应商。先在账号页或密钥页登记可用来源。'));
+  const proxy = S.data?.proxy || {};
+  const providers = proxy.providers || [];
+  const selected = new Set(distEditing.pools || []);
+  const rows = [];
+  for (const provider of providers) {
+    const wasSelected = selected.has(provider.id) || selected.has(provider.src);
+    if (provider.off || provider.has_token === false || provider.supported === false) continue;
+    rows.push({ id: provider.id, name: provider.name, checked: wasSelected, oldId: provider.src });
+    selected.delete(provider.id);
+    selected.delete(provider.src);
+  }
+  // An existing grant can point at a shared pool, a removed provider or an old src string.
+  // Keep it explicitly selected: an empty grant means every enabled provider.
+  for (const id of selected) {
+    const oldProvider = providers.find(p => p.id === id || p.src === id);
+    const oldPool = (proxy.pools || []).find(p => p.id === id);
+    rows.push({ id, name: oldProvider?.name || oldPool?.name || '已移除的来源', checked: true, legacy: true });
+  }
+  if (!rows.length) {
+    host.appendChild(el('div', { class: 'gwempty' }, '没有可选供应商。先添加并启用一个可用来源。'));
     return;
   }
   host.appendChild(el('div', { class: 'gpg' }, '允许走哪些供应商（一个都不勾 = 全部启用的供应商）'));
-  for (const provider of providers) {
-    if (provider.off) continue;
-    const cb = el('input', { type: 'checkbox', class: 'gpmem-cb' });
-    cb.checked = poolIds.has(provider.id);
-    cb.addEventListener('change', () => {
-      const list = distEditing.pools;
-      const i = list.indexOf(provider.id);
-      if (cb.checked && i < 0) list.push(provider.id);
-      if (!cb.checked && i >= 0) list.splice(i, 1);
-    });
-    const name = el('span', { class: 'gpmem-name' }, provider.name || '未命名');
-    name.addEventListener('click', () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
-    host.appendChild(el('div', { class: 'gpmem' },
-      cb, name,
-      el('span', { class: 'tag' }, provider.live ? '可用' : '未接入组'),
-      !provider.live ? el('span', { class: 'tag expired' }, '当前不可用') : null));
+  for (const row of rows) {
+    const cb = el('input', { type: 'checkbox', class: 'gpmem-cb', checked: row.checked });
+    cb.onchange = () => {
+      distEditing.pools = distEditing.pools.filter(id => id !== row.id && id !== row.oldId);
+      if (cb.checked) distEditing.pools.push(row.id);
+    };
+    host.appendChild(el('label', { class: 'gpmem' }, cb, el('span', { class: 'gpmem-name' }, row.name),
+      row.legacy ? el('span', { class: 'tag' }, '已有授权') : null));
   }
 }
 
@@ -7726,10 +8161,11 @@ function row(label, desc, ctl) {
       desc && !help ? el('div', { class: 'desc' }, desc) : null),
     el('div', { class: 'ctl' }, ctl));
 }
-/* 上下结构：标题（+ 说明）占满一行在上，控件/编辑器在下面整宽。 */
-function rowWide(label, desc, ctl) {
+/* 上下结构：标题（+ 说明）占满一行在上，控件/编辑器在下面整宽。
+   domId 可选：给"从别处跳过来要定位到这一块"的行留个锚点（如「编辑侧导菜单」）。 */
+function rowWide(label, desc, ctl, domId) {
   const help = typeof desc === 'string' && (S.view !== 'remote' || desc.length > DESC_INLINE_MAX);
-  return el('div', { class: 'setrow wide' },
+  return el('div', { class: 'setrow wide', id: domId || null },
     el('div', {},
       el('div', { class: 'lab' }, label, desc && help ? qhelp(desc) : null),
       desc && !help ? el('div', { class: 'desc' }, desc) : null),
@@ -8510,7 +8946,7 @@ function renderSettings() {
           (v) => setSetting('appearance', 'nav_collapsed', v === 'auto' ? null : v === 'collapse'))),
       rowWide('侧导菜单', '左边是侧栏上实际的样子（首页 / 更多 / 设置固定不动），右边是收进「更多」的；'
         + '按住行尾六个点拖动，可以排序、也可以跨栏。',
-        sideMenuEditor()),
+        sideMenuEditor(), 'set-navmenu'),
       rowWide('「设置」菜单', '侧栏「设置」弹层里放哪些项、按什么顺序。',
         menuEditor('gear_menu', GEAR_MENU_ITEMS, '在「设置」里'))));
   }
@@ -9506,7 +9942,16 @@ function renderViewlist() {
   ul.appendChild(popRow('btn-more-menu', 'more', '更多', () => {
     const items = sideMenuSplit().more.map((id) => [id, SIDE_MENU_ITEMS[id][0], SIDE_MENU_ITEMS[id][1]]);
     items.push({ sep: true });
-    items.push(['menuEdit', '编辑侧导菜单', () => { setSection = 'appearance'; S.view = 'settings'; }]);
+    // 这一项是"去改侧导菜单"，不是"去看设置首页"：外观页最上面是品牌/桌面助手/主题/字号，
+    // 侧导菜单在下面好几屏。所以切到外观之后要定位到那一块，并闪一下——
+    // 只把页面翻到最上面，人还得自己往下找（她 11-05 点名的那批"只跳页不跳位置"）。
+    items.push(['menuEdit', '编辑侧导菜单', () => {
+      setSection = 'appearance';
+      S.view = 'settings';
+      // render() 由弹层那边统一调（openSidePopup：act() 之后 render()），
+      // 所以这里给选择器而不是元素——那一刻目标还没画出来。
+      jumpToPanel('#set-navmenu');
+    }]);
     return items;
   }));
   ul.appendChild(popRow('btn-gear-menu', 'gear', '设置', () => {
@@ -9644,6 +10089,15 @@ function bind() {
   $('qm-close').addEventListener('click', closeQuotaDetail);
   $('qm-save').addEventListener('click', savePendingQuota);
   $('qmodal').addEventListener('click', (e) => { if (e.target.id === 'qmodal') closeQuotaDetail(); });
+  // 积分包编辑弹窗：照密钥弹窗的规矩——点保存才落盘，Enter 也是保存，Esc/点外面关掉
+  bindPackDatePicker();
+  $('qp-cancel').addEventListener('click', closePackModal);
+  $('qp-save').addEventListener('click', savePackModal);
+  $('qp-del').addEventListener('click', deletePackModal);
+  $('qpmodal').addEventListener('click', (e) => { if (e.target.id === 'qpmodal') closePackModal(); });
+  $('qp-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') savePackModal(); });
+  $('qp-date').addEventListener('keydown', (e) => { if (e.key === 'Enter') savePackModal(); });
+  $('qp-note').addEventListener('keydown', (e) => { if (e.key === 'Enter') savePackModal(); });
   $('btn-key-new').addEventListener('click', () => openSiteModal(null));
   $('btn-keys-expiring').addEventListener('click', () => {
     S.keysSoonOnly = !S.keysSoonOnly;
@@ -9765,6 +10219,7 @@ function bind() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (!$('tour').hidden) endTour();
+      else if (!$('qpmodal').hidden) closePackModal();
       else if (!$('qmodal').hidden) closeQuotaDetail();
       else if (!$('wizard').hidden) closeWizard();
       else if (!$('imodal').hidden) closeDetail();

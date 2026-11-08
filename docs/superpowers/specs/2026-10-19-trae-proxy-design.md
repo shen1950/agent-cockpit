@@ -1,6 +1,6 @@
 # Trae 反代设计（2026-10-19）
 
-> 依据：`C:\Users\USER\.qoder-cn\projects\D--Claude---------\memory\reference-trae-reverse-proxy.md`
+> 依据：`C:\Users\Example\.qoder-cn\projects\D--Claude---------\memory\reference-trae-reverse-proxy.md`
 > 本文只写设计决策，协议底账都在那份记忆里。
 
 ## 1. 目标

@@ -49,9 +49,13 @@ html[data-theme="dark"] {
   --accent-ink: #14100B;
   --accent-soft: rgba(200, 149, 108, .13);
   --ok: #3ECF8E;
+  --ok-soft: rgba(62, 207, 142, .15);
+  --ok-line: rgba(62, 207, 142, .45);
+  /* 卡片边线：比 --line-strong 明显一档。首页那面卡片墙缩到一列一列时，
+     1px + rgba(255,255,255,.13) 的边几乎看不见（她 11-05 傍晚："边界线太细了"）。 */
+  --card-line: rgba(255, 255, 255, .22);
   --warn: #E2B34E;
   --danger: #E5484D;
-  --ok-soft: rgba(62, 207, 142, .15);
   --warn-soft: rgba(226, 179, 78, .08);
   --warn-line: rgba(226, 179, 78, .35);
   --danger-soft: rgba(229, 72, 77, .08);
@@ -81,6 +85,8 @@ html[data-theme="light"] {
   --warn: #9A6B00;
   --danger: #C0392B;
   --ok-soft: rgba(20, 125, 90, .12);
+  --ok-line: rgba(20, 125, 90, .40);
+  --card-line: rgba(24, 29, 39, .26);
   --warn-soft: rgba(154, 107, 0, .09);
   --warn-line: rgba(154, 107, 0, .32);
   --danger-soft: rgba(192, 57, 43, .07);
@@ -788,6 +794,22 @@ html[data-theme="light"] .card.running { border-color: rgba(20, 125, 90, .30) }
 }
 .qgwhen em.danger { color: var(--danger); border-color: var(--danger-line) }
 .qgwhen em.warn { color: var(--warn); border-color: var(--warn-line) }
+/* 「自填 / 改名 / 自建」三枚小牌子：都只是说明这几个字不是厂商口径。
+   字号压到 11px、不加边框以外的装饰，别把档位那一行撑成两行 */
+.qmanual-tag, .qgname .qtag {
+  font-style: normal; padding: 1px 7px; font-size: 10.5px; border-radius: var(--r-pill);
+  background: var(--bg-raised); border: 1px solid var(--line); color: var(--text-muted);
+  font-weight: 400;
+}
+.qghead .iconbtn { width: 24px; height: 24px; flex: none }
+.qghead .iconbtn svg { width: 13px; height: 13px }
+/* 「＋ 添加积分包」自己一行，靠左；它不属于任何一档 */
+.qgadd { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-2) }
+/* 编辑弹窗里总额/剩余两格只在"自己加的包"出现，隐藏时连标签一起收掉（.fields 是 grid） */
+.fields > [hidden] { display: none }
+/* 编辑弹窗底下那一句说明：一行小字，不要又一个带边框的盒子 */
+.qphint { margin-top: var(--sp-3); font-size: 11.5px; line-height: 1.6; color: var(--text-faint) }
+.qphint:empty { display: none }
 .qgstat { margin-left: auto; font-family: var(--font-data); font-size: 11.5px; color: var(--text-muted); font-variant-numeric: tabular-nums }
 .qgfoot { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap }
 .qgcount { font-size: 11px; color: var(--text-faint) }
@@ -820,7 +842,10 @@ html[data-theme="light"] .card.running { border-color: rgba(20, 125, 90, .30) }
   padding: 8px 10px; background: var(--bg-sunken);
   border: 1px solid var(--line); border-radius: var(--r-md);
 }
-.qitop { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; min-width: 0 }
+/* 明细行头一行：名字 + 几枚标签 + 一枚铅笔（铅笔贴右侧，不跟标签抢宽度） */
+.qitop { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0 }
+.qitop .iconbtn { margin-left: auto; width: 24px; height: 24px; flex: none }
+.qitop .iconbtn svg { width: 13px; height: 13px }
 .qitop b { font-size: 12.5px; font-weight: 650; color: var(--text); overflow-wrap: anywhere }
 .qtag {
   font-size: 10.5px; color: var(--text-faint); padding: 1px 7px; max-width: 100%;
@@ -979,10 +1004,17 @@ html[data-theme="light"] .modal { background: rgba(60, 55, 48, .32) }
 .fieldexp input { flex: 1 1 auto; min-width: 0 }
 .fieldexp .btn { flex: none }
 /* 借原生 date 弹日历的那个输入框：不参与布局也不可见，只负责把日期选出来 */
-#k-exp-native {
+#k-exp-native, #qp-native {
   position: absolute; width: 0; height: 0; padding: 0; border: 0;
   opacity: 0; pointer-events: none; overflow: hidden;
 }
+/* 弹层层级：所有 .modal 都是 50，同层时**后出现的盖住先出现的**（DOM 顺序决定）。
+   「编辑积分包」是从「积分明细」里点出来的，而它在 index.html 里排在明细前面，
+   于是弹窗被明细盖在下面、必须先关掉明细才能改。层级要按"谁后开谁在上"显式写：
+     积分明细 51 < 编辑积分包 52 < 确认框 10000（确认框在 index.html 上带内联值）
+   以后再有"从弹窗里再开弹窗"，给新开的那层一个更大的号，别靠 DOM 顺序。 */
+#qmodal { z-index: 51 }
+#qpmodal { z-index: 52 }
 .pasteline { margin-top: var(--sp-3) }
 .pasteline label { font-size: 12.5px; color: var(--text-muted); display: block; margin-bottom: 6px }
 .pasteline textarea {
@@ -1508,6 +1540,9 @@ html[data-theme="light"] .tourmask { background: rgba(60, 55, 48, .34) }
 /* 上下结构（照 Qoder 的设置分组）：标题在上、内容在下面整宽铺开。
    侧导菜单这类大块编辑器走这条——塞进右列会被推到右边、左边空一大片。 */
 .setrow.wide { grid-template-columns: minmax(0, 1fr); gap: 8px; align-items: stretch }
+/* 「更多 → 编辑侧导菜单」这类跳转会定位到设置页的某一行：留一点上边距，
+   别让标题贴着滚动容器顶边（只在 scrollIntoView 时生效，不影响布局）。 */
+.setrow.wide { scroll-margin-top: 10px }
 .setrow.wide .ctl { display: block; justify-content: stretch }
 .setrow .lab {
   font-size: 13.5px; color: var(--text);
@@ -1829,11 +1864,13 @@ svg.wave { display: block; width: 100%; height: 150px }
    所以里面任何一张放不下的表都会反过来把这一列顶宽，右侧整块被推出可视区——
    窗口一缩小就"遮盖"。允许它收缩之后，宽的东西只会在自己那一格里折行/省略。
    下面那条对所有整页视图同样生效，不只首页。 */
-.homepad { max-width: min(1000px, 100%); min-width: 0; margin: 0 auto; padding: 4px 2px 28px }
+/* 上限从 1000 放到 1440：首页现在有一整墙 Agent 卡片（她 11-05：想一行 4 个）。
+   1000 封顶时 1920 的窗口也只能排 3 列，右边留一大片空白。 */
+.homepad { max-width: min(1440px, 100%); min-width: 0; margin: 0 auto; padding: 4px 2px 28px }
 .pagebody > * { min-width: 0 }
-/* 福利活动 + 运行中的进程：从账号页搬到首页（同一份内容以前在 8 个 Agent 页里各来一遍）。
-   外面再套一层 .homepad 是为了跟首页其它块同宽同边距；上间距交给 .pagebody 的 gap，
-   两块之间自己排一列 gap。 */
+/* 福利活动 → 临期/待领取 → 运行中的进程：三块都从账号页搬到首页（同一份内容以前在
+   8 个 Agent 页里各来一遍）。外面再套一层 .homepad 是为了跟首页其它块同宽同边距；
+   上间距交给 .pagebody 的 gap，块之间自己排一列 gap。顺序就是 DOM 顺序（她 11-05 晚定的）。 */
 .homeextra { padding-top: 0; padding-bottom: var(--sp-4);
   display: flex; flex-direction: column; gap: var(--sp-4) }
 /* 顶栏「运行中 N」跳过来时闪一下：只滚动不闪，眼睛容易以为页面是自己跳的 */
@@ -1897,7 +1934,7 @@ svg.wave { display: block; width: 100%; height: 150px }
 .tbl.homebals tbody tr:hover { background: var(--bg-hover) }
 
 /* 两栏：临期 / 今天还能领 */
-.hcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+.hcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   gap: var(--sp-4); margin-bottom: var(--sp-4) }
 .hcols > .panel { margin: 0 }
 .hlist { display: flex; flex-direction: column; gap: 2px }
@@ -1915,16 +1952,76 @@ svg.wave { display: block; width: 100%; height: 150px }
 .hrow-x { flex: 0 0 80px; text-align: right; font-size: 12px; font-weight: 600 }
 .hrow-x.go { color: var(--accent) }
 
-/* Agent 概览：一行一个程序，点进它的账号页 */
-.hagent { display: flex; align-items: baseline; gap: var(--sp-3); width: 100%; text-align: left;
-  padding: 10px var(--sp-2); border: 0; border-radius: var(--r-sm); background: none;
-  color: var(--text); font: inherit; cursor: pointer }
-.hagent:hover { background: var(--bg-hover) }
-.hagent-n { flex: 0 0 180px; font-weight: 600; font-size: 13.5px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.hagent-t { flex: 1 1 auto; display: flex; gap: 10px; flex-wrap: wrap;
-  font-size: 12px; color: var(--text-muted) }
-.hagent-t > span:empty { display: none }
+/* Agent 概览：一片紧凑的卡片墙，一块矩形＝一个程序，点进它的账号页。
+   她 11-06 凌晨："列宽砍一半，两列变四列都绰绰有余" —— 所以：
+   ① 列宽下限 170px、1fr 拉满，行尾永远不留空格子：1080 窗口 4 列、1320 5 列、1920 7 列；
+   ② 卡片只有两行：名字（+临期角标）在上，第二行左边能力标、右边「账号数 · 签到」，
+      中间靠 margin-left:auto 顶开，不留空；
+   ③ 边线 2px、浅绿（--ok-line）；运行中的绿边 + 一颗匀速跑圈的亮点（.hacard-glow）。 */
+.hagents { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 6px }
+.hacard {
+  position: relative; overflow: hidden; isolation: isolate;
+  display: flex; align-items: center; gap: 5px; min-width: 0;
+  padding: 6px; text-align: left; font: inherit; color: var(--text);
+  background: var(--bg-sunken); border: 2px solid var(--card-line); border-radius: var(--r-md);
+  transition: border-color .14s ease, box-shadow .14s ease;
+  /* 定高：带临期角标的卡名字那一行会高 1px，整墙看着就参差 */
+  height: 46px;
+}
+.hacard > * { position: relative; z-index: 1 }
+.hacard.missing { opacity: .55 }
+/* 运行中：绿边 + 一颗沿边框匀速跑的亮点。
+   用 SVG 的 stroke-dashoffset 而不是"转一块锥形渐变"——锥形渐变在宽扁的矩形上
+   沿长边飞快、沿短边几乎停住，就是她 11-05 说的"一会加速一会减速"。
+   pathLength="100" 把周长归一化，dasharray 7 93 = 7% 亮，dashoffset 0→-100 走完一圈，
+   不管卡片多宽多高，速度都是每秒 38% 周长。 */
+.hacard.on { border-color: var(--ok-line) }
+.hacard.on:hover { box-shadow: 0 0 0 3px var(--ok-soft) }
+.hacard-glow { position: absolute; inset: 0; z-index: 0; pointer-events: none }
+.hacard-glow svg { width: 100%; height: 100%; display: block; overflow: visible }
+.hacard-glow rect {
+  fill: none; stroke: var(--ok); stroke-width: 2; rx: 9px;
+  x: 1px; y: 1px; width: calc(100% - 2px); height: calc(100% - 2px);
+}
+.hacard-glow .comet {
+  stroke: #B6FFDE; stroke-width: 2.5; stroke-linecap: round;
+  stroke-dasharray: 7 93;
+  animation: hacard-comet 2.6s linear infinite;
+}
+@keyframes hacard-comet { from { stroke-dashoffset: 0 } to { stroke-dashoffset: -100 } }
+@media (prefers-reduced-motion: reduce) { .hacard-glow .comet { animation: none; stroke-dasharray: none } }
+/* 悬停：没跑的卡换琥珀边；跑着的卡是绿边，只加一圈柔光 */
+.hacard:hover { border-color: var(--accent) }
+.hacard.on:hover { border-color: var(--ok-line) }
+.hacard-l { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 4px }
+.hacard-id { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 0 }
+.hacard-n { display: flex; align-items: center; gap: 3px; min-width: 0; width: 100%;
+  font-weight: 600; font-size: 11px; line-height: 1.35 }
+/* 名字自己是那一格：flex 容器上的 text-overflow 对裸文本不生效，必须给文字包一层，
+   否则长名字（Claude Code CLI / DeepSeek Harness）会顶进第二行右边那两段。 */
+.hacard-nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.hacard-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--text-faint); flex: none }
+.hacard.on .hacard-dot { background: var(--ok); box-shadow: 0 0 0 2.5px var(--ok-soft) }
+.hacard-sub { display: flex; align-items: center; gap: 4px; width: 100%; min-width: 0;
+  font-size: 9.5px; line-height: 1.4; color: var(--text-faint); overflow: hidden; white-space: nowrap }
+.hacard-cap { flex: none; padding: 0 3px; border-radius: var(--r-pill);
+  border: 1px solid var(--line-strong); font-size: 8.5px; line-height: 12px }
+/* 第二行右侧：账号数 · 签到，靠右顶到底，中间不留空 */
+.hacard-meta { display: flex; align-items: center; gap: 4px; min-width: 0; margin-left: auto;
+  overflow: hidden; white-space: nowrap }
+.hacard-meta .hm { color: var(--text-muted); font-variant-numeric: tabular-nums }
+.hacard-meta .hm.go { color: var(--accent); font-weight: 650 }
+/* 临期角标：只在真有临期时挂在名字后面，一小颗琥珀数字；没有就一个字都不占 */
+.hacard-alert { flex: none; min-width: 13px; height: 13px; padding: 0 3px; border-radius: var(--r-pill);
+  background: var(--warn-soft); border: 1px solid var(--warn-line); color: var(--warn);
+  font: 650 8.5px/11px var(--font-data); font-style: normal; text-align: center }
+/* 卡片里的程序图标：和侧栏同一套回退（内置品牌 SVG > exe 提取的 PNG > 名字缩写） */
+.hacard .fav { width: 20px; height: 20px; flex: none; border-radius: 5px }
+.hacard .fav.svg { display: inline-flex }
+.hacard .fav.svg svg { width: 100%; height: 100%; border-radius: 5px; display: block }
+.hacard .fav.none { display: grid; place-items: center; background: var(--bg);
+  border: 1px solid var(--line); font: 600 8.5px/1 var(--font-data); color: var(--text-muted) }
+
 
 /* 最近领过的 */
 .hlog { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px }
@@ -1943,6 +2040,9 @@ svg.wave { display: block; width: 100%; height: 150px }
   color: var(--text-muted); line-height: 1.55; padding: var(--sp-3);
   background: var(--accent-soft); border: 1px solid var(--line); border-radius: var(--r-md) }
 .cipend b { color: var(--text); font-weight: 650 }
+/* 已停止追踪：说的是"厂商欠着没发"，不是驾驶舱出错，用提醒色不用告警红 */
+.cipend.past { background: var(--warn-soft); border-color: var(--warn-line) }
+.cipend.past b { color: var(--warn) }
 
 /* ============================================================
    每日签到：产品 → 账号 两级
@@ -2059,12 +2159,39 @@ svg.wave { display: block; width: 100%; height: 150px }
 }
 .ci-chip:hover { color: var(--text); border-color: var(--line-strong) }
 .ci-chip.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft) }
+/* 领取日志的表头行：三列各带小三角，点了弹 WPS 式值清单。列宽跟下面的数据行
+   用同一套 cl-t / cl-who / cl-r，天然对齐；弹层挂 body 上（见 .cilogmenu），
+   这里 overflow 收着的只是单元格里的列名 */
+.cilogcols { display: flex; align-items: center; gap: var(--sp-3);
+  padding: 0 var(--sp-3); border-bottom: 1px solid var(--line); font-size: 12px }
+.cilogcols > span { padding: 7px 0; min-width: 0 }
+.cl-h { display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  cursor: pointer; user-select: none; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.cl-h:hover { color: var(--text) }
+.cl-h.on { color: var(--accent) }
+.cl-h .cl-h-l { overflow: hidden; text-overflow: ellipsis }
+.cl-h .cl-h-c { flex: none; font-size: 10px; transform: translateY(-1px); opacity: .7 }
+.cl-h:hover .cl-h-c, .cl-h.on .cl-h-c { opacity: 1 }
+.cilogmenu { position: fixed; z-index: 90; min-width: 210px; max-width: 340px;
+  max-height: 320px; overflow-y: auto; padding: 4px;
+  background: var(--bg-raised); border: 1px solid var(--line-strong);
+  border-radius: var(--r-md); box-shadow: 0 10px 28px rgba(0, 0, 0, .22) }
+.cilogmenu .cm-title { font-size: 11px; color: var(--text-faint); padding: 5px 8px 3px }
+.cilogmenu button { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+  padding: 6px 8px; border-radius: var(--r-sm); font-size: 12px; color: var(--text-muted) }
+.cilogmenu button:hover { background: var(--bg-hover); color: var(--text) }
+.cilogmenu button.on { color: var(--accent); background: var(--accent-soft) }
+.cilogmenu .cm-mark { flex: 0 0 12px; font-size: 11px }
+.cilogmenu .cm-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.cilogmenu .cm-n { flex: none; color: var(--text-faint); font-variant-numeric: tabular-nums }
 .cilogrows { display: flex; flex-direction: column; max-height: 340px; overflow-y: auto }
 .cilogrow { display: flex; align-items: baseline; gap: var(--sp-3);
   padding: 7px var(--sp-3); font-size: 12px; border-bottom: 1px solid var(--line) }
 .cilogrow:last-child { border-bottom: 0 }
 .cilogrow:hover { background: var(--bg-hover) }
-.cl-t { flex: 0 0 92px; color: var(--text-faint); font-variant-numeric: tabular-nums }
+/* 150px 放得下「2026-11-06 07:28:31」（老条目只有日期，短一截也照这个宽对齐） */
+.cl-t { flex: 0 0 150px; color: var(--text-faint); font-variant-numeric: tabular-nums }
 .cl-who { flex: 0 0 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .cl-r { flex: 1 1 auto; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .cl-r.ok { color: var(--ok) }

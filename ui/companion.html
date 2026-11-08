@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Agent 驾驶舱桌面助手</title>
+  <link rel="stylesheet" href="companion.css">
+</head>
+<body>
+  <div id="compact" class="compact">
+    <button id="handle" class="handle" type="button" aria-label="打开桌面助手">
+      <span class="orb-mark"><img src="brand-light.png" alt="" draggable="false"></span>
+      <span class="pet-mark" aria-hidden="true"><span class="ear left"></span><span class="ear right"></span><span class="face"><i></i><i></i><b>ᴗ</b></span></span>
+      <span class="badge" id="badge" hidden>0</span>
+    </button>
+    <button id="close-compact" class="close-compact" type="button" title="关闭桌面助手" aria-label="关闭桌面助手">×</button>
+  </div>
+  <button id="edge-tab" class="edge-tab" type="button" hidden aria-label="展开桌面助手">◈ <span id="tab-count"></span></button>
+  <section id="panel" class="panel" hidden aria-label="桌面助手提醒">
+    <header id="drag-bar">
+      <img src="brand-light.png" alt="" draggable="false"><strong>桌面助手</strong><span class="spacer"></span>
+      <button id="open-settings" class="icon" type="button" title="打开设置" aria-label="打开设置">⚙</button>
+      <button id="pin" class="icon" type="button" title="固定展开" aria-label="固定展开">⌖</button>
+      <button id="collapse" class="icon" type="button" title="收起" aria-label="收起">−</button>
+      <button id="close-panel" class="icon" type="button" title="关闭桌面助手" aria-label="关闭桌面助手">×</button>
+    </header>
+    <div class="tabs" role="tablist">
+      <button type="button" data-tab="alerts" class="active">提醒 <span id="count"></span></button>
+      <button type="button" data-tab="sessions">会话</button>
+      <button type="button" data-tab="todo">待办</button>
+    </div>
+    <main id="content" aria-live="polite"></main>
+    <div id="notice" role="status" hidden></div>
+  </section>
+  <script src="companion.js"></script>
+</body>
+</html>

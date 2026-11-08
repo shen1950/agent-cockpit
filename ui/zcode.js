@@ -2,6 +2,7 @@
 const ZCODE_SECTIONS = [['info', '概览'], ['quota', '额度与用量'], ['run', '运行管理'],
   ['auth', '登录管理'], ['data', '文件位置'], ['danger', '移除账号']];
 const ZCODE_BUSY = new Set();
+
 function zcodeProvider(provider) { return provider === 'bigmodel' ? 'BigModel' : provider === 'zai' ? 'Z.ai' : '未识别'; }
 
 async function zcodeAction(action, name = '', extra = {}) {

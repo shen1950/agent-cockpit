@@ -1,0 +1,48 @@
+.gateway-destination{display:grid;gap:8px;margin-bottom:18px}
+.gateway-destination>label{display:flex;align-items:center;gap:12px;font-weight:600}
+.gateway-destination p{margin:0;font-size:13px;line-height:1.7}
+.gateway-client-embedded{padding:0;margin:0 0 18px;border:0;box-shadow:none;background:transparent}
+.gateway-client-embedded .panelhead{flex-wrap:wrap;gap:8px}
+.gateway-routes{padding:20px 22px;margin-bottom:18px;overflow:hidden;flex-shrink:0}
+.gateway-routes .panelhead .sp{flex:1}
+.gateway-route-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0;color:var(--muted,var(--text-muted));font-size:13px}
+.gateway-route-toolbar label{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.gateway-route-status{display:flex;align-items:center;gap:8px;font-weight:600;color:var(--fg,var(--text))}
+.gateway-route-status:before{content:'';width:7px;height:7px;border-radius:50%;background:currentColor;opacity:.6}
+.gateway-route-graph{display:grid;grid-template-columns:minmax(130px,1fr) 34px minmax(130px,1fr) 34px minmax(200px,2fr);align-items:center;gap:4px;padding:14px 0 25px}
+.gateway-route-node{min-width:0;display:flex;align-items:center;flex-direction:column;gap:9px;padding:22px 14px;border:1px solid var(--line-strong,#d8d4cc);border-radius:14px;background:var(--bg-raised);text-align:center;overflow-wrap:anywhere}
+.gateway-route-node b{font-size:16px}.gateway-route-symbol{font-size:27px;line-height:1;color:var(--muted,var(--text-muted))}
+.gateway-route-hub{border-color:var(--accent,#a65c28);box-shadow:0 0 0 5px color-mix(in srgb,var(--accent,#a65c28) 9%,transparent)}
+.gateway-route-hub .gateway-route-symbol{color:var(--accent,#a65c28)}
+.gateway-route-subtitle{font-size:12px;line-height:1.5;color:var(--muted,var(--text-muted));overflow-wrap:anywhere}
+.gateway-route-link{font-size:25px;text-align:center;color:var(--muted,var(--text-muted));opacity:.6}
+.gateway-route-link.active{color:var(--accent,#a65c28);animation:gateway-route-pulse 1.6s ease-in-out infinite}
+.gateway-route-targets{list-style:none;padding:0;margin:0 0 0 8px;display:grid;gap:10px;max-height:360px;overflow:auto}
+.gateway-route-attempt{border:1px solid var(--line-strong,#d8d4cc);border-left:3px solid var(--line-strong,#d8d4cc);border-radius:10px;padding:12px 14px;min-width:0;display:grid;gap:6px}
+.gateway-route-attempt.active{border-left-color:var(--accent,#a65c28)}
+.gateway-route-attempt.complete{border-left-color:var(--ok,#22845c)}
+.gateway-route-attempt.failed{border-left-color:var(--bad,#b34d42)}
+.gateway-route-attempt-heading{display:flex;align-items:center;gap:8px;font-size:13px;min-width:0;flex-wrap:wrap}
+.gateway-route-attempt-heading b{overflow-wrap:anywhere;flex:1;min-width:80px}
+.gateway-route-index{display:grid;place-items:center;border:1px solid var(--line-strong,#d8d4cc);border-radius:50%;width:20px;height:20px;font-size:11px;flex-shrink:0;color:var(--muted,var(--text-muted))}
+.gateway-route-attempt-state{font-size:11px;white-space:nowrap;font-weight:500}
+.gateway-route-reason{font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+.gateway-route-empty{border:1px dashed var(--line-strong,#d8d4cc);border-radius:12px;padding:25px 15px;text-align:center;color:var(--muted,var(--text-muted));font-size:14px}
+.gateway-route-footer{border-top:1px solid var(--line-strong,#d8d4cc);padding-top:16px;display:flex;align-items:center;gap:20px;justify-content:space-between;flex-wrap:wrap}
+.gateway-route-footer p,.gateway-route-help{font-size:12px;color:var(--muted,var(--text-muted));line-height:1.7;margin:0;max-width:400px}
+.gateway-route-stats{display:flex;gap:24px}.gateway-route-stats>div{display:grid;gap:4px;text-align:center;min-width:40px}
+.gateway-route-stats b{font-size:23px;line-height:1.1;font-variant-numeric:tabular-nums}.gateway-route-stats span{font-size:11px;color:var(--muted,var(--text-muted))}
+.gateway-route-help{margin-top:14px;max-width:none}
+.gateway-route-error{font-size:12px;color:var(--bad,#b34d42);overflow-wrap:anywhere;line-height:1.6}
+.gateway-route-history-wrap{margin-top:20px;border-top:1px solid var(--line-strong,#d8d4cc);padding-top:12px}
+.gateway-route-history-wrap>summary{cursor:pointer;font-size:13px;font-weight:600;padding:4px 0}
+.gateway-route-history{max-height:280px;overflow:auto;margin-top:10px}
+.gateway-route-request{width:100%;display:grid;grid-template-columns:70px minmax(90px,1fr) minmax(130px,2fr) 70px;gap:12px;align-items:center;padding:10px 12px;text-align:left;background:transparent;border:1px solid transparent;border-radius:8px;color:inherit;cursor:pointer;font-family:inherit;font-size:12px}
+.gateway-route-request:hover,.gateway-route-request.selected{background:color-mix(in srgb,var(--accent,#a65c28) 7%,transparent)}
+.gateway-route-request.selected{border-color:color-mix(in srgb,var(--accent,#a65c28) 35%,transparent)}
+.gateway-route-request-model{overflow-wrap:anywhere;min-width:0}.gateway-route-request time{font-variant-numeric:tabular-nums;color:var(--muted,var(--text-muted))}
+.gateway-route-request-state{text-align:right}.gateway-route-request-state.failed{color:var(--bad,#b34d42)}.gateway-route-request-state.complete{color:var(--ok,#22845c)}
+@keyframes gateway-route-pulse{50%{opacity:1}}
+@media(prefers-reduced-motion:reduce){.gateway-route-link.active{animation:none}}
+@media(max-width:1050px){.gateway-route-graph{grid-template-columns:minmax(110px,1fr) 24px minmax(110px,1fr);row-gap:12px}.gateway-route-graph>.gateway-route-link:nth-child(4){display:none}.gateway-route-targets{grid-column:1/-1;margin:0}.gateway-route-node{padding:16px 12px}.gateway-route-footer{gap:14px}.gateway-route-stats{gap:18px}.gateway-route-request{grid-template-columns:65px minmax(80px,1fr) minmax(100px,2fr);gap:8px}.gateway-route-request-state{grid-column:2/-1;text-align:left}.gateway-routes{padding:16px}}
+@media(max-width:600px){.gateway-route-toolbar{align-items:flex-start;flex-direction:column}.gateway-route-stats{width:100%;justify-content:space-around}.gateway-route-request{grid-template-columns:65px 1fr}.gateway-route-request-model{grid-column:1/-1}.gateway-route-request-state{grid-column:1/-1}}

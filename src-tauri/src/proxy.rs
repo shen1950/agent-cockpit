@@ -51,8 +51,18 @@ pub struct Proxy {
 /// 兼容保留：老式（无上游组配置）时的成员清单 = 所有登记过 token 的账号 + 勾了「进反代」的 Key
 pub fn legacy_pool(global_upstream: &str) -> Vec<Upstream> {
     let mut out = Vec::new();
+    let off = gateway::sources_off();
     for app in all_apps() {
         for m in load_instances(&app.id) {
+            let name = m["name"].as_str().unwrap_or("");
+            if off.contains(&gateway::member_src_instance(&app.id, name)) { continue; }
+            if app.id == "zcode" {
+                if crate::zcode::proxy_available(name) {
+                    out.push(Upstream { label: format!("{}/{name}", app.name), token: name.to_string(),
+                        base_url: crate::zcproxy::BASE_MARK.to_string(), pool: "（未分池）".into() });
+                }
+                continue;
+            }
             let tok = m["token"].as_str().unwrap_or("").trim().to_string();
             if tok.is_empty() {
                 continue;
@@ -66,13 +76,21 @@ pub fn legacy_pool(global_upstream: &str) -> Vec<Upstream> {
             });
         }
     }
-    for (label, tok) in crate::keys::proxy_tokens() {
-        out.push(Upstream {
-            label,
-            token: tok,
-            base_url: global_upstream.to_string(),
-            pool: "（未分池）".into(),
-        });
+    for site in crate::keys::sites() {
+        let site_id = site["id"].as_str().unwrap_or_default();
+        let site_name = site["name"].as_str().unwrap_or_default();
+        for key in site["keys"].as_array().into_iter().flatten() {
+            let token = key["key"].as_str().unwrap_or_default().trim();
+            let src = gateway::member_src_key(site_id, key["id"].as_str().unwrap_or_default());
+            if key["use_in_proxy"] != true || token.is_empty() || off.contains(&src) { continue; }
+            let label = key["label"].as_str().unwrap_or_default().trim();
+            out.push(Upstream {
+                label: if label.is_empty() { format!("Key/{site_name}") } else { format!("Key/{site_name}/{label}") },
+                token: token.to_owned(),
+                base_url: global_upstream.to_string(),
+                pool: "（未分池）".into(),
+            });
+        }
     }
     out
 }
@@ -95,9 +113,6 @@ pub fn pick_upstreams(incoming: &str, global_upstream: &str) -> Route {
         disabled,
     };
     let pools = gateway::pools();
-    if pools.is_empty() {
-        return empty_route(legacy_pool(global_upstream), "", String::new(), false);
-    }
     if let Some(d) = gateway::find_dist(incoming) {
         let name = d["name"].as_str().unwrap_or("未命名").to_string();
         let did = d["id"].as_str().unwrap_or("").to_string();
@@ -111,7 +126,8 @@ pub fn pick_upstreams(incoming: &str, global_upstream: &str) -> Route {
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
-        let ups = gateway::upstreams_for(&ids, global_upstream);
+        let ups = if pools.is_empty() && ids.is_empty() { legacy_pool(global_upstream) }
+            else { gateway::upstreams_for(&ids, global_upstream) };
         let pool_names: Vec<String> = if ids.is_empty() {
             vec!["全部上游组".into()]
         } else {
@@ -123,6 +139,9 @@ pub fn pick_upstreams(incoming: &str, global_upstream: &str) -> Route {
         };
         let via = format!("{}（{}）", name, pool_names.join("、"));
         return empty_route(ups, &did, via, false);
+    }
+    if pools.is_empty() {
+        return empty_route(legacy_pool(global_upstream), "", String::new(), false);
     }
     // 不认识的 key：所有启用的上游组（便于本机自用，也不破坏老配置）
     empty_route(gateway::upstreams_for(&[], global_upstream), "", String::new(), false)
@@ -204,6 +223,7 @@ impl Proxy {
         pool: &str,
         via: &str,
     ) {
+        crate::gateway_routes::response(status);
         if let Some(m) = &model {
             if m != "-" {
                 model_stats_bump(m, status);
@@ -325,6 +345,7 @@ impl Proxy {
     }
 
     pub fn stop(&self) -> (bool, String) {
+        crate::zcproxy::stop();
         if !self.is_running() {
             return (false, "反代未运行".into());
         }
@@ -337,14 +358,29 @@ impl Proxy {
 
     fn serve(&self, req: tiny_http::Request) {
         let method = req.method().as_str().to_string();
-        let path = req.url().to_string();
+        let desktop = match crate::claude_gateway::route(req.url()) {
+            Ok(route) => route,
+            Err(_) => { let _ = req.respond(text_response(404, r#"{"error":"unknown desktop route"}"#)); return; }
+        };
+        let path = desktop.as_ref().map(|(_, path)| path.clone()).unwrap_or_else(|| req.url().to_owned());
 
         let mut fwd: Vec<(String, String)> = Vec::new();
+        let mut attempt_mark = String::new();
+        let mut describing = false;
+        let mut trace_mark = String::new();
+        let mut user_agent = String::new();
         // 客户端带来的 key：决定这次能用哪些上游组（之后会被换成上游自己的凭据）
         let mut incoming_key = String::new();
         for h in req.headers() {
             let name = h.field.as_str().as_str().to_lowercase();
             let val = h.value.as_str().to_string();
+            if name == crate::gateway_routes::HEADER {trace_mark=val;continue;}
+            if name == "user-agent" {user_agent=val.clone();}
+            if name == crate::gateway_dispatch::MARK {
+                if crate::gateway_dispatch::verified(&val).is_some() { attempt_mark = val; }
+                continue;
+            }
+            if name == crate::gateway_vision::DESCRIBER_HEADER { describing = true; continue; }
             if name == "authorization" {
                 incoming_key = val
                     .strip_prefix("Bearer ")
@@ -358,6 +394,17 @@ impl Proxy {
                 if incoming_key.is_empty() {
                     incoming_key = val.trim().to_string();
                 }
+                continue;
+            }
+            // Gemini 官方客户端用这个头带 key
+            if name == "x-goog-api-key" {
+                if incoming_key.is_empty() {
+                    incoming_key = val.trim().to_string();
+                }
+                continue;
+            }
+            // 进站层的回环标记：只用来防回环，不外发上游
+            if name == crate::ingress::LOOPBACK_MARK {
                 continue;
             }
             if matches!(
@@ -386,12 +433,39 @@ impl Proxy {
             return;
         }
 
+        // Gemini 客户端还可能把 key 放 query（?key=…）。头里没有才认，别抢 Authorization 的。
+        if incoming_key.is_empty() {
+            if let Some(q) = path.split('?').nth(1) {
+                for pair in q.split('&') {
+                    if let Some(v) = pair.strip_prefix("key=") {
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            incoming_key = v.to_string();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
         let mut body = Vec::new();
         let mut req = req;
         let _ = req.as_reader().read_to_end(&mut body);
-        let model = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|v| v["model"].as_str().map(|s| s.to_string()));
+        if let Some((selected, _)) = &desktop {
+            if method == "POST" {
+                if let Ok(Value::Object(mut message)) = serde_json::from_slice(&body) {
+                    message.insert("model".into(), json!(selected));
+                    body = serde_json::to_vec(&message).expect("JSON object serializes");
+                }
+            }
+        }
+        let model = crate::ingress::model_from_url(&method, &path).or_else(|| {
+            let v: Value = serde_json::from_slice(&body).ok()?;
+            v["model"].as_str().map(str::to_owned)
+        });
+        let _trace = (method=="POST" && !path.contains(":countTokens") &&
+            (crate::ingress::Ingress::detect(&method,&path).is_some() || path.split('?').next().unwrap_or("").trim_end_matches('/').ends_with("/chat/completions")))
+            .then(||crate::gateway_routes::begin(model.as_deref().unwrap_or("未指定模型"),&user_agent,&trace_mark));
 
         let (global_upstream, strategy) = self.config();
         let route = pick_upstreams(&incoming_key, &global_upstream);
@@ -423,6 +497,22 @@ impl Proxy {
         }
         // 模型清单本地应答：别的 Agent 接入时基本都先拉 /v1/models，
         // 转发给 WorkBuddy/Trae 的上游必然 404，用户只会看到「填了地址连不上」。
+        if let Some((selected, _)) = &desktop {
+            if method == "GET" {
+                let listed_model = models_for(&ups).into_iter().find(|m| m["id"].as_str() == Some(selected));
+                let listed = listed_model.is_some();
+                let row = listed_model.as_ref().map(crate::claude_gateway::model_details).unwrap_or(Value::Null);
+                let alias = crate::claude_gateway::ALIAS;
+                let (status, payload) = if path == "/v1/models" {
+                    let data = if listed { vec![row] } else { vec![] };
+                    (200, json!({"data":data,"has_more":false,"first_id":data.first().map(|_|alias),"last_id":data.last().map(|_|alias)}))
+                } else if listed && path == format!("/v1/models/{alias}") { (200, row) }
+                else { (404, json!({"error":"model not found"})) };
+                self.push_log(&method, &path, None, status, "-", "-", &via);
+                let _ = req.respond(text_response(status, &payload.to_string()));
+                return;
+            }
+        }
         if method == "GET" && (path == "/v1/models" || path == "/models") {
             let data = models_for(&ups);
             self.push_log(&method, &path, None, 200, "-", "-", &via);
@@ -432,9 +522,49 @@ impl Proxy {
             ));
             return;
         }
+        // Codex 模型目录：provider 配了 model_catalog_url 后客户端会带 key 来拉，
+        // 选择器和默认模型从此显示反代的真实模型（minimax/…），不再是内置 GPT 集。
+        // 带不带 /v1 前缀都认；格式与字段约束见 codexcatalog.rs。
+        if method == "GET" && path.split('?').next().unwrap_or(&path).trim_end_matches('/').ends_with("model_catalog.json") {
+            let data = crate::codexcatalog::catalog(&models_for(&ups));
+            self.push_log(&method, &path, None, 200, "-", "-", &via);
+            let _ = req.respond(text_response(
+                200,
+                &data.to_string(),
+            ));
+            return;
+        }
         // 模型带 Agent 前缀（如 trae/glm-5.3-flash）：只在属于这一家的上游里挑，
         // 指向永远确定。前缀没授权/没账号 → 直接拒绝，别漂到别的 Agent 去。
-        if let Some((owner, bare)) = model.as_deref().and_then(split_namespaced) {
+        let namespace = model.as_deref().and_then(split_namespaced);
+        let inference = method == "POST" && !path.contains(":countTokens") &&
+            (crate::ingress::Ingress::detect(&method,&path).is_some() || path.split('?').next().unwrap_or("").trim_end_matches('/').ends_with("/chat/completions"));
+        if inference {
+            if let Some((owner,_)) = namespace {
+                if attempt_mark.is_empty() && ups.iter().any(|u|owner_of_base(&u.base_url)==Some(owner)) {
+                    let settings = match crate::gateway_dispatch::load() {
+                        Ok(s)=>s, Err(e)=>{let _=req.respond(text_response(500,&json!({"error":{"message":e}}).to_string()));return;}
+                    };
+                    if settings.providers.get(owner).is_some_and(|r|r.scheduled()) {
+                        let models=models_for(&ups);
+                        crate::gateway_dispatch::run(req,crate::gateway_dispatch::Dispatch {
+                            port:self.port(), key:&incoming_key, path:&path, model:model.as_deref().unwrap(),
+                            body:&body, headers:&fwd, ups:&ups, settings:&settings, models:&models, describing,
+                        });
+                        return;
+                    }
+                }
+                if let Err((status,e))=crate::gateway_vision::prepare(&path,model.as_deref().unwrap(),&mut body,&incoming_key,self.port(),describing,||models_for(&route.ups)) {
+                    let error=crate::ingress::Ingress::detect(&method,&path).map_or_else(||json!({"error":{"message":e}}),|i|crate::ingress::error_json(i,status,&e));
+                    self.push_log(&method,&path,model.clone(),status,"-","-",&via);
+                    let _=req.respond(text_response(status,&error.to_string()));return;
+                }
+            }
+            if let Some(id) = crate::gateway_dispatch::verified(&attempt_mark) {
+                ups.retain(|u|crate::gateway_dispatch::lane_id(u)==id);
+            }
+        }
+        if let Some((owner, _)) = namespace {
             let filtered: Vec<Upstream> = ups
                 .iter()
                 .filter(|u| owner_of_base(&u.base_url) == Some(owner))
@@ -455,15 +585,7 @@ impl Proxy {
                 return;
             }
             ups = filtered;
-            // 报文里的模型名剥成裸名（上游只认裸名）；`model` 保持带前缀的形式，
-            // 让日志和逐模型实测按「Agent/模型」分开记。
-            if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-                if v["model"].as_str().is_some() {
-                    let mut v2 = v.clone();
-                    v2["model"] = json!(bare);
-                    body = serde_json::to_vec(&v2).unwrap_or(body);
-                }
-            }
+
         }
         if ups.is_empty() {
             let hint = if via.is_empty() {
@@ -475,6 +597,38 @@ impl Proxy {
             self.push_log(&method, &path, model, 502, "无可用上游", "-", &via);
             let _ = req.respond(text_response(502, &json!({ "error": hint }).to_string()));
             return;
+        }
+        // ── 多协议进站（ingress.rs）：/v1/responses、/v1/messages、Gemini ──
+        // 翻译成 chat 报文后回环走 /v1/chat/completions，路由/上游翻译/日志/记账原链复用。
+        // 放在上游选择之前、round-robin 取号之前：外层不消耗轮询序号，只让内层消耗一次。
+        let ingress = crate::ingress::Ingress::detect(&method, &path);
+        // AStudio accepts native Responses, including Codex tools and SSE.
+        let native_responses = ingress == Some(crate::ingress::Ingress::Responses)
+            && ups.iter().all(|u| crate::asproxy::is_astudio_base(&u.base_url));
+        let native_zcode_messages = ingress == Some(crate::ingress::Ingress::Anthropic)
+            && ups.iter().all(|u| crate::zcproxy::is_base(&u.base_url));
+        if let Some(ing) = ingress.filter(|_| !native_responses && !native_zcode_messages) {
+            if method == "GET" {
+                // Gemini 的 GET /v1beta/models：照 models_for 的清单翻成 Google 形状
+                let data = models_for(&ups);
+                self.push_log(&method, &path, None, 200, "-", "-", &via);
+                let _ = req.respond(text_response(
+                    200,
+                    &crate::ingress::gemini_models_json(&data).to_string(),
+                ));
+                return;
+            }
+            self.serve_ingress(req, &method, &path, &body, &fwd, &incoming_key, model, ing, &via, &attempt_mark, describing);
+            return;
+        }
+        // Strip the owner only at the final upstream hop. Translated requests
+        // keep it through loopback so the authenticated route stays restricted.
+        let req = crate::gateway_cost::Metered::new(req, if inference && namespace.is_some() {model.clone()} else {None},!attempt_mark.is_empty());
+        if let Some((_, bare)) = namespace {
+            if let Ok(mut v) = serde_json::from_slice::<Value>(&body) {
+                v["model"] = json!(bare);
+                body = serde_json::to_vec(&v).expect("JSON request serializes");
+            }
         }
         let i = if strategy == "random" {
             (std::time::SystemTime::now()
@@ -490,6 +644,11 @@ impl Proxy {
             return;
         }
         let up = ups[i].clone();
+        crate::gateway_routes::attempt(model.as_deref().unwrap_or("未指定模型"),&up,"按上游组选择账号");
+        if crate::zcproxy::is_base(&up.base_url) {
+            self.serve_zcode(req, &method, &path, &body, &up, &via, &route.dist_id, model.clone());
+            return;
+        }
         if crate::traeproxy::is_trae_base(&up.base_url) {
             self.serve_trae(req, &method, &path, &body, &up, &via, &route.dist_id, model.clone());
             return;
@@ -526,6 +685,9 @@ impl Proxy {
         // start 可能切换端口，当前请求也必须使用新地址，不能发给旧端口的占用者。
         let target_base = if is_qw { crate::qwbridge::base() } else { up.base_url.clone() };
         let url = crate::qproxy::upstream_url(&target_base, &path);
+        if native_responses {
+            body = crate::asproxy::prepare_responses(&body);
+        }
 
         // 模型名归一：客户端（WorkBuddy / Cherry Studio / 各家 Agent）发的是自己的模型名，
         // Qoder 不认时仍然回 200，正文却是一帧 SSE `event: error`——客户端读不到字节就直接
@@ -588,7 +750,7 @@ impl Proxy {
                         let capacity = msg.contains("All models failed")
                             || msg.contains("All backends failed")
                             || msg.contains("provider_error");
-                        if capacity && !used.eq_ignore_ascii_case("auto") {
+                        if capacity && !used.eq_ignore_ascii_case("auto") && attempt_mark.is_empty() {
                             if let Some((h2, br2, st2)) =
                                 self.qoder_retry_auto(&method, &url, &fwd, &up.token, &body)
                             {
@@ -704,7 +866,7 @@ impl Proxy {
     ///   * 流是**边读边翻**的，所以 usage/provider 要等 `respond` 返回（流写完）后才拿得到。
     fn serve_trae(
         &self,
-        mut req: tiny_http::Request,
+        req: crate::gateway_cost::Metered,
         method: &str,
         path: &str,
         body: &[u8],
@@ -863,7 +1025,7 @@ impl Proxy {
                     let mut txt = String::new();
                     let _ = resp.into_reader().take(2000).read_to_string(&mut txt);
                     let k = crate::traeproxy::classify(code as i64, &txt);
-                    if k.retry_with_new_ip() && attempt == 0 {
+                    if k.retry_with_new_ip() && attempt == 0 && !req.scheduled() {
                         continue; // 4011 = 身份没过，重算出口 IP 再试一次
                     }
                     crate::traeproxy::bump(&format!("err:{}", k.as_str()));
@@ -892,6 +1054,120 @@ impl Proxy {
         }
     }
 
+    /// 多协议进站（ingress.rs）：/v1/responses、/v1/messages、Gemini generateContent。
+    /// 翻译成 chat 报文后回环打自己的 /v1/chat/completions —— 路由、各家上游翻译、
+    /// 日志、逐模型计数全部原链复用，进站协议本身不碰任何上游细节。
+    /// 回环安全：proxy 每请求一个 worker 线程，accept 循环不会被堵死；
+    /// 内层请求带 LOOPBACK_MARK，detect 对 /v1/chat/completions 本来也不认，双保险。
+    fn serve_ingress(
+        &self,
+        mut req: tiny_http::Request,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        fwd: &[(String, String)],
+        incoming_key: &str,
+        model: Option<String>,
+        ing: crate::ingress::Ingress,
+        via: &str,
+        attempt_mark: &str,
+        describing: bool,
+    ) {
+        // countTokens 没必要过模型：本地估算就行，别白烧一次配额
+        if path.contains(":countTokens") {
+            let out = crate::ingress::gemini_count_tokens(body);
+            self.push_log(method, path, model, 200, "-", "-", via);
+            let _ = req.respond(text_response(200, &out.to_string()));
+            return;
+        }
+        let chat = match crate::ingress::to_chat_request(ing, path, body) {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_log(method, path, model, 400, "-", "-", via);
+                let err = crate::ingress::error_json(ing, 400, &e);
+                let _ = req.respond(text_response(400, &err.to_string()));
+                return;
+            }
+        };
+        let inner_model = chat["model"].as_str().unwrap_or("").to_string();
+        let payload = serde_json::to_vec(&chat).unwrap_or_default();
+
+        // start 可能换过端口，永远打当前监听的那个
+        let url = format!("http://127.0.0.1:{}/v1/chat/completions", self.port());
+        let mut call = ureq::post(&url)
+            .timeout(std::time::Duration::from_secs(600))
+            .set("Content-Type", "application/json")
+            .set("Authorization", &format!("Bearer {incoming_key}"))
+            .set(crate::ingress::LOOPBACK_MARK, "1")
+            .set("User-Agent", "agent-cockpit/2.0");
+        if !attempt_mark.is_empty() {call=call.set(crate::gateway_dispatch::MARK,attempt_mark);}
+        if describing {call=call.set(crate::gateway_vision::DESCRIBER_HEADER,"1");}
+        if let Some(mark)=crate::gateway_routes::marker(){call=call.set(crate::gateway_routes::HEADER,&mark);}
+        for (k, v) in fwd {
+            call = call.set(k, v);
+        }
+        match call.send_bytes(&payload) {
+            Ok(resp) => {
+                self.ingress_respond(req, resp, method, path, ing, &inner_model, via)
+            }
+            Err(ureq::Error::Status(_code, resp)) => {
+                // 内层跑到了并回了错误状态：交给 JSON 分支统一翻错
+                self.ingress_respond(req, resp, method, path, ing, &inner_model, via)
+            }
+            Err(e) => {
+                // 回环都没发出去，内层多半没跑：日志和模型计数由这里补
+                self.push_log(method, path, model, 502, "反代回环", "-", via);
+                let err =
+                    crate::ingress::error_json(ing, 502, &format!("反代内层请求失败：{e}"));
+                let _ = req.respond(text_response(502, &err.to_string()));
+            }
+        }
+    }
+
+    /// 内层响应 → 进站协议响应。SSE 包一层翻译器直接流出去；JSON 整体重写。
+    /// 模型计数和内层日志由内层请求自己记过了，这里只记进站路径这一行，不再重复计数。
+    fn ingress_respond(
+        &self,
+        mut req: tiny_http::Request,
+        resp: ureq::Response,
+        method: &str,
+        path: &str,
+        ing: crate::ingress::Ingress,
+        inner_model: &str,
+        via: &str,
+    ) {
+        let status = resp.status() as u16;
+        let ctype = resp.header("Content-Type").unwrap_or("").to_string();
+        if ctype.contains("text/event-stream") {
+            let tr = crate::ingress::SseTranslator::new(resp.into_reader(), ing, inner_model);
+            self.push_log(method, path, None, status, "-", "-", via);
+            let _ = req.respond(Response::new(
+                StatusCode(status),
+                vec![
+                    header("Content-Type", "text/event-stream; charset=utf-8"),
+                    header("Cache-Control", "no-cache"),
+                    cors_header(),
+                ],
+                tr,
+                None,
+                None,
+            ));
+            return;
+        }
+        let text = resp.into_string().unwrap_or_default();
+        let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|_| {
+            json!({ "error": { "message": "反代内层响应不是 JSON", "type": "upstream_error" } })
+        });
+        let out = if (200..300).contains(&status) {
+            crate::ingress::rewrite_json(ing, &parsed, inner_model)
+                .unwrap_or_else(|e| crate::ingress::error_json(ing, 502, &e))
+        } else {
+            crate::ingress::rewrite_error(ing, status, &parsed)
+        };
+        self.push_log(method, path, None, status, "-", "-", via);
+        let _ = req.respond(text_response(status, &out.to_string()));
+    }
+
     /// MiniMax Code 上游：OpenAI 进、Anthropic 出、Anthropic SSE 再翻回 OpenAI SSE。
     /// 协议、实测记录、令牌刷新纪律都在 mmproxy.rs。
     ///
@@ -900,7 +1176,7 @@ impl Proxy {
     /// 一个长跑的反代用快照会在半夜突然全 401。
     fn serve_mm(
         &self,
-        mut req: tiny_http::Request,
+        req: crate::gateway_cost::Metered,
         method: &str,
         path: &str,
         body: &[u8],
@@ -1076,12 +1352,39 @@ impl Proxy {
         }
     }
 
+    fn serve_zcode(&self, req: crate::gateway_cost::Metered, method: &str, path: &str, body: &[u8],
+        up: &Upstream, via: &str, dist_id: &str, model: Option<String>) {
+        let path_only = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+        let anthropic = matches!(path_only, "/v1/messages" | "/messages");
+        if method != "POST" || !(anthropic || matches!(path_only, "/v1/chat/completions" | "/chat/completions")) {
+            let _ = req.respond(text_response(404, &json!({"error":{"message":"ZCode 不支持这个接口"}}).to_string())); return;
+        }
+        let v: Value = match serde_json::from_slice(body) {
+            Ok(v) => v, Err(_) => { let _ = req.respond(text_response(400, &json!({"error":{"message":"请求体不是 JSON"}}).to_string())); return; }
+        };
+        match crate::zcproxy::request(&up.token, &v, anthropic) {
+            Ok(resp) => {
+                let status = resp.status();
+                let content_type = resp.header("Content-Type").unwrap_or("application/json").to_string();
+                // Relay directly: tool_use blocks, reasoning and SSE errors survive.
+                let _ = req.respond(Response::new(StatusCode(status), vec![header("Content-Type", &content_type),
+                    header("Cache-Control", "no-cache"), cors_header()], resp.into_reader(), None, None));
+                self.push_log(method, path, model, status, &up.label, &up.pool, via);
+                if !dist_id.is_empty() { gateway::bump_dist(dist_id, &up.label); }
+            },
+            Err((status, message)) => {
+                self.push_log(method, path, model, status, &up.label, &up.pool, via);
+                let _ = req.respond(text_response(status, &json!({"error":{"message":message,"type":"zcode_upstream_error"}}).to_string()));
+            }
+        }
+    }
+
     /// 妙手上游：**进程内云端直连**（协议底账见 pawbridge.rs）。
     /// OpenAI 进 → 妙手云端 create/agent-stream/connect 出 → 云端 SSE 翻回 OpenAI SSE。
     /// 与旧命名管道方案的区别：不需要妙手桌面端在跑，也没有 8789 桥进程。
     fn serve_paw(
         &self,
-        mut req: tiny_http::Request,
+        req: crate::gateway_cost::Metered,
         method: &str,
         path: &str,
         body: &[u8],
@@ -1309,7 +1612,7 @@ impl Proxy {
     ///   * 流式要边透传边把尾巴留下来，respond 返回后才拿得到 usage/credit。
     fn serve_wb(
         &self,
-        mut req: tiny_http::Request,
+        req: crate::gateway_cost::Metered,
         method: &str,
         path: &str,
         body: &[u8],
@@ -1331,6 +1634,7 @@ impl Proxy {
 
         for k in 0..budget {
             let up = &ups[(start + k) % ups.len()];
+            crate::gateway_routes::attempt(model.as_deref().unwrap_or("未指定模型"),up,"按上游组选择 WorkBuddy 账号");
             let Some(region) = crate::wbproxy::region_from_base(&up.base_url) else {
                 continue;
             };
@@ -1565,7 +1869,7 @@ fn known_owners() -> &'static [&'static str] {
     // 前缀在这张表里，客户端填 `owner/模型` 才会被切成「按这家挑上游 + 报文里剥成裸名」。
     // 少登记一家的后果是：同名模型在几家之间互相漂（glm-5.3-flash 谁都有）。
     &["workbuddy", "workbuddy-intl", "trae", "qoder", "qoder-cn", "opencode", "astudio",
-      "qwenwork", "catpaw", "minimax"]
+      "qwenwork", "catpaw", "minimax", "zcode"]
 }
 
 /// 给一家自己的模型清单打上 `owner/` 前缀（幂等：已经带过的不重复加）。
@@ -1602,7 +1906,8 @@ fn split_namespaced(model: &str) -> Option<(&str, &str)> {
 }
 
 /// 上游基址 → 归属的 Agent id（模型前缀路由用）。key 类上游回 None。
-fn owner_of_base(base: &str) -> Option<&'static str> {
+pub(crate) fn owner_of_base(base: &str) -> Option<&'static str> {
+    if crate::zcproxy::is_base(base) { return Some("zcode"); }
     if let Some(r) = crate::wbproxy::region_from_base(base) {
         return Some(crate::wbproxy::app_for_region(r));
     }
@@ -1654,38 +1959,77 @@ fn model_stats_path() -> std::path::PathBuf {
     crate::registry::base_dir().join("proxymodel.json")
 }
 
-/// 反代每处理一个请求就记一次（重启不丢）：「反代全景」里模型质量的本地证据。
-/// 键是请求里带的模型名，带前缀的按前缀记（同一家内部的裸名也合并）。
-fn model_stats_bump(model: &str, status: u16) {
-    let _g = MODEL_STATS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let path = model_stats_path();
-    let mut v: Value = std::fs::read_to_string(&path)
+/// 纯函数：「读到的旧 JSON + 一次实测」→ 新 JSON。不碰磁盘，单测只测这一层——
+/// 测试绝不能真写 ~/.agent-cockpit/proxymodel.json，那会弄脏用户自己的实测统计。
+/// 格式与老文件一致：{"models":{"<model id>":{"calls":n,"ok":n,"fail":n,"last_status":u16,"at":secs}}}
+/// fail 由 calls-ok 统一算，调用方永远传不进「三个数对不上」的状态。
+pub fn merge_model_stat(mut old: Value, model_id: &str, status: u16, at: u64) -> Value {
+    if !old.is_object() {
+        old = json!({});
+    }
+    // 老文件被手工改坏（models 是个字符串/数组）时重建，不让一条脏数据把整块统计锁死。
+    if !old["models"].is_object() {
+        old["models"] = json!({});
+    }
+    let e = &old["models"][model_id];
+    let calls = e["calls"].as_u64().unwrap_or(0) + 1;
+    // ok 上限夹到 calls：脏文件里 ok > calls 时 fail 不出现 u64 下溢，也不出现成功率 >100%
+    let ok = (e["ok"].as_u64().unwrap_or(0) + u64::from((200..300).contains(&status))).min(calls);
+    let fail = calls - ok;
+    old["models"][model_id] = json!({
+        "calls": calls, "ok": ok, "fail": fail,
+        "last_status": status, "at": at,
+    });
+    old
+}
+
+fn read_model_stats_file() -> Value {
+    std::fs::read_to_string(model_stats_path())
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .filter(|x| x.is_object())
-        .unwrap_or_else(|| json!({}));
-    let e = &v["models"][model];
-    let calls = e["calls"].as_u64().unwrap_or(0) + 1;
-    let ok = e["ok"].as_u64().unwrap_or(0) + u64::from((200..300).contains(&status));
-    let fail = calls - ok;
-    v["models"][model] = json!({
-        "calls": calls, "ok": ok, "fail": fail,
-        "last_status": status, "at": crate::registry::now_secs(),
-    });
+        .unwrap_or_else(|| json!({}))
+}
+
+/// 记一次逐模型实测（重启不丢）：「反代全景」里模型质量的本地证据。
+/// 反代请求和面板上的手动「测试」共用同一把锁、同一份文件、同一套键。
+/// status 用 HTTP 状态码；拿不到真实状态码的路径见 record_model_probe。
+/// 内部只做「加锁 → 读 → 纯函数合并 → 原子落盘」，纯逻辑在 merge_model_stat 里可单测。
+pub fn record_model_stat(model_id: &str, status: u16) {
+    if model_id.trim().is_empty() {
+        return;
+    }
+    let _g = MODEL_STATS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = model_stats_path();
+    let v = merge_model_stat(
+        read_model_stats_file(),
+        model_id,
+        status,
+        crate::registry::now_secs(),
+    );
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, serde_json::to_string(&v).unwrap_or_default()).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
 }
 
+/// 手动测试入口：只有成/败，没有上游 HTTP 状态码。
+/// 成功记 200；失败记 0——0 表示这层根本没拿到 HTTP 响应（超时 / 协议错 / 本地闸门直接回绝）。
+/// 失败也必须记，否则「成功率」永远 100%，统计就没有意义。
+pub fn record_model_probe(model_id: &str, ok: bool) {
+    record_model_stat(model_id, if ok { 200 } else { 0 });
+}
+
+/// 反代每处理一个请求就记一次（重启不丢）。
+/// 键是请求里带的模型名，带前缀的按前缀记（同一家内部的裸名也合并）。
+fn model_stats_bump(model: &str, status: u16) {
+    record_model_stat(model, status);
+}
+
 /// 读全部逐模型计数（纯本地文件，不起进程）。
 pub fn model_stats() -> Value {
     let _g = MODEL_STATS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    std::fs::read_to_string(model_stats_path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .filter(|x| x.is_object())
-        .unwrap_or_else(|| json!({}))
+    read_model_stats_file()
 }
 
 /// Qoder（客户端模型缓存，国内版含本地桥）、OpenCode（本地桥 /v1/models）。
@@ -1728,14 +2072,22 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
                     "credits": m.credits,
                     "context_window": m.context,
                     "max_output_tokens": m.max_output,
+                    "vision": m.supports_images,
+                    "free": m.free,
                 }));
             }
         } else if crate::traeproxy::is_trae_base(&up.base_url) {
             has_trae = true;
-        } else if crate::qproxy::is_qoder_base(&up.base_url) {
+        } else if matches!(owner_of_base(&up.base_url),Some("qoder"|"qoder-cn")) {
             has_qoder = true;
         } else if crate::asproxy::is_astudio_base(&up.base_url) {
             has_as = true;
+        } else if crate::zcproxy::is_base(&up.base_url) {
+            for m in crate::zcproxy::models(&up.token) {
+                push(m["id"].as_str().unwrap_or(""), "zcode", json!({"name":m["name"],
+                    "context_window":m["context_window"],"max_output_tokens":m["max_output_tokens"],"vision":m["vision"],
+                    "tools":m["tools"],"reasoning":m["reasoning"],"source":m["source"]}));
+            }
         } else if crate::mmproxy::is_mm_base(&up.base_url) {
             has_mm = true;
         } else if up.base_url.starts_with("http://127.0.0.1:8211") {
@@ -1778,6 +2130,9 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
                     push(m["id"].as_str().unwrap_or(""), "trae", json!({
                         "channel": m["channel"].clone(),
                         "context_window": m["context_window"].clone(),
+                        "max_output_tokens": m["max_output_tokens"].clone(),
+                        "vision": m["vision"].clone(),
+                        "name": m["name"].clone(),
                     }));
                 }
             }
@@ -1793,11 +2148,14 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
                 continue;
             }
             let app = row["app"].as_str().unwrap_or("qoder").to_string();
+            if !ups.iter().any(|u|owner_of_base(&u.base_url)==Some(app.as_str())) {continue;}
             for m in row["models"].as_array().cloned().unwrap_or_default() {
                 push(m["id"].as_str().unwrap_or(""), &app, json!({
                     "name": m["name"].clone(),
                     "free": m["free"].clone(),
                     "context_window": m["context"].clone(),
+                    "max_output_tokens": m["max_output_tokens"].clone(),
+                    "vision": m["vision"].clone(),
                 }));
             }
         }
@@ -1809,7 +2167,7 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
         }
     }
     if has_as {
-        for m in crate::asproxy::models_static() {
+        for m in crate::asproxy::account_models() {
             push(
                 m["id"].as_str().unwrap_or(""),
                 "astudio",
@@ -1817,6 +2175,8 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
                     "name": m["name"].clone(),
                     "free": m["free"].clone(),
                     "multiplier": m["multiplier"].clone(),
+                    "supported_reasoning_levels": m["supported_reasoning_levels"].clone(),
+                    "default_reasoning_level": m["default_reasoning_level"].clone(),
                 }),
             );
         }
@@ -1831,12 +2191,14 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
                     "name": m["name"].clone(),
                     "free": m["free"].clone(),
                     "reasoning": m["reasoning"].clone(),
+                    "vision": m["vision"].clone(),
                     "context_window": m["context_window"].clone(),
                     "max_output_tokens": m["max_output_tokens"].clone(),
                 }),
             );
         }
     }
+    crate::model_caps::apply(&mut out,&crate::model_caps::load().unwrap_or_default());
     out
 }
 
@@ -1900,7 +2262,7 @@ fn cors_header() -> Header {
     header("Access-Control-Allow-Origin", "*")
 }
 
-fn text_response(code: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn text_response(code: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string(body).with_status_code(StatusCode(code))
 }
 
@@ -1964,5 +2326,56 @@ mod tests {
             std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
             "停止后端口仍被占用"
         );
+    }
+
+    /// 反代请求和手动「测试」共用 merge_model_stat：一次成功 + 一次失败 → calls=2 / ok=1 / fail=1。
+    /// 这条只测纯函数，一个字节都不写用户的 proxymodel.json。
+    #[test]
+    fn merge_model_stat_counts_ok_and_fail_under_prefixed_key() {
+        let key = "astudio/spark-x2.6";
+        let v = merge_model_stat(json!({}), key, 200, 1_700_000_000);
+        let e = &v["models"][key];
+        assert_eq!(e["calls"].as_u64(), Some(1), "第一次成功应记 1 次调用");
+        assert_eq!(e["ok"].as_u64(), Some(1));
+        assert_eq!(e["fail"].as_u64(), Some(0));
+        assert_eq!(e["last_status"].as_u64(), Some(200));
+        assert_eq!(e["at"].as_u64(), Some(1_700_000_000));
+
+        // 手动测试失败也要记：record_model_probe(false) 走 status=0（没有上游 HTTP 码）
+        let v = merge_model_stat(v, key, 0, 1_700_000_060);
+        let e = &v["models"][key];
+        assert_eq!(e["calls"].as_u64(), Some(2));
+        assert_eq!(e["ok"].as_u64(), Some(1));
+        assert_eq!(e["fail"].as_u64(), Some(1), "失败要让 fail 自增，否则成功率永远 100%");
+        assert_eq!(e["last_status"].as_u64(), Some(0));
+    }
+
+    /// 同一份文件里多个模型互不吞；脏 JSON 不 panic，也不清掉别家的计数。
+    #[test]
+    fn merge_model_stat_keeps_other_models_and_tolerates_garbage() {
+        let v = merge_model_stat(
+            json!({"models": {"trae/glm-5.3-flash": {"calls": 3, "ok": 2, "fail": 1, "at": 5}}}),
+            "minimax/MiniMax-M3.1-Flash",
+            502,
+            99,
+        );
+        assert_eq!(v["models"]["trae/glm-5.3-flash"]["calls"].as_u64(), Some(3));
+        assert_eq!(v["models"]["minimax/MiniMax-M3.1-Flash"]["fail"].as_u64(), Some(1));
+        // 整个文件不是对象：重建，不 panic
+        let v = merge_model_stat(json!([1, 2, 3]), "zcode/GLM-5.3-Flash", 200, 1);
+        assert_eq!(v["models"]["zcode/GLM-5.3-Flash"]["calls"].as_u64(), Some(1));
+        // models 字段被手工改坏成字符串：同样重建
+        let v = merge_model_stat(json!({"models": "oops"}), "opencode/x", 200, 2);
+        assert_eq!(v["models"]["opencode/x"]["ok"].as_u64(), Some(1));
+        // 旧文件里 ok > calls：夹到 calls，成功率不会 >100%，也不会 u64 下溢 panic
+        let v = merge_model_stat(
+            json!({"models": {"qoder-cn/bad": {"calls": 1, "ok": 9}}}),
+            "qoder-cn/bad",
+            500,
+            3,
+        );
+        assert_eq!(v["models"]["qoder-cn/bad"]["calls"].as_u64(), Some(2));
+        assert_eq!(v["models"]["qoder-cn/bad"]["ok"].as_u64(), Some(2));
+        assert_eq!(v["models"]["qoder-cn/bad"]["fail"].as_u64(), Some(0));
     }
 }

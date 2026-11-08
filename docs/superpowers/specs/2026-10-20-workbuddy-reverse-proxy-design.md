@@ -37,7 +37,7 @@
 ## 2. 已核实的事实底账
 
 标注：**〔测〕** = 2026-10-20 本机真发请求看到响应；**〔源〕** = 读过安装包/源码原文；**〔推〕** = 推断。
-探针脚本与全部原始输出留在 `D:\Claude\agent-cockpit-workspace\_wb_proxy_probe\`。
+探针脚本与全部原始输出留在 `D:\Projects\Example\_wb_proxy_probe\`。
 
 ### 2.1 端点〔测〕
 
@@ -57,14 +57,14 @@ primary `www.workbuddy.cn` / alternate `copilot.tencent.com` / backup `wb.tencen
 asar 内唯一的 HMAC-SHA256 是 `VlmContextEnvelope`，用进程内随机 32 字节 secret 签本地 sessionId，
 不出网、无法从进程外伪造。所以两个区域走**同一条代码路径**，只差 origin 与归属常量。
 
-### 2.2 凭据〔测〕
+### 2.2 凭据结构（以下身份与日期为虚构示例）
 
 登录态文件（`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\`）：
 
 | 区域 | 文件 | uid | nickname | `auth.domain` | `auth.expiresAt` |
 |---|---|---|---|---|---|
-| 国内版 | `workbuddy-desktop.info` | `00000000-0000-0000-0000-000000000000` | ExampleAccount | `www.codebuddy.cn` | 1794843281209（≈2026-11-16） |
-| 国际版 | `workbuddy-desktop-ai.info` | `11111111-1111-1111-1111-111111111111` | shen1950 | `www.workbuddy.ai` | 1822899910698（≈2027-10） |
+| 国内版 | `workbuddy-desktop.info` | `00000000-0000-4000-8000-000000000001` | demo_account_cn | `www.codebuddy.cn` | 示例到期时间 |
+| 国际版 | `workbuddy-desktop-ai.info` | `00000000-0000-4000-8000-000000000002` | demo_account_intl | `www.workbuddy.ai` | 示例到期时间 |
 
 文件是 JSON，顶层四键 `account` / `auth` / `accounts` / `allAccounts`。
 `auth.accessToken`、`auth.refreshToken`、`account.nickname`、`account.phoneNumber`

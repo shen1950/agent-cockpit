@@ -313,6 +313,19 @@ pub fn swap_set(app_id: &str, name: &str, force: bool) -> SwapOut {
             ),
         };
     }
+    // 商汤小浣熊只认**真实目录**：档案根带 .raccoon-lab-client.json 标记，客户端
+    // openClientProfile 里对 lstat 出来的链接一律报「客户端配置目录无效」——用 junction
+    // 换号会让它整个起不来。它自己支持 `--client-profile <目录>` 做多档案（每个目录要有
+    // 那份标记），驾驶舱还没接这条，所以这里老实拦住，别去 rename 一个能被它拒掉的目录。
+    if app_id == "raccoon" {
+        return SwapOut::err(format!(
+            "商汤小浣熊只认真实目录（档案根有 .raccoon-lab-client.json 标记，链接一律拒绝），\
+             用目录链接换号会让它启动失败，驾驶舱不做这一步。\n\
+             换号请在小浣熊里退出登录、再登另一个号（当前档案 {}），\
+             登进来之后这张卡会自己认出当前登录的是谁。",
+            p.display()
+        ));
+    }
     let snap = snapshot_fresh();
     if app.kind == "cli" {
         if agent_running(app_id, &snap) {
@@ -734,7 +747,7 @@ mod tests {
         crate::registry::set_swap(
             &mut cfg,
             "qoder-cn",
-            Some(serde_json::json!({ "instance": "exampleuser_b" })),
+            Some(serde_json::json!({ "instance": "demo_account" })),
         );
         crate::registry::save_config(&cfg);
         assert!(crate::registry::swaps_of(&crate::registry::load_config())

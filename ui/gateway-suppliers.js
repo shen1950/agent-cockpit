@@ -18,36 +18,44 @@ const gatewaySuppliers = (() => {
     return number;
   }
 
-    function create(host, app = {}) {
-      const foldKey = 'cockpit-proxy-fold';
-      const readFold = () => {
-        try { return JSON.parse(localStorage.getItem(foldKey) || '{}').suppliers === true; } catch { return false; }
-      };
-      const writeFold = folded => {
-        try {
-          const state = JSON.parse(localStorage.getItem(foldKey) || '{}');
-          state.suppliers = folded;
-          localStorage.setItem(foldKey, JSON.stringify(state));
-        } catch {}
-      };
-      let folded = readFold();
-      let providers = [], selected = localStorage.getItem('cockpit-gateway-supplier') || '', busy = false, providerSignature = '';
+  function create(host, app = {}) {
+    const foldKey = 'cockpit-proxy-fold';
+    const readFold = () => {
+      try { return JSON.parse(localStorage.getItem(foldKey) || '{}').suppliers === true; } catch { return false; }
+    };
+    const writeFold = folded => {
+      try {
+        const state = JSON.parse(localStorage.getItem(foldKey) || '{}');
+        state.suppliers = folded;
+        localStorage.setItem(foldKey, JSON.stringify(state));
+      } catch {}
+    };
+    let folded = readFold();
+    let providers = [], selected = localStorage.getItem('cockpit-gateway-supplier') || '', busy = false, providerSignature = '';
     let keyId = '', selectedModel = '', details = [], policies = {}, draft = {};
-    let providerEditor = null, capabilityGeneration = 0;
+    let providerEditor = null, capabilityGeneration = 0, providerGeneration = 0, loading = false, modalOpen = false;
+    let capabilitiesLoaded = false, capabilitiesLoading = false;
     const message = el('p', { class: 'gateway-suppliers-message', aria: { live: 'polite' } });
 
     const invoke = async (action, fields = {}) => {
-      const response = await window.invoke('action', { payload: { action, ...fields } });
+      const response = await window.__TAURI__.core.invoke('action', { payload: { action, ...fields } });
       if (!response?.ok) throw Error(response?.msg || '操作失败');
       return response;
     };
-    const client = async (operation, fields = {}) => window.invoke('client_gateway', {
+    const client = async (operation, fields = {}) => window.__TAURI__.core.invoke('client_gateway', {
       app: app.id, name: app.current_account || '', op: operation,
       keyId: fields.keyId || keyId, model: fields.model || selectedModel,
       policy: fields.policy, scope: fields.scope, settings: fields.settings,
     });
-    const distKeys = () => ((app.data || (globalThis.S?.data || {})).proxy?.dist || [])
+    const distKeys = () => ((typeof S !== 'undefined' && S.data || app.data || {}).proxy?.dist || [])
       .filter(key => key.enabled !== false);
+    const unpack = response => typeof response.msg === 'string' ? JSON.parse(response.msg) : (response.result || response);
+
+    function resetCapabilities() {
+      capabilityGeneration++;
+      details = []; policies = {}; selectedModel = ''; draft = {}; capabilitiesLoaded = false; capabilitiesLoading = false;
+      providerEditor?.clear(); providerEditor = null;
+    }
 
     function selector(label, choices, value, change) {
       const input = el('select', { class: 'px-select', aria: { label } });
@@ -101,9 +109,9 @@ const gatewaySuppliers = (() => {
 
     function detailPanel(providerRow) {
       const box = el('div', { class: 'gateway-supplier-detail' });
-      if (!providerRow.has_token)
-        box.append(el('p', { class: 'gateway-supplier-warning' }, '这个来源还没有读到令牌或登录态，启用后网关也不会列出模型。'));
-      box.append(message, el('p', { class: 'gateway-hint' }, '先选择接入密钥和模型，再设置这个供应商的能力、调度和计价。'));
+      if (!providerRow.has_token || providerRow.supported === false)
+        box.append(el('p', { class: 'gateway-supplier-warning' }, providerRow.availability_reason || '这个来源尚未就绪，请先完成登录或配置反代地址。'));
+      box.append(message, el('p', { class: 'gateway-hint' }, '以下为所选接入密钥可访问的模型。模型能力、调度和计价按模型来源共享，不是当前账号的独立设置。'));
       const keyChoices = distKeys().map(key => [key.id, key.name]);
       if (!keyChoices.length) {
         box.append(el('p', {}, '还没有接入密钥。先生成一把密钥，再回来设置供应商。'));
@@ -111,12 +119,11 @@ const gatewaySuppliers = (() => {
       }
       if (!keyChoices.some(([id]) => id === keyId)) keyId = keyChoices.length === 1 ? keyChoices[0][0] : '';
       box.append(selector('接入密钥', [['', '选择接入密钥'], ...keyChoices], keyId, id => {
-        keyId = id; details = []; policies = {}; selectedModel = ''; draft = {};
-        providerEditor?.clear(); providerEditor = null; loadCapabilities();
+        keyId = id; resetCapabilities(); loadCapabilities();
       }));
       if (!details.length) {
         box.append(el('p', { class: 'gateway-supplier-empty' },
-          keyId ? '正在读取模型目录…' : '选择接入密钥后读取这个供应商的模型。'));
+          keyId ? (capabilitiesLoaded ? '这把接入密钥当前没有可用模型。' : '正在读取模型目录…') : '选择接入密钥后读取模型。'));
         return box;
       }
       const modelSelector = selector('设置模型', [['', '选择模型'], ...details.map(item => [item.id, item.id])],
@@ -170,19 +177,32 @@ const gatewaySuppliers = (() => {
       return box;
     }
 
-    async function toggleProvider(row, input) {
-      if (busy) { input.checked = row.off === false; return; }
-      busy = true; paint();
+    async function refreshProviders() {
+      const generation = ++providerGeneration;
+      const raw = unpack(await invoke('proxy_providers'));
+      if (generation !== providerGeneration) return false;
+      providers = raw.providers || [];
+      if (typeof S !== 'undefined' && S.data?.proxy) S.data.proxy.providers = providers;
+      const signature = JSON.stringify(providers);
+      const changed = signature !== providerSignature;
+      providerSignature = signature;
+      if (selected && !providers.some(row => row.id === selected)) {
+        selected = ''; localStorage.removeItem('cockpit-gateway-supplier'); resetCapabilities();
+      }
+      return changed;
+    }
+
+    async function toggleProvider(row) {
+      if (busy) return;
+      busy = true; providerGeneration++; paint();
       try {
-        await invoke('proxy_source_toggle', { src: row.src });
-        await load(true);
+        await invoke('proxy_provider_set_enabled', { id: row.id, enabled: !!row.off });
+        await refreshProviders();
         message.textContent = row.off ? '已启用供应商。' : '已停用供应商。';
-        if (selected) paint();
       } catch (error) {
         message.textContent = String(error.message || error);
-        paint();
       } finally {
-        busy = false;
+        busy = false; paint();
       }
     }
 
@@ -190,21 +210,131 @@ const gatewaySuppliers = (() => {
       const head = el('div', { class: 'gateway-supplier-head' },
         el('button', { class: 'gateway-supplier-back', onclick: () => {
           selected = ''; localStorage.removeItem('cockpit-gateway-supplier');
-          providerEditor?.clear(); providerEditor = null; paint();
+          resetCapabilities(); paint();
         } }, '‹ 返回供应商'),
         el('b', {}, row.name || '供应商'),
         el('span', { class: 'chip' + (row.off ? ' expired' : ' swap') }, row.off ? '已停用' : '已启用'),
         el('span', { class: 'sp' }),
-        el('button', { class: 'btn sm', onclick: async event => {
-          const button = event.currentTarget;
-          if (busy) return;
-          const sw = el('input', { type: 'checkbox', class: 'gateway-switch', checked: !row.off });
-          button.disabled = true;
-          await toggleProvider(row, sw);
-          button.disabled = false;
-        } }, row.off ? '启用' : '停用'));
+        el('button', { class: 'btn sm', disabled: busy, onclick: () => toggleProvider(row) }, row.off ? '启用' : '停用'));
       return el('section', { class: 'panel gateway-supplier-page' + (folded ? ' px-folded' : ''), aria: { label: row.name || '供应商详情' } },
         head, detailPanel(row));
+    }
+
+    async function addSupplierModal() {
+      if (busy || modalOpen) return;
+      modalOpen = true;
+      const previousFocus = document.activeElement;
+      let saving = false, members = { instances: [], keys: [] }, suggestedName = '';
+      const status = el('p', { class: 'gateway-suppliers-message', aria: { live: 'polite' } }, '正在读取本机来源…');
+      const name = el('input', { id: 'supplier-name', class: 'px-input', type: 'text', maxLength: 120 });
+      const type = el('select', { id: 'supplier-type', class: 'px-select' },
+        el('option', { value: 'instance' }, 'Agent 账号 / 本地桥'), el('option', { value: 'key' }, 'API Key'));
+      const source = el('select', { id: 'supplier-source', class: 'px-select', disabled: true });
+      const labelFor = row => row.site_name
+        ? row.site_name + (row.label ? ' / ' + row.label : '')
+        : row.app_name + ' / ' + row.instance + (row.bridge ? '（本地桥）' : '');
+      const rows = () => type.value === 'key' ? members.keys || [] : members.instances || [];
+      const choose = () => {
+        const row = rows().find(row => row.src === source.value);
+        const next = row ? labelFor(row) : '';
+        if (!name.value.trim() || name.value === suggestedName) name.value = next;
+        suggestedName = next;
+        save.disabled = !row || saving;
+      };
+      const populate = () => {
+        source.replaceChildren(el('option', { value: '' }, '请选择来源'));
+        let count = 0;
+        for (const row of rows()) {
+          const existing = providers.find(provider => provider.src === row.src);
+          if (existing && !existing.off) continue;
+          const available = row.has_token !== false && row.supported !== false;
+          const reason = !available ? ' — ' + (row.availability_reason || '登录态或桥尚未就绪')
+            : existing ? ' — 已停用，添加后启用' : '';
+          source.append(el('option', { value: row.src, disabled: !available }, labelFor(row) + reason));
+          count++;
+        }
+        source.disabled = false;
+        status.textContent = count ? '已启用的来源不会重复列出。'
+          : '没有待添加的来源。可先在账号页或 API Key 页登记来源，或重新添加已删除的供应商。';
+        choose();
+      };
+      const close = () => {
+        if (saving) return;
+        overlay.remove(); modalOpen = false;
+        if (previousFocus?.isConnected) previousFocus.focus();
+        else host.querySelector('button')?.focus();
+      };
+      const cancel = el('button', { class: 'btn', type: 'button', onclick: close }, '取消');
+      const save = el('button', { class: 'btn primary', type: 'button', disabled: true, onclick: async () => {
+        if (saving || busy) return;
+        if (!name.value.trim()) { status.textContent = '请输入供应商名称。'; name.focus(); return; }
+        if (!source.value) { status.textContent = '请选择可用的来源。'; return; }
+        saving = true; busy = true; providerGeneration++;
+        save.disabled = true; cancel.disabled = true; source.disabled = true; type.disabled = true; name.disabled = true;
+        status.textContent = '正在添加…';
+        let saved = false;
+        try {
+          await invoke('proxy_provider_upsert', { item: { src: source.value, name: name.value.trim() } });
+          saved = true;
+          await refreshProviders();
+          message.textContent = '已添加供应商「' + name.value.trim() + '」。';
+        } catch (error) {
+          status.textContent = String(error.message || error);
+          if (saved) message.textContent = '已保存，但刷新列表失败：' + status.textContent;
+        } finally {
+          saving = false; busy = false;
+          save.disabled = false; cancel.disabled = false; source.disabled = false; type.disabled = false; name.disabled = false;
+          if (saved) { close(); paint(); } else choose();
+        }
+      } }, '添加');
+      const panel = el('div', { class: 'dialog gateway-supplier-dialog', role: 'dialog', aria: { modal: 'true', labelledby: 'supplier-title' }, tabIndex: -1 },
+        el('h3', { id: 'supplier-title' }, '添加供应商'),
+        el('div', { class: 'fields' },
+          el('label', { htmlFor: 'supplier-type' }, '来源类型'), type,
+          el('label', { htmlFor: 'supplier-source' }, '选择来源'), source,
+          el('label', { htmlFor: 'supplier-name' }, '供应商名称'), name),
+        el('p', { class: 'gateway-hint' }, '来源取自本机已登记的账号、API Key 和本地桥。添加后启用该来源，接入密钥仍按原有授权范围使用。'),
+        status, el('div', { class: 'gateway-supplier-actions' }, cancel, save));
+      const overlay = el('div', { class: 'modal', id: 'supplier-modal' }, panel);
+      overlay.onclick = event => { if (event.target === overlay) close(); };
+      overlay.onkeydown = event => {
+        if (event.key === 'Escape') { event.stopPropagation(); close(); }
+        if (event.key === 'Tab') {
+          const controls = [...panel.querySelectorAll('input,select,button')].filter(node => !node.disabled);
+          const first = controls[0], last = controls.at(-1);
+          if (!first) { event.preventDefault(); panel.focus(); }
+          else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+        }
+      };
+      type.onchange = populate;
+      source.onchange = choose;
+      document.body.append(overlay);
+      type.focus();
+      try {
+        members = unpack(await invoke('proxy_members')).members || { instances: [], keys: [] };
+        if (overlay.isConnected) populate();
+      } catch (error) {
+        status.textContent = '读取来源失败：' + String(error.message || error);
+      }
+    }
+
+    async function confirmDeleteSupplier(row) {
+      if (busy) return;
+      busy = true;
+      try {
+        if (!await askConfirm('删除供应商「' + row.name + '」后，该来源将退出反代，原账号和 API Key 保留。之后可通过「添加供应商」恢复。', {
+          title: '删除供应商', okText: '删除', danger: true,
+        })) return;
+        providerGeneration++; paint();
+        await invoke('proxy_provider_delete', { id: row.id });
+        await refreshProviders();
+        message.textContent = '已删除供应商「' + row.name + '」。';
+      } catch (error) {
+        message.textContent = String(error.message || error);
+      } finally {
+        busy = false; paint();
+      }
     }
 
     function listView() {
@@ -212,71 +342,73 @@ const gatewaySuppliers = (() => {
       section.append(el('div', { class: 'px-head gateway-supplier-head' },
         el('b', {}, '供应商'), el('span', { class: 'sp' }),
         el('button', { class: 'btn sm', onclick: () => { folded = !folded; writeFold(folded); paint(); } }, folded ? '展开' : '收起'),
-        el('button', { class: 'btn sm', onclick: () => load(true) }, '刷新')));
+        el('button', { class: 'btn sm', disabled: busy, onclick: () => load(true) }, '刷新'),
+        el('button', { class: 'btn primary sm', disabled: busy, onclick: addSupplierModal }, '添加供应商')), message);
       if (!providers.length) {
-        section.append(el('p', { class: 'gateway-supplier-empty' }, '没有可用的供应商。先在账号页或密钥页登记可用来源。'));
+        section.append(el('p', { class: 'gateway-supplier-empty' },
+          '暂无供应商。点击「添加供应商」，选择本机账号、API Key 或本地桥。'));
         return section;
       }
       for (const row of providers) {
         const sw = el('input', {
-          type: 'checkbox', class: 'gateway-switch', checked: !row.off,
-          'aria-label': (row.off ? '启用 ' : '停用 ') + (row.name || '供应商'),
+          type: 'checkbox', class: 'gateway-switch', checked: !row.off, disabled: busy,
+          aria: { label: (row.off ? '启用 ' : '停用 ') + (row.name || '供应商') },
+          onchange: () => toggleProvider(row),
         });
-        sw.onclick = event => event.stopPropagation();
-        sw.onchange = () => toggleProvider(row, sw);
-        section.append(el('div', { class: 'gateway-supplier-item' },
-          el('button', { class: 'gateway-supplier-row', onclick: () => {
-            selected = row.id; localStorage.setItem('cockpit-gateway-supplier', selected);
-            providerEditor?.clear(); providerEditor = null; paint();
-            if (keyId && !details.length) loadCapabilities();
-          } },
-            el('span', { class: 'gateway-supplier-label' },
-              el('b', {}, row.name || '供应商'),
-              el('small', {}, row.app_name || row.site_name || row.kind)),
-            sw, el('span', { class: 'gateway-supplier-caret' }, '›'))));
+        const unavailable = row.supported === false || !row.has_token;
+        const item = el('div', { class: 'gateway-supplier-item' });
+        item.append(el('button', { class: 'gateway-supplier-row', disabled: busy, onclick: () => {
+          selected = row.id; localStorage.setItem('cockpit-gateway-supplier', selected);
+          resetCapabilities(); paint();
+          if (keyId) loadCapabilities();
+        } },
+          el('span', { class: 'gateway-supplier-label' },
+            el('b', {}, row.name || '供应商'),
+            el('small', {}, row.app_name || row.site_name || row.kind),
+            unavailable ? el('small', { class: 'gateway-supplier-warning' }, row.availability_reason || '登录态或桥尚未就绪') : null),
+          el('span', { class: 'gateway-supplier-caret' }, '›')),
+          el('div', { class: 'gateway-supplier-ops' }, sw,
+            el('button', { class: 'btn danger sm', disabled: busy, title: '删除供应商，保留原账号和 API Key',
+              onclick: () => confirmDeleteSupplier(row) }, '删除')));
+        section.append(item);
       }
       return section;
     }
 
     async function loadCapabilities() {
       if (!keyId || !selected) { paint(); return; }
+      if (capabilitiesLoading) return;
+      capabilitiesLoading = true;
       const generation = ++capabilityGeneration;
       paint();
       try {
         const catalog = await client('models');
         if (generation !== capabilityGeneration) return;
+        capabilitiesLoaded = true;
         details = catalog.details || [];
         policies = catalog.policies || {};
         selectedModel = details.some(row => row.id === selectedModel) ? selectedModel : details[0]?.id || '';
         readPolicyDraft(details);
         message.textContent = '';
       } catch (error) {
-        if (generation === capabilityGeneration) message.textContent = String(error.message || error);
+        if (generation === capabilityGeneration) { capabilitiesLoaded = true; message.textContent = String(error.message || error); }
       } finally {
-        if (generation === capabilityGeneration) paint();
+        if (generation === capabilityGeneration) { capabilitiesLoading = false; paint(); }
       }
     }
 
     async function load(force = false) {
-      if (busy) return;
-      busy = true;
+      if (busy || loading) return;
+      loading = true;
       try {
-        const response = await invoke('proxy_providers');
-        const raw = typeof response.msg === 'string' ? JSON.parse(response.msg) : (response.result || response);
-        providers = raw.providers || [];
-        const signature = JSON.stringify(providers);
-        const changed = force || signature !== providerSignature;
-        providerSignature = signature;
-        if (!providers.some(row => row.id === selected)) {
-          selected = '';
-          localStorage.removeItem('cockpit-gateway-supplier');
-        }
-        if (changed) paint();
+        const changed = await refreshProviders();
+        if (changed || force) paint();
+        if (selected && keyId && !capabilitiesLoaded && !details.length) loadCapabilities();
       } catch (error) {
         message.textContent = String(error.message || error);
         paint();
       } finally {
-        busy = false;
+        loading = false;
       }
     }
 

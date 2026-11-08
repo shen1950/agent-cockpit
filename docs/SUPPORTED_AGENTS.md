@@ -29,6 +29,7 @@
 | Marvis | plain | 换号 | ✅ | — |
 | Xiaomi MiMo | Electron | 换号 | ✅ | — |
 | Coze | Electron | 换号 | 身份 | — |
+| 商汤小浣熊 | Electron | 换号 | ✅ | — |
 | CodeBuddy | Electron | 多开 | — | — |
 | CodeBuddy CN | Electron | 多开 | — | — |
 

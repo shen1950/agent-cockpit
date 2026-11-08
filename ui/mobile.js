@@ -358,7 +358,7 @@
       host.append(el('div', { class: 'row' },
         el('div', { class: 'grow' },
           el('div', { class: 't' }, txt(`${x.account ? who + ' · ' + x.account : who}`)),
-          el('div', { class: 'd' }, txt(x.at || ''))),
+          el('div', { class: 'd' }, txt(x.at_time ? `${x.at || ''} ${x.at_time}` : (x.at || '')))),
         pill(t.cls, t.word)));
     }
   }

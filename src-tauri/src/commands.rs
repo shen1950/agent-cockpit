@@ -398,7 +398,7 @@ pub fn service_action(handle: &tauri::AppHandle, payload: &Value) -> Result<Valu
     // 持锁跑就是"点了没反应、别的动作全被挡"——2026-10-20 实测复现过。
     if act.starts_with("chatgpt_") || act.starts_with("zcproxy_") || app_id == "zcode" || matches!(
         act.as_str(),
-        "key_test" | "key_probe_models" | "key_models"
+        "key_test" | "key_probe_models" | "key_models" | "key_chat"
             | "qproxy_probe" | "qproxy_oneclick"
             | "qproxy_cn_login" | "qproxy_cn_bridge"
             | "wproxy_probe" | "wproxy_oneclick"
@@ -409,6 +409,13 @@ pub fn service_action(handle: &tauri::AppHandle, payload: &Value) -> Result<Valu
             | "qwbridge_start" | "qwbridge_stop" | "qwbridge_test" | "qwbridge_oneclick"
             // 妙手的 test 要等整个云端回合跑完（最坏几十秒）、oneclick 要起反代
             | "pawbridge_test" | "pawbridge_probe" | "pawbridge_oneclick"
+            // 签到这三条要等上游回话（本机网络被 TLS 停等拖的时候一次十几秒）：
+            // 只改 checkin.json，自己已经用 LEDGER_WRITE / CLAIM_WRITE 串行，
+            // 不该再把整台驾驶舱压在 CMD_LOCK 后面
+            | "checkin_claim" | "checkin_refresh_one"
+            // 导出只写一个 CSV 文件（自带路径，不碰共享状态）；开文件夹就起个 explorer。
+            // 都不压锁，界面上点了立刻要有反应
+            | "checkin_export" | "reveal_dir"
     ) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_action(&act, &app_id, &name, &payload, &state_ref)
@@ -704,6 +711,27 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             let data_dir = Path::new(meta["data_dir"].as_str().unwrap_or(""));
             let _ = std::fs::create_dir_all(data_dir);
 
+            // Antigravity 共用一份档案、换号靠写 Windows 登录凭据，既没有 swap 目录也没有
+            // swap 记录。卡片判定「本机登录中」时前端只给「打开窗口」，这里若还按 swap 记录
+            // 判多开，就变成"明明登着这个号却连窗口都打不开"（2026-11-04 实测）。改按真实登录判。
+            if app_id == crate::antigravity::APP {
+                // 直接读凭据，不走 machine::current 的缓存——缓存里可能还留着旧的空账号。
+                let m = crate::antigravity::machine_state();
+                let uid = m["user_id"].as_str().unwrap_or("").trim().to_string();
+                let own = meta["quota_user_id"].as_str().unwrap_or("").trim().to_string();
+                if uid.is_empty() || own.is_empty() || !uid.eq_ignore_ascii_case(&own) {
+                    return err(format!(
+                        "现在登录的是 {}，不是「{}」。先在登录管理里切到该账号，再打开窗口。",
+                        if uid.is_empty() { "其它账号" } else { uid.as_str() },
+                        name
+                    ));
+                }
+                return match crate::antigravity::launch_app() {
+                    Ok(_) => ok(format!("已打开 {}", app.name)),
+                    Err(e) => err(format!("启动失败：{}", e)),
+                };
+            }
+
             // 已知不能多开、而且现在挂着的不是这个账号：点「启动」没有任何意义——
             // 独立数据目录不生效（Qoder 0.4.x 直接忽略 --user-data-dir），
             // 结果只会是等 8 秒再报"转交给了已开窗口"。当场说清该走换号。
@@ -979,6 +1007,52 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             if o { ok(m) } else { err(m) }
         }
 
+        // 积分包编辑：改名 / 补截止日 / 备注（写 ~/.agent-cockpit/expiry.json）。
+        // 只在本机生效，厂商读数一个字节不动；读得到真日期的地方也不覆盖（见 expiry.rs）。
+        "quota_pack_save" => {
+            if meta.is_none() {
+                return err("先选中账号，再改它的积分包");
+            }
+            let key = payload["key"].as_str().unwrap_or("");
+            let label = payload["label"].as_str().unwrap_or("");
+            let date = payload["date"].as_str().unwrap_or("");
+            let note = payload["note"].as_str().unwrap_or("");
+            match crate::expiry::upsert(app_id, name, key, label, date, note) {
+                Ok(()) => ok(if label.trim().is_empty() && date.trim().is_empty() && note.trim().is_empty() {
+                    "已恢复成厂商原样".to_string()
+                } else {
+                    format!("已保存「{}」的修改（只在本机生效）", if label.trim().is_empty() { key.trim() } else { label.trim() })
+                }),
+                Err(e) => err(e),
+            }
+        }
+
+        // 手工加一个包 / 改一个包 / 删一个包。id 为空＝新增。
+        "quota_pack_custom" => {
+            if meta.is_none() {
+                return err("先选中账号，再加积分包");
+            }
+            let del = payload["delete"].as_bool().unwrap_or(false);
+            match crate::expiry::custom(
+                app_id,
+                name,
+                payload["id"].as_str().unwrap_or(""),
+                payload["label"].as_str().unwrap_or(""),
+                payload["total"].as_str().unwrap_or(""),
+                payload["left"].as_str().unwrap_or(""),
+                payload["date"].as_str().unwrap_or(""),
+                payload["note"].as_str().unwrap_or(""),
+                del,
+            ) {
+                Ok(id) => ok(if del {
+                    format!("已删掉这个自己加的包（{id}）")
+                } else {
+                    format!("已保存「{}」", payload["label"].as_str().unwrap_or("").trim())
+                }),
+                Err(e) => err(e),
+            }
+        }
+
         // 本机这份档案换登成另一个号了：把这张卡改绑到当前登录的号，而不是再建一张重复卡。
         // 账号名与 userId 一律以后端现读的为准，界面只负责说"我要改绑"。
         "rebind_instance" => {
@@ -1208,8 +1282,9 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             // Qoder 系例外：登录态存在 %APPDATA%\QoderCN，实例目录空着时按目录读只会报"没登录过"，
             // 这时回落读本机当前登录，由下面的 userId 校验决定能不能写进这张卡。
             let data_dir = meta["data_dir"].as_str().unwrap_or("").to_string();
-            let from_default = crate::local_quota::falls_back_to_default(store, &data_dir);
-            let q = match crate::local_quota::fetch_for_account(store, &data_dir) {
+            let from_default = !matches!(store, "workbuddy" | "workbuddy-intl")
+                && crate::local_quota::falls_back_to_default(store, &data_dir);
+            let q = match crate::local_quota::fetch_for_instance(store, app_id, &meta) {
                 Ok(q) => q,
                 Err(e) => return err(e),
             };
@@ -1300,8 +1375,10 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             let mut rename_note = String::new();
             // 名字已经等于读到的账号时压根不该走这一步——否则 rename_instance 原地改名会成功，
             // 于是弹一条「账号名已从「demo_account_intl」改成「demo_account_intl」」的废话（她 10-14 抓到）
-            if acct != name && usable && !taken && (placeholder || bound_here) {
-                let (o, m) = space::rename_instance(app_id, name, &acct);
+            let follows_vendor = meta["name_customized"].as_bool() != Some(true)
+                && (placeholder || bound_here || meta["auto_account_name"].as_str() == Some(name));
+            if acct != name && usable && !taken && follows_vendor {
+                let (o, m) = space::rename_instance_auto(app_id, name, &acct);
                 if o {
                     renamed = acct.clone();
                 } else {
@@ -1555,6 +1632,20 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             }
             match crate::authpack::restore(app_id, name) {
                 Ok(r) => {
+                    // 写完必须核对**真正登进去的是谁**：写进文件的如果本身就是别人的包，
+                    // 客户端重启后还是原来那个号，界面上却报"已切换"——这正是"切了没反应"的成因。
+                    let wrote_uid = r["user_id"].as_str().unwrap_or("").trim().to_string();
+                    let wrote_acct = r["account"].as_str().unwrap_or("").trim().to_string();
+                    if let Some((live_acct, live_uid)) = crate::authpack::live_identity(app_id) {
+                        if !wrote_uid.is_empty() && !live_uid.is_empty() && wrote_uid != live_uid {
+                            return err(format!(
+                                "登录态写进去了，但核对发现档案里登的是「{live_acct}」，不是「{name}」。\n\
+                                 说明「{name}」这张卡存的包其实属于「{wrote_acct}」（早先一次误收包把它顶掉了）。\n\
+                                 去客户端里退出登录、登「{name}」一次，驾驶舱会重新收下它自己的登录态；\
+                                 之后来回切就正常了。"
+                            ));
+                        }
+                    }
                     let exe = match reg::resolve_exe(&app) {
                         Some(e) => e,
                         None => {
@@ -1587,6 +1678,19 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                      客户端已经被结束了（当前号的登录态已经收进保管箱，没丢），\
                      直接重新打开它还是原来那个号。"
                 )),
+            }
+        }
+
+        // 从"换号前自动留的备份"里找回某个号的登录态。
+        // 共用一份档案的产品上，一次误收包会把 A 的登录态顶成 B 的，A 那张卡从此
+        // "存的其实是别人"，点切换写回去还是 B。备份里 A 的真身还在，解出来就认得出。
+        "auth_recover" => {
+            if meta.is_none() {
+                return err("实例不存在");
+            }
+            match crate::authpack::recover_from_backups(app_id, name) {
+                Ok(v) => json!({ "ok": true, "msg": v["msg"], "account": v["account"], "from": v["from"] }),
+                Err(e) => err(e),
             }
         }
 
@@ -1708,6 +1812,44 @@ fn ids_of(payload: &Value) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 从 action 的返回里取「这次测试到底成没成」。
+/// 外层 ok 不可信：qwbridge_test / pawbridge_test 历史上把外层 ok 硬编码成 true，
+/// 真结果在 result.ok 里。result 没有 ok 字段时才退回外层。
+fn probe_ok(out: &Value) -> bool {
+    out["result"]["ok"]
+        .as_bool()
+        .or_else(|| out["ok"].as_bool())
+        .unwrap_or(false)
+}
+
+/// 手动「测试」的统计键，必须与 proxy_models_list 的模型 id 完全同构：`{owner}/{bare_model}`。
+/// UI 传的已经是裸名（pxTestModelCard 会剔掉 Agent 前缀），这里再兜一层：
+/// 万一调用方把带前缀的 id 原样传进来，不会拼成 `owner/owner/model`。
+fn probe_stat_key(owner: &str, model: &str) -> Option<String> {
+    let owner = owner.trim();
+    let asked = model.trim();
+    if owner.is_empty() || asked.is_empty() {
+        return None;
+    }
+    let bare = asked
+        .strip_prefix(owner)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(asked)
+        .trim();
+    if bare.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{bare}"))
+}
+
+/// 手动测试计入逐模型实测（与 8788 反代请求同一份 proxymodel.json、同一把锁）。
+/// 成功失败都记：失败不记的话「成功率」永远 100%，统计就没意义了。
+fn record_probe(out: &Value, owner: &str, model: &str) {
+    if let Some(key) = probe_stat_key(owner, model) {
+        crate::proxy::record_model_probe(&key, probe_ok(out));
+    }
 }
 
 fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
@@ -1889,7 +2031,10 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         // ===== 每日签到 =====
         // view 用缓存（界面 4 秒一轮不能每次都打六家接口），refresh 才真去查
         "checkin_view" => crate::checkin::view(),
-        "checkin_refresh" => crate::checkin::refresh(),
+        // 点「刷新状态」不再同步等一整轮：立刻回快照 + 后台去问（见 checkin::refresh_async）。
+        // 同步那版一轮 4~51 秒，全程压着全局锁，点完之后所有动作排队——
+        // 2026-11-05 她说的"每次等好几分钟才响应"就是这条。
+        "checkin_refresh" => crate::checkin::refresh_async(),
         // 只重查一家（或一个账号）：她把这一行的 ↻ 点一下，不要为了一行去问六家
         "checkin_refresh_one" => {
             let store = payload["store"].as_str().unwrap_or("");
@@ -1958,6 +2103,34 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
                 Some((app, acct))
             };
             crate::checkin::claim(store, pair)
+        }
+        // 补记外部签到：她在官方客户端里自己签的，日志里标注"非驾驶舱领取"，
+        // 并把当天记成完成，防止自动领再发一次
+        "checkin_external" => {
+            let store = payload["store"].as_str().unwrap_or("");
+            let acct = payload["account"].as_str().unwrap_or("");
+            crate::checkin::record_external(store, acct)
+        }
+        // 导出领取日志：后端把 CSV 写进「下载」文件夹并回报完整路径。
+        // 以前走 WebView2 匿名下载，文件不知道落哪儿（2026-11-08 她报的）
+        "checkin_export" => crate::checkin::export_csv(payload["csv"].as_str().unwrap_or("")),
+        // 打开一个文件夹（导出完成后「打开所在文件夹」用）。只开目录，不开文件
+        "reveal_dir" => {
+            let d = payload["dir"].as_str().unwrap_or("");
+            if d.is_empty() || !std::path::Path::new(d).is_dir() {
+                return Some(err("文件夹不存在，可能被挪走了"));
+            }
+            let mut command = std::process::Command::new("explorer");
+            command.arg(d);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            match command.spawn() {
+                Ok(_) => ok("已打开所在文件夹"),
+                Err(e) => err(format!("打开失败：{}", e)),
+            }
         }
         "checkin_auto" => {
             // 只提交改到的那几个键。整份 settings 当补丁传回去，会顺带把
@@ -2060,7 +2233,29 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         "proxy_stop" => {
             let (o, m) = st.proxy.stop();
             if o {
-                ok(m)
+                // 反代一停，客户端里指向本机网关的模型条目就没有上游了。
+                // 清理要起内置 Python 读 SQLite，不能压在这条命令上同步等：
+                // 第一次跑还要解压运行环境，界面会像卡死。丢给后台，结果记日志。
+                let port = st.proxy.port();
+                std::thread::spawn(move || {
+                    let cleaned = crate::gateway_cleanup::sweep(port, None);
+                    let removed = cleaned["removed"].as_u64().unwrap_or(0);
+                    let notes: Vec<String> = cleaned["notes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect();
+                    crate::lifecycle::note(&format!(
+                        "反代已停止：清理 {removed} 条网关模型{}",
+                        if notes.is_empty() {
+                            String::new()
+                        } else {
+                            format!("；{}", notes.join("；"))
+                        }
+                    ));
+                });
+                ok(format!("{m}，正在清理客户端里的网关模型"))
             } else {
                 err(m)
             }
@@ -2098,6 +2293,51 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             if o { ok(m) } else { err(m) }
         }
 
+        // ── 反代：来源级开关（停用后所有上游组与模型目录立即排除它） ──
+        "proxy_source_toggle" => {
+            let (o, m) = crate::gateway::toggle_source(payload["src"].as_str().unwrap_or(""));
+            if o { ok(m) } else { err(m) }
+        }
+
+        "proxy_provider_toggle" => {
+            let id = payload["id"].as_str().unwrap_or("");
+            // app_free 返回 Option：这里不能用 `?`（那是给 Result 用的），
+            // 找不到就把原因原样回给界面，而不是悄悄落成"未选择 Agent"
+            let row = match crate::gateway::provider_by_id(id) {
+                Some(r) => r,
+                None => return Some(err("没找到这个供应商")),
+            };
+            let (o, m) = crate::gateway::toggle_source(row["src"].as_str().unwrap_or(""));
+            if o { ok(m) } else { err(m) }
+        }
+
+        "proxy_provider_upsert" => {
+            let (o, m) = crate::gateway::upsert_provider(&payload["item"]);
+            if o { ok(m) } else { err(m) }
+        }
+
+        "proxy_provider_delete" => {
+            let (o, m) = crate::gateway::remove_provider(payload["id"].as_str().unwrap_or(""));
+            if o { ok(m) } else { err(m) }
+        }
+
+        "proxy_provider_set_enabled" => {
+            let enabled = match payload["enabled"].as_bool() {
+                Some(value) => value,
+                None => return Some(err("请指定供应商启用状态")),
+            };
+            let (o, m) = crate::gateway::set_provider_enabled(payload["id"].as_str().unwrap_or(""), enabled);
+            if o { ok(m) } else { err(m) }
+        }
+
+        "proxy_provider_save" => {
+            let row = match crate::gateway::ensure_provider_pool(payload["id"].as_str().unwrap_or("")) {
+                Ok(r) => r,
+                Err(e) => return Some(err(e)),
+            };
+            ok(format!("已保存「{}」", row["name"].as_str().unwrap_or("供应商")))
+        }
+
         // 点了「显示」才把明文取出来；列表里永远是打码的
         "proxy_dist_reveal" => {
             match crate::gateway::reveal_dist(payload["id"].as_str().unwrap_or("")) {
@@ -2108,6 +2348,8 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
 
         // 可勾选的成员清单：按 Agent 分组列账号 + API 台账里的 Key
         "proxy_members" => ok(json!({ "members": crate::gateway::member_options() }).to_string()),
+
+        "proxy_providers" => ok(json!({ "providers": crate::gateway::provider_options() }).to_string()),
 
         // 「可用模型」面板：把所有上游组当前真能调的模型按厂商分组列出
         "proxy_models_list" => ok(crate::proxy::models_payload().to_string()),
@@ -2126,14 +2368,17 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             })
         }
         "opencode_test" => {
-            let r = crate::opencode::test(payload["model"].as_str().unwrap_or(""));
-            json!({
+            let model = payload["model"].as_str().unwrap_or("");
+            let r = crate::opencode::test(model);
+            let out = json!({
                 "ok": r["ok"].as_bool().unwrap_or(false),
                 "msg": r["error"].as_str()
                     .or_else(|| r["content"].as_str())
                     .unwrap_or("测完了"),
                 "result": r,
-            })
+            });
+            record_probe(&out, "opencode", model);
+            out
         }
 
         // ── Qoder / Qoder CN 模型反代（见 qproxy.rs） ──
@@ -2141,6 +2386,8 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
 
         // 探一个账号：默认连推理一起试（花几个 token），infer=false 只验令牌；deep=false 走快档
         "qproxy_probe" => {
+            let owner = payload["app"].as_str().unwrap_or("");
+            let model = payload["model"].as_str().unwrap_or("auto");
             let r = crate::qproxy::probe(
                 payload["app"].as_str().unwrap_or(""),
                 payload["name"].as_str().unwrap_or(""),
@@ -2148,11 +2395,13 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
                 payload["deep"].as_bool().unwrap_or(true),
                 payload["model"].as_str().unwrap_or("auto"),
             );
-            json!({
+            let out = json!({
                 "ok": r["ok"].as_bool().unwrap_or(false),
                 "msg": r["text"].as_str().unwrap_or("探完了"),
                 "result": r,
-            })
+            });
+            record_probe(&out, owner, model);
+            out
         }
 
         // 一键：探测 → 建/复用池 → 生成/复用接入密钥 → 起反代
@@ -2232,18 +2481,22 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
 
         // 用指定模型发一次极小补全：验证账号、模型名和整条上游链路
         "wproxy_test" => {
+            let owner = payload["app"].as_str().unwrap_or("");
+            let model = payload["model"].as_str().unwrap_or("");
             let r = crate::wbproxy::test(
                 payload["app"].as_str().unwrap_or(""),
                 payload["name"].as_str().unwrap_or(""),
                 payload["model"].as_str().unwrap_or(""),
             );
-            json!({
+            let out = json!({
                 "ok": r["ok"].as_bool().unwrap_or(false),
                 "msg": r["error"].as_str()
                     .or_else(|| r["content"].as_str())
                     .unwrap_or("测完了"),
                 "result": r,
-            })
+            });
+            record_probe(&out, owner, model);
+            out
         }
 
         // 一键：探活 → 建/复用池 → 生成/复用接入密钥 → 起反代
@@ -2287,18 +2540,23 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
 
         // 单发探针：花几个积分，验证「翻译 + 出口 IP + 真模型」整条链
         "trae_probe" => {
+            let model = payload["model"].as_str().unwrap_or("glm-5.3-flash");
             let r = crate::traeproxy::probe(
                 payload["app"].as_str().unwrap_or("traework-cn"),
                 payload["name"].as_str().unwrap_or(""),
-                payload["model"].as_str().unwrap_or("glm-5.3-flash"),
+                model,
             );
-            json!({
+            let out = json!({
                 "ok": r["ok"].as_bool().unwrap_or(false),
                 "msg": r["error"].as_str()
                     .or_else(|| r["message"].as_str())
                     .unwrap_or("探完了"),
                 "result": r,
-            })
+            });
+            // 统计键的 owner 固定是 trae（models_payload 里 Trae 模型一律 owned_by=trae），
+            // 不是 payload 里那个 traework-cn 账号 app id。
+            record_probe(&out, "trae", model);
+            out
         }
 
         // 一键：刷新 → 探一发 → 建/复用池 → 生成/复用 Key → 起反代
@@ -2352,14 +2610,15 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
 
         // 用指定模型发一次极小补全：验证「令牌 + 网关 + 模型名」整条链
         "astudio_test" => {
-            let r = crate::asproxy::test(
-                payload["model"].as_str().unwrap_or("spark-x2.6-4b"),
-            );
-            json!({
+            let model = payload["model"].as_str().unwrap_or("spark-x2.6-4b");
+            let r = crate::asproxy::test(model);
+            let out = json!({
                 "ok": r["ok"].as_bool().unwrap_or(false),
                 "msg": r["error"].as_str().unwrap_or("测完了"),
                 "result": r,
-            })
+            });
+            record_probe(&out, "astudio", model);
+            out
         }
 
         // 清令牌缓存 + 拉一次账号级实时模型清单（Cookie 打 /bot/models/configs）
@@ -2400,8 +2659,11 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             Ok(result) => json!({"ok":true,"msg":result["msg"],"result":result}), Err(message) => err(message),
         },
         "zcproxy_test" => {
+            let model = payload["model"].as_str().unwrap_or("");
             let result = crate::zcproxy::test(payload["name"].as_str().unwrap_or(""), payload["model"].as_str().unwrap_or(""));
-            json!({"ok":result["ok"],"result":result})
+            let out = json!({"ok":result["ok"],"result":result});
+            record_probe(&out, "zcode", model);
+            out
         },
 
         // ── MiniMax Code（见 mmproxy.rs）──
@@ -2420,12 +2682,15 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
 
         // 用指定模型发一次极小补全（约 10 token）
         "minimax_test" => {
-            let r = crate::mmproxy::test(payload["model"].as_str().unwrap_or("MiniMax-M3.1-Flash"));
-            json!({
+            let model = payload["model"].as_str().unwrap_or("MiniMax-M3.1-Flash");
+            let r = crate::mmproxy::test(model);
+            let out = json!({
                 "ok": r["ok"].as_bool().unwrap_or(false),
                 "msg": r["error"].as_str().unwrap_or("测完了"),
                 "result": r,
-            })
+            });
+            record_probe(&out, "minimax", model);
+            out
         }
 
         // 刷新 OAuth 令牌（轮换制，只有真过期才换；成功立刻写回 auth.json）
@@ -2473,7 +2738,10 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         }
         "qwbridge_test" => {
             let model = payload["model"].as_str().unwrap_or("flash");
-            json!({ "ok": true, "result": crate::qwbridge::test(model) })
+            let out = json!({ "ok": true, "result": crate::qwbridge::test(model) });
+            // 外层 ok 恒 true，真正的成败在 result.ok（见 probe_ok）
+            record_probe(&out, "qwenwork", model);
+            out
         }
 
         // ── 妙手（进程内云端直连，见 pawbridge.rs；旧命名管道桥已废弃）──
@@ -2491,7 +2759,10 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         }
         "pawbridge_test" => {
             let model = payload["model"].as_str().unwrap_or("LongCat-2.0");
-            json!({ "ok": true, "result": crate::pawbridge::test(model) })
+            let out = json!({ "ok": true, "result": crate::pawbridge::test(model) });
+            // 外层 ok 恒 true，真正的成败在 result.ok（见 probe_ok）
+            record_probe(&out, "catpaw", model);
+            out
         }
 
         "key_upsert" => {
@@ -2670,6 +2941,40 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
                     keys::upsert_key(site, &item);
                 }
             }
+            if good { ok(msg) } else { err(msg) }
+        }
+
+        "key_chat" => {
+            // 「请求」：真发一条最小对话。测试只证明模型清单打得通，有的站点这个接口
+            // 根本不验 key（小红书 Dots 实测假 key 也返回 200），真调用才见分晓。
+            let site = payload["site"].as_str().unwrap_or("");
+            let id = payload["id"].as_str().unwrap_or("");
+            // ① 锁内快照：base / key / 模型名一次拿齐就撤，20 秒的等待不压全局锁
+            let (base, key, model) = {
+                let _g = cmd_guard();
+                match find_pair(site, id) {
+                    Some((sobj, item)) => (
+                        keys::base_for(&sobj, &item),
+                        item["key"].as_str().unwrap_or("").to_string(),
+                        keys::models_for(&sobj, &item)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default(),
+                    ),
+                    None => return Some(err("记录不存在")),
+                }
+            };
+            if base.is_empty() {
+                return Some(err("这个站点还没有接入点——点「改站点」把 Base URL 填上"));
+            }
+            // 模型名优先用站点清单里的第一个：空着随便猜一个名字，上游多半回 400，
+            // 那不叫「key 不能用」，叫「我们没告诉它调哪个模型」
+            let model = if model.is_empty() {
+                "gpt-4o-mini".to_string()
+            } else {
+                model
+            };
+            let (good, msg) = keys::chat_probe(&base, &key, &model);
             if good { ok(msg) } else { err(msg) }
         }
 
@@ -3360,7 +3665,8 @@ mod tests {
         for act in [
             "storage_report", "vault_state", "storage_rollback", "ai_list_models",
             "key_upsert", "key_delete", "key_test", "key_models", "key_fetch_quota",
-            "key_probe_models", "key_dedup_scan", "perk_save", "proxy_members",
+            "key_probe_models", "key_dedup_scan", "perk_save", "proxy_members", "proxy_providers",
+            "proxy_provider_upsert", "proxy_provider_delete", "proxy_provider_set_enabled",
             "proxy_models_list",
             "delete_backup", "kill_pids",
             // 快捷方式三连：空入参下 create/remove 都在起 PowerShell 之前就报错回绝，
@@ -3397,5 +3703,47 @@ mod tests {
         let any = Some(PathBuf::from("C:\\Users\\x\\.qoder-cn"));
         assert!(!adopt_needs_confirm("copy", any.as_ref(), None));
         assert!(!adopt_needs_confirm("fresh", None, None));
+    }
+
+    /// 手动「测试」的成败判定：qwbridge_test / pawbridge_test 外层 ok 是硬编码 true，
+    /// 真结果在 result.ok。这里验的正是「别把桥没起来记成成功」。
+    #[test]
+    fn probe_ok_prefers_provider_result_over_hardcoded_outer_ok() {
+        // 桥没起来：外层 true、result.ok false —— 必须判失败，否则成功率永远 100%
+        assert!(!probe_ok(&json!({"ok": true, "result": {"ok": false, "error": "桥没在跑"}})));
+        assert!(probe_ok(&json!({"ok": true, "result": {"ok": true, "text": "可用"}})));
+        // 老形状：没有 result.ok 时退回外层
+        assert!(probe_ok(&json!({"ok": true})));
+        assert!(!probe_ok(&json!({"ok": false})));
+        // 什么都没有 = 失败（宁可少记一次成功，不虚报成功率）
+        assert!(!probe_ok(&json!({})));
+    }
+
+    /// 统计键必须和 proxy_models_list 的模型 id 一模一样：`{owner}/{bare_model}`。
+    /// 拼错一个前缀，界面就还是会显示「暂无实测」。
+    #[test]
+    fn probe_stat_key_is_owner_slash_bare_model() {
+        assert_eq!(
+            probe_stat_key("qoder-cn", "qmodel_38max").as_deref(),
+            Some("qoder-cn/qmodel_38max")
+        );
+        assert_eq!(
+            probe_stat_key("trae", "glm-5.3-flash").as_deref(),
+            Some("trae/glm-5.3-flash")
+        );
+        // 带前缀传进来也不会拼成 owner/owner/model
+        assert_eq!(
+            probe_stat_key("qoder-cn", "qoder-cn/qmodel_38max").as_deref(),
+            Some("qoder-cn/qmodel_38max")
+        );
+        // owner 取 payload.app（qoder / qoder-cn / workbuddy / workbuddy-intl 都在这里）
+        assert_eq!(
+            probe_stat_key("workbuddy-intl", "claude-sonnet-4").as_deref(),
+            Some("workbuddy-intl/claude-sonnet-4")
+        );
+        // 空 owner / 空 model 不记：别往统计里塞 "/" 这种垃圾键
+        assert_eq!(probe_stat_key("", "model"), None);
+        assert_eq!(probe_stat_key("qoder", "   "), None);
+        assert_eq!(probe_stat_key("qoder", "qoder/"), None);
     }
 }

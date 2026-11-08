@@ -1,13 +1,12 @@
 //! AStudio（科大讯飞 星辰/星火）模型反代。
 //!
 //! AStudio 是讯飞把 Codex 内核改造的 Electron IDE：模型上游不是私有协议，
-//! 就是 OpenAI 兼容网关 `…/model-gateway/v1`，同时支持 `/chat/completions`
-//! 与 `/responses`。鉴权只要一行 `Authorization: Bearer <modelBearerToken>`，
+//! 使用 OpenAI Responses 网关 `…/model-gateway/v1/responses`。
+//! 鉴权只要一行 `Authorization: Bearer <modelBearerToken>`，
 //! 令牌明文躺在产品自己的 `astron-session.json` 里（不是同文件的 `token`——
 //! 那是 Astron SSO 会话令牌，拿去当 Bearer 会 401）。
 //!
-//! 2026-10-23 本机实测（免费模型 `spark-x2.6-4b`）：
-//!   `/chat/completions` 200、流式 200、工具调用正常、只带 Bearer 也 200。
+//! spark-x2.6-4b 的 Responses 支持流式输出和工具回传。
 //! 令牌拿不到时用 Cookie 打 `/xingchen-studio/bot/models/configs` 换 `api_key`。
 //!
 //! 注意方向：往 AStudio 里写自定义模型（provider 配置）有签名校验，那条路做不了；
@@ -181,69 +180,70 @@ pub fn invalidate() {
 
 // ───────────────────────── 模型清单 ─────────────────────────
 
-/// 静态清单：账号配置接口返回的 9 条 + 限免的 `spark-x2.6-4b`。
-/// 面板与「可用模型」用它，不依赖网络；点「刷新」才走 `models_live()`。
-pub fn models_static() -> Vec<Value> {
-    vec![
-        json!({ "id": "astronclaw-auto", "name": "Auto", "free": true, "multiplier": "x1.0" }),
-        json!({ "id": "xsparkx2agent", "name": "Spark-X2-Agent", "multiplier": "x2.0" }),
-        json!({ "id": "spark-x", "name": "Spark-X2-Flash", "multiplier": "x0.5" }),
-        json!({ "id": "xopglm52", "name": "GLM-5.2", "multiplier": "x2.0" }),
-        json!({ "id": "xopglm51", "name": "GLM-5.1", "multiplier": "x2.0" }),
-        json!({ "id": "xminimaxm25", "name": "MiniMax-M2.5", "multiplier": "x1.0" }),
-        json!({ "id": "xopkimik26", "name": "Kimi-K2.6", "multiplier": "x2.0" }),
-        json!({ "id": "xopqwen36v35b", "name": "Qwen3.6-35B-A3B", "multiplier": "x1.0" }),
-        json!({ "id": "xopdeepseekv4pro", "name": "DeepSeek-V4-Pro", "multiplier": "x2.0" }),
-        json!({ "id": "spark-x2.6-4b", "name": "Spark-X2.6-Lite", "free": true }),
-    ]
+/// AStudio writes this catalog after fetching descriptors for the active account.
+/// Match its account fingerprint before advertising any of the cached slugs.
+pub fn account_models() -> Vec<Value> {
+    let Some(dir) = crate::registry::profile_dir("astudio") else { return Vec::new() };
+    let Some(catalog) = std::fs::read(dir.join("provider-model-catalog-v1.json"))
+        .ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else { return Vec::new() };
+    let session = read_session();
+    let Some(account) = session["accountId"].as_str().filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    catalog_rows(&catalog, account)
 }
 
-/// 账号级实时清单（带 Cookie 拉 `/bot/models/configs`）。失败回落静态清单。
+fn catalog_rows(catalog: &Value, account: &str) -> Vec<Value> {
+    let matches_account = ["AStudio", "AstronStudio"].iter().any(|namespace| {
+        let scope = format!("{namespace}:provider-model-catalog:v1:account\0{account}");
+        let hash = crate::wbproxy::hex(&crate::wbproxy::sha256(scope.as_bytes()));
+        catalog["accountScopeHash"].as_str() == Some(hash.as_str())
+    });
+    if catalog["schemaVersion"] != 1 || !matches_account {
+        return Vec::new();
+    }
+    catalog["models"].as_array().into_iter().flatten().filter_map(|m| {
+        let id = m["slug"].as_str()?.trim();
+        if id.is_empty() { return None; }
+        let levels: Vec<Value> = m["supportedReasoningEfforts"].as_array().into_iter()
+            .flatten().filter_map(|level| {
+                let effort = level["value"].as_str()?;
+                Some(json!({"effort": wire_effort(effort), "description": level["description"]}))
+            }).collect();
+        Some(json!({ "id": id, "name": m["name"].as_str().unwrap_or(id),
+                     "free": id == "spark-x2.6-4b",
+                     "supported_reasoning_levels": levels,
+                     "default_reasoning_level": wire_effort(m["defaultReasoningEffort"].as_str().unwrap_or("high")) }))
+    }).collect()
+}
+
+// AStudio's UI uses max, while the Responses gateway accepts xhigh.
+// Older generated Codex catalogs advertised medium/minimal, which the gateway rejects.
+fn wire_effort(effort: &str) -> &str {
+    match effort {
+        "max" => "xhigh",
+        "medium" => "high",
+        "minimal" => "none",
+        other => other,
+    }
+}
+
+pub fn prepare_responses(body: &[u8]) -> Vec<u8> {
+    let Ok(mut request) = serde_json::from_slice::<Value>(body) else { return body.to_vec() };
+    if let Some(effort) = request["reasoning"]["effort"].as_str() {
+        let normalized = wire_effort(effort).to_owned();
+        request["reasoning"]["effort"] = json!(normalized);
+    }
+    serde_json::to_vec(&request).expect("JSON request serializes")
+}
+
 pub fn models_live() -> Value {
-    let session = read_session();
-    let cookie = session_cookie(&session);
-    if cookie.is_empty() {
-        return json!({ "ok": false, "models": models_static(), "error": "会话里没有账号 Cookie" });
+    let models = account_models();
+    if models.is_empty() {
+        return json!({"ok": false, "models": [], "error": "请先在 AStudio 用当前账号打开模型选择器，以更新模型目录"});
     }
-    let res = ureq::get(MODELS_URL)
-        .set("Accept", "application/json")
-        .set("Cookie", &cookie)
-        .set("User-Agent", "Mozilla/5.0")
-        .timeout(Duration::from_secs(15))
-        .call();
-    match res {
-        Ok(resp) => {
-            let v: Value = resp.into_json().unwrap_or_else(|_| json!({}));
-            if v["code"] != json!(0) && v["code"] != json!("0") {
-                return json!({
-                    "ok": false, "models": models_static(),
-                    "error": v["desc"].as_str().unwrap_or("模型配置读取失败"),
-                });
-            }
-            let mut rows: Vec<Value> = v["data"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| {
-                    json!({
-                        "id": m["model"].clone(),
-                        "name": m["name"].clone(),
-                        "multiplier": m["point_multiplier"].clone(),
-                        "current": m["is_current"] == json!(true),
-                    })
-                })
-                .collect();
-            // 限免那条不在账号配置接口里，但网关认（2026-10-23 实测）
-            if !rows.iter().any(|m| m["id"] == json!("spark-x2.6-4b")) {
-                rows.push(json!({ "id": "spark-x2.6-4b", "name": "Spark-X2.6-Lite", "free": true }));
-            }
-            json!({ "ok": true, "models": rows })
-        }
-        Err(e) => json!({
-            "ok": false, "models": models_static(), "error": e.to_string(),
-        }),
-    }
+    json!({"ok": true, "models": models})
 }
 
 // ───────────────────────── 探测 / 测试 ─────────────────────────
@@ -301,13 +301,13 @@ pub fn test(model: &str) -> Value {
     let t0 = Instant::now();
     let body = json!({
         "model": model,
-        "messages": [{ "role": "user", "content": "ping" }],
+        "input": "Reply OK",
         "stream": false,
-        "max_tokens": 16,
+        "max_output_tokens": 128,
     })
     .to_string();
     let res = identity_headers(
-        ureq::post(&format!("{}/v1/chat/completions", GATEWAY_BASE))
+        ureq::post(&format!("{}/v1/responses", GATEWAY_BASE))
             .set("Authorization", &format!("Bearer {}", tok))
             .set("Content-Type", "application/json")
             .set("Accept", "application/json"),
@@ -319,13 +319,15 @@ pub fn test(model: &str) -> Value {
             let status = resp.status();
             let v: Value = resp.into_json().unwrap_or_else(|_| json!({}));
             json!({
-                "ok": status < 400,
+                "ok": v["status"] == "completed",
                 "status": status,
                 "ms": t0.elapsed().as_millis() as u64,
                 "model_used": v["model"].clone(),
-                "content": v["choices"][0]["message"]["content"].clone(),
+                "content": v["output"].as_array().into_iter().flatten()
+                    .filter_map(|item| item["content"].as_array()).flatten()
+                    .filter_map(|part| part["text"].as_str()).collect::<String>(),
                 "usage": v["usage"].clone(),
-                "error": if status < 400 { Value::Null } else { v["error"].clone() },
+                "error": v["error"].clone(),
             })
         }
         Err(ureq::Error::Status(code, resp)) => {
@@ -398,7 +400,7 @@ pub fn view() -> Value {
     );
     json!({
         "accounts": rows,
-        "models": models_static(),
+        "models": account_models(),
         "token_from": p["from"].clone(),
         "token_masked": p["masked"].clone(),
         "pool": find_pool().map(|p| json!({ "id": p["id"], "name": p["name"] })),
@@ -476,4 +478,35 @@ pub fn dist_reveal() -> String {
 /// 换号/重登后调用：清令牌缓存，下次请求重新读会话文件
 pub fn on_account_changed() {
     invalidate();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_normalizes_legacy_effort_without_losing_tools_or_history() {
+        let original = json!({
+            "model": "spark-x2.6-4b", "reasoning": {"effort": "medium", "summary": "auto"},
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "OK"}],
+            "tools": [{"type": "function", "name": "echo", "parameters": {"type": "object"}}]
+        });
+        let prepared: Value = serde_json::from_slice(&prepare_responses(&serde_json::to_vec(&original).unwrap())).unwrap();
+        assert_eq!(prepared["reasoning"]["effort"], "high");
+        assert_eq!(prepared["reasoning"]["summary"], "auto");
+        assert_eq!(prepared["input"], original["input"]);
+        assert_eq!(prepared["tools"], original["tools"]);
+        assert_eq!(wire_effort("max"), "xhigh");
+        assert_eq!(wire_effort("none"), "none");
+    }
+
+    #[test]
+    fn catalog_is_scoped_to_the_logged_in_account() {
+        let catalog = json!({
+            "schemaVersion": 1, "accountScopeHash": "c8781b40b03a26f6e2148b2ab0146ece3ce740e734ffd0f63482929fa7bb1189",
+            "models": [{"slug": "spark-x2.6-4b", "name": "Lite"}]
+        });
+        assert_eq!(catalog_rows(&catalog, "alice")[0]["id"], "spark-x2.6-4b");
+        assert!(catalog_rows(&catalog, "bob").is_empty());
+    }
 }

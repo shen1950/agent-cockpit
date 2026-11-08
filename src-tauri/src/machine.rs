@@ -82,6 +82,9 @@ pub fn read(app_id: &str) -> Value {
             // 认出现在登的是谁，就顺手把这份登录态收进保管箱：她手动登录那一次是最后一次，
             // 以后切回来是一键（见 authpack.rs）
             crate::authpack::capture_current(app_id, &q.account, &q.user_id);
+            if matches!(app_id, "workbuddy" | "workbuddy-intl") {
+                sync_workbuddy_name(app_id, &q.account, &q.user_id);
+            }
             json!({
                 "ok": true, "app": app_id, "at": now,
                 "account": q.account, "user_id": q.user_id, "user_type": q.user_type,
@@ -101,6 +104,25 @@ pub fn read(app_id: &str) -> Value {
             "ok": false, "app": app_id, "at": now, "err": e,
             "profile_dir": dir.to_string_lossy(),
         }),
+    }
+}
+
+fn sync_workbuddy_name(app_id: &str, account: &str, uid: &str) {
+    let account = account.trim();
+    if account.is_empty() || account.contains('@') || account.chars().count() > 80
+        || account.contains(['/', '\\', ':', '<', '>', '"', '|', '?', '*']) { return; }
+    let Some(name) = crate::authpack::card_for_login(app_id, account, uid) else { return; };
+    let Some(mut meta) = registry::find_instance(app_id, &name) else { return; };
+    if meta["quota_user_id"].as_str() != Some(uid) { return; }
+    let follows = meta["name_customized"].as_bool() != Some(true)
+        && (name.contains('@') || meta["auto_account_name"].as_str() == Some(name.as_str())
+            || meta["quota_account"].as_str() == Some(name.as_str()));
+    if meta["quota_account"].as_str() != Some(account) {
+        meta["quota_account"] = json!(account);
+        registry::save_instance(app_id, &meta);
+    }
+    if follows && name != account {
+        let _ = crate::space::rename_instance_auto(app_id, &name, account);
     }
 }
 

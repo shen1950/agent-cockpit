@@ -222,17 +222,28 @@ function openChatgptAdd(app, options = {}) {
     } else if (selected === 'token') {
       const text = field('token', { multiline: true, rows: 7, spellcheck: false, placeholder: '粘贴 auth.json、Token JSON、access token 或 refresh token', aria: { label: '待导入凭据' } });
       const base = field('tokenBase', { type: 'url', placeholder: '可选 Base URL', aria: { label: 'Token Base URL' } });
+      // API Key 凭据可以自选进站协议；ChatGPT 令牌不受影响（后端只对 API Key 生效）
+      const wire = el('select', { aria: { label: '接口协议' } },
+        el('option', { value: '' }, '协议：默认（Responses，Codex 原生）'),
+        el('option', { value: 'chat' }, '协议：Chat Completions（旧版兼容；Codex 0.163+ 已移除，选 Responses）'));
+      wire.value = fields.tokenWire || '';
+      wire.addEventListener('change', () => { fields.tokenWire = wire.value; });
       const file = el('input', { type: 'file', accept: '.json,.txt,application/json,text/plain', aria: { label: '选择凭据文件' } });
       file.addEventListener('change', async () => {
         const chosen = file.files?.[0]; if (!chosen) return;
         if (chosen.size > 8 * 1024 * 1024) { note.textContent = '凭据文件不能超过8MB。'; return; }
         try { fields.token = await chosen.text(); text.value = fields.token; } catch { note.textContent = '文件读取失败。'; }
       });
-      body.append(text, file, base, btn('导入并添加账号', 'primary sm', async () => { const r = await add('chatgpt_add_import', { text: text.value, base_url: base.value }); if (r) await completed(r.name); }));
+      body.append(text, file, base, wire, btn('导入并添加账号', 'primary sm', async () => { const r = await add('chatgpt_add_import', { text: text.value, base_url: base.value, wire_api: wire.value }); if (r) await completed(r.name); }));
     } else if (selected === 'apikey') {
       const key = field('key', { type: 'password', placeholder: 'API Key', aria: { label: 'API Key' } });
       const base = field('base', { type: 'url', placeholder: 'Base URL，留空使用官方接口', aria: { label: 'API Base URL' } });
-      body.append(key, base, btn('保存并添加账号', 'primary sm', async () => { const r = await add('chatgpt_add_apikey', { key: key.value, base_url: base.value }); if (r) await completed(r.name); }));
+      const wire = el('select', { aria: { label: '接口协议' } },
+        el('option', { value: '' }, '协议：默认（Responses，Codex 原生）'),
+        el('option', { value: 'chat' }, '协议：Chat Completions（旧版兼容；Codex 0.163+ 已移除，选 Responses）'));
+      wire.value = fields.apiWire || '';
+      wire.addEventListener('change', () => { fields.apiWire = wire.value; });
+      body.append(key, base, wire, btn('保存并添加账号', 'primary sm', async () => { const r = await add('chatgpt_add_apikey', { key: key.value, base_url: base.value, wire_api: wire.value }); if (r) await completed(r.name); }));
     } else {
       const source = field('source', { placeholder: '留空读取本机默认 .codex；也可填写 auth.json 或其目录', spellcheck: false, aria: { label: '本机凭据来源' } });
       body.append(source,
@@ -549,8 +560,13 @@ function chatgptAuthPanel(app, name, instance) {
   } else if (tab === 'apikey') {
     const key = field('apiKey', { type: 'password', placeholder: 'API Key', aria: { label: 'API Key' } });
     const base = field('apiBase', { type: 'url', placeholder: '可选 Base URL，默认使用官方接口', aria: { label: 'API Base URL' } });
-    body.append(key, base,
-      btn('保存 API Key', 'primary sm', async () => { const r = await act('chatgpt_apikey', { key: key.value, base_url: base.value }); if (r?.ok) { fields.apiKey = ''; key.value = ''; renderDetail(); } }));
+    const wire = el('select', { aria: { label: '接口协议' } },
+      el('option', { value: '' }, '协议：默认（Responses，Codex 原生）'),
+      el('option', { value: 'chat' }, '协议：Chat Completions（旧版兼容；Codex 0.163+ 已移除，选 Responses）'));
+    wire.value = fields.apiDetailWire || '';
+    wire.addEventListener('change', () => { fields.apiDetailWire = wire.value; });
+    body.append(key, base, wire,
+      btn('保存 API Key', 'primary sm', async () => { const r = await act('chatgpt_apikey', { key: key.value, base_url: base.value, wire_api: wire.value }); if (r?.ok) { fields.apiKey = ''; key.value = ''; renderDetail(); } }));
   } else {
     const source = field('localSource', { placeholder: '留空读取本机默认 .codex；也可填写 auth.json 或其目录', spellcheck: false, aria: { label: '本机凭据来源' } });
     body.append(source,

@@ -4,17 +4,31 @@
 #![recursion_limit = "256"]
 
 mod ai;
+mod brand;
 mod antigravity;
+mod antigravity_l10n;
 mod asproxy;
 mod authpack;
 mod checkin;
 mod chatgpt;
 mod cliauth;
+mod codexcatalog;
 mod commands;
+mod client_connect;
+mod claude_gateway;
+mod agentfind;
+mod companion;
 mod discover;
+mod expiry;
 mod gateway;
+mod gateway_cleanup;
+mod gateway_cost;
+mod gateway_dispatch;
+mod gateway_routes;
+mod gateway_vision;
 mod icons;
 mod identity;
+mod ingress;
 mod inject;
 mod inventory;
 mod keys;
@@ -22,10 +36,12 @@ mod local_quota;
 mod lifecycle;
 mod machine;
 mod mmproxy;
+mod model_caps;
 mod opencode;
 mod pawbridge;
 mod procs;
 mod proxy;
+mod proxy_ledger;
 mod qproxy;
 mod qwbridge;
 mod quota;
@@ -46,6 +62,7 @@ mod usage_dashboard;
 mod wbproxy;
 mod webquota;
 mod zcode;
+mod zcproxy;
 
 use std::time::Duration;
 
@@ -100,6 +117,20 @@ fn main() {
         lifecycle::exit();
         std::process::exit(code);
     }
+    // Explicit repair action; do not recreate a deliberately deleted desktop link on every launch.
+    if std::env::args().any(|a| a == "--create-desktop-shortcut") {
+        storage::ensure_first_run();
+        let state = shelllink::status();
+        let occupied = state["desktop"]["exists"].as_bool() == Some(true)
+            && state["desktop"]["ours"].as_bool() != Some(true);
+        let result = if occupied {
+            serde_json::json!({"ok":false,"msg":"桌面同名快捷方式指向其他程序，未覆盖"})
+        } else if state["ok"].as_bool() == Some(true) { shelllink::create("desktop") } else { state };
+        let success = result["ok"].as_bool() == Some(true);
+        lifecycle::why(if success { "已创建桌面快捷方式" } else { "创建桌面快捷方式失败" });
+        lifecycle::exit();
+        std::process::exit(if success {0} else {1});
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -149,6 +180,7 @@ fn main() {
                     let _ = w.set_focus();
                 }
             }
+            brand::restore(app.handle());
             let handle = app.handle().clone();
             std::thread::spawn(move || quota_watch_loop(handle));
             // 积分到账监测单独一条线程：30 积分那种服务端按天结算的，几十分钟一轮的
@@ -159,6 +191,31 @@ fn main() {
             let h3 = app.handle().clone();
             std::thread::spawn(move || checkin_loop(h3));
             std::thread::spawn(usage_dashboard::watch);
+            // 上次退出时客户端还开着，清理没法落盘：这里补做一遍。
+            // 只重试台账里记着的那些，不会凭空去动别人的配置。
+            let cleanup_handle = app.handle().clone();
+            let port = settings::get()["proxy"]["port"]
+                .as_u64()
+                .unwrap_or(registry::PROXY_PORT as u64) as u16;
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(8));
+                // 网关没开着时，客户端里指向它的模型就是死条目（上一次没清干净的）；
+                // 全量清扫会还原/兜底清理它们；开着时只补做待清理。
+                let running = {
+                    use tauri::Manager;
+                    cleanup_handle.state::<commands::AppState>().proxy.is_running()
+                };
+                let result = if running {
+                    gateway_cleanup::retry_pending(port)
+                } else {
+                    gateway_cleanup::sweep(port, None)
+                };
+                for note in result["notes"].as_array().into_iter().flatten() {
+                    lifecycle::note(note.as_str().unwrap_or(""));
+                }
+            });
+            // 客户端在清理时还开着，只能等它退出再补：这里每 20 秒看一眼待清理台账。
+            std::thread::spawn(move || gateway_cleanup::watch_pending(port));
             // 便携 exe 不进开始菜单就搜不到，而搜不到就没人能进设置去点那个按钮——
             // 启动后自己在后台补一条（要起 PowerShell，不放启动路径上）
             std::thread::spawn(shelllink::ensure_start_menu);
@@ -169,9 +226,14 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            brand::set_brand_icon,
             commands::get_state,
             commands::usage_dashboard,
             commands::action,
+            antigravity_l10n::antigravity_l10n,
+            client_connect::client_gateway,
+            agentfind::agentfind_port,
+            companion::desktop_companion,
             commands::get_meta,
             commands::get_key_plain,
             commands::add_app,
@@ -187,8 +249,19 @@ fn main() {
     // RunEvent::Exit 只在正常走完退出流程时触发。所以日志里「有 start、没有配对的 exit」
     // 就说明是被外部结束的——换 exe 的 Stop-Process、任务管理器、系统关机。
     // 这正是 10-20 那次查不出的东西，当时只能靠 bin/ 里回滚件的时间戳反推。
-    app.run(|_app, event| {
+    app.run(|app, event| {
         if let tauri::RunEvent::Exit = event {
+            // 退出时反代跟着走，客户端里指向它的模型条目也要走。
+            // 这里不能等：事件循环已经要收尾了。跑得完就清掉，
+            // 跑不完的部分记进待清理，下次启动或客户端退出时补。
+            let state = app.state::<commands::AppState>();
+            if state.proxy.is_running() {
+                let port = state.proxy.port();
+                let _ = state.proxy.stop();
+                // 退出只给很短的时间窗：清得完就清，清不完记进待清理。
+                let _ = gateway_cleanup::sweep_within(port, None, Duration::from_secs(5));
+            }
+            zcproxy::stop();
             lifecycle::exit();
         }
     });
@@ -205,6 +278,7 @@ fn show_main(app: &tauri::AppHandle) {
 
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开驾驶舱", true, None::<&str>)?;
+    let desktop = MenuItem::with_id(app, "desktop_companion", "桌面助手", true, None::<&str>)?;
     let clients = Submenu::with_id(app, "chatgpt_windows", "打开 ChatGPT 窗口", true)?;
     refresh_chatgpt_tray(app, &clients)?;
     let rescan = MenuItem::with_id(app, "rescan", "重新扫描本机程序", true, None::<&str>)?;
@@ -220,7 +294,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open, &clients, &rescan, &refresh, &proxy, &data_dir, &sep, &auto, &sep2, &restart, &quit],
+        &[&open, &desktop, &clients, &rescan, &refresh, &proxy, &data_dir, &sep, &auto, &sep2, &restart, &quit],
     )?;
 
     if let Ok(enabled) = app.autolaunch().is_enabled() {
@@ -275,6 +349,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         }
         match event.id().as_ref() {
             "open" => show_main(app),
+            "desktop_companion" => { let h=app.clone();tauri::async_runtime::spawn(async move {if let Err(e)=companion::show(&h,true){lifecycle::note(&e);}}); },
             "rescan" => {
                 std::thread::spawn(commands::do_rescan);
             }
@@ -286,6 +361,18 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 let p = state.proxy.clone();
                 if p.is_running() {
                     let _ = p.stop();
+                    // 反代停了，客户端里指向它的模型条目也该跟着走。
+                    // 起内置 Python 要一两秒，菜单回调不能等，放后台跑。
+                    let port = settings::get()["proxy"]["port"]
+                        .as_u64()
+                        .unwrap_or(registry::PROXY_PORT as u64) as u16;
+                    std::thread::spawn(move || {
+                        let cleaned = gateway_cleanup::sweep(port, None);
+                        let removed = cleaned["removed"].as_u64().unwrap_or(0);
+                        if removed > 0 {
+                            lifecycle::note(&format!("反代已停止，清理了 {removed} 条网关模型"));
+                        }
+                    });
                     let _ = proxy_item.set_checked(false);
                 } else {
                     let port = settings::get()["proxy"]["port"]

@@ -13,6 +13,10 @@ pub fn member_src_key(site_id: &str, key_id: &str) -> String {
     format!("key:{}/{}", site_id, key_id)
 }
 
+fn stable_provider_id(src: &str) -> String {
+    format!("pv-{}", crate::wbproxy::hex(&crate::wbproxy::sha256(src.as_bytes())))
+}
+
 pub fn new_id(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -218,6 +222,297 @@ pub fn save_proxy_field(field: &str, value: Value) {
     save_config(&cfg);
 }
 
+/// 用户手动停用的来源（Magpie 式开关）：停用后所有上游组与模型目录立即排除它。
+/// 与成员在不在某个组里无关，这是"这个来源参与不参与网关"的总闸。
+pub fn sources_off() -> Vec<String> {
+    let proxy = proxy_cfg(&load_config());
+    let mut off = string_list(&proxy["sources_off"]);
+    // A removed provider remains blocked even if a legacy action rewrites sources_off.
+    for src in string_list(&proxy["providers_removed"]) {
+        if !off.contains(&src) { off.push(src); }
+    }
+    off
+}
+
+fn source_enabled(src: &str, off: &[String]) -> bool {
+    !off.iter().any(|s| s == src)
+}
+
+/// 来源级开关：账号或台账 Key 一键停用/启用，写回 sources_off 列表
+pub fn toggle_source(src: &str) -> (bool, String) {
+    let src = src.trim();
+    if src.is_empty() {
+        return (false, "缺少来源标识".into());
+    }
+    if string_list(&proxy_cfg(&load_config())["providers_removed"]).iter().any(|s| s == src) {
+        return (false, "这个供应商已删除，请先在供应商页重新添加".into());
+    }
+    let mut off = sources_off();
+    let label = resolve_member(src, "", "")
+        .map(|(label, _, _)| label)
+        .unwrap_or_else(|| src.to_string());
+    let now_off = if let Some(i) = off.iter().position(|s| s == src) {
+        off.remove(i);
+        false
+    } else {
+        off.push(src.to_string());
+        true
+    };
+    save_proxy_field("sources_off", json!(off));
+    (
+        true,
+        if now_off {
+            format!("已停用「{label}」：网关不再使用这个来源，模型目录与所有上游组同步生效")
+        } else {
+            format!("已启用「{label}」：这个来源重新参与网关分流")
+        },
+    )
+}
+
+/// Magpie 式供应商视图：一个账号、一条台账 Key 或一个本地桥就是一行供应商。
+/// 每行绑定一个隐式上游组，密钥授权仍然沿用原来的组授权模型，不迁移旧数据。
+pub fn provider_options() -> Value {
+    provider_rows(&member_options(), &proxy_cfg(&load_config()))
+}
+
+fn string_list(value: &Value) -> Vec<String> {
+    value.as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+}
+
+fn provider_rows(members: &Value, proxy: &Value) -> Value {
+    // 显式标注：rows 只在闭包里被 push，闭包里的 `r["src"]` 会推不出类型（E0282）
+    let mut rows: Vec<Value> = Vec::new();
+    let removed = string_list(&proxy["providers_removed"]);
+    let off = string_list(&proxy["sources_off"]);
+    let pools = proxy["pools"].as_array().into_iter().flatten().collect::<Vec<_>>();
+    let assigned: std::collections::HashSet<&str> = pools.iter()
+        .flat_map(|p| p["members"].as_array().into_iter().flatten()).filter_map(|m| m["src"].as_str())
+        .chain(proxy["dist"].as_array().into_iter().flatten()
+            .flat_map(|d| d["pools"].as_array().into_iter().flatten()).filter_map(Value::as_str)).collect();
+    let mut rows_from = |values: &[Value]| {
+        for m in values {
+            let src = m["src"].as_str().unwrap_or_default().to_string();
+            if src.is_empty() || removed.contains(&src) || rows.iter().any(|r| r["src"] == src) {
+                continue;
+            }
+            if !assigned.contains(src.as_str()) && proxy["provider_names"][&src].is_null()
+                && !off.contains(&src) && !(pools.is_empty() && m["legacy"] == true) {
+                continue;
+            }
+            let app = m["app_name"].as_str().unwrap_or("供应商").to_string();
+            let instance = m["instance"].as_str().unwrap_or_default().to_string();
+            let site = m["site_name"].as_str().unwrap_or_default().to_string();
+            let label = m["label"].as_str().unwrap_or_default().to_string();
+            let default_name = if !site.is_empty() {
+                if label.is_empty() { site.clone() } else { format!("{site}/{label}") }
+            } else if instance.is_empty() {
+                app.clone()
+            } else {
+                format!("{app}/{instance}")
+            };
+            rows.push(json!({
+                "id": stable_provider_id(&src),
+                "src": src,
+                "name": proxy["provider_names"][&src].as_str().filter(|name| !name.trim().is_empty()).unwrap_or(&default_name),
+                "kind": if site.is_empty() { "instance" } else { "key" },
+                "app": m["app"].as_str().unwrap_or_default(),
+                "app_name": app,
+                "site_name": site,
+                "label": label,
+                "masked": m["masked"].as_str().unwrap_or_default(),
+                "has_token": m["has_token"].as_bool().unwrap_or(true),
+                "off": off.contains(&src),
+                "supported": m["supported"].as_bool().unwrap_or(false),
+                "availability_reason": m["availability_reason"].as_str().unwrap_or_default(),
+                "bridge": m["bridge"].as_bool().unwrap_or(false),
+            }));
+        }
+    };
+    if let Some(items) = members["instances"].as_array() {
+        rows_from(items);
+    }
+    if let Some(items) = members["keys"].as_array() {
+        rows_from(items);
+    }
+    json!(rows)
+}
+
+fn available_member<'a>(members: &'a Value, src: &str) -> Option<&'a Value> {
+    ["instances", "keys"].into_iter().flat_map(|group| members[group].as_array().into_iter().flatten())
+        .find(|member| member["src"].as_str() == Some(src))
+}
+
+fn require_provider_ready(member: &Value) -> Result<(), String> {
+    if member["supported"] != true || member["has_token"] != true {
+        return Err(member["availability_reason"].as_str().filter(|s| !s.is_empty())
+            .unwrap_or("这个来源尚未具备可用的反代适配或登录态").into());
+    }
+    Ok(())
+}
+
+fn set_source_flag(proxy: &mut Value, field: &str, src: &str, present: bool) {
+    let mut entries = string_list(&proxy[field]);
+    entries.retain(|s| s != src);
+    if present { entries.push(src.to_string()); }
+    proxy[field] = json!(entries);
+}
+
+fn put_provider_pool(proxy: &mut Value, src: &str, name: &str) {
+    let id = stable_provider_id(src);
+    let mut list = proxy["pools"].as_array().cloned().unwrap_or_default();
+    if let Some(found) = list.iter_mut().find(|p| p["id"] == id) {
+        let mut member = found["members"].as_array().into_iter().flatten()
+            .find(|member| member["src"].as_str() == Some(src)).cloned()
+            .unwrap_or_else(|| json!({"src":src,"base_url":""}));
+        member["enabled"] = json!(true);
+        found["name"] = json!(format!("供应商 · {name}"));
+        found["enabled"] = json!(true);
+        found["members"] = json!([member]);
+    } else {
+        list.push(json!({"id":id,"name":format!("供应商 · {name}"),"enabled":true,
+            "members":[{"src":src,"base_url":"","enabled":true}]}));
+    }
+    proxy["pools"] = json!(list);
+}
+
+/// Creating the first explicit pool switches off the legacy fallback. Preserve the old
+/// routes and their effective endpoints; only accounts/keys actually in that fallback qualify.
+fn preserve_legacy_pools(proxy: &mut Value, members: &Value) {
+    if proxy["pools"].as_array().is_some_and(|list| !list.is_empty()) { return; }
+    let rows = provider_rows(members, proxy);
+    for row in rows.as_array().into_iter().flatten() {
+        let src = row["src"].as_str().unwrap_or_default();
+        let Some(member) = available_member(members, src) else { continue };
+        if member["legacy"] != true { continue; }
+        put_provider_pool(proxy, src, row["name"].as_str().unwrap_or_default());
+        // Legacy API keys used the global upstream, including for sites whose own URL differs.
+        if src.starts_with("key:") {
+            let upstream = proxy["upstream"].as_str().unwrap_or("https://api.openai.com").to_owned();
+            if let Some(pool) = proxy["pools"].as_array_mut().and_then(|list| list.last_mut()) {
+                pool["members"][0]["base_url"] = json!(upstream);
+            }
+        }
+    }
+}
+
+/// Pure config edits make removal/restoration testable without touching local credentials.
+fn edit_provider_upsert(proxy: &mut Value, members: &Value, item: &Value) -> Result<String, String> {
+    let src = item["src"].as_str().unwrap_or_default().trim();
+    let name = item["name"].as_str().unwrap_or_default().trim();
+    if name.is_empty() { return Err("供应商名称不能为空".into()); }
+    if name.chars().count() > 120 { return Err("供应商名称不能超过 120 个字".into()); }
+    let member = available_member(members, src).ok_or("没找到这个来源，请刷新后重新选择")?;
+    require_provider_ready(member)?;
+    preserve_legacy_pools(proxy, members);
+    set_source_flag(proxy, "providers_removed", src, false);
+    set_source_flag(proxy, "sources_off", src, false);
+    if !proxy["provider_names"].is_object() { proxy["provider_names"] = json!({}); }
+    proxy["provider_names"][src] = json!(name);
+    put_provider_pool(proxy, src, name);
+    Ok(format!("已保存供应商「{name}」"))
+}
+
+fn edit_provider_delete(proxy: &mut Value, members: &Value, id: &str) -> Result<String, String> {
+    let src = ["instances", "keys"].into_iter()
+        .flat_map(|group| members[group].as_array().into_iter().flatten())
+        .filter_map(|member| member["src"].as_str())
+        .find(|src| stable_provider_id(src) == id).map(str::to_owned)
+        .or_else(|| string_list(&proxy["providers_removed"]).into_iter().find(|src| stable_provider_id(src) == id))
+        .ok_or("没找到这个供应商")?;
+    set_source_flag(proxy, "providers_removed", &src, true);
+    set_source_flag(proxy, "sources_off", &src, true);
+    // Preserve every dist scope. Removing its last pool ID would mean "all pools".
+    // Old shared pools and original account/API key records also remain intact.
+    if let Some(list) = proxy["pools"].as_array_mut() {
+        for pool in list.iter_mut().filter(|pool| pool["id"].as_str() == Some(id)) {
+            pool["enabled"] = json!(false);
+        }
+    }
+    Ok("已删除供应商并停用来源；原账号、API Key 和授权范围已保留".into())
+}
+
+fn edit_provider_enabled(proxy: &mut Value, members: &Value, id: &str, enabled: bool) -> Result<String, String> {
+    let row = provider_rows(members, proxy).as_array().into_iter().flatten()
+        .find(|row| row["id"].as_str() == Some(id)).cloned().ok_or("没找到这个供应商，请刷新列表")?;
+    let src = row["src"].as_str().ok_or("供应商缺少来源")?;
+    if enabled {
+        require_provider_ready(available_member(members, src).ok_or("没找到这个来源")?)?;
+        preserve_legacy_pools(proxy, members);
+        put_provider_pool(proxy, src, row["name"].as_str().unwrap_or("供应商"));
+    }
+    set_source_flag(proxy, "sources_off", src, !enabled);
+    Ok(if enabled { "已启用供应商" } else { "已停用供应商" }.into())
+}
+
+fn save_provider_change(edit: impl FnOnce(&mut Value, &Value) -> Result<String, String>) -> (bool, String) {
+    let members = member_options();
+    let mut cfg = load_config();
+    let mut proxy = proxy_cfg(&cfg);
+    if !cfg.is_object() || !proxy.is_object() { return (false, "反代配置格式不正确，未保存".into()); }
+    let message = match edit(&mut proxy, &members) {
+        Ok(message) => message,
+        Err(error) => return (false, error),
+    };
+    cfg["proxy"] = proxy;
+    persist_proxy_config(&cfg, message)
+}
+
+fn persist_proxy_config(cfg: &Value, message: String) -> (bool, String) {
+    save_config(cfg);
+    // save_config predates Result-based writes; read the file, not its last-good cache.
+    let saved = std::fs::read(crate::registry::config_file()).ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if saved.as_ref().map(|value| &value["proxy"]) != Some(&cfg["proxy"]) {
+        return (false, "反代配置未能写入磁盘，请检查数据目录权限后重试".into());
+    }
+    (true, message)
+}
+
+pub fn upsert_provider(item: &Value) -> (bool, String) {
+    save_provider_change(|proxy, members| edit_provider_upsert(proxy, members, item))
+}
+
+pub fn remove_provider(id: &str) -> (bool, String) {
+    save_provider_change(|proxy, members| edit_provider_delete(proxy, members, id))
+}
+
+pub fn set_provider_enabled(id: &str, enabled: bool) -> (bool, String) {
+    save_provider_change(|proxy, members| edit_provider_enabled(proxy, members, id, enabled))
+}
+
+/// 用稳定的 id 查回供应商行；列表重建后来源不变，id 也不会变。
+pub fn provider_by_id(id: &str) -> Option<Value> {
+    provider_options().as_array()?.into_iter().find(|p| p["id"] == id).cloned()
+}
+
+/// 保证每个供应商都有一个一对一的隐式上游组。旧组不受影响。
+pub fn ensure_provider_pool(id: &str) -> Result<Value, String> {
+    let row = provider_by_id(id).ok_or("没找到这个供应商")?;
+    let src = row["src"].as_str().ok_or("供应商缺少来源")?;
+    let pool_id = stable_provider_id(src);
+    let mut list = pools();
+    if let Some(found) = list.iter_mut().find(|p| p["id"] == pool_id) {
+        let changed = found["members"].as_array().map(|m| m.len()) != Some(1)
+            || found["members"].as_array().and_then(|m| m.first()).and_then(|m| m["src"].as_str()) != Some(src)
+            || found["enabled"] == false;
+        if !changed {
+            return Ok(found.clone());
+        }
+        found["name"] = json!(format!("供应商 · {}", row["name"].as_str().unwrap_or_default()));
+        found["enabled"] = json!(true);
+        found["members"] = json!([{"src":src,"base_url":"","enabled":true}]);
+    } else {
+        list.push(json!({
+            "id": pool_id,
+            "name": format!("供应商 · {}", row["name"].as_str().unwrap_or_default()),
+            "enabled": true,
+            "members": [{"src":src,"base_url":"","enabled":true}],
+        }));
+    }
+    save_proxy_field("pools", json!(list));
+    Ok(pools().into_iter().find(|p| p["id"] == pool_id).ok_or("隐式上游组保存失败")?)
+}
+
 /// 一个可用的上游：label 用于日志，token 替换 Authorization，base_url 是转发目标
 #[derive(Debug, Clone, PartialEq)]
 pub struct Upstream {
@@ -360,26 +655,45 @@ pub fn reveal_dist(id: &str) -> Option<String> {
         .and_then(|d| d["key"].as_str().map(|s| s.to_string()))
 }
 
+/// Accept stable provider IDs and the source selectors saved by the earlier UI.
+/// Unknown/legacy IDs stay in the scope: dropping the last one would grant all pools.
+fn normalize_provider_scope(proxy: &mut Value, members: &Value, ids: &[String], activate: bool) -> Vec<String> {
+    let rows = provider_rows(members, proxy);
+    let mut normalized = Vec::new();
+    for selected in ids {
+        let row = rows.as_array().into_iter().flatten()
+            .find(|row| row["id"].as_str() == Some(selected) || row["src"].as_str() == Some(selected));
+        let id = if let Some(row) = row {
+            let id = row["id"].as_str().unwrap_or_default();
+            let exists = proxy["pools"].as_array().into_iter().flatten().any(|pool| pool["id"] == id);
+            if (!exists || activate) && row["off"] == false && row["supported"] == true && row["has_token"] == true {
+                preserve_legacy_pools(proxy, members);
+                put_provider_pool(proxy, row["src"].as_str().unwrap_or_default(), row["name"].as_str().unwrap_or("供应商"));
+            }
+            id.to_string()
+        } else { selected.clone() };
+        if !normalized.contains(&id) { normalized.push(id); }
+    }
+    normalized
+}
+
 /// 建/改接入密钥。新建时返回明文 key 一并提示（只在这里出现一次也够用）。
 pub fn upsert_dist(item: &Value) -> (bool, String) {
     let name = item["name"].as_str().unwrap_or("").trim().to_string();
     if name.is_empty() {
         return (false, "给它起个名字（谁在用），日后好停用".into());
     }
-    let sel: Vec<String> = item["pools"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect();
+    let mut cfg = load_config();
+    let mut proxy = proxy_cfg(&cfg);
+    if !cfg.is_object() || !proxy.is_object() { return (false, "反代配置格式不正确，未保存".into()); }
+    let sel = normalize_provider_scope(&mut proxy, &member_options(), &string_list(&item["pools"]), true);
     let scope = if sel.is_empty() {
         "全部上游组".to_string()
     } else {
         format!("{} 个上游组", sel.len())
     };
     let id = item["id"].as_str().unwrap_or("").trim().to_string();
-    let mut list = dist_keys();
+    let mut list = proxy["dist"].as_array().cloned().unwrap_or_default();
 
     if id.is_empty() {
         let key = gen_dist_key();
@@ -394,11 +708,9 @@ pub fn upsert_dist(item: &Value) -> (bool, String) {
             "last_account": "",
             "created": crate::registry::now_secs(),
         }));
-        save_proxy_field("dist", json!(list));
-        return (
-            true,
-            format!("已生成接入密钥（{}）：{} —— 填到客户端当 API Key", scope, key),
-        );
+        proxy["dist"] = json!(list);
+        cfg["proxy"] = proxy;
+        return persist_proxy_config(&cfg, format!("已生成接入密钥（{}）：{} —— 填到客户端当 API Key", scope, key));
     }
 
     let mut hit = false;
@@ -415,8 +727,9 @@ pub fn upsert_dist(item: &Value) -> (bool, String) {
     if !hit {
         return (false, "没找到这条分发记录".into());
     }
-    save_proxy_field("dist", json!(list));
-    (true, format!("已保存接入密钥「{}」（授权 {}）", name, scope))
+    proxy["dist"] = json!(list);
+    cfg["proxy"] = proxy;
+    persist_proxy_config(&cfg, format!("已保存接入密钥「{}」（授权 {}）", name, scope))
 }
 
 pub fn remove_dist(id: &str) -> (bool, String) {
@@ -581,6 +894,13 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
         let meta = load_instances(app_id).into_iter().find(|m| {
             m["name"].as_str().unwrap_or("") == name
         })?;
+        if app_id == "zcode" {
+            // Account names are handles, never bearer tokens. Ignore arbitrary
+            // base overrides so saved ZCode credentials cannot leave this adapter.
+            return crate::zcode::proxy_available(name).then(|| (
+                format!("{app_name}/{name}"), name.to_string(), crate::zcproxy::BASE_MARK.to_string()
+            ));
+        }
         let mut tok = meta["token"].as_str().unwrap_or("").trim().to_string();
         // Qoder 系的令牌不在账号记录里，而在产品自己的 auth.v1.dat（见 qproxy）。
         // Trae 的在 storage.json（见 traeproxy）。
@@ -699,7 +1019,6 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
                 continue;
             }
             let site_name = site["name"].as_str().unwrap_or("").to_string();
-            let site_base = site["base_url"].as_str().unwrap_or("").to_string();
             if let Some(ks) = site["keys"].as_array() {
                 for k in ks {
                     if k["id"].as_str().unwrap_or("") != key_id {
@@ -718,7 +1037,7 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
                     let base = if !member_base.trim().is_empty() {
                         member_base.trim().to_string()
                     } else {
-                        crate::keys::norm_base(&site_base)
+                        key_proxy_base(&site, k)
                     };
                     return Some((format!("Key/{}", name), tok, base));
                 }
@@ -735,11 +1054,15 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
 pub fn pool_upstreams(pool: &Value, global_upstream: &str) -> Vec<Upstream> {
     let pool_name = pool["name"].as_str().unwrap_or("未命名池").to_string();
     let mut out = Vec::new();
+    let off = sources_off();
     for m in pool["members"].as_array().cloned().unwrap_or_default() {
         if !m["enabled"].as_bool().unwrap_or(true) {
             continue;
         }
         let src = m["src"].as_str().unwrap_or("");
+        if !source_enabled(src, &off) {
+            continue;
+        }
         let base = m["base_url"].as_str().unwrap_or("");
         if let Some((label, token, base_url)) = resolve_member(src, base, global_upstream) {
             out.push(Upstream {
@@ -755,15 +1078,21 @@ pub fn pool_upstreams(pool: &Value, global_upstream: &str) -> Vec<Upstream> {
 
 /// 指定上游组（按 id）里的可用上游；ids 为空 = 全部启用的上游组
 pub fn upstreams_for(ids: &[String], global_upstream: &str) -> Vec<Upstream> {
-    let all = pools();
+    let mut proxy = proxy_cfg(&load_config());
+    // Resolve old source scopes without requiring users to edit each existing key.
+    // This is an in-memory view; request handling never writes provider config.
+    let needs_compat = ids.iter().any(|id| id.starts_with("key:") || id.starts_with("instance:") || id.starts_with("bridge:"));
+    let normalized = if needs_compat { normalize_provider_scope(&mut proxy, &member_options(), ids, false) }
+        else { ids.to_vec() };
+    let all = proxy["pools"].as_array().cloned().unwrap_or_default();
     let mut out = Vec::new();
     for p in &all {
         if !p["enabled"].as_bool().unwrap_or(true) {
             continue;
         }
-        if !ids.is_empty() {
+        if !normalized.is_empty() {
             let pid = p["id"].as_str().unwrap_or("");
-            if !ids.iter().any(|x| x == pid) {
+            if !normalized.iter().any(|x| x == pid) {
                 continue;
             }
         }
@@ -801,42 +1130,79 @@ pub fn bump_dist(id: &str, account: &str) {
     }
 }
 
+fn http_base(value: &str) -> bool {
+    tauri::Url::parse(value.trim()).is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
+fn key_proxy_base(site: &Value, key: &Value) -> String {
+    let base = crate::keys::base_for(site, key);
+    let base = if base.is_empty() { site["base_url"].as_str().unwrap_or("") } else { &base };
+    let trimmed = base.trim_end_matches('/');
+    for suffix in ["/chat/completions", "/responses", "/messages", "/models"] {
+        if let Some(base) = trimmed.strip_suffix(suffix) { return base.to_owned(); }
+    }
+    trimmed.to_owned()
+}
+
+fn instance_supported(app: &str, own_base: &str) -> bool {
+    crate::qproxy::region_of(app).is_some()
+        || crate::traeproxy::APPS.contains(&app)
+        || crate::wbproxy::APPS.contains(&app)
+        || crate::asproxy::APPS.contains(&app)
+        || crate::mmproxy::APPS.contains(&app)
+        || app == "zcode"
+        || http_base(own_base)
+}
+
 /// 可选的成员清单（给界面做勾选用）：按 Agent 分组列账号，再列 API 台账里的 key
 pub fn member_options() -> Value {
+    let off = sources_off();
     let mut instances = Vec::new();
     for app in all_apps() {
         for m in load_instances(&app.id) {
             let name = m["name"].as_str().unwrap_or("").to_string();
             let tok = m["token"].as_str().unwrap_or("").trim().to_string();
-            // Qoder 系的令牌在产品自己的档案里（qproxy 读），这里按"反代真的能不能用"报
-            let usable = !tok.is_empty()
-                || (crate::qproxy::region_of(&app.id).is_some()
-                    && crate::qproxy::token_for(&app.id, &name).is_some())
-                || (crate::traeproxy::APPS.contains(&app.id.as_str())
-                    && crate::traeproxy::token_for(&app.id, &name).is_some())
-                // WorkBuddy 的令牌在 `%LOCALAPPDATA%\CodeBuddyExtension\...\*.info`（wbproxy 读），
-                // 账号记录里那个 token 字段永远是空的。缺了这一支，池子里明明能用的号
-                // 在「选择成员」弹框里会被标成「不可用 / 该账号还没登记 Token」。
-                || (crate::wbproxy::APPS.contains(&app.id.as_str())
-                    && crate::wbproxy::token_for(&app.id, &name).is_some())
-                || (crate::asproxy::APPS.contains(&app.id.as_str())
-                    && !crate::asproxy::token().is_empty())
-                // MiniMax Code：整机一份 OAuth 登录态（mmproxy 读 auth.json）。
-                // 这里用 token_quiet —— 界面 4 秒一轮的轮询不该触发轮换制刷新。
-                || (crate::mmproxy::APPS.contains(&app.id.as_str())
-                    && !crate::mmproxy::token_quiet().is_empty());
+            let own_base = m["proxy_base_url"].as_str().unwrap_or("");
+            let supported = instance_supported(&app.id, own_base);
+            // Read adapter credentials, never confuse a product's SSO token with a model key.
+            // MiniMax reads must stay quiet: listing providers must not refresh OAuth tokens.
+            let usable = if crate::asproxy::APPS.contains(&app.id.as_str()) {
+                !crate::asproxy::token().is_empty()
+            } else if crate::mmproxy::APPS.contains(&app.id.as_str()) {
+                !crate::mmproxy::token_quiet().is_empty()
+            } else if app.id == "zcode" {
+                crate::zcode::proxy_available(&name)
+            } else if app.id == "qoder-cn" {
+                crate::qproxy::token_for(&app.id, &name).is_some()
+            } else {
+                !tok.is_empty()
+                    || (crate::qproxy::region_of(&app.id).is_some() && crate::qproxy::token_for(&app.id, &name).is_some())
+                    || (crate::traeproxy::APPS.contains(&app.id.as_str()) && crate::traeproxy::token_for(&app.id, &name).is_some())
+                    || (crate::wbproxy::APPS.contains(&app.id.as_str()) && crate::wbproxy::token_for(&app.id, &name).is_some())
+            };
+            let reason = if !supported {
+                "尚无账号反代适配；可在密钥页登记兼容服务的 API Key"
+            } else if !usable && app.id == "qoder-cn" {
+                "国内版直连需要官方签名；请启动已登录账号的本地桥"
+            } else if !usable {
+                "未读取到可用登录态或模型令牌，请先登录对应账号"
+            } else { "" };
             instances.push(json!({
                 "src": member_src_instance(&app.id, &name),
                 "app": app.id,
                 "app_name": app.name,
                 "instance": name,
                 "has_token": usable,
-                "proxy_base_url": m["proxy_base_url"].as_str().unwrap_or(""),
+                "legacy": if app.id == "zcode" { usable } else { !tok.is_empty() },
+                "supported": supported,
+                "availability_reason": reason,
+                "proxy_base_url": own_base,
                 "qregion": crate::qproxy::region_of(&app.id).unwrap_or(""),
                 "qstate": crate::qproxy::stored_state(&app.id, &name).unwrap_or_default(),
                 "trae": crate::traeproxy::APPS.contains(&app.id.as_str()),
                 "astudio": crate::asproxy::APPS.contains(&app.id.as_str()),
                 "minimax": crate::mmproxy::APPS.contains(&app.id.as_str()),
+                "off": off.contains(&member_src_instance(&app.id, &name)),
             }));
             // 千问办公：桌面端登录态在就能挂「本地桥」（桥没跑 serve() 会自愈拉起）
             if crate::qwbridge::APPS.contains(&app.id.as_str()) {
@@ -847,10 +1213,13 @@ pub fn member_options() -> Value {
                     "app_name": app.name,
                     "instance": name,
                     "has_token": up,
+                    "supported": true,
+                    "availability_reason": if up { "" } else { "请先登录千问办公客户端" },
                     "proxy_base_url": crate::qwbridge::base(),
                     "qregion": "",
                     "qstate": if up { "bridge" } else { "bridge_idle" },
                     "bridge": true,
+                    "off": off.contains(&format!("bridge:{}/{}", app.id, name)),
                 }));
             }
             // 妙手：改成进程内云端直连了——auth.json 在就能挂，桌面端跑不跑无关
@@ -862,10 +1231,13 @@ pub fn member_options() -> Value {
                     "app_name": app.name,
                     "instance": name,
                     "has_token": up,
+                    "supported": true,
+                    "availability_reason": if up { "" } else { "请先登录妙手客户端" },
                     "proxy_base_url": crate::pawbridge::BASE_MARK,
                     "qregion": "",
                     "qstate": if up { "bridge" } else { "bridge_idle" },
                     "bridge": true,
+                    "off": off.contains(&format!("bridge:{}/{}", app.id, name)),
                 }));
             }
             // Qoder CN：CLI 登录过就能挂本地桥（国内版唯一通路，见 qproxy.rs）
@@ -877,10 +1249,13 @@ pub fn member_options() -> Value {
                     "app_name": app.name,
                     "instance": name,
                     "has_token": up,
+                    "supported": true,
+                    "availability_reason": if up { "" } else { "请先启动 Qoder CN 本地桥" },
                     "proxy_base_url": format!("http://127.0.0.1:{}/v1", crate::qproxy::CN_PORT),
                     "qregion": "cn",
                     "qstate": if up { "bridge" } else { "bridge_idle" },
                     "bridge": true,
+                    "off": off.contains(&format!("bridge:{}/{}", app.id, name)),
                 }));
             }
         }
@@ -889,16 +1264,25 @@ pub fn member_options() -> Value {
     for site in crate::keys::sites() {
         let sid = site["id"].as_str().unwrap_or("").to_string();
         let sname = site["name"].as_str().unwrap_or("").to_string();
-        let sbase = site["base_url"].as_str().unwrap_or("").to_string();
         for k in site["keys"].as_array().cloned().unwrap_or_default() {
             let kid = k["id"].as_str().unwrap_or("").to_string();
+            let src = member_src_key(&sid, &kid);
+            let has_token = !k["key"].as_str().unwrap_or("").trim().is_empty();
+            let sbase = key_proxy_base(&site, &k);
+            let supported = http_base(&sbase);
             keys.push(json!({
-                "src": member_src_key(&sid, &kid),
+                "src": src,
                 "site_id": sid,
                 "site_name": sname,
                 "base_url": sbase,
                 "label": k["label"].as_str().unwrap_or(""),
                 "masked": crate::keys::mask(k["key"].as_str().unwrap_or("")),
+                "has_token": has_token,
+                "legacy": has_token && k["use_in_proxy"].as_bool().unwrap_or(false),
+                "supported": supported,
+                "availability_reason": if !supported { "请先在密钥页填写有效的 HTTP(S) 服务地址" }
+                    else if !has_token { "请先在密钥页填写 API Key" } else { "" },
+                "off": off.contains(&src),
             }));
         }
     }
@@ -908,6 +1292,170 @@ pub fn member_options() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider_fixture() -> (Value, Value, String) {
+        let src = "instance:qoder/account-a";
+        let id = stable_provider_id(src);
+        let members = json!({"instances":[{"src":src,"app":"qoder","app_name":"Qoder",
+            "instance":"account-a","supported":true,"has_token":true}],"keys":[]});
+        let proxy = json!({"upstream":"https://example.test","strategy":"round-robin",
+            "pools":[
+                {"id":id,"name":"供应商 · Qoder/account-a","enabled":true,
+                    "members":[{"src":src,"base_url":"https://saved-endpoint.test"}]},
+                {"id":"legacy","name":"旧共享组","enabled":true,"members":[{"src":src},{"src":"key:other/key"}]}],
+            "dist":[{"id":"restricted","pools":[id],"enabled":true,"key":"fixture-only"},
+                {"id":"shared","pools":["legacy"],"enabled":true}],
+            "sources_off":["key:already/off"],"unrelated":{"preserve":true}});
+        (members, proxy, id)
+    }
+
+    #[test]
+    fn provider_delete_is_idempotent_and_never_broadens_key_scope() {
+        let (members, mut proxy, id) = provider_fixture();
+        let before = proxy.clone();
+        edit_provider_delete(&mut proxy, &members, &id).unwrap();
+        assert!(provider_rows(&members, &proxy).as_array().unwrap().is_empty());
+        assert_eq!(proxy["dist"], before["dist"], "last authorized pool must never become all-pools scope");
+        assert_eq!(proxy["pools"][1], before["pools"][1], "shared pools must remain intact");
+        assert_eq!(proxy["pools"][0]["enabled"], false);
+        assert_eq!(proxy["unrelated"], before["unrelated"]);
+        assert_eq!(proxy["upstream"], before["upstream"]);
+        assert!(string_list(&proxy["sources_off"]).contains(&"instance:qoder/account-a".into()));
+        let removed = proxy.clone();
+        edit_provider_delete(&mut proxy, &members, &id).unwrap();
+        assert_eq!(proxy, removed, "deleting an already disabled/removed supplier must not re-enable it");
+        assert!(edit_provider_enabled(&mut proxy, &members, &id, true).is_err());
+        assert_eq!(proxy, removed, "removed suppliers require explicit restoration");
+    }
+
+    #[test]
+    fn provider_restore_reuses_pool_and_persists_name_and_admission() {
+        let (members, mut proxy, id) = provider_fixture();
+        let old_dist = proxy["dist"].clone();
+        edit_provider_enabled(&mut proxy, &members, &id, false).unwrap();
+        edit_provider_delete(&mut proxy, &members, &id).unwrap();
+        let item = json!({"src":"instance:qoder/account-a","name":"  工作账号  "});
+        edit_provider_upsert(&mut proxy, &members, &item).unwrap();
+        let first = proxy.clone();
+        edit_provider_upsert(&mut proxy, &members, &item).unwrap();
+        assert_eq!(proxy, first, "retrying a successful add must not duplicate pools");
+        assert_eq!(proxy["dist"], old_dist);
+        assert_eq!(proxy["pools"].as_array().unwrap().len(), 2);
+        assert_eq!(proxy["pools"][0]["id"], id);
+        assert_eq!(proxy["pools"][0]["name"], "供应商 · 工作账号");
+        assert_eq!(proxy["pools"][0]["members"][0]["src"], item["src"]);
+        assert_eq!(proxy["pools"][0]["members"][0]["base_url"], "https://saved-endpoint.test");
+        assert_eq!(proxy["pools"][0]["enabled"], true);
+        let rows = provider_rows(&members, &proxy);
+        assert_eq!(rows[0]["name"], "工作账号");
+        assert_eq!(rows[0]["off"], false);
+        assert!(!string_list(&proxy["sources_off"]).contains(&"instance:qoder/account-a".into()));
+        assert!(string_list(&proxy["sources_off"]).contains(&"key:already/off".into()));
+        edit_provider_enabled(&mut proxy, &members, &id, false).unwrap();
+        let disabled = proxy.clone();
+        edit_provider_enabled(&mut proxy, &members, &id, false).unwrap();
+        assert_eq!(proxy, disabled, "set-enabled is idempotent, unlike toggle");
+        assert_eq!(provider_rows(&members, &proxy)[0]["off"], true);
+    }
+
+    #[test]
+    fn provider_upsert_rejects_unavailable_or_unknown_sources_without_changes() {
+        let (mut members, mut proxy, id) = provider_fixture();
+        let before = proxy.clone();
+        for item in [json!({"src":"instance:missing/account","name":"Unknown"}),
+            json!({"src":"instance:qoder/account-a","name":"  "})] {
+            assert!(edit_provider_upsert(&mut proxy, &members, &item).is_err());
+            assert_eq!(proxy, before);
+        }
+        let item = json!({"src":"instance:qoder/account-a","name":"Valid"});
+        for missing in ["has_token", "supported"] {
+            members["instances"][0][missing] = json!(false);
+            assert!(edit_provider_upsert(&mut proxy, &members, &item).is_err());
+            assert!(edit_provider_enabled(&mut proxy, &members, &id, true).is_err());
+            assert_eq!(proxy, before);
+            members["instances"][0][missing] = json!(true);
+        }
+        assert!(edit_provider_delete(&mut proxy, &members, "gp-not-a-provider").is_err());
+        assert_eq!(proxy, before);
+    }
+
+    #[test]
+    fn provider_admission_requires_adapter_or_explicit_generic_endpoint() {
+        assert!(instance_supported("qoder", ""));
+        assert!(instance_supported("zcode", ""));
+        assert!(!instance_supported("codex", ""), "Codex OAuth is not an OpenAI API key");
+        assert!(!instance_supported("custom", "file:///secret"));
+        assert!(!instance_supported("custom", "not a URL"));
+        assert!(instance_supported("custom", "https://example.test/v1"));
+        assert!(http_base("http://127.0.0.1:8211/v1"));
+    }
+
+    #[test]
+    fn provider_isolated_disk_roundtrip() {
+        // Running in a subprocess keeps both the data-root environment and static caches
+        // isolated from the rest of the parallel Rust suite and the user's running cockpit.
+        const CHILD: &str = "AGENTCOCKPIT_SUPPLIER_DISK_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("supplier-fixture"), b"test-only").unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gateway::tests::provider_isolated_disk_roundtrip", "--nocapture"])
+                .env("AGENT_COCKPIT_HOME", dir.path()).env(CHILD, dir.path()).status().unwrap();
+            assert!(status.success());
+            assert!(dir.path().join("supplier-test-completed").is_file());
+            return;
+        }
+        let root = crate::registry::base_dir();
+        assert_eq!(Some(root.as_os_str().to_owned()), std::env::var_os(CHILD));
+        assert_eq!(std::fs::read(root.join("supplier-fixture")).unwrap(), b"test-only");
+        let cfg = json!({"proxy":{"upstream":"https://legacy.example.test","pools":[],"dist":[]}});
+        save_config(&cfg);
+        let src = "key:site/candidate";
+        let id = stable_provider_id(src);
+        let keys = json!({"providers":[{"id":"site","name":"Fixture","base_urls":[
+            {"format":"openai","url":"https://example.test/compatible/v1"}],"keys":[
+            {"id":"candidate","key":"fixture-candidate","label":"new"},
+            {"id":"already","key":"fixture-legacy","label":"old","use_in_proxy":true}]}]});
+        std::fs::write(crate::keys::store_file(), keys.to_string()).unwrap();
+        assert!(available_member(&member_options(), src).is_some());
+        let rows = provider_options();
+        assert!(!rows.as_array().unwrap().iter().any(|row| row["src"] == src));
+        let legacy_id = stable_provider_id("key:site/already");
+        assert!(provider_by_id(&legacy_id).is_some());
+        assert!(remove_provider(&legacy_id).0);
+        assert!(crate::proxy::legacy_pool("https://legacy.example.test").is_empty());
+        assert!(upsert_provider(&json!({"src":"key:site/already","name":"restored"})).0);
+        // Re-enter the old, empty-pools configuration to exercise its first-pool migration.
+        save_config(&cfg);
+        assert!(upsert_provider(&json!({"src":src,"name":"My supplier"})).0);
+        assert_eq!(provider_by_id(&id).unwrap()["name"], "My supplier");
+        assert!(provider_by_id(&legacy_id).is_some());
+        let old_route = upstreams_for(&[legacy_id], "https://legacy.example.test");
+        assert_eq!(old_route[0].base_url, "https://legacy.example.test");
+        assert!(upsert_dist(&json!({"name":"scoped","pools":[src]})).0);
+        let d = dist_keys().into_iter().find(|d| d["name"] == "scoped").unwrap();
+        assert_eq!(d["pools"], json!([id]));
+        let route = || crate::proxy::pick_upstreams(d["key"].as_str().unwrap(), "https://legacy.example.test").ups;
+        assert_eq!(route().len(), 1);
+        assert_eq!(route()[0].base_url, "https://example.test/compatible/v1");
+        let mut old = load_config();
+        old["proxy"]["dist"][0]["pools"] = json!([src]);
+        old["proxy"]["pools"].as_array_mut().unwrap().retain(|p| p["id"] != id);
+        save_config(&old);
+        assert_eq!(route().len(), 1, "keys with old source scopes work before re-saving");
+        assert!(set_provider_enabled(&id, false).0);
+        assert!(route().is_empty());
+        assert!(remove_provider(&id).0);
+        assert!(provider_by_id(&id).is_none());
+        assert!(route().is_empty());
+        let stored: Value = serde_json::from_slice(&std::fs::read(crate::registry::config_file()).unwrap()).unwrap();
+        assert_eq!(stored["proxy"]["dist"][0]["pools"], json!([src]));
+        assert_eq!(std::fs::read_to_string(crate::keys::store_file()).unwrap(), keys.to_string());
+        assert!(upsert_provider(&json!({"src":src,"name":"Restored"})).0);
+        assert_eq!(provider_by_id(&id).unwrap()["name"], "Restored");
+        assert_eq!(route().len(), 1);
+        std::fs::write(root.join("supplier-test-completed"), b"ok").unwrap();
+    }
 
     #[test]
     fn dist_key_shape_is_stable() {

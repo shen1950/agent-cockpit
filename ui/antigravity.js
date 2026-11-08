@@ -1,5 +1,5 @@
 /* Antigravity 账号：登录态整机一份（Windows 凭据管理器），切换只切凭据 + 重启客户端。 */
-const ANTIGRAVITY_SECTIONS = [['info', '概览'], ['quota', '额度与用量'], ['auth', '登录管理'], ['danger', '移除账号']];
+const ANTIGRAVITY_SECTIONS = [['info', '概览'], ['quota', '额度与用量'], ['auth', '登录管理'], ['l10n', '界面汉化'], ['danger', '移除账号']];
 const ANTIGRAVITY_BUSY = new Set();
 
 async function antigravityAction(action, name = '', extra = {}) {
@@ -47,6 +47,7 @@ function antigravityDetailPanel(instance, section) {
       current || auth.ready ? antigravityOpenButton(instance) : null,
       btn('重新授权 / 导入', 'sm', () => openAntigravityAdd({ existingName: name })),
       current && auth.ready ? btn('移除凭据', 'danger sm', () => antigravityAction('antigravity_remove', name)) : null)));
+  if (section === 'l10n') return antigravityL10nPanel();
   if (section === 'danger') return secPanel('移除账号', el('div', { class: 'cpt-settings' },
     el('p', {}, '仅移除卡片。登录凭据与本机数据保留。'),
     el('div', { class: 'cpt-actions' }, btn('移除账号', 'danger sm', async () => {
@@ -61,8 +62,61 @@ function antigravityDetailPanel(instance, section) {
     quotaPanel(instance)));
 }
 
+/* —— 界面汉化：第三方引擎 qqxpee/antigravity2-cn，随驾驶舱分发在 tools/antigravity-l10n/。
+   状态与安装走独立命令 antigravity_l10n（不走 action 分发，安装会强杀 Antigravity.exe）。 —— */
+let antigravityL10n = null;
+let antigravityL10nCtx = null;
+
+async function antigravityL10nCall(action) {
+  const key = `antigravity_l10n_${action}`;
+  if (ANTIGRAVITY_BUSY.has(key)) return { ok: false, busy: true };
+  ANTIGRAVITY_BUSY.add(key);
+  try {
+    const result = await invoke('antigravity_l10n', { payload: { action } });
+    if (result) antigravityL10n = { ...(antigravityL10n || {}), ...result };
+    return result || { ok: false };
+  } catch (error) {
+    const msg = String(error?.message || error);
+    if (action === 'install') toast(msg, false);
+    return { ok: false, msg };
+  } finally { ANTIGRAVITY_BUSY.delete(key); }
+}
+
+async function antigravityL10nInstall() {
+  if (!await askConfirm('将关闭正在运行的 Antigravity，并修改其程序文件（app.asar）注入中文界面。\n客户端自动更新会覆盖汉化，届时回到这里重新安装。继续？',
+    { title: '安装 / 更新界面汉化', okText: '关闭并安装' })) return;
+  antigravityL10n = { ...(antigravityL10n || {}), output: '正在运行汉化引擎（约 1-2 分钟，首次要下载打包工具会更久）…' };
+  if (antigravityL10nCtx?.sec === 'l10n') renderDetail();
+  const result = await antigravityL10nCall('install');
+  if (!result.busy) toast(result?.msg || (result?.ok ? '汉化完成' : '汉化失败'), !!result?.ok);
+  if (antigravityL10nCtx?.sec === 'l10n') renderDetail();
+}
+
+function antigravityL10nPanel() {
+  const info = (label, value) => chatgptInfoRow(label, value);
+  const s = antigravityL10n;
+  if (!s) { // 首次进入：后台拉状态，拉完还停在本分区就重画
+    antigravityL10nCall('status').then(() => { if (antigravityL10nCtx?.sec === 'l10n') renderDetail(); });
+    return secPanel('界面汉化', el('p', { class: 'hintline' }, '正在读取汉化状态…'));
+  }
+  if (!s.ok && s.msg && !s.found) return secPanel('界面汉化', el('p', { class: 'hintline' }, s.msg));
+  const stateText = !s.found ? '未找到 Antigravity 安装' : s.localized ? '已汉化' : '未汉化（官方英文）';
+  const canInstall = s.found && s.engine_ready && s.node_ready;
+  return secPanel('界面汉化',
+    el('div', { class: 'cpt-settings' },
+      info('客户端版本', s.version || '未知'),
+      info('汉化状态', stateText),
+      info('引擎', s.engine_ready ? '就绪（tools/antigravity-l10n）' : '缺失（tools/antigravity-l10n/）'),
+      s.found && !s.node_ready ? el('p', { class: 'hintline' }, '本机未检测到 node，安装前请先安装 Node.js。') : null,
+      s.output ? el('pre', { class: 'cpt-l10n-log', style: 'max-height:180px;overflow:auto;white-space:pre-wrap;padding:8px;border-radius:6px;background:rgba(127,127,127,.12);font-size:12px;' }, s.output) : null),
+    el('div', { class: 'cpt-actions' },
+      btn('刷新状态', 'sm', async () => { await antigravityL10nCall('status'); if (antigravityL10nCtx?.sec === 'l10n') renderDetail(); }),
+      canInstall ? btn(s.localized ? '更新汉化' : '安装汉化', 'primary sm', antigravityL10nInstall) : null));
+}
+
 function renderAntigravityDetail(detail, instance) {
   $('im-save').hidden = true;
+  antigravityL10nCtx = detail;
   if (!ANTIGRAVITY_SECTIONS.some(([id]) => id === detail.sec)) detail.sec = 'info';
   const nav = $('im-nav'); clear(nav);
   for (const [id, label] of ANTIGRAVITY_SECTIONS) {

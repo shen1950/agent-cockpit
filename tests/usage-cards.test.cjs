@@ -16,6 +16,7 @@ function fixture(chart = null) {
     trendCharts: q => { calls.push(['trend', q]); return chart; },
     closeDetail: async () => { context.S.detail = null; },
     render: () => calls.push(['render']),
+    renderDetail: () => calls.push(['renderDetail']),
     UsageDashboard: { selectApp: app => calls.push(['select', app]) },
   };
   vm.createContext(context);
@@ -49,6 +50,43 @@ test('an existing trend is rendered and passed through unchanged', () => {
   assert.equal(calls[0][1], quota);
   assert.ok(panel.children.includes(chart));
   assert.doesNotMatch(text(panel), /暂无法展示/);
+});
+
+test('independent local tokens and saved credits can be selected without mixing them', () => {
+  const chart = { tag: 'svg', children: [] };
+  const { context, calls } = fixture(chart);
+  const local = { unit: 'tokens', days: [{ date: '2026-10-01', credits: 100 }], scope: 'device' };
+  const vendor = { unit: 'credits', days: [{ date: '2026-10-01', credits: 8 }], source: '官网' };
+  const instance = { app: 'qoder-cn', quota: { local_trend: local, vendor_trend: vendor, trend: local } };
+  const panel = context.usageTrendPanel(instance);
+  assert.equal(calls[0][1].trend, local);
+  assert.match(text(panel), /共用历史无法按账号准确拆分/);
+  const switches = panel.children.find(n => n.attrs?.class?.includes('trend-source-switch'));
+  assert.ok(switches, 'two distinct histories expose a source switch');
+  const vendorButton = switches.children.find(n => n.label === '额度历史');
+  vendorButton.click();
+  assert.equal(context.S.detail.trendSource, 'vendor');
+  assert.equal(context.S.trendSel, '');
+  assert.equal(calls.at(-1)[0], 'renderDetail');
+  context.usageTrendPanel(instance);
+  assert.equal(calls.at(-1)[1].trend, vendor);
+});
+
+test('a source read failure is visible even when vendor history is available', () => {
+  const { context } = fixture({ tag: 'svg', children: [] });
+  const panel = context.usageTrendPanel({ app: 'qoder', quota: {
+    local_trend_error: '采集程序启动失败',
+    vendor_trend: { unit: 'credits', days: [{ date: '2026-10-01', credits: 8 }] },
+  }});
+  assert.match(text(panel), /本地记录读取失败：采集程序启动失败/);
+  assert.doesNotMatch(text(panel), /暂无法展示用量趋势/);
+});
+
+test('identical local and saved histories do not create a misleading duplicate switch', () => {
+  const { context } = fixture({ tag: 'svg', children: [] });
+  const trend = { unit: 'tokens', days: [{ date: '2026-10-01', credits: 100 }] };
+  const panel = context.usageTrendPanel({ app: 'codex', quota: { local_trend: trend, vendor_trend: trend } });
+  assert.equal(panel.children.some(n => n.attrs?.class?.includes('trend-source-switch')), false);
 });
 
 test('special account detail paths use the common component', () => {

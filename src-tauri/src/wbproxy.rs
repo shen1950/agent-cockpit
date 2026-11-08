@@ -2625,7 +2625,7 @@ mod tests {
         // 没走到 note()。直接读会稳定地少记一发，看着像 bug。
         std::thread::sleep(std::time::Duration::from_millis(800));
         let st = load_store();
-        let served: u64 = ["workbuddy/ExampleAccount", "workbuddy-intl/shen1950"]
+        let served: u64 = ["workbuddy/demo_account_cn", "workbuddy-intl/demo_account_intl"]
             .iter()
             .filter_map(|k| st["accounts"][k]["calls"].as_u64())
             .sum();

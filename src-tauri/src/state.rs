@@ -148,7 +148,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
             Vec::new()
         };
         let insts = load_instances(&app.id);
-        let inst_names: Vec<&str> = insts.iter().filter_map(|m| m["name"].as_str()).collect();
+        let inst_names: Vec<String> = insts.iter().filter_map(|m| m["name"].as_str().map(str::to_string)).collect();
         // 「这台机器现在登的是谁」——产品级的一份真值，和卡片上绑的账号是两件事。
         // 不摆出来，就出现"人早换成另一个号了，卡片还停在旧号"这种看着像 bug 的错。
         let machine = if app.id == crate::zcode::APP { crate::zcode::machine_state(crate::machine::current(&app.id)) } else { crate::machine::current(&app.id) };
@@ -159,9 +159,18 @@ pub fn build_state(proxy: &Proxy) -> Value {
         let m_uid = machine["value"]["user_id"].as_str().unwrap_or("").to_string();
         // 认得出当前登录的那个号时，程序级进程才按它归属；一个都对不上（登的是没建过卡的
         // 第三个号）就退回换号记录，否则整批进程没人认领，卡片上一个「结束」都点不到。
+        // 判据含登录包里的 userId：包是这张卡身份的硬凭据，卡片上的 quota_user_id 可能被覆盖过。
         let login_known = m_ok
             && !m_uid.is_empty()
-            && insts.iter().any(|m| m["quota_user_id"].as_str() == Some(m_uid.as_str()));
+            && insts.iter().any(|m| {
+                let name = m["name"].as_str().unwrap_or("");
+                let pu = crate::authpack::pack_uid(&app.id, name);
+                if pu.is_empty() {
+                    m["quota_user_id"].as_str() == Some(m_uid.as_str())
+                } else {
+                    pu == m_uid
+                }
+            });
         apps_out.push(json!({
             "id": app.id, "name": app.name, "short": reg_short_of(&app), "kind": app.kind,
             "installed": installed, "swapped": swapped,
@@ -171,7 +180,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
             "auth_switch": crate::registry::auth_switch_ok(&app.id),
             "web_quota": crate::webquota::supports(&app.id),
             // 换号记录指向一个已经不存在的账号：档案目录还挂着 junction，得能一键还原
-            "swap_orphan": !swapped.is_empty() && !inst_names.contains(&swapped.as_str()),
+            "swap_orphan": !swapped.is_empty() && !inst_names.iter().any(|n| n == &swapped),
             "discovered": app.discovered, "isolatable": can_isolate,
             "custom": app.id.starts_with("custom-"),
             "removed": removed, "new": is_new,
@@ -185,9 +194,41 @@ pub fn build_state(proxy: &Proxy) -> Value {
         for m in insts {
             let cands = account_candidates(&app.id, &m, &swaps);
             let swapped_here = swapped == m["name"].as_str().unwrap_or("");
-            // 客户端里现在登的就是这张卡的号（按 userId 认，读不到当前登录时一律为假）
-            let logged_in =
-                login_known && m["quota_user_id"].as_str().unwrap_or("") == m_uid.as_str();
+            let inst_name = m["name"].as_str().unwrap_or("");
+            // 这个号存过的那份登录态属于谁：**包里的 userId 才是这张卡的身份硬凭据**。
+            // 卡片上的 quota_user_id 会被一次误读/一次改绑覆盖成别人的（Qoder CN 两张卡
+            // 曾同时写着 shen1950 的 uid，于是两张卡都标成「本机登录中」，其中另一张卡
+            // 其实并不是现在登着的那个号）。有包就按包认，没包才退回卡片上那个字段。
+            let pack = crate::authpack::stored(&app.id, inst_name);
+            let pack_uid = pack
+                .as_ref()
+                .and_then(|p| p["user_id"].as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let pack_account = pack
+                .as_ref()
+                .and_then(|p| p["account"].as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let card_uid = if pack_uid.is_empty() {
+                m["quota_user_id"].as_str().unwrap_or("").to_string()
+            } else {
+                pack_uid.clone()
+            };
+            // 客户端里现在登的就是这张卡的号（按身份 userId 认，读不到当前登录时一律为假）。
+            // 只认身份，不看「让位」标记：让位标记只说明"这张卡当初把档案让给了谁"，
+            // 而这个号后来又登回来的话，标记会被 capture_current 摘掉——拿它否掉"正在登录"，
+            // 只会让人看到两张卡一个都不亮，反而不知道现在是谁。
+            let logged_in = login_known && card_uid == m_uid.as_str();
+            // 这张卡存的包到底是谁的：包里的账号名正对着**另一张卡**，说明这个包本来就是那张卡的，
+            // 是被一次误收包顶到这张卡上的——这种卡点「切换到此账号」写回去还是原来那个号。
+            // 不能只比"包里的账号名 != 卡名"：卡片可以被人改成任意昵称，那样每张改过名的卡都会被误判。
+            let pack_foreign = !pack_account.is_empty()
+                && pack_account != inst_name
+                && inst_names.iter().any(|n| *n == pack_account);
+
             // 这个账号名下的进程：先按实例目录精确匹配；匹配不到而它又是当前换号账号，
             // 才按程序级算（换号产品的进程命令行里只有默认档案路径）
             let owned: Vec<u32> = match app.kind.as_str() {
@@ -233,7 +274,27 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 n_running += 1;
             }
             // 多笔积分：逐笔统计剩余/总额并各自算到期日；没有多笔就回退到单笔字段
-            let raw_credits = m.get("credits").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+            let mut raw_credits = m.get("credits").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+            // 她自己填的到期日：只补"厂商没给"的那些笔（按笔名、其次按档名认，见 expiry.rs）。
+            // 这份值只在本机生效，所以每一笔都要带 expires_manual，界面才标得出"自填"。
+            let acct_name = m["name"].as_str().unwrap_or("");
+            // 自填到期日读一次盘，之后在同一份快照里查内存（见 expiry.rs 的 Book）
+            let exp_book = crate::expiry::Book::load();
+            let mut manual_portions: Vec<bool> = Vec::with_capacity(raw_credits.len());
+            for c in raw_credits.iter_mut() {
+                let real = crate::quota::expiry(c["expires_on"].as_str().unwrap_or("")).1.is_some();
+                let mut manual = false;
+                if !real {
+                    let label = c["label"].as_str().unwrap_or("");
+                    let category = c["category"].as_str().unwrap_or("");
+                    let pid = c["pid"].as_str().unwrap_or("");
+                    if let Some(d) = exp_book.for_portion(&app.id, acct_name, label, category, pid) {
+                        c["expires_on"] = json!(d);
+                        manual = true;
+                    }
+                }
+                manual_portions.push(manual);
+            }
             let has_portions = !raw_credits.is_empty();
             // 这份数是从服务端实时读的，还是"客户端上次联网时的缓存"？
             // 旧缓存不能当实时数用，也不能拿它去报"临期"——否则会催一堆早已作废的到期提醒。
@@ -277,7 +338,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
             let mut sum_total = 0.0f64;
             let mut has_total = false;
             // 这里只汇总数值，不算到期——到期判定统一放到下面 groups 之后那一处
-            for c in &raw_credits {
+            for (ci, c) in raw_credits.iter().enumerate() {
                 let l = c["left"].as_f64();
                 let t = c["total"].as_f64();
                 let e = c["expires_on"].as_str().unwrap_or("").trim().to_string();
@@ -299,6 +360,8 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     "unit": c["unit"].as_str().unwrap_or("credits").to_string(),
                     "expires_on": e,
                     "days_left": d,
+                    // 这个日期是她自己填的，不是厂商给的：界面必须标出来
+                    "expires_manual": manual_portions.get(ci).copied().unwrap_or(false),
                     "note": c["note"].as_str().unwrap_or("").to_string(),
                 }));
             }
@@ -306,7 +369,21 @@ pub fn build_state(proxy: &Proxy) -> Value {
             // 过期与否在这里现算，不用 agenthub 抓取那一刻留下的计数——
             // 一笔"今天 15:31 作废"的积分，15:32 打开界面就该已经在「已过期」里。
             let mut groups_out: Vec<Value> = Vec::new();
-            for g in m.get("quota_groups").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            // 自填的改名/日期/手工包先铺进原始 groups，再照原算法算最近到期——
+            // 这样"这一档叫什么""什么时候作废""到点作废多少""临期提醒"四处自动跟手填值一致
+            let mut src_groups = m.get("quota_groups").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            exp_book.apply(&app.id, acct_name, &mut src_groups);
+            for g in src_groups.into_iter() {
+                let gid = g["gid"].as_str().unwrap_or("").to_string();
+                let orig = g["orig"].as_str().unwrap_or("").to_string();
+                let renamed = g["renamed"].as_bool().unwrap_or(false);
+                let custom = g["custom"].as_bool().unwrap_or(false);
+                let group_note = g["note"].as_str().unwrap_or("").to_string();
+                let fallback_exp = g["fallback_expires"].as_str().unwrap_or("").to_string();
+                let (mut exp_manual, group_manual_date) =
+                    (g["expires_manual"].as_bool().unwrap_or(false), {
+                        if fallback_exp.is_empty() { None } else { Some(fallback_exp.clone()) }
+                    });
                 let mut items: Vec<Value> = Vec::new();
                 let (mut live_left, mut live_n, mut dead_n, mut usable_n) =
                     (0.0f64, 0usize, 0usize, 0usize);
@@ -360,7 +437,25 @@ pub fn build_state(proxy: &Proxy) -> Value {
                         "expires_on": e,
                         "days_left": d,
                         "expired": dead,
+                        // 这一笔的日期是她自己填的（厂商那份是空，或被她改过）
+                        "expires_manual": it["expires_manual"].as_bool().unwrap_or(false),
+                        // 厂商原来给的那个日期：她改过之后仍然留着，好让她能"改回厂商口径"
+                        "expires_vendor": it["expires_vendor"].as_str().unwrap_or("").to_string(),
+                        // 逐笔的身份键与原名：30 多笔全叫「平台赠送」，编辑要按 pid 认人
+                        "pid": it["pid"].as_str().unwrap_or("").to_string(),
+                        "iid": it["iid"].as_str().unwrap_or("").to_string(),
+                        "orig": it["orig"].as_str().unwrap_or("").to_string(),
+                        "renamed": it["renamed"].as_bool().unwrap_or(false),
                     }));
+                }
+                // 这一档的到期日：她自己填的那一个优先（编辑里填了就照她填的显示），
+                // 没有才用逐笔算出来的最近到期。只有汇总数、没有逐笔的档本来就只有这一个。
+                if let Some(d) = group_manual_date.clone() {
+                    nearest = d;
+                    exp_manual = true;
+                    // 档级日期下，到点作废的就是这一档全部剩余——逐笔那套"最早一笔"用不上
+                    nearest_left = g["left"].as_f64();
+                    nearest_unknown = nearest_left.is_none();
                 }
                 groups_out.push(json!({
                     // 档名与单位一律照厂商自己的（Trae 的「每日签到」、AStudio 的
@@ -379,6 +474,15 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     "expires_left": nearest_left,
                     "expires_left_unknown": nearest_unknown,
                     "days_left": days_left(&nearest),
+                    // 这个到期日是自己填的 → 界面标「自填」，别让人以为是厂商给的
+                    "expires_manual": exp_manual,
+                    // 编辑用：厂商原档名、稳定键、改过名没有、是不是自己手工加的包
+                    "orig": orig,
+                    "gid": gid,
+                    "renamed": renamed,
+                    "custom": custom,
+                    "custom_id": g["custom_id"].as_str().unwrap_or(""),
+                    "note": group_note,
                     "items": items,
                 }));
             }
@@ -456,6 +560,9 @@ pub fn build_state(proxy: &Proxy) -> Value {
                             e
                         ),
                         "level": if d <= danger_days { "danger" } else { "warn" },
+                        // 这个到期日是她自己填的（厂商没给）：提醒里要说清楚，
+                        // 免得过一阵把这句提醒当成厂商口径去信
+                        "expires_manual": g["expires_manual"].as_bool().unwrap_or(false),
                     }));
                 }
             } else {
@@ -523,8 +630,19 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 }
                 (Some(gl), Some(gt), earliest_exp, earliest_dl)
             } else {
-                let e = m["expires_on"].as_str().unwrap_or("");
-                let (dead, d) = crate::quota::expiry(e);
+                // 连分组都没有、只有一个汇总数的店：界面会把它合成一档叫「积分」，
+                // 连分组都没有、只有一个汇总数的店：界面会把它合成一档叫「积分」，
+                // 编辑弹窗挂的也是这个名字，所以这里按「积分」查一次覆盖
+                let raw_exp = m["expires_on"].as_str().unwrap_or("");
+                let e = if crate::quota::expiry(raw_exp).1.is_some() {
+                    raw_exp.to_string()
+                } else {
+                    exp_book
+                        .get(&app.id, acct_name, "g:积分")
+                        .or_else(|| exp_book.get(&app.id, acct_name, "积分"))
+                        .unwrap_or_else(|| raw_exp.to_string())
+                };
+                let (dead, d) = crate::quota::expiry(&e);
                 let l = m["credits_left"].as_f64();
                 if !dead {
                     if let Some(dd) = d {
@@ -540,6 +658,9 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 }
                 (l, m["credits_total"].as_f64(), e.to_string(), d)
             };
+            let local_trend = crate::usage_dashboard::trend_for(&app.id, m["data_dir"].as_str().unwrap_or(""));
+            let vendor_trend = m["quota_trend"].clone();
+            let preferred_trend = local_trend.clone().unwrap_or_else(|| vendor_trend.clone());
             instances.push(json!({
                 "app": app.id, "app_name": app.name, "kind": app.kind,
                 "name": m["name"], "workdir": m["workdir"].as_str().unwrap_or(""),
@@ -569,8 +690,12 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 // 磁盘上的换号记录不会随客户端登录变化，拿它当当前账号必然认错
                 "logged_in": logged_in,
                 // 这个号存过登录态没有：存过才能一键切回来，没存过界面只给"去登一次"
-                "auth_pack": crate::authpack::stored(&app.id, m["name"].as_str().unwrap_or("")),
-                "identity": identity::inspect(m["data_dir"].as_str().unwrap_or("")),
+                "auth_pack": pack,
+                // 这张卡存的登录态到底是谁的：跟卡名/另一张卡对不上就是被别人顶过，
+                // 这种卡点「切换到此账号」写回去还是原来那个号（切不动就是这么来的）
+                "pack_account": pack_account,
+                "pack_foreign": pack_foreign,
+                "identity": identity::inspect_cached(m["data_dir"].as_str().unwrap_or(""), &app.id),
                 "chatgpt_auth": if app.id == "codex-desktop" { crate::chatgpt::status(&m) } else { Value::Null },
                 "chatgpt_quota": if app.id == "codex-desktop" { crate::chatgpt::quota_status(&m) } else { Value::Null },
                 "zcode_auth": if app.id == crate::zcode::APP { crate::zcode::status(&m) } else { Value::Null },
@@ -578,7 +703,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 "usage": m["usage"],
                 "usage_fetched_at": m["usage_fetched_at"],
                 // 今天签到状态：只读后台缓存，绝不在这里发网络请求（见 checkin::for_app）
-                "checkin": crate::checkin::for_app(&app.id),
+                "checkin": crate::checkin::for_instance(&app.id, m["name"].as_str().unwrap_or("")),
                 "quota": {
                     "total": total, "left": left,
                     "expires_on": expires_on, "days_left": dl,
@@ -614,16 +739,21 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     // 登录态实际读的档案文件：Qoder 0.4.x 换壳后，这是唯一能看出"读错档案"的线索
                     "auth_from": m["quota_auth_from"].as_str().unwrap_or(""),
                     // 这张卡的数属于谁 ≠ 本机现在登的是谁：卡片要标灰并给出"改绑/新建/换号"三个动作，
-                    // 而不是像以前那样把新读数挡回去、让界面永远停在旧号
-                    "bound_mismatch": crate::machine::mismatch(
+                    // 而不是像以前那样把新读数挡回去、让界面永远停在旧号。
+                    // **共用一份档案的产品不受这条约束**：那种产品每个号本来就只有"登着的那个"是它，
+                    // 没登的那张卡不是"串号"，只是"没在登录"，拿它报串号会把人往「改绑」上带
+                    // ——而「改绑」恰恰是把 A 的身份写成 B 的那一步（Qoder CN 11-03 就这么乱掉的）。
+                    "bound_mismatch": !shared && crate::machine::mismatch(
                         m["quota_user_id"].as_str().unwrap_or(""),
                         &machine,
                     ),
                     // 按天消耗序列（波形图/热力图）：`{unit,days[],total,peak...}` 或 `{error}`；
                     // Null = 这个产品压根没有逐笔时刻可聚，界面就不许出现图占位
-                    "trend": crate::usage_dashboard::trend_for(&app.id, m["data_dir"].as_str().unwrap_or(""))
-                        .unwrap_or_else(|| m["quota_trend"].clone()),
-                    "trend_reason": crate::usage_dashboard::unavailable_reason(&app.id),
+                    "trend": preferred_trend,
+                    "local_trend": local_trend,
+                    "vendor_trend": vendor_trend,
+                    "trend_reason": crate::usage_dashboard::reason_for(&app.id, m["data_dir"].as_str().unwrap_or("")),
+                    "local_trend_error": crate::usage_dashboard::error_for(&app.id, m["data_dir"].as_str().unwrap_or("")),
                     // CLI 类产品（Codex）的登录态：只读 auth.json（不跑子进程——
                     // build_state 每 4 秒一次，跑 `codex login status` 太频）。
                     // 官方那句话（"Logged in using …"）由前端按需调 codex_status 拿。
@@ -731,6 +861,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
             "pools": crate::gateway::pools_view(&upstream),
             "dist": crate::gateway::list_dist_masked(),
             "members": crate::gateway::member_options(),
+            "providers": crate::gateway::provider_options(),
             // Qoder / Qoder CN 模型反代：账号状态、能不能进组、一键反代的结果
             "qproxy": crate::qproxy::view(),
             // Trae CN：这里**只读缓存**（4 秒轮询不起 python）；刷新走 trae_refresh 动作
@@ -743,6 +874,7 @@ pub fn build_state(proxy: &Proxy) -> Value {
             // MiniMax Code：上游是 Anthropic 协议（/messages），mmproxy 负责
             // 令牌（OAuth，轮换制刷新）+ OpenAI ⇄ Anthropic 双向翻译
             "minimax": crate::mmproxy::view(),
+            "zcode": crate::zcproxy::view(),
             // 千问办公：本地桥（qwenwork-bridge）探活、模型清单、有没有进上游组
             "qwbridge": crate::qwbridge::view(),
             // 妙手：本地桥（catpaw-bridge）探活 + 管道闸门 + 登录态 + 有没有进上游组

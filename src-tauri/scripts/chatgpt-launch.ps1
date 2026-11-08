@@ -29,12 +29,19 @@ try {
   }
   $info.EnvironmentVariables['CODEX_HOME']=$auth
   $info.EnvironmentVariables['CODEX_ELECTRON_USER_DATA_PATH']=$profile
+  $adapter=Join-Path $adapterDirectory 'codex-shared-resume.exe'
+  $real=Join-Path ([IO.Path]::GetDirectoryName($exe)) 'resources\codex.exe'
+  if([IO.File]::Exists($adapter) -and [IO.File]::Exists($real)) {
+    $info.EnvironmentVariables['CODEX_CLI_PATH']=$adapter
+    $info.EnvironmentVariables['AGENTCOCKPIT_CODEX_REAL']=$real
+  }
   $child=[Diagnostics.Process]::Start($info)
   $result=@{ok=$true;pid=$child.Id}
 } catch {$result=@{ok=$false;message=$_.Exception.Message}}
 [IO.File]::WriteAllText($receipt,($result | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
 '@
-  $inner='$exe='+(Literal $Executable)+';$profile='+(Literal $Profile)+';$auth='+(Literal $AuthHome)+';$receipt='+(Literal $receipt)+"`n"+$inner
+  $adapterDirectory=Join-Path $env:USERPROFILE '.agent-cockpit\bin'
+  $inner='$adapterDirectory='+(Literal $adapterDirectory)+';$exe='+(Literal $Executable)+';$profile='+(Literal $Profile)+';$auth='+(Literal $AuthHome)+';$receipt='+(Literal $receipt)+"`n"+$inner
   $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
   $helper=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
   try {

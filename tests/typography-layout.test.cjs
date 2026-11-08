@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
-const { chromium } = require('D:/npm-global/node_modules/@playwright/mcp/node_modules/playwright');
+const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '../ui');
 const artifacts = path.resolve(__dirname, '../.agent-sync/typography-evidence');
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -22,7 +22,7 @@ async function seed(page, appearance) {
     clearInterval(pollTimer);
     const source = structuredClone(window.typographySource ||= S.data.instances[0]);
     const timestamp = Math.floor(Date.now() / 1000);
-    const name = variant === 'zcode' ? 'Example User B' : variant === 'api' ? 'exampleuser_b' : 'anna.smith-demo-85f935@example.test';
+    const name = variant === 'zcode' ? 'Demo User' : variant === 'api' ? 'demo_account' : 'demo-user-long-name@example.test';
     const account = Object.assign(source, {
       app: 'codex-desktop', app_name: 'ChatGPT', name, kind: 'pwa',
       running: true, resident: false, procs: 8, created: '2026-10-27',

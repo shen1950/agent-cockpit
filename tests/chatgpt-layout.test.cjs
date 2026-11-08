@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
-const { chromium } = require('D:/npm-global/node_modules/@playwright/mcp/node_modules/playwright');
+const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '../ui');
 const artifacts = path.resolve(__dirname, '../.agent-sync/layout-evidence');
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.png': 'image/png' };
@@ -153,18 +153,24 @@ async function verifyClaudeDesktop(page, zoom) {
     panel?.querySelector('button:not(.qhelp)')?.click();
     result.wizardHidden = document.getElementById('wizard').hidden;
     renderHome(S.data);
-    result.home = [...document.querySelectorAll('.hagent')].find(node => node.querySelector('.hagent-n')?.textContent === 'Claude 桌面版')?.textContent;
+    result.home = [...document.querySelectorAll('.hacard')].find(node => node.querySelector('.hacard-n')?.textContent === 'Claude 桌面版')?.textContent;
     return result;
   }, zoom);
   assert.ok(result.text?.includes('资料位置'), JSON.stringify(result));
   assert.equal(result.cap, '桌面客户端');
   assert.equal(result.navCap, '客户端');
-  assert.ok(result.home?.includes('桌面客户端') && !/换号|还没有账号/.test(result.home), JSON.stringify(result));
+  // 首页卡片（2026-11-05 改成紧凑平铺）：能力标只写「客户端」，不再写「桌面客户端」；
+  // 这条要守的是"桌面客户端不被当成换号/多开、也不报账号数"，不是那几个字怎么写。
+  assert.ok(result.home?.includes('客户端') && !/换号|多开|还没有账号/.test(result.home), JSON.stringify(result));
   assert.equal(result.path, 'C:\\Users\\Example\\AppData\\Local\\Claude-3p');
   assert.equal(result.overflow, false);
   assert.equal(result.wizardHidden, true, 'desktop launch must not create an account wizard');
-  assert.deepEqual(result.calls.map(c => c.payload?.action), ['launch_app', 'claude_desktop_open_data']);
-  assert.ok(result.calls.every(c => c.payload.app === 'claude-desktop' && !c.payload.name && !c.payload.path));
+  // 只比"动作"调用：账号页还会发 client_gateway（接入本地网关那块面板的状态查询），
+  // 它不是 action，混进来会让这条断言变成"面板有没有渲染"的间接测试
+  assert.deepEqual(result.calls.filter(c => c.command === 'action').map(c => c.payload?.action),
+    ['launch_app', 'claude_desktop_open_data']);
+  assert.ok(result.calls.filter(c => c.command === 'action')
+    .every(c => c.payload.app === 'claude-desktop' && !c.payload.name && !c.payload.path));
   return { product: 'claude-desktop', section: 'client', problems: [], width: await page.evaluate(() => innerWidth) };
 }
 (async () => {

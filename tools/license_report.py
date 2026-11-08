@@ -1,7 +1,8 @@
 """Report third-party crate licenses from Cargo.lock and the local registry cache.
 
-Resolved crate metadata is read from the cargo registry source cache
-($CARGO_HOME/registry/src), so the report reflects what actually gets compiled.
+Exact locked versions are read from the cargo registry source cache
+($CARGO_HOME/registry/src). Cargo.lock also includes optional and other-target
+packages, so this is an inventory, not a claim that every entry is shipped.
 Only package names, versions and SPDX expressions are printed - no local paths.
 """
 import argparse
@@ -51,15 +52,8 @@ def read_license(name, version, hosts):
                 return found[1]
             return 'LICENSE-FILE' if LICENSE_FILE.search(
                 direct.read_text(encoding='utf-8', errors='replace')) else 'UNKNOWN'
-    for host in hosts:  # cached under a slightly different version string
-        matches = sorted(p for p in host.iterdir() if p.is_dir() and re.match(
-            rf'^{re.escape(name)}-\d', p.name))
-        if matches:
-            text = (matches[-1] / 'Cargo.toml').read_text(encoding='utf-8', errors='replace')
-            found = LICENSE.search(text)
-            if found:
-                return found[1]
-            return 'LICENSE-FILE' if LICENSE_FILE.search(text) else 'UNKNOWN'
+    # Licenses can change between versions. Never substitute a cached version
+    # for the version in Cargo.lock, even when the package name is identical.
     return 'UNKNOWN'
 
 

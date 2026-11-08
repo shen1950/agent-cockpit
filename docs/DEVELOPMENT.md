@@ -6,14 +6,10 @@
 |---|---|
 | Rust（MSVC 工具链） | 后端编译，edition 2021。安装时选 `x86_64-pc-windows-msvc` |
 | VS Build Tools | 需要「使用 C++ 的桌面开发」工作负载 |
-| Node.js | 前端无构建步骤，仅用于 `npm test` |
+| Node.js | Tauri CLI、前端检查与浏览器测试；原生前端本身无打包步骤 |
 | WebView2 Runtime | Windows 11 自带；Windows 10 需单独安装 |
 
-```bash
-npm install
-npx tauri dev        # 开发模式（带热重载与 DevTools）
-npx tauri build      # 产出 exe + NSIS 安装包
-```
+先运行 `npm install` 安装开发依赖。编译和测试使用下面的协调入口；不要先启动一轮独立的 Tauri/Cargo 构建。
 
 ## 铁律：编译与测试只走 agsync
 
@@ -26,13 +22,15 @@ agsync task new --title "..." --files <要改的文件>
 agsync conflicts --task-id <任务号>           # 与别人的文件重叠就换文件或等
 # ...改代码...
 agsync task ready                            # 标就绪，等批次编译
-agsync build                                 # 编译 + 测试（含隐私门）
+agsync build                                 # 执行该工作区配置的编译与测试命令
 agsync deploy                                # 部署
 ```
 
 `agsync` 不在 PATH 时用 `python ~/.agents/skills/agent-sync/bin/agsync.py`。
 
-不登记的改动不会被编进批次，等于白干。编译失败时**先读自己任务文件里的 `error:` 段**：报错指向你的文件就修你的；与你无关就别动别人的文件，你的任务会自动退回 `ready`。
+`agsync` 协调共享工作区，不是自动隔离未完成修改的构建系统；所有参与者都应登记并确认就绪，避免构建读到别人改到一半的文件。编译失败时先读自己任务的错误归因：报错指向自己的文件就修自己的，其他文件由其 owner 处理。
+
+PowerShell 设置身份使用 `$env:AGSYNC_OWNER='你的固定名'`。新克隆目录若没有 `.agent-sync/`，先安装 agent-sync 工具并初始化该工作区；编译命令、测试命令和部署路径需要按本机配置。`agsync build` 是否包含隐私门，取决于工作区实际的 `build_cmd` / `test_cmd`，不能仅凭命令名称认定已经扫描。
 
 ### 部署前两条硬检查
 
@@ -41,15 +39,21 @@ agsync deploy                                # 部署
 
 ## 测试
 
-```bash
-npm test                                     # 粘贴解析器离线用例（不依赖 DOM / Tauri）
-cd src-tauri && cargo test                   # Rust 单测 + 反代端到端
-cd src-tauri && cargo test -- --include-ignored   # 真机用例（真扫本机 / 真连反代）
-```
+默认使用 `agsync build` 中配置的测试入口。需要更换测试命令时使用 `--test-cmd`；下面是可放入该参数的检查内容，不要绕过协调锁直接运行构建或测试：
+
+| 检查内容 | 工作目录为项目根时的命令 |
+|---|---|
+| Rust 单测 | `python tools/private_build.py test` |
+| 粘贴解析 | `npm test` |
+| 隐私扫描回归 | `python tests/privacy-check.test.py` |
+| 许可版本匹配回归 | `python tests/license-report.test.py` |
+| 网关前端 | 选择 `tests/` 中对应的浏览器用例，通过同一批次执行 |
+
+包含 `--include-ignored` 的真机测试可能读本机档案或实际发出请求，应先查看用例的副作用；日常构建不用它替代离线单测。
 
 反代模块带端到端单测：起服务 → 空池 502 → 记日志 → 停止释放端口。
 
-前端用例在 `tests/`（`node tests/paste-test.js` 可直接跑）。另有 Python 侧用例（隐私门、用量统计等）。
+前端与 Python 用例在 `tests/`，由协调批次的测试命令统一执行。
 
 ## 本地调试技巧
 
@@ -97,11 +101,12 @@ export LOCALAPPDATA="$USERPROFILE/AppData/Local"
 
 ## 发布流程
 
-发布必须过隐私门，顺序不能乱：
+发布先完成源码扫描与测试，再用路径脱敏构建检查最终 EXE。以下是各阶段的命令内容；编译和测试命令必须通过 `agsync build --cmd` / `--test-cmd` 执行，部署仍走 `agsync deploy`：
 
 ```bash
 python tools/privacy_check.py                     # 源码扫描：只报文件/行号/类别，不打印原文
 python tests/privacy-check.test.py
+python tests/license-report.test.py
 python tools/private_build.py build --release     # 编译路径映射为中性目录
 python tools/privacy_check.py --binary <exe>      # 二进制扫描（UTF-8 / UTF-16）
 python tools/export_public_source.py <仓库外的目标.zip>
@@ -112,9 +117,11 @@ python tools/export_public_source.py <仓库外的目标.zip>
 | `privacy_check.py` | 扫邮箱、家目录路径、密钥形态字面量、私钥；规则可配 |
 | `private_build.py` | 把编译路径映射成中性目录，减少二进制里的开发者路径 |
 | `export_public_source.py` | 生成**无 `.git` 历史**、无本机配置/日志/旧 exe/备份/账号的源码快照 |
-| `license_report.py` | 从 Cargo.lock + registry 缓存生成第三方许可报告 |
+| `license_report.py` | 按 Cargo.lock 的精确版本读取本地缓存，生成许可索引；缺失版本如实标未知 |
 
 导出脚本要求输出路径在仓库外，且不能覆盖已有文件——避免把公开发布包误留在工作区。
+
+发行包应同时附带 [LICENSE](../LICENSE)、[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)、`docs/third-party/` 中的原许可和实际打包依赖要求的声明。CPython 归档内的 LICENSE 必须保留；zcode-api 等另行安装的非商业组件若进入组合包，不能把整包简单标为 MIT。许可索引只是索引，不代替许可证原文或必要的源码提供信息。
 
 ## 发布前的额外人工检查
 
@@ -135,5 +142,6 @@ python tools/export_public_source.py <仓库外的目标.zip>
 |---|---|
 | `8788` | 本地反代（OpenAI 兼容，只绑 127.0.0.1） |
 | `8765` | 千问办公本地桥（按需自愈拉起，空闲自退） |
+| `8790` | 用户主动开启的手机远控；内置会话索引服务也有自己的默认端口与冲突处理，以当前服务状态为准 |
 
-反代与驾驶舱窗口同进程，杀了窗口 8788 就没了，反之亦然。
+模型网关与驾驶舱同进程；退出或替换进程会中断该网关连接。普通关窗可只是收进托盘，不等于退出。

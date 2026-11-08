@@ -5,7 +5,7 @@
 .gateway-supplier-head b{font-size:15px}
 .gateway-supplier-back{border:0;background:transparent;color:var(--text-muted);cursor:pointer;padding:2px 4px}
 .gateway-supplier-back:hover{color:var(--text)}
-.gateway-supplier-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:10px;width:100%;
+.gateway-supplier-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;width:100%;min-width:0;
   padding:13px 18px;border:0;border-bottom:1px solid var(--line);background:transparent;color:var(--text);font:inherit;cursor:pointer;text-align:left}
 .gateway-supplier-row:last-child{border-bottom:0}
 .gateway-supplier-row:hover{background:var(--bg-hover)}
@@ -22,7 +22,18 @@
 .gateway-supplier-detail{padding:16px 18px 20px;display:flex;flex-direction:column;gap:12px}
 .gateway-supplier-warning{color:var(--warn)}
 .gateway-supplier-facts{font-size:12px;color:var(--text-muted);overflow-wrap:anywhere}
-.gateway-supplier-empty,.gateway-suppliers-message:empty{display:none}
+.gateway-supplier-empty:empty,.gateway-suppliers-message:empty{display:none}
+.gateway-supplier-empty{padding:16px 18px;color:var(--text-muted)}
+.gateway-supplier-item{display:flex;align-items:center;min-width:0;border-bottom:1px solid var(--line)}
+.gateway-supplier-item:last-child{border-bottom:0}
+.gateway-supplier-item .gateway-supplier-row{flex:1;border-bottom:0}
+.gateway-supplier-ops{display:flex;align-items:center;gap:12px;padding-right:18px;flex:none}
+.gateway-supplier-page>.gateway-suppliers-message:not(:empty){padding:12px 18px;margin:0}
+.gateway-supplier-dialog .gateway-hint{margin-top:16px}
+.gateway-supplier-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
+.gateway-supplier-dialog .fields input,.gateway-supplier-dialog .fields select{min-width:0}
+.gateway-supplier-dialog:focus{outline:none}
+.gateway-supplier-label small.gateway-supplier-warning{color:var(--warn);overflow-wrap:anywhere}
 .gateway-suppliers-message:not(:empty){color:var(--text);font-size:12px}
 .gateway-supplier-select{display:flex;align-items:center;gap:8px;color:var(--text-muted);font-size:12px;max-width:420px}
 .gateway-supplier-detail .gateway-controls{display:flex;align-items:center;flex-wrap:wrap;gap:10px}

@@ -5,6 +5,7 @@ are opened read-only; output consists only of an aggregate local time range,
 event count and token count. Machines with no recent ChatGPT event are skipped.
 """
 import datetime as dt
+from collections import Counter
 import importlib.util
 import json
 import os
@@ -113,12 +114,14 @@ def main():
     result = usage.collect("chatgpt", home)
     if not result:
         raise AssertionError("a recent ChatGPT token event was found but the collector returned no usage")
-    recorded = {(round(row["timestamp"], 3), float(row.get("exact_tokens", 0)))
+    recorded = Counter((round(row["timestamp"], 3), float(row.get("exact_tokens", 0)))
                 for row in result.get("_records", [])
-                if isinstance(row.get("timestamp"), (int, float)) and row.get("exact_tokens", 0) > 0}
-    matches = [event for event in events if event in recorded]
-    if not matches:
-        raise AssertionError("recent token_count timestamps and increments were not retained by the collector")
+                if isinstance(row.get("timestamp"), (int, float)) and row.get("exact_tokens", 0) > 0)
+    expected = Counter(events)
+    missing = expected - recorded
+    if missing:
+        raise AssertionError(f"collector missed {sum(missing.values())} recent token_count events")
+    matches = events
     first = dt.datetime.fromtimestamp(min(t for t, _ in matches)).astimezone().strftime("%Y-%m-%d %H:%M")
     last = dt.datetime.fromtimestamp(max(t for t, _ in matches)).astimezone().strftime("%Y-%m-%d %H:%M")
     print(f"PASS: real ChatGPT token events {first} to {last}; {len(matches)} records; {sum(n for _, n in matches):.0f} tokens")

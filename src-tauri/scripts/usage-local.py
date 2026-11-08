@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 METRICS = ("tokens", "exact_tokens", "estimated_tokens", "input_tokens", "output_tokens",
            "cached_tokens", "requests", "failures", "timed_output_tokens", "duration_ms",
            "timing_samples", "ttft_ms", "ttft_samples")
@@ -157,7 +157,9 @@ def json_lines(path):
                 except (ValueError, TypeError):
                     continue
     except OSError:
-        return
+        # A failed read is distinct from an empty log; the outer collector
+        # reports this without leaking source paths or conversation content.
+        raise
 
 
 def codex_file(path):
@@ -260,8 +262,8 @@ def sql_rows(connection, table, optional=False):
     # Only constant adapter-owned identifiers are accepted by callers.
     try:
         yield from connection.execute('SELECT * FROM "' + table + '"')
-    except sqlite3.Error:
-        if not optional:
+    except sqlite3.OperationalError as exc:
+        if not optional or str(exc) != "no such table: " + table:
             raise
 
 
@@ -325,6 +327,44 @@ def marvis_db(path):
     return records
 
 
+def astudio_db(path):
+    """AStudio（讯飞 星辰/星火）把每轮消耗写成计费报告，落在 state.sqlite。
+
+    `turn_billing_outbox.report_json.model_usages` 是厂商自己记的账：
+    input/output/total/cached_input/reasoning_output 都在里面，还带 provider 与
+    effective_model。同一个 turn 可能有多条 model_usage（子 turn 聚合），逐条计入。
+    只读报告的用量字段，不碰 user_query 等对话内容。
+    """
+    records = []
+    with closing(connect(path)) as con:
+        for raw in sql_rows(con, "turn_billing_outbox", optional=True):
+            row = dict(raw)
+            payload = row.get("report_json")
+            if not payload:
+                continue
+            try:
+                report = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(report, dict):
+                continue
+            stamp = report.get("started_at") or report.get("completed_at")
+            session = report.get("session_id") or report.get("thread_id") or ""
+            failed = str(report.get("turn_status") or "").lower() in ("failed", "error", "cancelled")
+            usages = report.get("model_usages")
+            if not isinstance(usages, list):
+                continue
+            for index, usage in enumerate(usages):
+                if not isinstance(usage, dict):
+                    continue
+                model = usage.get("effective_model") or usage.get("requested_model") or ""
+                identity = "%s:%s:%s" % (row.get("billing_turn_id"), index, model)
+                records.append(event(identity, session or row.get("billing_account_id"),
+                                     stamp, model, usage.get("provider") or "",
+                                     usage=usage, failure=failed))
+    return records
+
+
 def dsh_file(path):
     raw = path.read_bytes()
     try:
@@ -362,10 +402,7 @@ def dsh_file(path):
 
 def gemini_file(path):
     records = []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return records
+    data = json.loads(path.read_text(encoding="utf-8"))
     pending_input = 0
     session = data.get("sessionId") or path.stem
     for index, row in enumerate(data.get("messages") or []):
@@ -398,6 +435,8 @@ def paths_for(app, root):
         return [(p, "opencode") for p in candidates if p.is_file()][:1]
     if app == "marvis":
         return [(root / "database" / "data.db", "marvis")]
+    if app == "astudio":
+        return [(root / "state.sqlite", "astudio")]
     if app == "dsh":
         return [(p, "dsh") for p in (root / "sessions").glob("**/session.v4.jsonl.zstd")]
     if app in ("gemini", "gemini-cli"):
@@ -472,6 +511,7 @@ SOURCES = {"codex": "本机 Codex 会话日志", "claude": "本机 Claude Code �
            "workbuddy": "本机 WorkBuddy 会话日志", "workbuddy-intl": "本机 WorkBuddy 国际版会话日志",
            "zcode": "本机 ZCode model_usage 请求库", "opencode": "本机 OpenCode 请求库",
            "minimax": "本机 MiniMax 会话日志", "marvis": "本机 Marvis 日用量库",
+           "astudio": "本机 AStudio 逐轮计费报告",
            "dsh": "本机 DSH 会话日志逐条 usage"}
 
 
@@ -492,6 +532,7 @@ def collect(app, root, cache_dir=None):
         except (OSError, ValueError):
             pass
     previous = cache.get("files", {}) if cache.get("version") == CACHE_VERSION else {}
+    changed = cache.get("version") != CACHE_VERSION
     updated = {}
     records = []
     errors = 0
@@ -506,25 +547,38 @@ def collect(app, root, cache_dir=None):
             if cached.get("stamp") == stamp:
                 rows = cached["records"]
             elif kind == "codex":
+                changed = True
                 rows = codex_file(path)
             elif kind == "messages":
+                changed = True
                 rows = message_file(path, app)
             elif kind == "zcode":
+                changed = True
                 rows = zcode_db(path)
             elif kind == "opencode":
+                changed = True
                 rows = opencode_db(path)
             elif kind == "marvis":
+                changed = True
                 rows = marvis_db(path)
+            elif kind == "astudio":
+                changed = True
+                rows = astudio_db(path)
             elif kind == "dsh":
+                changed = True
                 rows = dsh_file(path)
             else:
+                changed = True
                 rows = gemini_file(path)
             updated[key] = {"stamp": stamp, "records": rows}
             records.extend(rows)
             files += 1
         except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, subprocess.TimeoutExpired):
             errors += 1
-    if cache_path:
+    # An unchanged source does not need the complete event cache serialized and
+    # rewritten again every polling interval. Removed/unreadable files invalidate it.
+    changed = changed or len(updated) != len(previous)
+    if cache_path and changed:
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = cache_path.with_suffix(".%s.tmp" % os.getpid())
@@ -533,7 +587,10 @@ def collect(app, root, cache_dir=None):
             temporary.replace(cache_path)
         except OSError:
             pass
-    return aggregate(records, SOURCES.get(app, "本机 " + app + " 会话日志"), source_key, files, errors)
+    result = aggregate(records, SOURCES.get(app, "本机 " + app + " 会话日志"), source_key, files, errors)
+    if result is None and errors:
+        return {"error": "本地用量文件读取失败，请检查文件权限与数据库状态。"}
+    return result
 
 
 if __name__ == "__main__":
@@ -543,4 +600,4 @@ if __name__ == "__main__":
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
     except Exception:
         # Do not expose source rows, paths or snippets in an error response.
-        print("null")
+        print(json.dumps({"error": "本地用量采集失败，请检查数据文件与运行环境。"}, ensure_ascii=False))

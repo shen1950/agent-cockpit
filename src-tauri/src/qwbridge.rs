@@ -366,7 +366,7 @@ pub fn one_click(proxy: &std::sync::Arc<crate::proxy::Proxy>) -> Value {
     })
 }
 
-/// 桥目录：优先环境变量，其次本机这个固定位置（桥是本仓库的配套件）
+/// 桥目录：显式配置优先，其次用户目录与程序相邻目录。
 fn bridge_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("QWB_DIR") {
         let pb = PathBuf::from(p);
@@ -374,9 +374,15 @@ fn bridge_dir() -> Option<PathBuf> {
             return Some(pb);
         }
     }
-    let cand = PathBuf::from(r"D:\Claude\agent-cockpit-workspace\qwenwork-bridge");
-    if cand.join("bridge.py").exists() {
-        return Some(cand);
+    let mut candidates = vec![crate::registry::home().join(".agent-cockpit").join("qwenwork-bridge")];
+    if let Ok(exe) = std::env::current_exe() {
+        // Supports both a portable sibling and the repository's bin/ layout.
+        for parent in exe.ancestors().skip(1).take(3) {
+            candidates.push(parent.join("qwenwork-bridge"));
+        }
+    }
+    for candidate in candidates {
+        if candidate.join("bridge.py").is_file() { return Some(candidate); }
     }
     None
 }
@@ -400,14 +406,14 @@ fn python_exe(windowless: bool) -> String {
             return v;
         }
     }
-    let dir = r"C:\Users\USER\.agenthub\venv\Scripts";
+    let dir = crate::registry::home().join(".agenthub").join("venv").join("Scripts");
     if windowless {
-        let w = format!(r"{dir}\pythonw.exe");
+        let w = dir.join("pythonw.exe").to_string_lossy().into_owned();
         if std::path::Path::new(&w).exists() {
             return w;
         }
     }
-    let v = format!(r"{dir}\python.exe");
+    let v = dir.join("python.exe").to_string_lossy().into_owned();
     if std::path::Path::new(&v).exists() {
         return v;
     }

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Agent 驾驶舱",
-  "version": "2.3.0",
-  "identifier": "com.demo.agent-cockpit",
+  "version": "2.4.0",
+  "identifier": "io.agentcockpit.desktop",
   "build": {
     "frontendDist": "../ui"
   },
@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'"
+      "csp": "default-src 'self'; frame-src 'self' http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'"
     }
   },
   "bundle": {

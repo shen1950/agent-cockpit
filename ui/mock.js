@@ -351,10 +351,11 @@ const DATA = {
       instances: [
         { src: 'instance:qoder/账号1', app: 'qoder', app_name: 'Qoder', instance: '账号1', has_token: true, proxy_base_url: '' },
         { src: 'instance:qoder/账号2', app: 'qoder', app_name: 'Qoder', instance: '账号2', has_token: true, proxy_base_url: '' },
-        { src: 'instance:qoder-cn/账号1', app: 'qoder-cn', app_name: 'Qoder CN', instance: '账号1', has_token: true, proxy_base_url: '' },
+        { src: 'instance:qoder-cn/账号1', app: 'qoder-cn', app_name: 'Qoder CN', instance: '账号1', has_token: false, availability_reason: '直连未验证，请使用已启动的本地桥', proxy_base_url: '' },
+        { src: 'bridge:qoder-cn/账号1', app: 'qoder-cn', app_name: 'Qoder CN', instance: '账号1', has_token: true, bridge: true },
         { src: 'instance:qoder-cn/账号2', app: 'qoder-cn', app_name: 'Qoder CN', instance: '账号2', has_token: false, proxy_base_url: '' },
         { src: 'instance:workbuddy/账号1', app: 'workbuddy', app_name: 'WorkBuddy', instance: '账号1', has_token: false, proxy_base_url: '' },
-        { src: 'instance:codex/账号1', app: 'codex', app_name: 'Codex CLI', instance: '账号1', has_token: true, proxy_base_url: '' },
+        { src: 'instance:codex/账号1', app: 'codex', app_name: 'Codex CLI', instance: '账号1', has_token: false, supported: false, availability_reason: '尚无账号登录态反代适配，请配置兼容 API 地址与令牌', proxy_base_url: '' },
       ],
       keys: [
         { src: 'key:p-longcat/k-lc-1', site_id: 'p-longcat', site_name: 'Longcat', base_url: 'https://api.longcat.chat/openai/v1', label: 'Pot', masked: 'sk-lc-••••1111' },
@@ -613,10 +614,41 @@ DATA.backups = [
   { file: 'traework-cn__账号1__20261002-155822.zip', app: 'traework-cn', account: '账号1', bytes: 21495808, mb: 20.5, at: '2026-10-02 15:58' },
 ];
 
+function mockProviderRows() {
+  const removed = DATA.proxy.providers_removed || [];
+  const off = DATA.proxy.sources_off || [];
+  const members = DATA.proxy.members || { instances: [], keys: [] };
+  const registered = new Set((DATA.proxy.pools || []).flatMap(p => p.members.map(m => m.src)));
+  return [...members.instances, ...members.keys].filter(m => !removed.includes(m.src) &&
+    (registered.has(m.src) || off.includes(m.src) || DATA.proxy.provider_names?.[m.src])).map(m => ({
+    id: 'pv-mock-' + encodeURIComponent(m.src), src: m.src,
+    name: DATA.proxy.provider_names?.[m.src] || (m.label ? (m.site_name || m.app_name) + '/' + m.label
+      : m.instance ? m.app_name + '/' + m.instance : m.site_name || m.app_name),
+    kind: m.site_name ? 'key' : 'instance', app: m.app, app_name: m.app_name || m.site_name,
+    site_name: m.site_name || '', label: m.label || '', masked: m.masked || '',
+    has_token: m.has_token !== false, supported: m.supported !== false,
+    availability_reason: m.availability_reason || '', off: off.includes(m.src), bridge: !!m.bridge,
+  }));
+}
+function mockProviderFlag(field, src, enabled) {
+  const entries = (DATA.proxy[field] || []).filter(value => value !== src);
+  if (enabled) entries.push(src);
+  DATA.proxy[field] = entries;
+  const removed = DATA.proxy.providers_removed || [], off = DATA.proxy.sources_off || [];
+  for (const row of [...DATA.proxy.members.instances, ...DATA.proxy.members.keys])
+    row.off = off.includes(row.src) || removed.includes(row.src);
+}
+function mockProviderPool(row) {
+  const pool = { id: row.id, name: '供应商 · ' + row.name, enabled: true,
+    members: [{ src: row.src, base_url: '', enabled: true }] };
+  const index = DATA.proxy.pools.findIndex(p => p.id === row.id);
+  if (index >= 0) DATA.proxy.pools[index] = pool; else DATA.proxy.pools.push(pool);
+}
+
 window.__TAURI__ = {
   core: {
     invoke(cmd, args = {}) {
-      if (cmd === 'get_state') return Promise.resolve(JSON.parse(JSON.stringify(DATA)));
+      if (cmd === 'get_state') { DATA.proxy.providers = mockProviderRows(); return Promise.resolve(JSON.parse(JSON.stringify(DATA))); }
       if (cmd === 'get_settings') return Promise.resolve(JSON.parse(JSON.stringify(DATA.settings)));
       if (cmd === 'set_settings') {
         const p = args.patch || {};
@@ -816,27 +848,42 @@ window.__TAURI__ = {
           for (const m of (DATA.proxy.members?.keys || [])) m.off = off.includes(m.src);
           return Promise.resolve({ ok: true, msg: i >= 0 ? '已启用来源' : '已停用来源' });
         }
-        if (p.action === 'proxy_providers') {
-          const members = DATA.proxy.members || { instances: [], keys: [] };
-          const providers = [...(members.instances || []), ...(members.keys || [])].map((m, index) => ({
-            id: 'pv-mock-' + index, src: m.src, name: m.label ? `${m.site_name || m.app_name}/${m.label}`
-              : m.instance ? `${m.app_name}/${m.instance}` : (m.site_name || m.app_name),
-            kind: m.site_name ? 'key' : 'instance', app: m.app, app_name: m.app_name || m.site_name,
-            site_name: m.site_name || '', label: m.label || '', masked: m.masked || '',
-            has_token: m.has_token !== false, off: !!m.off, bridge: !!m.bridge,
-          }));
-          return Promise.resolve({ ok: true, msg: JSON.stringify({ providers }) });
+        if (p.action === 'proxy_members') {
+          return Promise.resolve({ ok: true, msg: JSON.stringify({ members: DATA.proxy.members }) });
         }
-        if (p.action === 'proxy_provider_toggle') {
-          const members = DATA.proxy.members || { instances: [], keys: [] };
-          const rows = [...(members.instances || []), ...(members.keys || [])];
-          const off = DATA.proxy.sources_off || (DATA.proxy.sources_off = []);
-          const target = rows[(String(p.id).split('-').pop() | 0)];
-          if (!target) return Promise.resolve({ ok: false, msg: '没找到这个供应商' });
-          const index = off.indexOf(target.src);
-          if (index >= 0) off.splice(index, 1); else off.push(target.src);
-          rows.forEach((row) => { row.off = off.includes(row.src); });
-          return Promise.resolve({ ok: true, msg: index >= 0 ? '已启用供应商' : '已停用供应商' });
+        if (p.action === 'proxy_providers') {
+          return Promise.resolve({ ok: true, msg: JSON.stringify({ providers: mockProviderRows() }) });
+        }
+        if (p.action === 'proxy_provider_upsert') {
+          const item = p.item || {};
+          const member = [...DATA.proxy.members.instances, ...DATA.proxy.members.keys].find(m => m.src === item.src);
+          if (!member || member.has_token === false || member.supported === false || !item.name?.trim())
+            return Promise.resolve({ ok: false, msg: '请选择可用来源并填写供应商名称' });
+          DATA.proxy.provider_names ||= {};
+          DATA.proxy.provider_names[item.src] = item.name.trim();
+          mockProviderFlag('providers_removed', item.src, false);
+          mockProviderFlag('sources_off', item.src, false);
+          mockProviderPool(mockProviderRows().find(row => row.src === item.src));
+          return Promise.resolve({ ok: true, msg: '已添加供应商' });
+        }
+        if (p.action === 'proxy_provider_delete') {
+          const row = mockProviderRows().find(row => row.id === p.id);
+          if (!row) return Promise.resolve({ ok: false, msg: '没找到这个供应商' });
+          mockProviderFlag('providers_removed', row.src, true);
+          mockProviderFlag('sources_off', row.src, true);
+          const pool = DATA.proxy.pools.find(pool => pool.id === p.id);
+          if (pool) pool.enabled = false;
+          return Promise.resolve({ ok: true, msg: '已删除供应商' });
+        }
+        if (['proxy_provider_set_enabled', 'proxy_provider_toggle'].includes(p.action)) {
+          const row = mockProviderRows().find(row => row.id === p.id);
+          if (!row) return Promise.resolve({ ok: false, msg: '没找到这个供应商' });
+          const enabled = p.action === 'proxy_provider_toggle' ? row.off : p.enabled;
+          if (enabled && (!row.has_token || !row.supported))
+            return Promise.resolve({ ok: false, msg: row.availability_reason || '来源尚未就绪' });
+          mockProviderFlag('sources_off', row.src, !enabled);
+          if (enabled) mockProviderPool(row);
+          return Promise.resolve({ ok: true, msg: enabled ? '已启用供应商' : '已停用供应商' });
         }
         if (p.action === 'proxy_provider_save') return Promise.resolve({ ok: true, msg: '已保存供应商' });
         if (p.action === 'proxy_dist_create') {
@@ -844,7 +891,13 @@ window.__TAURI__ = {
           DATA.proxy.dist.push({ id: 'dk-' + Date.now(), name: p.item.name, masked: `${key.slice(0, 6)}••••${key.slice(-4)}`, pools: p.item.pools || [], enabled: true, calls: 0, last_used: 0 });
           return Promise.resolve({ ok: true, msg: `已生成接入密钥 ${key}` });
         }
-        if (['proxy_dist_update', 'proxy_dist_toggle', 'proxy_dist_delete', 'proxy_pool_upsert', 'proxy_pool_delete'].includes(p.action)) {
+        if (p.action === 'proxy_dist_update') {
+          const row = DATA.proxy.dist.find(row => row.id === p.item.id);
+          if (!row) return Promise.resolve({ ok: false, msg: '没找到接入密钥' });
+          Object.assign(row, { name: p.item.name, enabled: p.item.enabled, pools: [...p.item.pools] });
+          return Promise.resolve({ ok: true, msg: '已保存接入密钥' });
+        }
+        if (['proxy_dist_toggle', 'proxy_dist_delete', 'proxy_pool_upsert', 'proxy_pool_delete'].includes(p.action)) {
           return Promise.resolve({ ok: true, msg: '已保存' });
         }
       }

@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 def key():
     secret = os.environ.get('ZCODE_CREDENTIAL_SECRET') or (
@@ -74,6 +75,21 @@ def snapshot(record):
     return {'identity': who, 'record': {k: v for k, v in record.items() if k in allowed}}
 
 
+def proxy_credential(record, expected):
+    """Explicit, pipe-only export for the selected card; never use another login."""
+    who = identity(record)
+    if not expected or not who['has_auth'] or who['user_id'] != expected:
+        raise ValueError('ZCode proxy account identity does not match the selected card')
+    jwt = decode(record.get('zcodejwttoken', '')).strip()
+    if not jwt:
+        raise ValueError('ZCode Start Plan token is missing; open ZCode and save this login again')
+    parts = jwt.split('.')
+    claims = json.loads(base64.urlsafe_b64decode(parts[1] + '=' * (-len(parts[1]) % 4)))
+    if claims.get('exp') is not None and float(claims['exp']) <= time.time():
+        raise ValueError('ZCode Start Plan token expired; sign in again and save the login')
+    return {'provider': who['provider'], 'user_id': expected, 'jwt': jwt}
+
+
 def merge(current, target=None, selected_provider=None):
     # A shared record may cache both providers. Preserve every other provider's
     # ciphertext, bot credentials and project API configuration byte-for-byte.
@@ -106,6 +122,8 @@ def run(request):
         return identity(record)
     if mode == 'snapshot':
         return snapshot(record)
+    if mode == 'proxy':
+        return proxy_credential(record, request.get('expected_user_id', ''))
     if mode == 'merge':
         return {'record': merge(record, request.get('target'), request.get('provider'))}
     raise ValueError('Unknown ZCode credential operation')

@@ -135,7 +135,10 @@ pub fn status(m: &Value) -> Value {
     if s["mode"]=="apikey" {
         if let Ok(text)=fs::read_to_string(h.join("config.toml")){if let Ok(config)=text.parse::<toml::Value>(){
             let provider=config.get("model_provider").and_then(toml::Value::as_str).unwrap_or("openai");
-            s["provider"]=json!(provider);s["base_url"]=json!(config.get("model_providers").and_then(|v|v.get(provider)).and_then(|v|v.get("base_url")).and_then(toml::Value::as_str).unwrap_or("https://api.openai.com/v1"));
+            let pv=config.get("model_providers").and_then(|v|v.get(provider));
+            s["provider"]=json!(provider);s["base_url"]=json!(pv.and_then(|v|v.get("base_url")).and_then(toml::Value::as_str).unwrap_or("https://api.openai.com/v1"));
+            // 账号卡自选的协议（responses/chat），卡片上一眼能看到
+            s["wire_api"]=json!(pv.and_then(|v|v.get("wire_api")).and_then(toml::Value::as_str).unwrap_or("responses"));
         }}
     }
     s["path_error"] = json!(check_plain_path(Path::new(m["data_dir"].as_str().unwrap_or(""))).err());
@@ -233,7 +236,7 @@ fn launch(m: &Value) -> Result<Value, String> {
         if !under(&h, &reg::base_dir().join("chatgpt-auth")) { return Err("独立凭据目录超出受管范围".into()); }
         if !h.join("config.toml").is_file() { h=prepare_home(m)?; }
         let auth=status(m);
-        if auth["has_auth"]==true&&auth["mode"]=="chatgpt"{provider_config(&h,"",name)?;}
+        if auth["has_auth"]==true&&auth["mode"]=="chatgpt"{provider_config(&h,"",name,"")?;}
         if auth["has_auth"]==true&&auth["mode"]=="apikey"{sync_provider_label(m)?;}
         procs::launch_pwa_isolated(&exe, p, Some(&h))?;
     }
@@ -335,7 +338,7 @@ fn normalize_one(v:&Value)->Result<Value,String>{
     if !v.is_object(){return Err("凭据必须是对象或令牌文本".into());}
     for k in ["auth","credentials","session"] {if v.get(k).is_some_and(Value::is_object){return normalize_one(&v[k]);}}
     let key=token_value(v,&["OPENAI_API_KEY","api_key","apiKey"]);
-    if !key.is_empty(){return Ok(json!({"auth_mode":"apikey","OPENAI_API_KEY":key,"base_url":token_value(v,&["base_url","api_base_url","baseUrl"])}));}
+    if !key.is_empty(){return Ok(json!({"auth_mode":"apikey","OPENAI_API_KEY":key,"base_url":token_value(v,&["base_url","api_base_url","baseUrl"]),"wire_api":token_value(v,&["wire_api","wire"])}));}
     let t=if v["tokens"].is_object(){&v["tokens"]}else{v};
     let access=token_value(t,&["access_token","accessToken","personal_access_token"]);
     let refresh=token_value(t,&["refresh_token","refreshToken"]);
@@ -357,8 +360,9 @@ fn normalize_many(text:&str)->Result<Vec<Value>,String>{
     let values=if let Some(list)=list{if list.len()>100{return Err("一次最多导入100个账号".into());}list.iter().map(normalize_one).collect::<Result<Vec<_>,_>>()?}else{vec![normalize_one(&raw)?]};
     if values.is_empty(){return Err("没有可导入账号".into());}Ok(values)
 }
-fn with_import_base(mut value:Value,base:&str)->Result<Value,String>{
+fn with_import_base(mut value:Value,base:&str,wire:&str)->Result<Value,String>{
     if !base.trim().is_empty(){if value["auth_mode"]!="apikey"{return Err("自定义 Base URL 只适用于 API Key，请为 ChatGPT 账号令牌留空该字段。".into());}value["base_url"]=json!(base.trim());}
+    if !wire.trim().is_empty(){if value["auth_mode"]!="apikey"{return Err("协议类型只适用于 API Key，请为 ChatGPT 账号令牌留空该字段。".into());}value["wire_api"]=json!(wire.trim());}
     Ok(value)
 }
 fn refresh_if_needed(v:&Value)->Result<Value,String>{
@@ -377,7 +381,7 @@ fn refresh_if_needed(v:&Value)->Result<Value,String>{
     let out=normalize_one(&reply)?;
     if out["tokens"]["access_token"].as_str().unwrap_or("").is_empty(){return Err("续期未返回访问令牌".into());}Ok(out)
 }
-fn provider_config(h:&Path,base:&str,label:&str)->Result<(),String>{
+fn provider_config(h:&Path,base:&str,label:&str,wire:&str)->Result<(),String>{
     let file=h.join("config.toml");
     let mut cfg:toml::Value=fs::read_to_string(&file).map_err(|e|e.to_string())?.parse().map_err(|_|"账号配置无法解析")?;
     if base.trim().is_empty(){
@@ -389,11 +393,20 @@ fn provider_config(h:&Path,base:&str,label:&str)->Result<(),String>{
     }
     let base=base.trim().trim_end_matches('/');
     if !(base.starts_with("https://")||base.starts_with("http://127.0.0.1:")||base.starts_with("http://localhost:")) || base.contains(['\n','\r','"','@','?','#']) {return Err("Base URL需要HTTPS地址或本机HTTP端口，且不能包含凭据和查询参数".into());}
+    // wire_api 由账号卡自选：responses 是 Codex 原生协议（8788 反代已实现进站），
+    // chat 走 OpenAI 兼容的 /v1/chat/completions —— 上游端点更朴素的网关用它更稳。
+    let wire=match wire.trim().to_lowercase().as_str(){"chat"|"chat_completions"=>"chat",_=>"responses"};
     let table=cfg.as_table_mut().ok_or("账号配置必须是TOML表")?;
     table.insert("model_provider".into(),toml::Value::String("agentcockpit".into()));
     let providers=table.entry("model_providers".to_string()).or_insert_with(||toml::Value::Table(Default::default())).as_table_mut().ok_or("model_providers必须是配置表")?;
     let mut provider=toml::map::Map::new();
-    for(k,v)in[("name",toml::Value::String(if label.trim().is_empty(){"API 账号".into()}else{label.into()})),("base_url",toml::Value::String(base.into())),("wire_api",toml::Value::String("responses".into())),("requires_openai_auth",toml::Value::Boolean(true))]{provider.insert(k.into(),v);}
+    for(k,v)in[("name",toml::Value::String(if label.trim().is_empty(){"API 账号".into()}else{label.into()})),("base_url",toml::Value::String(base.into())),("wire_api",toml::Value::String(wire.into())),("requires_openai_auth",toml::Value::Boolean(true))]{provider.insert(k.into(),v);}
+    // 模型目录：客户端选择器从此显示反代的真实模型（minimax/…），
+    // 内置的 GPT 推荐集（gpt-6.1-sol 那排）不再出现。目录由 8788 本地应答，
+    // 只挂本机地址——外部网关没有这个端点，挂了也只会 404。
+    if base.starts_with("http://127.0.0.1:")||base.starts_with("http://localhost:"){
+        provider.insert("model_catalog_url".into(),toml::Value::String(format!("{base}/model_catalog.json")));
+    }
     providers.insert("agentcockpit".into(),toml::Value::Table(provider));
     atomic_write(&file,toml::to_string(&cfg).map_err(|e|e.to_string())?.as_bytes())
 }
@@ -408,12 +421,39 @@ fn sync_provider_label(m:&Value)->Result<bool,String>{
     let id=cfg.get("model_provider").and_then(toml::Value::as_str).unwrap_or("openai").to_string();
     let label=m["name"].as_str().ok_or("账号名称缺失")?;
     if id=="openai" {
-        provider_config(&h,"https://api.openai.com/v1",label)?;return Ok(true);
+        provider_config(&h,"https://api.openai.com/v1",label,"responses")?;return Ok(true);
     }
     let provider=cfg.get_mut("model_providers").and_then(|p|p.get_mut(&id)).and_then(toml::Value::as_table_mut).ok_or("账号供应商配置不存在")?;
-    if provider.get("name").and_then(toml::Value::as_str)==Some(label){return Ok(false);}
-    provider.insert("name".into(),toml::Value::String(label.into()));
-    atomic_write(&file,toml::to_string(&cfg).map_err(|e|e.to_string())?.as_bytes())?;Ok(true)
+    let mut changed=false;
+    // 存量账号回填 model_catalog_url：launch 每次都会走到这里，老账号不用重新导入
+    // 也能拿到真实模型目录。只补自己的 agentcockpit provider，别碰用户手改的其他供应商。
+    if id=="agentcockpit" && provider.get("model_catalog_url").is_none() {
+        if let Some(base)=provider.get("base_url").and_then(toml::Value::as_str).map(|s| s.trim_end_matches('/')).filter(|s| s.starts_with("http://127.0.0.1:")||s.starts_with("http://localhost:")){
+            provider.insert("model_catalog_url".into(),toml::Value::String(format!("{base}/model_catalog.json")));
+            changed=true;
+        }
+    }
+    if provider.get("name").and_then(toml::Value::as_str) != Some(label) {
+        provider.insert("name".into(),toml::Value::String(label.into()));
+        changed = true;
+    }
+    let port = reg::load_config()["proxy"]["port"].as_u64().unwrap_or(reg::PROXY_PORT as u64);
+    let base = provider.get("base_url").and_then(toml::Value::as_str).unwrap_or("").trim_end_matches('/');
+    let local_proxy = id == "agentcockpit" && ["localhost", "127.0.0.1"].iter()
+        .any(|host| base == format!("http://{host}:{port}/v1"));
+    if local_proxy {
+        if let Some(old) = cfg.get("model").and_then(toml::Value::as_str).and_then(|s| s.strip_prefix("astudio/")) {
+            let models = crate::asproxy::account_models();
+            if !models.iter().any(|m| m["id"] == old) && models.iter().any(|m| m["id"] == "spark-x2.6-4b") {
+                cfg["model"] = toml::Value::String("astudio/spark-x2.6-4b".into());
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        atomic_write(&file,toml::to_string(&cfg).map_err(|e|e.to_string())?.as_bytes())?;
+    }
+    Ok(changed)
 }
 fn install_stdin(h:&Path,flag:&str,secret:&str)->Result<(),String>{
     let mut c=command(h)?;
@@ -435,10 +475,10 @@ fn import_one(m:&Value,value:&Value)->Result<Value,String>{
     let old_auth=fs::read(&auth_path).ok();let old_config=fs::read(&config_path).map_err(|e|e.to_string())?;
     let result=(||->Result<(),String>{if value["auth_mode"]=="apikey"{
         let base=value["base_url"].as_str().filter(|s|!s.trim().is_empty()).unwrap_or("https://api.openai.com/v1");
-        provider_config(&h,base,name)?;
+        provider_config(&h,base,name,value["wire_api"].as_str().unwrap_or(""))?;
         install_stdin(&h,"--with-api-key",value["OPENAI_API_KEY"].as_str().ok_or("API Key为空")?)?;
     }else{
-        provider_config(&h,"",name)?;
+        provider_config(&h,"",name,"")?;
         if value["tokens"]["id_token"].as_str().unwrap_or("").is_empty() && value["tokens"]["refresh_token"].as_str().unwrap_or("").is_empty(){
             install_stdin(&h,"--with-access-token",value["tokens"]["access_token"].as_str().ok_or("访问令牌为空")?)?;
         }else{
@@ -543,8 +583,8 @@ fn rename(name:&str,new:&str)->Result<Value,String>{
 fn handle(act:&str,p:&Value)->Result<Value,String>{
     let name=p["name"].as_str().unwrap_or("").trim();
     if act.starts_with("chatgpt_official_"){return official::handle(act,p);}
-    if act=="chatgpt_add_import"{let values=normalize_many(p["text"].as_str().unwrap_or(""))?;if values.len()!=1{return Err("请选择一份凭据；批量导入请使用批量创建入口".into());}let v=with_import_base(values[0].clone(),p["base_url"].as_str().unwrap_or(""))?;return commit_new(p,&v);}
-    if act=="chatgpt_add_apikey"{return commit_new(p,&normalize_one(&json!({"OPENAI_API_KEY":p["key"],"base_url":p["base_url"]}))?);}
+    if act=="chatgpt_add_import"{let values=normalize_many(p["text"].as_str().unwrap_or(""))?;if values.len()!=1{return Err("请选择一份凭据；批量导入请使用批量创建入口".into());}let v=with_import_base(values[0].clone(),p["base_url"].as_str().unwrap_or(""),p["wire_api"].as_str().unwrap_or(""))?;return commit_new(p,&v);}
+    if act=="chatgpt_add_apikey"{return commit_new(p,&normalize_one(&json!({"OPENAI_API_KEY":p["key"],"base_url":p["base_url"],"wire_api":p["wire_api"]}))?);}
     if act=="chatgpt_add_local"{return commit_new(p,&local_credentials(p)?);}
     if act=="chatgpt_add_oauth"{let n=new_account_name(p,&Value::Null)?;let mut request=p.clone();request["name"]=json!(n);request["origin"]=json!("fresh");create(&request)?;let mut result=start_login(&meta(&n)?,p["method"]=="device")?;result["name"]=json!(n);return Ok(result);}
     if !matches!(act,"chatgpt_status"|"chatgpt_cancel"|"chatgpt_open_home") && official::busy_target(name){return Err("这个账号正在完成临时官方登录，请等待完成或先取消该流程。".into());}
@@ -580,7 +620,7 @@ fn handle(act:&str,p:&Value)->Result<Value,String>{
         "chatgpt_import"=>{let values=normalize_many(p["text"].as_str().unwrap_or(""))?;if values.len()!=1{return Err("这里需要一份账号凭据。多份JSON或令牌请逐个导入到独立账号。".into());}import_one(&m,&values[0])},
         "chatgpt_local_import"=>local_import(&m,p),
         "chatgpt_open_home"=>{let h=home(&m);check_plain_path(&h)?;let(ok,msg)=crate::space::open_dir(&h.to_string_lossy());if ok{Ok(json!({"msg":msg}))}else{Err(msg)}},
-        "chatgpt_apikey"=>import_one(&m,&normalize_one(&json!({"OPENAI_API_KEY":p["key"],"base_url":p["base_url"]}))?),
+        "chatgpt_apikey"=>import_one(&m,&normalize_one(&json!({"OPENAI_API_KEY":p["key"],"base_url":p["base_url"],"wire_api":p["wire_api"]}))?),
         _=>Err("未知ChatGPT操作".into()),
     }
 }
@@ -633,18 +673,23 @@ mod tests {
     }
     #[test] fn oauth_configuration_cannot_reuse_custom_provider(){
         let dir=temp_dir();let file=dir.join("config.toml");fs::write(&file,"model = 'kept'\ncli_auth_credentials_store = 'file'\n").unwrap();
-        provider_config(&dir,"http://127.0.0.1:8788/v1","My API Account").unwrap();
+        provider_config(&dir,"http://127.0.0.1:8788/v1","My API Account","").unwrap();
         let cfg:toml::Value=fs::read_to_string(&file).unwrap().parse().unwrap();assert_eq!(cfg["model_provider"].as_str(),Some("agentcockpit"));
         assert_eq!(cfg["model_providers"]["agentcockpit"]["name"].as_str(),Some("My API Account"));
-        provider_config(&dir,"","OAuth Account").unwrap();let cfg:toml::Value=fs::read_to_string(&file).unwrap().parse().unwrap();assert_eq!(cfg["model_provider"].as_str(),Some("openai"));assert_eq!(cfg["model"].as_str(),Some("kept"));
-        assert!(provider_config(&dir,"https://user:secret@invalid.example","Account").is_err());clean_temp(&dir);
+        // 不传协议时默认 responses；显式选 chat 就写 chat
+        assert_eq!(cfg["model_providers"]["agentcockpit"]["wire_api"].as_str(),Some("responses"));
+        provider_config(&dir,"http://127.0.0.1:8788/v1","My API Account","chat").unwrap();
+        let cfg:toml::Value=fs::read_to_string(&file).unwrap().parse().unwrap();assert_eq!(cfg["model_providers"]["agentcockpit"]["wire_api"].as_str(),Some("chat"));
+        assert_eq!(cfg["model_providers"]["agentcockpit"]["model_catalog_url"].as_str(),Some("http://127.0.0.1:8788/v1/model_catalog.json"));
+        provider_config(&dir,"","OAuth Account","").unwrap();let cfg:toml::Value=fs::read_to_string(&file).unwrap().parse().unwrap();assert_eq!(cfg["model_provider"].as_str(),Some("openai"));assert_eq!(cfg["model"].as_str(),Some("kept"));
+        assert!(provider_config(&dir,"https://user:secret@invalid.example","Account","chat").is_err());clean_temp(&dir);
     }
     #[test] fn copying_or_swapping_native_profile_is_never_attempted(){
         assert!(!crate::swap::swap_set(APP,"missing",true).ok);assert!(!crate::swap::swap_clear(APP).0);assert!(!crate::swap::rehome(APP,"missing",true).0);
         let p=std::env::temp_dir().join("chatgpt-copy-must-not-exist");assert!(crate::space::seed_instance(APP,&p,"copy",Some(&native_home())).is_err());
     }
     #[test] fn import_preserves_oidc_fields_and_uses_timestamp_string(){let v=normalize_one(&json!({"tokens":{"access_token":"a","id_token":"i","refresh_token":"r","account_id":"x"}})).unwrap();assert_eq!(v["tokens"]["id_token"],"i");assert!(v["last_refresh"].is_string());}
-    #[test] fn custom_import_base_is_preserved_only_for_api_keys(){let key=normalize_one(&json!({"OPENAI_API_KEY":"sk-test"})).unwrap();assert_eq!(with_import_base(key,"https://relay.example/v1").unwrap()["base_url"],"https://relay.example/v1");let token=normalize_one(&json!({"access_token":"abc"})).unwrap();assert!(with_import_base(token,"https://relay.example/v1").is_err());}
+    #[test] fn custom_import_base_is_preserved_only_for_api_keys(){let key=normalize_one(&json!({"OPENAI_API_KEY":"sk-test"})).unwrap();let out=with_import_base(key,"https://relay.example/v1","chat").unwrap();assert_eq!(out["base_url"],"https://relay.example/v1");assert_eq!(out["wire_api"],"chat");let token=normalize_one(&json!({"access_token":"abc"})).unwrap();assert!(with_import_base(token,"https://relay.example/v1","chat").is_err());}
     #[test] #[ignore="explicit maintenance of registered account labels and queued project visibility repairs"]
     fn maintain_registered_chatgpt_cards(){
         if std::env::var("AGENTCOCKPIT_CARD_MAINTENANCE").as_deref()!=Ok("1"){return;}

@@ -81,7 +81,7 @@ fn secure_random(_bytes: &mut [u8]) -> Result<(), String> {
     Err("当前系统不支持安全随机数，无法配对".into())
 }
 
-fn random_hex(n: usize) -> Result<String, String> {
+pub(crate) fn random_hex(n: usize) -> Result<String, String> {
     let mut bytes = vec![0u8; n];
     secure_random(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02X}")).collect())

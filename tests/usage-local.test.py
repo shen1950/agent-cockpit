@@ -50,6 +50,52 @@ class UsageAccounting(unittest.TestCase):
                                      "cached_input_tokens": 80, "reasoning_output_tokens": 20})
         self.assertEqual(values, (100, 25, 80, 125))
 
+    def test_unchanged_log_does_not_rewrite_cache(self):
+        log = self.jsonl("sessions/a.jsonl", [self.codex("2026-10-01T12:00:00+08:00", 100, 100)])
+        cache_dir = self.root / "cache"
+        first = usage.collect("codex", self.root, cache_dir)
+        cache = next(cache_dir.glob("*.json"))
+        before = cache.stat().st_mtime_ns
+        second = usage.collect("codex", self.root, cache_dir)
+        self.assertEqual(first["total"], second["total"])
+        self.assertEqual(cache.stat().st_mtime_ns, before)
+        with log.open("a", encoding="utf-8") as stream:
+            stream.write("\n" + json.dumps(self.codex("2026-10-01T12:01:00+08:00", 200, 100)))
+        third = usage.collect("codex", self.root, cache_dir)
+        self.assertEqual(third["total"], 200)
+
+    def test_invalid_sqlite_reports_read_error_instead_of_empty_history(self):
+        db = self.root / "cli" / "db" / "db.sqlite"
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b"invalid database bytes")
+        result = usage.collect("zcode", self.root)
+        self.assertIn("error", result)
+        self.assertNotIn(str(self.root), result["error"])
+
+    def test_gemini_invalid_history_reports_error_and_recovers_after_repair(self):
+        path = self.root / "tmp/project/chats/session-broken.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{broken", encoding="utf8")
+        cache = self.root / "cache"
+        self.assertIn("error", usage.collect("gemini", self.root, cache))
+        path.write_text(json.dumps({"sessionId": "s", "messages": [{"id": "r", "type": "gemini",
+            "timestamp": "2026-10-01T12:00:00Z", "tokens": {"total": 42}}]}), encoding="utf8")
+        result = usage.collect("gemini", self.root, cache)
+        self.assertEqual(result["total"], 42)
+        self.assertFalse(result["partial"])
+
+    def test_opencode_optional_table_suppresses_only_missing_table(self):
+        with closing(sqlite3.connect(":memory:")) as con:
+            self.assertEqual(list(usage.sql_rows(con, "message", optional=True)), [])
+        class BrokenConnection:
+            def execute(self, _query):
+                raise sqlite3.OperationalError("database is locked")
+        with self.assertRaises(sqlite3.OperationalError):
+            list(usage.sql_rows(BrokenConnection(), "message", optional=True))
+        db = self.root / "opencode.db"
+        db.write_bytes(b"invalid database bytes")
+        self.assertIn("error", usage.collect("opencode", self.root))
+
     def test_history_retains_real_event_time_and_never_invents_date_only_time(self):
         self.jsonl("sessions/a.jsonl", [self.codex("2026-10-01T12:00:00+08:00", 100, 100)])
         result = usage.collect("codex", self.root)

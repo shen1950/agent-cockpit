@@ -381,6 +381,11 @@ fn pwa_command(exe: &Path, data_dir: &Path, codex_home: Option<&Path>) -> Result
         crate::chatgpt::check_plain_path(home)?;
         for key in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ACCESS_TOKEN", "OPENAI_IDENTITY_TOKEN_FILE"] { c.env_remove(key); }
         c.env("CODEX_HOME", home).env("CODEX_ELECTRON_USER_DATA_PATH", data_dir);
+        let adapter = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("codex-shared-resume.exe");
+        let real = exe.parent().unwrap_or(Path::new(".")).join("resources").join("codex.exe");
+        if adapter.is_file() && real.is_file() {
+            c.env("CODEX_CLI_PATH", adapter).env("AGENTCOCKPIT_CODEX_REAL", real);
+        }
     }
     c.arg(format!("--user-data-dir={}", data_dir.display()))
         .current_dir(exe.parent().unwrap_or(Path::new(".")));

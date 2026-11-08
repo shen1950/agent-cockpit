@@ -28,6 +28,10 @@ pub const CATALOG: &[(&str, &str)] = &[
     ("trae-cn", "Trae CN"),
     ("minimax", "MiniMax Code"),
     ("astudio", "AStudio"),
+    // 每天 300 积分；当天登录过桌面客户端的那笔有效期 7 天（本机 2026-11-05 实测）。
+    // 领取＝带桌面头打一条 office/v3/setting_info（agenthub 的 ci_raccoon）；
+    // 服务端不发时回 need_login，界面那一步会拉起客户端登一次。
+    ("raccoon", "商汤小浣熊"),
     ("qoder-cn", "Qoder CN"),
     ("qoder", "Qoder"),
 ];
@@ -47,12 +51,21 @@ static CACHE: Mutex<Option<Value>> = Mutex::new(None);
 
 /// 缓存还没建起来时用的回落快照（落盘的"上次结果"或静态目录），带 15 秒 TTL
 static FALLBACK: Mutex<Option<(f64, Value)>> = Mutex::new(None);
+static LEDGER_WRITE: Mutex<()> = Mutex::new(());
+static CLAIM_WRITE: Mutex<()> = Mutex::new(());
 
 fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// 本机时刻 HH:MM:SS。日志条目的 `at` 只有日期（按天去重、按天筛都靠它），
+/// 「几点几分领的」记在旁边这个 `at_time` 里——她 2026-11-06 要看精确时间；
+/// 老条目没有这一栏，界面回落成只显示日期。
+fn now_hms() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 /// 整数就不带小数点（30 而不是 30.0），跟界面上其它积分读数同一套写法
@@ -104,12 +117,190 @@ fn load_state() -> Value {
         Some(o) => o.clone(),
         None => serde_json::Map::new(),
     };
-    for (k, d) in [("done", json!({})), ("log", json!([])), ("pending", json!({})), ("arrived", json!([]))] {
+    for (k, d) in [("done", json!({})), ("log", json!([])), ("pending", json!({})), ("arrived", json!([])), ("expired", json!([])), ("auto_fails", json!({}))] {
         if !o.contains_key(k) {
             o.insert(k.into(), d);
         }
     }
-    Value::Object(o)
+    let mut state = Value::Object(o);
+    normalize_legacy_workbuddy(&mut state);
+    backfill_log_times(&mut state);
+    state
+}
+
+// A product-only entry has no stable owner after login changes. Retain ambiguous
+// history, but never query the newly logged-in account to settle an older claim.
+fn normalize_legacy_workbuddy(st: &mut Value) {
+    let pending = st["pending"].as_object().cloned().unwrap_or_default();
+    for (key, entry) in pending {
+        if key == "workbuddy-intl" || key.starts_with("workbuddy-intl|") {
+            if !st["unassigned_pending"].is_object() { st["unassigned_pending"] = json!({}); }
+            st["unassigned_pending"][&key] = entry;
+            st["pending"].as_object_mut().map(|o| o.remove(&key));
+        }
+    }
+    for (list, message) in [("log", "message"), ("arrived", "text")] {
+        let rows = st[list].as_array().cloned().unwrap_or_default();
+        let mut kept = Vec::new();
+        for row in &rows {
+            let anonymous = row["store"] == "workbuddy-intl"
+                && row["account"].as_str().unwrap_or("").is_empty();
+            let text = row[message].as_str().unwrap_or("");
+            let arrival_body = text.split_once('」').map(|(_, tail)| tail);
+            let duplicate = anonymous && text.contains("到账的 30 积分")
+                && arrival_body.is_some() && rows.iter().any(|other|
+                    other["store"] == row["store"] && other["at"] == row["at"]
+                    && !other["account"].as_str().unwrap_or("").is_empty()
+                    && other[message].as_str().and_then(|s| s.split_once('」').map(|(_, t)| t)) == arrival_body);
+            if !duplicate {
+                let mut entry = row.clone();
+                if anonymous { entry["account"] = json!("历史记录（未记录账号）"); }
+                kept.push(entry);
+            }
+        }
+        st[list] = json!(kept);
+    }
+}
+
+/// 一次性回填：2026-11-06 之前写的日志条目只有日期（`at`），精确时刻从未落盘。
+/// 能救的只有三个真实来源，按可信度依次：
+///   ① 回填条目自己的消息里嵌着厂商到账时间戳（「…」2026-10-30 07:10:38 到账的 30 积分）；
+///   ② pending 里还留着的 since——领取发起的那一刻；
+///   ③ arrived 里还留着的 at——检测到到账的那一刻（列表只留 20 条，能对上得很少）。
+/// 三个来源都对不上的（绝大多数旧条目）本地只剩日期，那就继续只有日期——
+/// 凭空编一个时刻比没有更糟。已有 at_time 的新条目一律不动。
+fn backfill_log_times(st: &mut Value) {
+    let pend = st["pending"].as_object().cloned().unwrap_or_default();
+    let unassigned = st["unassigned_pending"].as_object().cloned().unwrap_or_default();
+    let arrived = st["arrived"].as_array().cloned().unwrap_or_default();
+    let rows = match st["log"].as_array_mut() {
+        Some(r) => r,
+        None => return,
+    };
+    for row in rows.iter_mut() {
+        if row.get("at_time").is_some() { continue; }
+        let store = row["store"].as_str().unwrap_or("");
+        let account = row["account"].as_str().unwrap_or("");
+        let at = row["at"].as_str().unwrap_or("");
+        let mut hit: Option<String> = None;
+        // ① 厂商时间戳：格式「{label}」{YYYY-MM-DD HH:MM:SS} 到账的 30 积分。
+        //   「最近一笔于 {ts} 到账」那种消息里的时间戳是上一笔的，不是这一条的，不认。
+        let msg = row["message"].as_str().unwrap_or("");
+        if let Some(i) = msg.find("到账的 30 积分") {
+            if let Some(ts) = i.checked_sub(20).and_then(|s| msg.get(s..i - 1)) {
+                if is_stamp(ts) && msg[..i - 20].ends_with('」') {
+                    hit = Some(ts[11..19].to_string());
+                }
+            }
+        }
+        // ② pending.since：领取发起的时刻。只认真正领到/在等的条目——
+        //   失败的重试行不该被钉上后来成功那一笔的时刻。
+        //   账号行的键是 store@账号，产品行是 store；国际版的键带 |今天，
+        //   其他家不带（日期在值的 today 里）；产品级国际版的旧键被
+        //   normalize_legacy_workbuddy 挪进了 unassigned_pending。
+        if hit.is_none() && !at.is_empty() {
+            let real = row["claimed"].as_bool().unwrap_or(false)
+                || row["settling"].as_bool().unwrap_or(false)
+                || row["already"].as_bool().unwrap_or(false);
+            if real {
+                let mut keys: Vec<String> = Vec::new();
+                if account.is_empty() {
+                    keys.push(format!("{store}|{at}"));
+                    keys.push(store.to_string());
+                } else {
+                    keys.push(format!("{store}@{account}|{at}"));
+                    keys.push(format!("{store}@{account}"));
+                }
+                for k in keys {
+                    if let Some(e) = pend.get(&k).or_else(|| unassigned.get(&k)) {
+                        if k.contains('|') || e["today"].as_str() == Some(at) {
+                            hit = e["since"].as_f64().map(epoch_hms);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // ③ arrived.at：检测到到账的那一刻
+        if hit.is_none() && !at.is_empty() {
+            let mut m = arrived.iter().filter(|a| {
+                a["store"].as_str() == Some(store)
+                    && a["account"].as_str().unwrap_or("") == account
+                    && a["log_date"].as_str() == Some(at)
+            });
+            if let (Some(a), None) = (m.next(), m.next()) {
+                hit = a["at"].as_f64().map(epoch_hms);
+            }
+        }
+        if let Some(t) = hit { row["at_time"] = json!(t); }
+    }
+}
+
+/// "YYYY-MM-DD HH:MM:SS" 的 19 位定长校验（只看骨架，不验日期真伪）
+fn is_stamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 19
+        && b[4] == b'-' && b[7] == b'-' && b[10] == b' '
+        && b[13] == b':' && b[16] == b':'
+        && b.iter().enumerate().all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16) || c.is_ascii_digit())
+}
+
+/// 纪元秒 → 本机 HH:MM:SS。和 now_hms() 同一套写法，只是时刻从哪来不同
+fn epoch_hms(secs: f64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|d| d.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+fn rename_ledger_account(st: &mut Value, store: &str, from: &str, to: &str) {
+    let old = format!("{store}@{from}");
+    let new = format!("{store}@{to}");
+    for field in ["done", "pending"] {
+        let map = st[field].as_object().cloned().unwrap_or_default();
+        for (key, mut value) in map {
+            if key == old || key.starts_with(&format!("{old}|")) {
+                let new_key = format!("{new}{}", &key[old.len()..]);
+                if value.is_object() {
+                    if let Some(label) = value["label"].as_str() {
+                        value["label"] = json!(label.replace(&format!(" · {from}"), &format!(" · {to}")));
+                    }
+                }
+                st[field].as_object_mut().map(|o| { o.remove(&key); o.insert(new_key, value); });
+            }
+        }
+    }
+    for field in ["log", "arrived"] {
+        if let Some(rows) = st[field].as_array_mut() {
+            for row in rows {
+                if row["store"] == store && row["account"] == from {
+                    row["account"] = json!(to);
+                    for key in ["label", "message", "text", "id"] {
+                        if let Some(s) = row[key].as_str() {
+                            row[key] = json!(s.replace(&format!(" · {from}"), &format!(" · {to}"))
+                                .replace(&old, &new));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Cached rows carry the old action key; rebuild them after renaming.
+    st.as_object_mut().map(|o| o.remove("last"));
+}
+
+pub fn rename_account(app: &str, from: &str, to: &str) {
+    let Some(store) = crate::local_quota::store_for(app) else { return; };
+    let _guard = LEDGER_WRITE.lock().unwrap();
+    let mut st = load_state();
+    rename_ledger_account(&mut st, store, from, to);
+    save_state(&st);
+    *CACHE.lock().unwrap() = None;
+    *FALLBACK.lock().unwrap() = None;
+    if let Ok(mut wants) = WANT.lock() {
+        for row in wants.iter_mut() {
+            if row["store"] == store && row["account"] == from { row["account"] = json!(to); }
+        }
+    }
 }
 
 /// 交给界面那份：`last` 是"上次查到的整份结果"，只给后端自己用来先把表格画出来，
@@ -160,8 +351,10 @@ pub fn refresh() -> Value {
             // 的产品才挂）。这一步是几次额外的 agenthub 调用，所以只在这一条后台路径上做，
             // 界面那 4 秒一轮读的是缓存。
             let mut items = expand_accounts(items);
-            let st = load_state();
+            let _guard = LEDGER_WRITE.lock().unwrap();
+            let mut st = load_state();
             apply_workbuddy_statuses(&mut items, &st);
+            record_external_signins(&items, &mut st);
             // 把这次的结果落盘：下次刚开机、后台第一轮还没跑完时，界面就能拿它先把
             // 整张表画出来（产品名、备注、操作列都在里面），不用干等六家接口。
             let mut persisted = st.clone();
@@ -175,33 +368,145 @@ pub fn refresh() -> Value {
     }
 }
 
-/// 国际版账单只有到账时间，没有活跃日期。当天是否完成对话以本地记录为准，
-/// 到账归属仅按次日结算惯例推测；不能用今早的到账堵住今天的签到。
+/// 国际版账单只有到账时间，没有活跃日期。今天"用过没有"有两个来源：
+/// ① agenthub 读桌面端自己的会话库（按 user_id）——她在客户端自己聊过就认得出来；
+/// ② 驾驶舱自己发过的那句（done 记账，或今天挂进 pending 的那条）。
+/// 到账归属仍只按次日结算惯例推测；不能拿今早的到账堵住今天的活跃。
 fn apply_workbuddy_status(item: &mut Value, st: &Value) {
     if item["product"].as_str() != Some("workbuddy-intl") || item.get("error").is_some() {
         return;
     }
     let today = item["today"].as_str().unwrap_or("").to_string();
     if today.is_empty() { return; }
-    let account = if item["scope"].as_str() == Some("account") {
-        item["account"].as_str().unwrap_or("")
-    } else { "" };
+    let account = item["ledger_account"].as_str().unwrap_or_else(||
+        if item["scope"].as_str() == Some("account") { item["account"].as_str().unwrap_or("") } else { "" });
     let key = if account.is_empty() { "workbuddy-intl".to_string() }
               else { format!("workbuddy-intl@{account}") };
-    if st["done"][&key].as_str() != Some(today.as_str()) { return; }
+    // pending 里今天这一条同样说明"已经发过"：done 是明文的键值账，账号卡改名、
+    // 或者文件被别的产品整段覆盖时会丢；pending 的键自带当天日期，比 done 更难丢。
+    // 她 2026-11-03："点过一轮发一句对话了，还让我重新发"——丢的正是这个键。
+    let pend_key = format!("{key}|{today}");
+    let done_today = st["done"][&key].as_str() == Some(today.as_str())
+        || st["pending"].get(&pend_key).map(|v| v.is_object()).unwrap_or(false)
+        || item["signed_today"].as_bool() == Some(true);
+    if !done_today { return; }
     let inferred = item["inferred_today_arrival"].as_bool() == Some(true);
+    let at = item["activity_at"].as_str().unwrap_or("").to_string();
     let note = item["note"].as_str().unwrap_or("").to_string();
     item["signed_today"] = json!(true);
     item["claimable"] = json!(false);
-    item["words"]["done"] = json!(if inferred { "已签到·推测到账" } else { "已签到·积分未到账" });
-    item["words"]["done_act"] = json!("今天已签到");
-    item["note"] = json!(format!("今天的对话已完成，{}；{}",
-        if inferred { "有推测属于今天的到账记录，归属未经厂商确认" } else { "今天的积分尚未发现到账记录" }, note));
+    item["words"]["done"] = json!(if inferred { "已活跃·推测到账" } else { "今天已活跃" });
+    item["words"]["done_act"] = json!("今天已用过");
+    item["note"] = json!(if at.is_empty() {
+        // 本地会话库里没这条（多半是驾驶舱自己用命令行发的那句），得说清是谁发的
+        format!("驾驶舱今天已经替你发过一句对话，今天的积分{}；{note}",
+            if inferred { "有推测属于今天的到账记录，归属未经厂商确认" }
+            else { "尚未发现到账记录" })
+    } else {
+        note
+    });
 }
 
 fn apply_workbuddy_statuses(items: &mut Value, st: &Value) {
     if let Some(arr) = items.as_array_mut() {
         for item in arr { apply_workbuddy_status(item, st); }
+    }
+}
+
+/// 今天这一天（store+账号）有没有一笔"已经到手"的签到：驾驶舱自己领的
+/// （claimed / already / settling）或已经记过的外部签到。外部签到的自动检测
+/// 和手动补记都靠它去重，同一天同一家最多记一笔。
+fn log_hit_today(st: &Value, store: &str, account: &str, today: &str) -> bool {
+    st["log"].as_array().map(|rows| rows.iter().any(|x| {
+        x["store"].as_str() == Some(store)
+            && x["account"].as_str().unwrap_or("") == account
+            && x["at"].as_str() == Some(today)
+            && (x["claimed"].as_bool().unwrap_or(false)
+                || x["already"].as_bool().unwrap_or(false)
+                || x["settling"].as_bool().unwrap_or(false)
+                || x["source"].as_str() == Some("external"))
+    })).unwrap_or(false)
+}
+
+fn append_external(st: &mut Value, store: &str, account: &str, today: &str, message: &str) {
+    let mut log = st["log"].as_array().cloned().unwrap_or_default();
+    log.push(json!({
+        "at": today, "at_time": now_hms(), "store": store, "account": account,
+        "source": "external", "message": message,
+    }));
+    if log.len() > 2000 {
+        log.drain(0..log.len() - 2000);
+    }
+    st["log"] = json!(log);
+}
+
+/// 补记一条「官方客户端手动签到」。她在官方客户端里自己签的（国际版是当天在
+/// 客户端里用过），驾驶舱日志里没有这一笔——补上并标注来源，翻日志时才分得清
+/// 哪次是驾驶舱签的、哪次是自己签的。同时把当天记成 done：名额已经在手，
+/// 自动领不该再发一次。
+pub fn record_external(store: &str, account: &str) -> Value {
+    if store.is_empty() {
+        return json!({ "ok": false, "msg": "没说要补记哪一家" });
+    }
+    // 按账号各记各的产品，产品行上没说是哪个号——按当前登录身份落到它名下，
+    // 与 claim() 解析当前账号用同一套逻辑，键才对得上
+    let resolved;
+    let account = if per_account(store) && account.is_empty() {
+        let app = crate::local_quota::app_for_store(store).unwrap_or(store);
+        match crate::authpack::live_identity(app)
+            .and_then(|(a, u)| crate::authpack::card_for_login(app, &a, &u)) {
+            Some(n) => { resolved = n; resolved.as_str() }
+            None => return json!({ "ok": false,
+                "msg": "读不出当前登录的账号：先在客户端登它一次，或在账号那一行上补记" }),
+        }
+    } else { account };
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let key = if account.is_empty() { store.to_string() } else { format!("{store}@{account}") };
+    let _guard = LEDGER_WRITE.lock().unwrap();
+    let mut st = load_state();
+    if st["done"][&key].as_str() == Some(today.as_str())
+        || log_hit_today(&st, store, account, &today) {
+        return json!({ "ok": true, "already": true,
+            "message": "今天已经记过了：驾驶舱领过，或外部签到已有记录" });
+    }
+    append_external(&mut st, store, account, &today, "官方客户端手动签到（非驾驶舱领取）");
+    st["done"].as_object_mut().map(|o| { o.insert(key, json!(today)); });
+    save_state(&st);
+    *CACHE.lock().unwrap() = None;
+    json!({ "ok": true, "message": format!("已补记 {today} 的外部签到") })
+}
+
+/// 刷新时顺带认领外部签到：状态读出来今天已签、但这天既不是驾驶舱经手的
+/// （done / pending / 日志都没有），就把这笔按"官方客户端"补进日志。她在客户端
+/// 里自己签的（含国际版当天在客户端里聊过）从此也有台账，当天也不会再被自动领
+/// 重复处理。旅行猫的派出/领取两步都由驾驶舱管，不在此列。
+fn record_external_signins(items: &Value, st: &mut Value) {
+    let Some(arr) = items.as_array() else { return };
+    let mut seen: Vec<String> = Vec::new();
+    for it in arr {
+        if it["signed_today"].as_bool() != Some(true) { continue; }
+        if !it["error"].is_null() || it["mode"].as_str() == Some("travel") { continue; }
+        let today = match it["today"].as_str() {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => continue,
+        };
+        let store = it["product"].as_str().unwrap_or("").to_string();
+        if store.is_empty() { continue; }
+        let account = it["account"].as_str().unwrap_or("").to_string();
+        let key = if account.is_empty() { store.clone() } else { format!("{store}@{account}") };
+        // 产品行与它名下账号行可能报到同一个号：同一天同一账号只记一笔
+        if seen.iter().any(|k| k == &key) { continue; }
+        seen.push(key.clone());
+        if st["done"][&key].as_str() == Some(today.as_str()) { continue; }
+        let pend_key = format!("{key}|{today}");
+        if st["pending"].get(&key).map(|v| v.is_object()).unwrap_or(false)
+            || st["pending"].get(&pend_key).map(|v| v.is_object()).unwrap_or(false) {
+            continue;
+        }
+        if log_hit_today(st, &store, &account, &today) { continue; }
+        append_external(st, &store, &account, &today,
+            "官方客户端已签到（驾驶舱读状态时检测到，非驾驶舱领取）");
+        st["done"].as_object_mut().map(|o| { o.insert(key, json!(today)); });
     }
 }
 
@@ -216,6 +521,15 @@ fn expand_accounts(items: Value) -> Value {
     for it in arr {
         let store = it["product"].as_str().unwrap_or("").to_string();
         let mut prod = it.clone();
+        if per_account(&store) {
+            if let Some(app_id) = crate::local_quota::app_for_store(&store) {
+                if let Some(card) = crate::authpack::card_for_login(app_id,
+                    it["account"].as_str().unwrap_or(""),
+                    it["user_id"].as_str().unwrap_or("")) {
+                    prod["ledger_account"] = json!(card);
+                }
+            }
+        }
         if let Some(o) = prod.as_object_mut() {
             o.insert("scope".into(), json!("product"));
             // 界面要 app id 才能拉起客户端（store 名跟 app id 不是一回事）
@@ -232,6 +546,23 @@ fn expand_accounts(items: Value) -> Value {
         }
     }
     json!(out)
+}
+
+/// 点「刷新状态」的那一下：**立刻回快照，后台去问各家**。
+///
+/// 以前这里是同步跑完一整轮（`refresh()` 直接返回）。本机实测一轮 4~51 秒——
+/// 51 秒那种是被 TLS 握手停等拖的（每次网络调用先白等 15 秒才降级），而这一整轮
+/// 期间 service_action 全程持有全局 CMD_LOCK：她点完「刷新状态」再去点换号/读额度，
+/// 那些动作全在这把锁后面排队，于是出现"10 分钟前的操作现在才反应过来"
+/// （2026-11-05 她报的）。真正要等结果的只有按钮那一句提示，而结果本来就有
+/// 4 秒一轮的 state 带回来。同一时间只放一轮：BUSY 挡住重复点。
+pub fn refresh_async() -> Value {
+    spawn_refresh();
+    let mut out = snapshot();
+    if let Some(o) = out.as_object_mut() {
+        o.insert("refreshing".into(), json!(true));
+    }
+    out
 }
 
 /// 后台刷一次；同一时间只放行一个。
@@ -454,6 +785,14 @@ pub fn refresh_one(store: &str, acct: Option<(&str, &str)>) -> Value {
             o.insert("app".into(), json!(app_id));
         }
     }
+    if acct.is_none() && per_account(store) {
+        if let Some(app_id) = crate::local_quota::app_for_store(store) {
+            if let Some(card) = crate::authpack::card_for_login(app_id,
+                item["account"].as_str().unwrap_or(""), item["user_id"].as_str().unwrap_or("")) {
+                item["ledger_account"] = json!(card);
+            }
+        }
+    }
     apply_workbuddy_status(&mut item, &load_state());
     // 并进缓存：只换掉同一条，别的行原样留着。**不动 fetched_at**——
     // 那是"整张表最后一次查于"，动它会让别的行看起来也刚查过。
@@ -479,13 +818,32 @@ pub fn refresh_one(store: &str, acct: Option<(&str, &str)>) -> Value {
 /// 领一家。返回 agenthub 那一条结果，并把缓存作废（领完状态必然变了）。
 /// `acct` 给了就按那个账号领（先用它自己的登录包铺临时档案），否则照旧领"当前登着的号"。
 pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
+    let _claim_guard = CLAIM_WRITE.lock().unwrap();
     if store.is_empty() {
         return json!({ "ok": false, "msg": "没说要给哪家签到" });
     }
     // 只有"登录态按账号各存一份"的产品才按账号领。其余几家的 acct 是界面顺手带上的
     // （产品行的 account 字段是"本机现在登着的那个号"），照着它去铺登录包会直接报
     // "还没存过登录态"——AStudio 那次点「确认领取」就是这么失败的（2026-10-17）。
-    let acct = acct.filter(|_| per_account(store));
+    let resolved;
+    let acct = if matches!(store, "workbuddy" | "workbuddy-intl") && acct.is_none() {
+        let app = crate::local_quota::app_for_store(store).unwrap_or(store);
+        resolved = crate::authpack::live_identity(app)
+            .and_then(|(a, u)| crate::authpack::card_for_login(app, &a, &u));
+        match resolved.as_deref() {
+            Some(name) => Some((app, name)),
+            None => return json!({"ok": false, "result": {"error": "当前登录身份没有对应的账号卡片，未签到"}}),
+        }
+    } else { acct.filter(|_| per_account(store)) };
+    if store == "workbuddy-intl" {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let key = format!("{store}@{}", acct.map(|(_, n)| n).unwrap_or(""));
+        let state = load_state();
+        if state["done"][&key].as_str() == Some(today.as_str()) {
+            return json!({"ok": true, "result": {"already": true, "today": today,
+                "message": "这个账号今天已活跃；到账进度按该账号单独追踪"}});
+        }
+    }
     let mut staged: Option<std::path::PathBuf> = None;
     let mut extra: Vec<String> = vec!["--claim".into(), store.to_string()];
     if let Some((app_id, name)) = acct {
@@ -526,6 +884,7 @@ pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
     // 旅行猫那种"先派、到点再领"的 settling 不带这个标记，今天还有第二步要走。
     let settled = item["settling"].as_bool().unwrap_or(false)
         && item["settling_final"].as_bool().unwrap_or(false);
+    let _guard = LEDGER_WRITE.lock().unwrap();
     let mut st = load_state();
     // 只有真领到了（或今天这份本来就已经在手）、且这家今天没有下一步了，才记"今天跑过"。
     // 以前是无条件记，于是 MiniMax 那种"服务端拒了但被解析成成功"的一次点击，
@@ -540,10 +899,23 @@ pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
         note_settling(&mut st, &key, &item, &today);
     }
     let mut log = st["log"].as_array().cloned().unwrap_or_default();
+    // 记下这一笔是哪个号领的。账号级领取取传进来的账号；产品级领取（没传账号）取
+    // agenthub 回包里它实际操作的账号——不取的话日志里只剩一条光秃秃的「Qoder CN」，
+    // 两个号各自领没领完全分不出来（2026-11-05 她圈出来的那两条）。
+    let log_acct = acct
+        .map(|(_, n)| n.to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            item["account"]
+                .as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default();
     log.push(json!({
-        "at": today, "store": store,
+        "at": today, "at_time": now_hms(), "store": store,
         // 账号级领取记下是哪个号领的——日志里两家都写 "qoder-cn" 就分不出是谁了
-        "account": acct.map(|(_, n)| n).unwrap_or(""),
+        "account": log_acct,
         "claimed": item["claimed"].as_bool().unwrap_or(false),
         "already": item["already"].as_bool().unwrap_or(false),
         // 旅行猫那种"这一步做成了、奖励要等"的，日志得跟即时提示一样按中性画——
@@ -612,6 +984,34 @@ fn note_settling(st: &mut Value, key: &str, item: &Value, today: &str) {
     );
 }
 
+/// 等到账到期还没来：转成一条「已到期」记录，写清欠的是哪一天、盯到什么时候收手。
+/// 以前到期就是从 pending 里删掉，界面一个字不留——厂商第 3 天才发的那笔，
+/// 事后连「欠过哪天」都查不出来（2026-11-06 她问的正是这条）。
+fn expired_record(key: &str, p: &Value, now: f64) -> Value {
+    json!({
+        "key": key, "today": p["today"], "label": p["label"], "expect": p["expect"],
+        "since": p["since"], "deadline": p["until"], "dropped_at": now,
+    })
+}
+
+/// 把到期的几条并进 `expired`：同一个键只留一条（多实例或重复轮询不该把同一天欠账记两遍），
+/// 整表留最近 60 条（一天最多几笔，够翻两个多月）。
+fn note_expired(st: &mut Value, expired: &[Value]) {
+    if expired.is_empty() {
+        return;
+    }
+    let mut list = st["expired"].as_array().cloned().unwrap_or_default();
+    for e in expired {
+        if !list.iter().any(|x| x["key"] == e["key"]) {
+            list.push(e.clone());
+        }
+    }
+    if list.len() > 60 {
+        list.drain(0..list.len() - 60);
+    }
+    st["expired"] = json!(list);
+}
+
 /// 现在有没有在等的到账
 pub fn has_pending() -> bool {
     !load_state()["pending"].as_object().map(|o| o.is_empty()).unwrap_or(true)
@@ -627,9 +1027,11 @@ pub fn check_arrivals() -> Vec<Value> {
     };
     let now = now_secs();
     let mut arrived: Vec<Value> = Vec::new();
+    let mut expired: Vec<Value> = Vec::new();
     let mut done: Vec<String> = Vec::new();
     for (key, p) in &pend {
         if p["until"].as_f64().unwrap_or(0.0) < now {
+            expired.push(expired_record(key, p, now));
             done.push(key.clone());
             continue;
         }
@@ -680,11 +1082,19 @@ pub fn check_arrivals() -> Vec<Value> {
         let label = p["label"].as_str().unwrap_or(key).to_string();
         let expect = p["expect"].as_str().unwrap_or("今天这份积分").to_string();
         let credit = item["reward"].as_f64();
+        // 到账时刻：厂商流水带了完整时间戳（"2026-11-04 07:28:31"）就取它的时刻部分；
+        // 没带（刚测到到账）才记现在。别拿检测时刻冒充到账时刻。
+        let log_time = inferred_arrival
+            .and_then(|entry| entry["arrived_at"].as_str())
+            .and_then(|s| s.split_once(' ')).map(|(_, t)| t.trim().to_string())
+            .filter(|t| t.contains(':') && t.len() <= 8)
+            .unwrap_or_else(|| now_hms());
         arrived.push(json!({
             "id": format!("{key}-{}", p["today"].as_str().unwrap_or("")),
             "at": now, "store": store, "account": acct.clone().unwrap_or_default(),
             "log_date": inferred_arrival.and_then(|entry| entry["arrived_at"].as_str())
                 .and_then(|date| date.get(..10)).unwrap_or(activity_date),
+            "log_time": log_time,
             "label": label,
             "text": if let Some(entry) = inferred_arrival {
                 format!("「{label}」{} 到账的 30 积分，按次日结算惯例推测属于 {activity_date} 的活跃；厂商未提供归属日期", entry["arrived_at"].as_str().unwrap_or(""))
@@ -697,6 +1107,7 @@ pub fn check_arrivals() -> Vec<Value> {
     if arrived.is_empty() && done.is_empty() {
         return arrived;
     }
+    let _guard = LEDGER_WRITE.lock().unwrap();
     let mut st = load_state();
     if let Some(o) = st["pending"].as_object_mut() {
         for k in &done {
@@ -709,10 +1120,13 @@ pub fn check_arrivals() -> Vec<Value> {
         arr.drain(0..arr.len() - 20);
     }
     st["arrived"] = json!(arr);
+    note_expired(&mut st, &expired);
     let mut log = st["log"].as_array().cloned().unwrap_or_default();
     for entry in &arrived {
-        log.push(json!({ "at": entry["log_date"], "store": entry["store"], "account": entry["account"],
-            "settling": true, "message": entry["text"] }));
+        // arrived 标记：日志筛选要分清「积分到账」和「已签未到」，两者都是 settling，
+        // 靠翻消息文案猜会错；老条目没这栏，界面回落按文案认
+        log.push(json!({ "at": entry["log_date"], "at_time": entry["log_time"], "store": entry["store"], "account": entry["account"],
+            "settling": true, "arrived": true, "message": entry["text"] }));
     }
     if log.len() > 2000 { log.drain(0..log.len() - 2000); }
     st["log"] = json!(log);
@@ -767,6 +1181,52 @@ pub fn should_run(
         && hour < to
 }
 
+/// 自动签到连续失败的封顶次数。她 2026-11-08："既然报错，能不能发几次就别发了，
+/// 试个四五次就停止"——403 那种厂商硬拒的失败，5 分钟一轮的自动领每轮都撞一次，
+/// 一上午就是几十条一模一样的红字，什么也换不来。连试 5 次没成就收手：
+/// 当天不再自动重试（手动点不受影响），并在日志里留一条「停止重试」说明原因。
+pub const AUTO_FAIL_LIMIT: u64 = 5;
+
+/// 失败计数的键：按产品+账号+当天分开——两个号各自的失败互不拖累，
+/// 隔了天自然作废（键里带日期，bump 时顺手清掉旧日期的键）。
+fn auto_fail_key(store: &str, account: &str, today: &str) -> String {
+    if account.is_empty() {
+        format!("{store}|{today}")
+    } else {
+        format!("{store}@{account}|{today}")
+    }
+}
+
+/// 这一轮自动领还许不许跑：当天的失败次数没用完才许
+fn auto_fail_left(st: &Value, key: &str) -> bool {
+    st["auto_fails"][key].as_u64().unwrap_or(0) < AUTO_FAIL_LIMIT
+}
+
+/// 记一次失败，返回累计次数。顺手把旧日期的键清掉，文件不会被攒大。
+fn bump_auto_fail(st: &mut Value, key: &str, today: &str) -> u64 {
+    let n = st["auto_fails"][key].as_u64().unwrap_or(0) + 1;
+    if let Some(o) = st["auto_fails"].as_object_mut() {
+        o.retain(|k, _| k.ends_with(&format!("|{today}")));
+        o.insert(key.to_string(), json!(n));
+    }
+    n
+}
+
+/// 领成了就清掉当天的失败前账：偶发一次失败不该一直记着
+fn clear_auto_fail(st: &mut Value, key: &str) {
+    if let Some(o) = st["auto_fails"].as_object_mut() {
+        o.remove(key);
+    }
+}
+
+/// 这一轮领取算不算"没领成"。领到 / 已领过 / 已经推进到等服务端结算
+/// （含国际版发完对话等到账）都不算——要么到手要么在等，重试没有意义。
+fn claim_failed(x: &Value) -> bool {
+    !(x["claimed"].as_bool().unwrap_or(false)
+        || x["already"].as_bool().unwrap_or(false)
+        || x["settling"].as_bool().unwrap_or(false))
+}
+
 /// 「登录并领取」的待办队列。
 ///
 /// 为什么要有它：她点「登录并领取」之后，客户端要她自己登进去——那是几十秒到几分钟的事，
@@ -805,6 +1265,7 @@ pub fn want_count() -> usize {
 /// 把一条提示塞进 `arrived`——界面已经有"认新 id 就 toast"的通道，不用另开一条。
 fn push_notice(text: &str) {
     let now = now_secs();
+    let _guard = LEDGER_WRITE.lock().unwrap();
     let mut st = load_state();
     let mut arr = st["arrived"].as_array().cloned().unwrap_or_default();
     arr.push(json!({
@@ -948,11 +1409,51 @@ pub fn snapshot() -> Value {
     v
 }
 
+/// 领取日志导出：把界面拼好的 CSV 落成文件，返回完整路径给界面标出来。
+/// 以前走 WebView2 的匿名下载（blob + a.click），文件进了系统下载目录，
+/// 界面只说一句「已导出 82 条」，她根本不知道文件在哪（2026-11-08 她报的）。
+/// 现在后端来写：优先「下载」文件夹（USERPROFILE\Downloads），被重定向或写不进
+/// 就退回驾驶舱数据目录——路径照实回报，是哪一个就说哪一个。
+pub fn export_csv(csv: &str) -> Value {
+    let name = format!("领取日志-{}.csv", chrono::Local::now().format("%Y-%m-%d"));
+    // 带 BOM：Excel 打开中文不乱码
+    let body = format!("\u{feff}{csv}");
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| registry::base_dir());
+    let mut last_err = String::new();
+    for dir in [home.join("Downloads"), registry::base_dir()] {
+        if let Err(e) = fs::create_dir_all(&dir) {
+            last_err = format!("{}（{}）", dir.display(), e);
+            continue;
+        }
+        let p = dir.join(&name);
+        // 同名就覆盖：文件名带日期，今天最新的一份永远是这一个，不用翻
+        match fs::write(&p, &body) {
+            Ok(_) => {
+                return json!({
+                    "ok": true,
+                    "msg": format!("已导出到 {}", p.display()),
+                    "path": p.to_string_lossy(),
+                    "dir": dir.to_string_lossy(),
+                })
+            }
+            Err(e) => last_err = format!("{}（{}）", p.display(), e),
+        }
+    }
+    json!({ "ok": false, "msg": format!("导出失败：{last_err}") })
+}
+
 /// 卡片上那枚签到角标的数据：**只读缓存，不发网络请求**。
 /// app id 与 agenthub 的 store 名不同名的情况（Trae 两边分别叫 traework-cn / trae-cn）
 /// 走 `local_quota::store_for` 那一份真值，别在这里再抄一张映射表。
 /// 缓存里没这家（不支持签到的产品）就回 Null，界面据此不画角标。
 pub fn for_app(app_id: &str) -> Value {
+    for_instance(app_id, "")
+}
+
+pub fn for_instance(app_id: &str, name: &str) -> Value {
     let store = match crate::local_quota::store_for(app_id) {
         Some(s) => s,
         None => return Value::Null,
@@ -964,7 +1465,9 @@ pub fn for_app(app_id: &str) -> Value {
         Some(a) => a,
         None => return Value::Null,
     };
-    let it = match items.iter().find(|x| x["product"].as_str() == Some(store)) {
+    let has_accounts = items.iter().any(|x| x["product"] == store && x["scope"] == "account");
+    let it = match items.iter().find(|x| x["product"].as_str() == Some(store)
+        && (name.is_empty() || !has_accounts || (x["scope"] == "account" && x["account"] == name))) {
         Some(x) => x,
         None => return Value::Null,
     };
@@ -1035,17 +1538,63 @@ pub fn tick(app: &tauri::AppHandle) {
     if auto_on {
         let from = c["window_start"].as_u64().unwrap_or(6) as u32;
         let to = c["window_end"].as_u64().unwrap_or(12) as u32;
+        // 按账号各存登录态的那几家（qoder 系 / WorkBuddy 系）：每个号各有各的当日名额。
+        // 只走产品级那一行的话，自动签到永远只落在"当前登着的那个号"头上——
+        // 她 2026-11-08："登录了哪个 WorkBuddy 国际版的账号，读取哪个积分到了，
+        // 另一个根本读取不了"。名下有账号行的就账号行各领各的，产品行不再重复。
+        let acct_stores: Vec<&str> = items
+            .iter()
+            .filter(|it| {
+                it["scope"].as_str() == Some("account")
+                    && it["product"]
+                        .as_str()
+                        .map(|s| per_account(s))
+                        .unwrap_or(false)
+                    && !it["account"].as_str().unwrap_or("").is_empty()
+            })
+            .filter_map(|it| it["product"].as_str())
+            .collect();
+        // (键, 产品, 账号, 最后一次败因)：失败计数与「停止重试」在循环后一次落盘
+        let mut failures: Vec<(String, String, String, String)> = Vec::new();
+        let mut succeeded: Vec<String> = Vec::new();
         for it in &items {
-            // 自动领只走产品级那一行：账号行是"同一件事的另一个视角"，
-            // 照它们各领一次会把同一家的当日名额重复消耗
-            if it["scope"].as_str() == Some("account") {
-                continue;
-            }
             let store = match it["product"].as_str() {
                 Some(s) => s,
                 None => continue,
             };
-            let already = state["done"][store].as_str() == Some(today.as_str());
+            let scope = it["scope"].as_str().unwrap_or("product");
+            let per_acct_row = acct_stores.contains(&store);
+            if scope != "account" && per_acct_row {
+                // 名下有账号行时让位——但仅当当前登录号自己就有账号行（有它自己的登录包）。
+                // 当前登录的那个号还没存登录包时，产品级那一行仍是它唯一的自动通道，
+                // 关掉它等于这个号永远没人领。
+                let cur = it["ledger_account"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| it["account"].as_str().unwrap_or(""));
+                let covered = !cur.is_empty()
+                    && items.iter().any(|a| {
+                        a["product"].as_str() == Some(store)
+                            && a["scope"].as_str() == Some("account")
+                            && a["account"].as_str() == Some(cur)
+                            && a["shared"].as_bool() != Some(true)
+                            && a["unreadable"].as_bool() != Some(true)
+                    });
+                if covered {
+                    continue;
+                }
+            }
+            if scope == "account" && !per_acct_row {
+                // 整机一份登录态的家（Trae CN / MiniMax…）挂出来的账号行只是"切到该号"的入口，
+                // 不是各存各的名额——自动领仍走产品级那一行
+                continue;
+            }
+            let account = if scope == "account" { it["account"].as_str().unwrap_or("") } else { "" };
+            let already = if account.is_empty() {
+                state["done"][store].as_str() == Some(today.as_str())
+            } else {
+                state["done"][&format!("{store}@{account}")].as_str() == Some(today.as_str())
+            };
             if !should_run(
                 true,
                 c["auto"][store].as_bool().unwrap_or(false),
@@ -1057,7 +1606,73 @@ pub fn tick(app: &tauri::AppHandle) {
             ) {
                 continue;
             }
-            claim(store, None);
+            let fail_key = auto_fail_key(store, account, &today);
+            if !auto_fail_left(&state, &fail_key) {
+                continue;
+            }
+            let app_id = it["app"].as_str().unwrap_or("");
+            let r = if account.is_empty() {
+                claim(store, None)
+            } else {
+                claim(store, Some((app_id, account)))
+            };
+            let x = &r["result"];
+            if claim_failed(x) {
+                let why = x["error"]
+                    .as_str()
+                    .or(x["message"].as_str())
+                    .unwrap_or("厂商没回原因")
+                    .to_string();
+                failures.push((fail_key, store.to_string(), account.to_string(), why));
+            } else {
+                succeeded.push(fail_key);
+            }
+        }
+        if !failures.is_empty() || !succeeded.is_empty() {
+            let mut stops: Vec<String> = Vec::new();
+            {
+                let _guard = LEDGER_WRITE.lock().unwrap();
+                let mut st = load_state();
+                for key in &succeeded {
+                    clear_auto_fail(&mut st, key);
+                }
+                let mut log = st["log"].as_array().cloned().unwrap_or_default();
+                for (key, store, account, why) in &failures {
+                    let n = bump_auto_fail(&mut st, key, &today);
+                    if n != AUTO_FAIL_LIMIT {
+                        continue;
+                    }
+                    // 到顶了：日志里留一条「停止重试」，把败因和出路说清
+                    let label = CATALOG
+                        .iter()
+                        .find(|(k, _)| *k == store.as_str())
+                        .map(|(_, n)| *n)
+                        .unwrap_or(store.as_str());
+                    let who = if account.is_empty() {
+                        label.to_string()
+                    } else {
+                        format!("{label} · {account}")
+                    };
+                    let msg = format!(
+                        "自动签到连试 {AUTO_FAIL_LIMIT} 次都没领成，今天不再自动重试；\
+                         最后一次败在：{why}。想领的话手动点这一行的按钮，或去客户端自己签一次"
+                    );
+                    log.push(json!({
+                        "at": today, "at_time": now_hms(), "store": store,
+                        "account": account, "source": "auto-stop", "message": msg,
+                    }));
+                    stops.push(format!("「{who}」自动签到已停止重试：{why}"));
+                }
+                if log.len() > 2000 {
+                    log.drain(0..log.len() - 2000);
+                }
+                st["log"] = json!(log);
+                save_state(&st);
+            }
+            for m in stops {
+                // 收手这件事要当场说一声：她可能正把窗口收在托盘里
+                let _ = app.notification().builder().title("Agent 驾驶舱").body(m).show();
+            }
         }
         state = load_state();
     }
@@ -1086,8 +1701,12 @@ pub fn tick(app: &tauri::AppHandle) {
         })
         .collect();
     // 不管有没有可领的，今天都算"报过"了：没可领的更不该晚上再弹一次
-    state["reminded"] = json!(today);
-    save_state(&state);
+    {
+        let _guard = LEDGER_WRITE.lock().unwrap();
+        let mut latest = load_state();
+        latest["reminded"] = json!(today);
+        save_state(&latest);
+    }
     if pending.is_empty() {
         return;
     }
@@ -1103,6 +1722,47 @@ pub fn tick(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn workbuddy_rename_keeps_each_accounts_history_and_pending() {
+        use super::*;
+        let mut st = json!({"done":{"workbuddy-intl@old@example.com":"2026-11-04","workbuddy-intl@previous":"2026-11-03"},
+            "pending":{"workbuddy-intl@old@example.com|2026-11-04":{"today":"2026-11-04","label":"WorkBuddy 国际版 · old@example.com"}},
+            "log":[{"store":"workbuddy-intl","account":"old@example.com","message":"已活跃"}],"arrived":[]});
+        rename_ledger_account(&mut st, "workbuddy-intl", "old@example.com", "Friendly Name");
+        assert_eq!(st["done"]["workbuddy-intl@Friendly Name"], "2026-11-04");
+        assert_eq!(st["done"]["workbuddy-intl@previous"], "2026-11-03");
+        assert!(st["done"].get("workbuddy-intl@old@example.com").is_none());
+        assert_eq!(st["pending"]["workbuddy-intl@Friendly Name|2026-11-04"]["label"], "WorkBuddy 国际版 · Friendly Name");
+        assert_eq!(st["log"][0]["account"], "Friendly Name");
+    }
+
+    #[test]
+    fn workbuddy_legacy_duplicate_arrival_has_one_owner() {
+        use super::*;
+        let mut st = json!({"pending":{"workbuddy-intl|2026-11-04":{"today":"2026-11-04"},
+            "workbuddy-intl@new|2026-11-04":{"today":"2026-11-04"}},
+            "log":[{"store":"workbuddy-intl","account":"","at":"2026-11-04","message":"「WorkBuddy 国际版」2026-11-04 07:28:31 到账的 30 积分"},
+                {"store":"workbuddy-intl","account":"new","at":"2026-11-04","message":"「WorkBuddy 国际版 · new」2026-11-04 07:28:31 到账的 30 积分"},
+                {"store":"workbuddy-intl","account":"previous","at":"2026-11-04","message":"「WorkBuddy 国际版 · previous」2026-11-04 01:13:44 到账的 30 积分"}],"arrived":[]});
+        normalize_legacy_workbuddy(&mut st);
+        assert_eq!(st["log"].as_array().unwrap().len(), 2);
+        assert_eq!(st["pending"].as_object().unwrap().len(), 1);
+        assert!(st["unassigned_pending"].get("workbuddy-intl|2026-11-04").is_some());
+        let before = st.clone();
+        normalize_legacy_workbuddy(&mut st);
+        assert_eq!(before, st);
+    }
+
+    #[test]
+    fn workbuddy_product_completion_follows_its_current_account() {
+        use super::*;
+        let mut it = json!({"product":"workbuddy-intl","scope":"product","ledger_account":"new",
+            "today":"2026-11-04","signed_today":false,"claimable":true});
+        apply_workbuddy_status(&mut it, &json!({"done":{"workbuddy-intl":"2026-11-04","workbuddy-intl@old":"2026-11-04"}}));
+        assert_eq!(it["claimable"], true);
+        apply_workbuddy_status(&mut it, &json!({"done":{"workbuddy-intl@new":"2026-11-04"}}));
+        assert_eq!(it["signed_today"], true);
+    }
+    #[test]
     fn workbuddy_intl_completion_is_separate_from_older_arrival() {
         use super::*;
         let base = json!({ "product": "workbuddy-intl", "today": "2026-10-29",
@@ -1114,11 +1774,45 @@ mod tests {
         let mut after = base.clone();
         apply_workbuddy_status(&mut after, &json!({"done": {"workbuddy-intl": "2026-10-29"}}));
         assert_eq!(after["claimable"], false);
-        assert_eq!(after["words"]["done"], "已签到·积分未到账");
+        assert_eq!(after["words"]["done"], "今天已活跃");
         let mut other = base.clone();
         other["scope"] = json!("account"); other["account"] = json!("B");
         apply_workbuddy_status(&mut other, &json!({"done": {"workbuddy-intl@A": "2026-10-29"}}));
         assert_eq!(other["claimable"], true);
+    }
+
+    /// 今天发过的那一句只剩在 pending 里（done 的键丢了）时，也必须认「今天已用过」，
+    /// 否则她又会被催着重发一次——她 2026-11-03 报的就是这个。
+    #[test]
+    fn workbuddy_intl_pending_today_counts_as_done() {
+        let base = json!({ "product": "workbuddy-intl", "today": "2026-10-29",
+            "scope": "account", "account": "A", "signed_today": false, "claimable": true,
+            "inferred_today_arrival": false, "note": "", "words": {} });
+        let mut it = base.clone();
+        apply_workbuddy_status(&mut it, &json!({"done": {},
+            "pending": {"workbuddy-intl@A|2026-10-29": {"since": 1.0}}}));
+        assert_eq!(it["claimable"], false);
+        assert_eq!(it["words"]["done_act"], "今天已用过");
+        // 别的日子挂着的那条不算今天
+        let mut old = base.clone();
+        apply_workbuddy_status(&mut old, &json!({"done": {},
+            "pending": {"workbuddy-intl@A|2026-10-28": {"since": 1.0}}}));
+        assert_eq!(old["claimable"], true);
+    }
+
+    /// 本地会话库认出来的活跃（agenthub 已把 signed_today 置真）不许被改回"可签到"，
+    /// 也不许说成"驾驶舱替你发过"——那次是她自己在客户端聊的。
+    #[test]
+    fn workbuddy_intl_local_evidence_keeps_client_word() {
+        let mut it = json!({ "product": "workbuddy-intl", "today": "2026-10-29",
+            "scope": "account", "account": "A", "signed_today": true, "claimable": false,
+            "inferred_today_arrival": false, "activity_at": "13:54",
+            "note": "本地会话记录显示这个号今天 13:54 还发过对话（1 条会话）", "words": {} });
+        apply_workbuddy_status(&mut it, &json!({"done": {}, "pending": {}}));
+        assert_eq!(it["words"]["done"], "今天已活跃");
+        assert_eq!(it["words"]["done_act"], "今天已用过");
+        assert_eq!(it["note"], "本地会话记录显示这个号今天 13:54 还发过对话（1 条会话）",
+            "她自己发的那次不能说成驾驶舱替她发的");
     }
 
     use super::*;
@@ -1200,5 +1894,164 @@ mod tests {
         assert!(remind_due(605, 600, false), "到点且今天没弹过");
         assert!(!remind_due(599, 600, false), "没到点");
         assert!(!remind_due(900, 600, true), "今天已经弹过就不再弹");
+    }
+
+    #[test]
+    fn external_hit_dedupes_by_day_and_account() {
+        let st = json!({"log": [
+            {"at": "2026-11-04", "store": "qoder-cn", "account": "", "claimed": true},
+            {"at": "2026-11-03", "store": "qoder-cn", "account": "", "source": "external"}
+        ]});
+        assert!(log_hit_today(&st, "qoder-cn", "", "2026-11-04"));
+        assert!(log_hit_today(&st, "qoder-cn", "", "2026-11-03"));
+        assert!(!log_hit_today(&st, "qoder-cn", "", "2026-11-02"));
+        assert!(!log_hit_today(&st, "qoder", "", "2026-11-04"));
+    }
+
+    #[test]
+    fn backfill_recovers_old_rows_from_real_sources_only() {
+        let mut st = json!({
+            "done": {}, "pending": {}, "unassigned_pending": {}, "arrived": [],
+            "log": [
+                {"at": "2026-10-30", "store": "workbuddy-intl", "account": "", "settling": true,
+                 "message": "「WorkBuddy 国际版」2026-10-30 07:10:38 到账的 30 积分，按次日结算惯例推测属于 2026-10-29 的活跃；厂商未提供归属日期"},
+                {"at": "2026-10-29", "store": "workbuddy-intl", "account": "", "settling": true,
+                 "message": "今天的对话已完成（6114 token，hy3），今天的积分尚待到账；最近一笔于 2026-10-29 07:52:43 到账，按次日结算惯例推测属于 2026-10-28 的活跃。"},
+                {"at": "2026-11-05", "store": "workbuddy-intl", "account": "Gerald", "settling": true,
+                 "message": "今天的对话已完成（6108 token，hy3），今天的积分尚待到账"},
+                {"at": "2026-10-13", "store": "qoder-cn", "account": "", "claimed": true, "message": "领取成功"},
+                {"at": "2026-11-06", "at_time": "20:21:11", "store": "qoder-cn", "account": "", "claimed": true, "message": "CLAIMED"}
+            ]
+        });
+        st["pending"]["workbuddy-intl@Gerald|2026-11-05"] =
+            json!({"since": 1793848074.08, "today": "2026-11-05"});
+        st["arrived"] = json!([{"store": "qoder-cn", "account": "", "log_date": "2026-10-13", "at": 1791855600.0}]);
+        backfill_log_times(&mut st);
+        // ① 厂商时间戳嵌在消息里的，精确到秒
+        assert_eq!(st["log"][0]["at_time"], "07:10:38");
+        // 「最近一笔于 …」里的时间戳是上一笔的，不是这一条的，不认
+        assert!(st["log"][1]["at_time"].is_null());
+        // ② pending.since（具体几点随时区，只看形状）
+        let t = st["log"][2]["at_time"].as_str().unwrap_or("");
+        assert!(t.len() == 8 && t.as_bytes()[2] == b':' && t.as_bytes()[5] == b':', "实际 {t:?}");
+        // ③ arrived.at
+        let t = st["log"][3]["at_time"].as_str().unwrap_or("");
+        assert!(t.len() == 8 && t.as_bytes()[2] == b':' && t.as_bytes()[5] == b':', "实际 {t:?}");
+        // 已有 at_time 的新条目不动
+        assert_eq!(st["log"][4]["at_time"], "20:21:11");
+    }
+
+    #[test]
+    fn external_signins_recorded_once_and_skip_cockpit_owned_days() {
+        // 同一天同一个号只记一笔（产品行 + 账号行报到同一个号时去重）
+        let mut st = json!({"done": {}, "pending": {}, "log": []});
+        record_external_signins(&json!([
+            {"product": "qoder-cn", "account": "", "today": "2026-11-04", "signed_today": true},
+            {"product": "qoder-cn", "account": "", "today": "2026-11-04", "signed_today": true},
+            {"product": "workbuddy-intl", "account": "Gerald", "today": "2026-11-04",
+             "signed_today": true, "mode": "activity"}
+        ]), &mut st);
+        assert_eq!(st["log"].as_array().unwrap().len(), 2);
+        assert_eq!(st["log"][0]["source"], "external");
+        // 新条目要带精确时刻（at 只有日期）；老条目没这栏，界面回落成只显示日期
+        let t = st["log"][0]["at_time"].as_str().unwrap_or("");
+        assert!(t.len() == 8 && t.as_bytes()[2] == b':' && t.as_bytes()[5] == b':',
+            "at_time 该是 HH:MM:SS，实际是 {t:?}");
+        assert_eq!(st["done"]["qoder-cn"], "2026-11-04");
+        assert_eq!(st["done"]["workbuddy-intl@Gerald"], "2026-11-04");
+        // 驾驶舱自己领过的（日志有 claimed）不再记外部
+        let mut st2 = json!({"done": {}, "pending": {}, "log": [
+            {"at": "2026-11-04", "store": "qoder-cn", "account": "", "claimed": true}]});
+        record_external_signins(&json!([
+            {"product": "qoder-cn", "account": "", "today": "2026-11-04", "signed_today": true}
+        ]), &mut st2);
+        assert_eq!(st2["log"].as_array().unwrap().len(), 1);
+        // 驾驶舱在等到账的（pending，含国际版的 key|today 键）也不记
+        let mut st3 = json!({"done": {}, "pending": {
+            "workbuddy-intl@Gerald|2026-11-04": {"since": 1}}, "log": []});
+        record_external_signins(&json!([
+            {"product": "workbuddy-intl", "account": "Gerald", "today": "2026-11-04",
+             "signed_today": true}
+        ]), &mut st3);
+        assert_eq!(st3["log"].as_array().unwrap().len(), 0);
+        // 旅行猫由驾驶舱管全程，不认外部
+        let mut st4 = json!({"done": {}, "pending": {}, "log": []});
+        record_external_signins(&json!([
+            {"product": "workbuddy-travel", "account": "", "today": "2026-11-04",
+             "signed_today": true, "mode": "travel"}
+        ]), &mut st4);
+        assert_eq!(st4["log"].as_array().unwrap().len(), 0);
+    }
+
+    /// 到期那一条必须把「欠的是哪天、盯到什么时候」一起带走，否则界面只剩一句空话
+    #[test]
+    fn expired_pending_keeps_which_day_was_owed() {
+        let p = json!({"since": 100.0, "today": "2026-11-05",
+            "label": "WorkBuddy 国际版 · Gerald Fabinhu", "expect": "今天这份积分", "until": 200.0});
+        let e = expired_record("workbuddy-intl@Gerald Fabinhu|2026-11-05", &p, 260.0);
+        assert_eq!(e["today"], json!("2026-11-05"));
+        assert_eq!(e["label"], json!("WorkBuddy 国际版 · Gerald Fabinhu"));
+        assert_eq!(e["expect"], json!("今天这份积分"));
+        assert_eq!(e["deadline"], json!(200.0));
+        assert_eq!(e["dropped_at"], json!(260.0));
+    }
+
+    #[test]
+    fn note_expired_dedupes_by_key_and_bounds_the_list() {
+        let one = |day: &str| json!({"key": format!("workbuddy-intl@A|{day}"), "today": day});
+        let mut st = json!({"expired": []});
+        note_expired(&mut st, &[one("2026-11-05")]);
+        // 同一天的欠账重复轮询不许记两遍
+        note_expired(&mut st, &[one("2026-11-05"), one("2026-11-06")]);
+        assert_eq!(st["expired"].as_array().unwrap().len(), 2);
+        let many: Vec<Value> = (0..70).map(|i| one(&format!("2026-{i:02}"))).collect();
+        let mut st2 = json!({"expired": []});
+        note_expired(&mut st2, &many);
+        let list = st2["expired"].as_array().unwrap();
+        assert_eq!(list.len(), 60);
+        assert_eq!(list[59]["today"], json!("2026-69"), "留下的是最近那批，不是最老的");
+    }
+
+    /// 自动领的失败封顶：产品级与账号级各记各的账，隔天作废，领成清前账。
+    /// 她 2026-11-08：403 撞了一上午没人喊停——不能再来一次。
+    #[test]
+    fn auto_fail_cap_counts_per_store_account_and_day() {
+        let mut st = json!({"auto_fails": {}});
+        let k = auto_fail_key("workbuddy-intl", "Gerald Fabinhu", "2026-11-08");
+        assert_eq!(k, "workbuddy-intl@Gerald Fabinhu|2026-11-08");
+        let kp = auto_fail_key("minimax", "", "2026-11-08");
+        assert_eq!(kp, "minimax|2026-11-08");
+        for _ in 0..4 {
+            bump_auto_fail(&mut st, &k, "2026-11-08");
+        }
+        assert!(auto_fail_left(&st, &k), "4 次还在限额内");
+        assert_eq!(bump_auto_fail(&mut st, &k, "2026-11-08"), 5);
+        assert!(!auto_fail_left(&st, &k), "到 5 次就收手");
+        // 另一个号 / 另一家 / 隔一天，各是各的账
+        assert!(auto_fail_left(&st, &auto_fail_key("workbuddy-intl", "shen1950", "2026-11-08")));
+        assert!(auto_fail_left(&st, &auto_fail_key("minimax", "", "2026-11-08")));
+        assert!(auto_fail_left(&st, &auto_fail_key("workbuddy-intl", "Gerald Fabinhu", "2026-11-09")));
+        // 新一天的第一次失败把旧日期的键清掉，文件不被攒大
+        bump_auto_fail(&mut st, &auto_fail_key("workbuddy-intl", "Gerald Fabinhu", "2026-11-09"), "2026-11-09");
+        assert!(st["auto_fails"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|x| x.ends_with("|2026-11-09")));
+        // 领成了清前账
+        clear_auto_fail(&mut st, &auto_fail_key("workbuddy-intl", "Gerald Fabinhu", "2026-11-09"));
+        assert!(auto_fail_left(&st, &auto_fail_key("workbuddy-intl", "Gerald Fabinhu", "2026-11-09")));
+    }
+
+    /// 什么算"没领成"：领到 / 已领过 / 已经在等结算都不算，重试没有意义
+    #[test]
+    fn claim_failed_only_counts_real_failures() {
+        assert!(claim_failed(&json!({"error": "这一句没跑成：403 request illegal"})));
+        assert!(claim_failed(&json!({"claimed": false, "message": "服务端拒了"})));
+        assert!(!claim_failed(&json!({"claimed": true})));
+        assert!(!claim_failed(&json!({"already": true})));
+        assert!(!claim_failed(&json!({"settling": true, "settling_final": true})),
+            "国际版发完对话等到账，不是失败");
+        assert!(!claim_failed(&json!({"claimed": false, "already": true})));
     }
 }

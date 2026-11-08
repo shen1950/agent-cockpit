@@ -41,10 +41,12 @@ TRAE CN：目前找到的运行时记忆主要是摘要，不能代表完整对�
 
 ## 验证与维护
 
+用量采集器所需运行时随 Windows 程序内置，无需在使用机器上安装 Python。首次采集会解压到驾驶舱数据目录，需要可用磁盘空间与写入权限；解压或采集失败时，页面会显示原因。开发和测试仍需要 Node.js、Python、Rust 及依赖；浏览器回归测试使用项目声明的 Playwright 与本机 Chrome，可先运行 `npm install` 安装 JavaScript 依赖。
+
 编译和测试统一通过 agent-sync：
 
 ```powershell
-python C:/Users/USER/.agents/skills/agent-sync/bin/agsync.py build --test-cmd 'powershell -NoProfile -ExecutionPolicy Bypass -File tests/check-usage.ps1'
+agsync build --test-cmd 'powershell -NoProfile -ExecutionPolicy Bypass -File tests/check-usage.ps1'
 ```
 
 验证包含 JavaScript 汇总语义、Python 各数据源、Rust 缓存与速率、现有 UI 回归及本机只读汇总探针。`.agent-sync/usage-evidence/real-usage.json` 只包含图表聚合数据，不包含对话正文或凭据。

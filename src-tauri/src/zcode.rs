@@ -101,6 +101,21 @@ fn card(name: &str) -> Result<Value, String> {
     if name.is_empty() || reg::bad_account_name(name).is_some() { return Err("账号名称无效".into()); }
     reg::find_instance(APP, name).ok_or_else(|| "账号不存在".into())
 }
+/// Only the model adapter receives plaintext, through an anonymous pipe.
+/// The current client may have refreshed this same identity since capture.
+pub fn proxy_credential(name: &str) -> Result<Value, String> {
+    if !secrets::available() { return Err("请先解锁凭据保管箱".into()); }
+    let meta = card(name)?;
+    let uid = meta["quota_user_id"].as_str().filter(|s| !s.is_empty()).ok_or("请先录入该账号登录")?;
+    let snapshot = if current_identity().is_ok_and(|who| who["user_id"] == uid) {
+        snapshot_current()?
+    } else { snapshot_for_uid(uid)? };
+    helper(json!({"mode":"proxy","record":snapshot["record"],"expected_user_id":uid}))
+}
+pub fn proxy_available(name: &str) -> bool {
+    card(name).ok().and_then(|m| snapshot_for_uid(m["quota_user_id"].as_str().unwrap_or("")).ok())
+        .is_some_and(|s| s["record"]["zcodejwttoken"].as_str().is_some_and(|v| !v.is_empty()))
+}
 fn clear_quota_cache(meta: &mut Value) {
     if let Some(fields) = meta.as_object_mut() {
         let keep = ["quota_user_id", "quota_account", "quota_url", "quota_adapter", "quota_params", "quota_auto"];

@@ -1,0 +1,6 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-companion",
+  "windows": ["desktop-orb", "desktop-pet", "desktop-panel"],
+  "permissions": ["core:default"]
+}

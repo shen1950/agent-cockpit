@@ -37,26 +37,26 @@ function setup(options = {}) {
     },
   };
   vm.createContext(context); vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui/zcode.js'),'utf8'),context);
-  const instance = { app:'zcode',name:'shen1950',data_dir:'C:/Users/Example/.zcode',quota:{},
-    zcode_auth:{ provider:'bigmodel', account:'shen1950', has_auth:true, current:false, auth_status:'ready' } };
+  const instance = { app:'zcode',name:'demo_account_intl',data_dir:'C:/Users/Example/.zcode',quota:{},
+    zcode_auth:{ provider:'bigmodel', account:'demo_account_intl', has_auth:true, current:false, auth_status:'ready' } };
   return { context, requests, notices, confirms, dom, instance };
 }
 test('ZCode card opens its selected login instead of rebinding the active account', async () => {
   const s = setup(); const b=s.context.zcodeOpenButton(s.instance);
   assert.equal(text(b),'切换并打开'); await b.action();
-  assert.deepEqual(JSON.parse(JSON.stringify(s.requests[0])),{action:'zcode_switch',app:'zcode',name:'shen1950'});
+  assert.deepEqual(JSON.parse(JSON.stringify(s.requests[0])),{action:'zcode_switch',app:'zcode',name:'demo_account_intl'});
   const current=s.context.zcodeOpenButton({...s.instance,zcode_auth:{...s.instance.zcode_auth,current:true}});
   assert.equal(text(current),'打开窗口'); await current.action(); assert.equal(s.requests.at(-1).action,'launch_app');
 });
 test('switch requires explicit restart confirmation before a forced request', async () => {
   const s=setup({respond:p=>p.force?{ok:true}:{ok:false,need_force:true}});
-  await s.context.zcodeAction('zcode_switch','shen1950');
+  await s.context.zcodeAction('zcode_switch','demo_account_intl');
   assert.equal(s.requests.length,2); assert.equal(s.requests[0].force,undefined); assert.equal(s.requests[1].force,true);
   assert.match(s.confirms[0].message,/保存/); assert.equal(s.confirms[0].settings.okText,'重启并切换');
 });
 test('cancelling a switch never sends a forced request', async () => {
   const s=setup({confirm:false,respond:()=>({ok:false,need_force:true})});
-  const r=await s.context.zcodeAction('zcode_switch','shen1950');
+  const r=await s.context.zcodeAction('zcode_switch','demo_account_intl');
   assert.equal(r.cancelled,true); assert.equal(s.requests.length,1);
 });
 test('ending a ZCode window confirms End without promising an account switch', async () => {
@@ -68,7 +68,7 @@ test('ending a ZCode window confirms End without promising an account switch', a
 });
 test('login view distinguishes platforms and does not offer logout for another account', () => {
   const s=setup(); const first=s.context.zcodeDetailPanel(s.instance,'auth');
-  const second=s.context.zcodeDetailPanel({...s.instance,name:'Example User B',zcode_auth:{provider:'zai',account:'Example User B',has_auth:true,current:true}},'auth');
+  const second=s.context.zcodeDetailPanel({...s.instance,name:'Demo User',zcode_auth:{provider:'zai',account:'Demo User',has_auth:true,current:true}},'auth');
   assert.match(text(first),/BigModel/); assert.match(text(second),/Z.ai/);
   assert.equal(button(first,'退出登录'),undefined); assert.ok(button(second,'退出登录'));
 });
@@ -81,18 +81,18 @@ test('removal is a registration operation with a visible data-preservation state
   s.context.del=async (...args)=>{removed=args;return true;};
   const panel=s.context.zcodeDetailPanel(s.instance,'danger');
   assert.match(text(panel),/本机对话和项目保留/); await button(panel,'移除账号').action();
-  assert.equal(removed[0],'zcode'); assert.equal(removed[1],'shen1950');
+  assert.equal(removed[0],'zcode'); assert.equal(removed[1],'demo_account_intl');
 });
 test('saved account import carries explicit identity and never switches the running client', async () => {
   const s=setup({respond:p=>p.action==='zcode_accounts'?{ok:true,accounts:[
-    {user_id:'zcode:bigmodel:1',provider:'bigmodel',account:'shen1950',has_auth:true},
-    {user_id:'zcode:zai:1',provider:'zai',account:'Example User B',has_auth:true,registered_as:'Example User B'},
+    {user_id:'zcode:bigmodel:1',provider:'bigmodel',account:'demo_account_intl',has_auth:true},
+    {user_id:'zcode:zai:1',provider:'zai',account:'Demo User',has_auth:true,registered_as:'Demo User'},
   ]}:{ok:true,name:p.name}});
   const dialog=s.context.openZcodeAdd(); await new Promise(resolve=>setImmediate(resolve));
   assert.match(text(dialog),/BigModel/); assert.match(text(dialog),/Z.ai/);
   await button(dialog,'添加账号').action();
   const capture=s.requests.find(p=>p.action==='zcode_capture');
-  assert.equal(capture.user_id,'zcode:bigmodel:1'); assert.equal(capture.name,'shen1950');
+  assert.equal(capture.user_id,'zcode:bigmodel:1'); assert.equal(capture.name,'demo_account_intl');
   assert.equal(s.requests.some(p=>['zcode_switch','zcode_logout','kill'].includes(p.action)),false);
 });
 test('an authoritative empty ZCode plan is shown as no plan while fresh errors remain visible', () => {

@@ -218,7 +218,10 @@
       const coverage = source[coverageField];
       if (coverage && typeof coverage === 'object') { hasCoverage = true; untimed += number(coverage.without_time_events); }
       for (const row of Array.isArray(source[field]) ? source[field] : []) {
-        if (!known(row?.timestamp) || row.timestamp < start - 300 || row.timestamp > now) continue;
+        // Exclude buckets that start before the requested window. A bucket
+        // straddling the left edge is omitted because its individual events
+        // cannot be separated accurately from the out-of-range portion.
+        if (!known(row?.timestamp) || row.timestamp < start || row.timestamp > now) continue;
         // Unix-aligned buckets avoid inventing missing subintervals. A partial
         // first/last bucket is still divided by the full window and labelled.
         const timestamp = Math.floor(row.timestamp / step) * step;
@@ -239,7 +242,11 @@
   function pollDelay(active, pending, updating, interval) {
     return active && !pending ? (updating ? 2000 : number(interval) * 1000) : 0;
   }
-  const api = { normalizeSources, scopedSources, aggregate, modelOptions, dateRange, fillDays, format, csvRows, monitorValues, scopedMonitor, historicalRates, mergeSnapshot, pollDelay };
+  function heatTooltip(date, day) {
+    if (!day) return `${date}\n没有采集记录`;
+    return `${date}\n实测 ${full(day.exact)} Token\n估算 ${full(day.estimated)} Token`;
+  }
+  const api = { normalizeSources, scopedSources, aggregate, modelOptions, dateRange, fillDays, format, csvRows, monitorValues, scopedMonitor, historicalRates, heatTooltip, mergeSnapshot, pollDelay };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.UsageDashboard = api;
   if (typeof document === 'undefined') return;
@@ -252,7 +259,7 @@
   const state = { active: false, mounted: false, pending: false, timer: null, bridge: null, data: null, error: '',
     range: '30', from: dateKey(new Date()), to: dateKey(new Date()), app: '', sourceId: '', model: '', selectedDate: '', dimension: 'agent',
     includeEstimated: preferences.includeEstimated !== false, ratios: preferences.ratios || {}, interval: [0, 15, 30, 60].includes(preferences.interval) ? preferences.interval : 30,
-    monitorRange: '24h', selectedRatePoint: null, scroller: null, parkedScroll: null };
+    monitorRange: '24h', selectedRatePoint: null };
   function persist() { try { localStorage.setItem('cockpit-usage-preferences', JSON.stringify({ ratios: state.ratios, includeEstimated: state.includeEstimated, interval: state.interval })); } catch (_) { /* Read-only webviews can still show charts. */ } }
   const byId = id => document.getElementById(id);
   function select(id, options, value, onChange) {
@@ -289,11 +296,16 @@
     const status = dom('div', 'ud-status'); status.id = 'ud-status'; status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
     const error = dom('div', 'ud-error'); error.id = 'ud-error'; error.hidden = true; error.setAttribute('role', 'alert');
     const body = dom('div', 'ud-body'); body.id = 'ud-body';
-    body.addEventListener('focusout', () => setTimeout(paint, 0));
+    body.addEventListener('focusout', event => {
+      const fromSelect = event.target.matches('select');
+      setTimeout(() => {
+        // Rebuilding the chart replaces and immediately refocuses its select.
+        // That synthetic blur must not schedule a perpetual repaint loop.
+        if (fromSelect && body.contains(document.activeElement) && document.activeElement?.matches('select')) return;
+        paint();
+      }, 0);
+    });
     target.append(tools, status, error, body);
-    const scroller = target.closest('.pagebody');
-    state.scroller = scroller; state.parkedScroll = scroller ? scroller.scrollTop : null;
-    if (scroller) scroller.addEventListener('scroll', () => { state.parkedScroll = scroller.scrollTop; }, { passive: true });
   }
   function updateSourceOptions() {
     const sources = scopedSources(state.data, { app: state.app, sourceId: state.sourceId }), appControl = byId('ud-agent'), sourceControl = byId('ud-source'), modelControl = byId('ud-model');
@@ -460,7 +472,7 @@
       const date = dateKey(cursor), day = map.get(date), value = day?.tokens || 0;
       const level = value ? Math.max(1, Math.min(4, Math.ceil(value / peak * 4))) : 0;
       const button = action('', () => selectDay(date), `ud-heat-cell ud-level-${level}${state.selectedDate === date ? ' ud-selected' : ''}`);
-      button.title = `${date}\n实测 ${full(day?.exact)} Token\n估算 ${full(day?.estimated)} Token${day ? '' : '\n没有采集记录'}`;
+      button.title = heatTooltip(date, day);
       button.setAttribute('aria-label', button.title); grid.append(button); cursor.setDate(cursor.getDate() + 1);
     }
     scroll.append(grid); section.append(scroll);
@@ -485,7 +497,7 @@
     section.append(strip);
     const controls = dom('div', 'ud-rate-controls');
     controls.append(labelled('速率时间范围', select('ud-rate-range', [['live', '实时采样'], ['24h', '近 24 小时'], ['7d', '近 7 天'], ['30d', '近 30 天']], state.monitorRange, value => {
-      state.monitorRange = value; parkScroll(); paint(true);
+      state.monitorRange = value; paint(true);
     })));
     section.append(controls);
     const historical = state.monitorRange !== 'live';
@@ -530,7 +542,7 @@
         || (stepSeconds ? points.find(p => state.selectedRatePoint.timestamp > p.timestamp && state.selectedRatePoint.timestamp < p.timestamp + stepSeconds) : null));
       if (picked) section.append(dom('p', 'ud-rate-picked', tipOf(picked, stepSeconds)));
       section.append(dom('p', 'ud-note', historical
-        ? `横轴：本地时间；纵轴：每分钟平均 Token。按日志时间将已记录消耗汇总到 ${result.step / 60} 分钟时间段并除以该时长；没有记录的时间段不画线。未记录的调用可能使数值偏低，头尾未满时段仍按完整时段计算。日志可能延迟写入，平均速率不代表模型实时输出速度。`
+        ? '横轴：本地时间；纵轴：每分钟平均 Token。按日志时间汇总到所选时间段并除以该时长；没有记录的时间段不画线。起始边界跨界的 5 分钟记录因无法准确拆分而不计入，首尾未满时段仍按完整时长计算。24 小时分桶按 UTC 零点对齐，本地日期可能从其他时刻开始。日志可能延迟写入，平均速率不代表模型实时输出速度。'
         : '横轴：本地采样时间；纵轴：两次采样之间每分钟观察到的 Token 消耗。日志集中写入可能产生短时峰值；采样可能因程序关闭而中断。'));
     } else section.append(dom('p', 'ud-note', historical ? result.unavailable : (m.unavailable || '还没有两次有效采样；等待后会显示实时曲线。')));
     if (historical && result && result.untimed > 0) section.append(dom('p', 'ud-note', `所选来源的全部可读取历史中，有 ${full(result.untimed)} 条记录缺少具体时刻，不能分配到速率时间段。`));
@@ -580,24 +592,14 @@
     for (const day of [...data.days].reverse()) { const row = dom('tr'); for (const text of [day.date, full(day.exact), full(day.estimated), full(day.tokens)]) row.append(dom('td', '', text)); table.append(row); }
     wrap.append(table); details.append(wrap); return details;
   }
-  // focus() 会把视口滚向控件本身，且可能推迟到渲染步才生效，落在 change 处理器捕获
-  // scrollTop 之后；先把视口停回用户原本的位置，下一帧再核一次，paint(true) 的还原
-  // 才不会把这次错位固化下来（同 app.js restoreScroll 的两道护栏）。
-  function parkScroll() {
-    const scroller = state.scroller;
-    if (!scroller || state.parkedScroll == null) return;
-    const top = state.parkedScroll;
-    const reset = () => { if (Math.abs(scroller.scrollTop - top) > 0.5) scroller.scrollTop = top; };
-    reset();
-    requestAnimationFrame(reset);
-  }
   function paint(force = false) {
     if (!state.mounted || !state.active) return;
     const rootNode = byId('ud-body'), scroller = rootNode.closest('.pagebody'), scrollTop = scroller?.scrollTop || 0;
-    // 这道护栏只保护自动刷新：轮询触发的 paint() 不得打断正在输入的控件。
-    // 用户主动的控件变更一律走 paint(true)，否则上次重聚焦的控件会让重绘被误吞。
+    // Protect active text input during background refresh. A focused select
+    // contains no uncommitted text, so it must not freeze the monitoring graph.
     const focused = rootNode.contains(document.activeElement) && document.activeElement?.matches('input, select');
-    if (focused && !force) { updateStatus(); return; }
+    const editingInput = focused && document.activeElement.matches('input');
+    if (editingInput && !force) { updateStatus(); return; }
     const focusedId = focused && document.activeElement.id;
     const expanded = [...rootNode.querySelectorAll('details[open]')].map(node => node.id);
     const data = current(), metrics = dom('div', 'ud-metrics');

@@ -638,6 +638,14 @@ pub fn parse_usage(usage: &Value, me: &Value, plan: &Value, page: &str) -> Value
                 },
                 "pool": gname,
                 "detail": src,
+                // 每一笔的身份键：官网的包 id 优先（同一档里 30 多笔全叫「平台赠送」，
+                // 光靠名字根本分不出是哪一笔，改名/改到期就会改到别人头上）；
+                // 没有 id 的老数据退回到「来源+总额+到期」，也够唯一。
+                "pid": if it["id"].as_str().unwrap_or("").is_empty() {
+                    format!("{src}|{total}|{exp}")
+                } else {
+                    it["id"].as_str().unwrap_or("").to_string()
+                },
                 "left": left,
                 "total": total,
                 "used": used,
@@ -821,10 +829,10 @@ mod tests {
     /// 另一张卡点刷新要么读不到、要么被防串号守卫挡回去（她 10-14 就是撞在这上面）。
     #[test]
     fn each_account_gets_its_own_web_session_slot() {
-        let a = json!({ "quota_user_id": "22222222-2222-2222-2222-222222222222" });
-        let b = json!({ "quota_user_id": "01a05beb-b936-746a-93ae-371662bc1b57" });
+        let a = json!({ "quota_user_id": "00000000-0000-4000-8000-000000000003" });
+        let b = json!({ "quota_user_id": "0aaa0beb-0000-4000-8000-0000000000aa" });
         assert_ne!(slot_of(&a), slot_of(&b));
-        assert_eq!(slot_of(&a), "22222222-2222-2222-2222-222222222222");
+        assert_eq!(slot_of(&a), "00000000-0000-4000-8000-000000000003");
         // 中文账号名整段会被洗成连字符，不补指纹两张卡会共用一份档案
         let c = slot_of(&json!({ "name": "你鸭神永远是你鸭神" }));
         let d = slot_of(&json!({ "name": "你鸭神也是你鸭神" }));
@@ -844,7 +852,7 @@ mod tests {
     /// 不钉住的话下一次刷新会去找一个空目录，等于刚登好的会话被丢在原地又要重登。
     #[test]
     fn recorded_slot_wins_over_a_newly_bound_user_id() {
-        let m = json!({ "quota_web_slot": "账号2", "quota_user_id": "22222222-2222" });
+        let m = json!({ "quota_web_slot": "账号2", "quota_user_id": "demo-user-id" });
         assert_eq!(slot_of(&m), "账号2");
     }
 
@@ -873,7 +881,7 @@ mod tests {
     #[test]
     fn parses_the_real_captured_usage_payload() {
         let usage = json!({
-          "user_id": "22222222-2222-2222-2222-222222222222",
+          "user_id": "00000000-0000-4000-8000-000000000003",
           "quota_key": "big_model_credits",
           "status": "active",
           "plan_quota": {"quota_summary": {"used_value":0,"limit_value":0,"remaining_value":0,"unit":"credits"},
@@ -893,11 +901,11 @@ mod tests {
           "total_quota": {"quota_summary": {"used_value":649.0,"limit_value":2400.0,"remaining_value":1751.0,"unit":"credits"}},
           "lastResetAt": 0, "nextResetAt": 0
         });
-        let me = json!({"id":"22222222-2222-2222-2222-222222222222","name":"shen1950"});
-        let plan = json!({"user_id":"22222222-2222-2222-2222-222222222222",
+        let me = json!({"id":"00000000-0000-4000-8000-000000000003","name":"demo_account_intl"});
+        let plan = json!({"user_id":"00000000-0000-4000-8000-000000000003",
                           "plan_tier_name":"PLAN_TIER_FREE","end_date":253402214400000.0});
         let w = parse_usage(&usage, &me, &plan, "https://qoder.com.cn/account/usage");
-        assert_eq!(w["account"], "shen1950");
+        assert_eq!(w["account"], "demo_account_intl");
         assert_eq!(w["plan_name"], "体验版");
         assert_eq!(w["left"], 1751.0);
         assert_eq!(w["total"], 2400.0);
@@ -919,9 +927,18 @@ mod tests {
         assert_eq!(g[2]["left"], 0.0);
         // 逐笔明细同时进 credits，卡片与临期提醒共用一套
         assert_eq!(w["portions"].as_array().unwrap().len(), 4);
+        // 每一笔都要带自己的身份键：Qoder 那 30 多笔全叫「平台赠送」，编辑改名/改到期
+        // 只能靠这个键认人，靠名字会改到别人头上
+        // 组内是按到期日升序排的（b2 比 b1 早到期，所以在前），这里只比集合不比顺序
+        let mut ids: Vec<&str> = g[1]["items"].as_array().unwrap().iter()
+            .map(|x| x["pid"].as_str().unwrap_or("")).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["b1", "b2"], "官网给的包 id 要原样带上来：{ids:?}");
+        assert_eq!(g[0]["items"][0]["pid"], "p1");
+        assert_eq!(g[2]["items"][0]["pid"], "b3");
         assert_eq!(w["portions"][1]["category"], "平台奖励积分");
-        let m = apply(&json!({ "name": "shen1950", "app": "qoder-cn" }), &w);
-        assert_eq!(m["quota_user_id"], "22222222-2222-2222-2222-222222222222");
+        let m = apply(&json!({ "name": "demo_account_intl", "app": "qoder-cn" }), &w);
+        assert_eq!(m["quota_user_id"], "00000000-0000-4000-8000-000000000003");
         assert_eq!(m["quota_source"], "web");
         // 明细的来源与时间要单独记：本机那条只有汇总数的读数靠这个判断该不该让路
         assert_eq!(m["quota_detail_source"], "web");
@@ -940,7 +957,7 @@ mod tests {
     #[test]
     fn plan_quota_falls_back_to_the_cycle_refresh_time() {
         let usage = json!({
-          "user_id": "01a05beb-b936-746a-93ae-371662bc1b57",
+          "user_id": "0aaa0beb-0000-4000-8000-0000000000aa",
           "quota_key": "big_model_credits", "status": "active",
           "plan_quota": {"quota_summary": {"used_value":0,"limit_value":2000,"remaining_value":2000,"unit":"credits"},
             "quota_detail": [{"id":"p1","limit_value":2000.0,"used_value":0.0,"remaining_value":2000.0,
@@ -955,7 +972,7 @@ mod tests {
         });
         let plan = json!({"plan_tier_name": "PLAN_TIER_PRO",
                           "end_date": 1792495712958.0, "next_refresh_date": 1792495712958.0});
-        let w = parse_usage(&usage, &json!({"name": "exampleuser_b"}), &plan, "");
+        let w = parse_usage(&usage, &json!({"name": "demo_account"}), &plan, "");
         let g: Vec<&Value> = w["groups"].as_array().unwrap().iter().collect();
         assert_eq!(g[0]["name"], "套餐基础积分");
         assert_eq!(g[0]["items"][0]["expires_on"], "2026-10-20 19:28");

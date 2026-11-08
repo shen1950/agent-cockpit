@@ -1,17 +1,21 @@
 //! Antigravity（Google AI IDE）账号登记与切换。
 //!
-//! 登录态落点（实测本机 2026-10-28 + 参照 Cockpit Tools 的机制）：
+//! 登录态落点（实测本机 2026-10-28，2026-11-04 复核 + 参照 Cockpit Tools 的机制）：
 //!   - Windows 凭据管理器 target `gemini:antigravity`（username `antigravity`，
-//!     CRED_TYPE_GENERIC，payload 是 JSON：
-//!     `{token:{access_token,refresh_token,expiry}, auth_method:"consumer", id_token}`）。
-//!   - 回退文件 `~/.gemini/jetski-standalone-oauth-token`（同一 payload）。
+//!     CRED_TYPE_GENERIC，payload 是 JSON）。身份写法实测有两种：
+//!       ① 旧：`{token:{access_token,refresh_token,expiry}, auth_method, id_token:<JWT>}`
+//!       ② 新（2026-11-04 本机）：`{token:{...,expires_in}, auth_method, id_token_email:"x@example.com"}`，
+//!          **只给邮箱、不带 JWT**。两种都要认，见 `Payload::email()`。
+//!   - 回退文件 `~/.gemini/jetski-standalone-oauth-token`（同一 payload，本机可能不存在）。
 //!
 //! 官方客户端启动时读这套凭据（compositeTokenStorage），用 refresh_token 换 access_token
 //! 登录。所以「换号」= 把目标账号的凭据写回上述两处 + 重启客户端，**不做目录 junction**
 //! （Antigravity 的数据目录 `{APPDATA}\Antigravity` 与 `~/.gemini` 是整机一份共享的，切号只切登录态）。
+//! 写回时 `Token`/`Payload` 用 `#[serde(flatten)]` 原样带回不认识的字段：早期版本只认
+//! `id_token`，一次切号就把 `id_token_email` / `expires_in` 抹掉，之后整机再也认不出账号。
 //!
-//! 旧版登录态在 `{APPDATA}\Antigravity\User\globalStorage\state.vscdb` 的 `antigravityAuthStatus`，
-//! 本机已是 2.0 新版（凭据管理器），旧路径只作兜底、这里暂不解析（交给 agenthub 读）。
+//! 旧版登录态在 `{APPDATA}\Antigravity\User\globalStorage\state.vscdb` 的 `antigravityAuthStatus`
+//! （含 name / email / apiKey），2.0 新版不用它登录，仅作排障佐证。
 //!
 //! 参考：本模块照 zcode.rs 的「凭据注入换号」模式实现，凭据读写用标准 Windows
 //! CredWriteW/CredReadW API（机制同 Cockpit Tools，代码自写）。
@@ -193,6 +197,9 @@ struct Token {
     refresh_token: String,
     #[serde(default)]
     expiry: String,
+    /// 官方凭据里还有 expires_in 等字段，换号写回时要原样带回。
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
@@ -202,6 +209,11 @@ struct Payload {
     auth_method: String,
     #[serde(default)]
     id_token: Option<String>,
+    /// 新版凭据不带 JWT，邮箱直接落在这个字段（实测 2026-11-04）。
+    #[serde(default)]
+    id_token_email: Option<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
 impl Payload {
@@ -210,8 +222,27 @@ impl Payload {
     fn clean_refresh_token(&self) -> &str {
         self.token.refresh_token.split('|').next().unwrap_or("").trim()
     }
+    /// 身份优先读新版 `id_token_email`，解不出再退回旧版 JWT。两条都试，
+    /// 免得客户端改写凭据格式后整机认不出账号。
     fn email(&self) -> Option<String> {
-        self.id_token.as_deref().and_then(email_from_id_token)
+        self.id_token_email
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| s.contains('@'))
+            .map(str::to_string)
+            .or_else(|| self.id_token.as_deref().and_then(email_from_id_token))
+    }
+    /// 把已确认的邮箱补进载荷：登记快照、换号写回、回读核验都靠它。
+    fn with_email(mut self, email: &str) -> Self {
+        let valid = self
+            .id_token_email
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| s.contains('@'));
+        if !valid {
+            self.id_token_email = Some(email.trim().to_string());
+        }
+        self
     }
 }
 
@@ -335,7 +366,11 @@ fn capture(name: &str) -> Result<Value, String> {
         return Err("账号名称无效".into());
     }
     let payload = read_current_payload()?;
-    let email = payload.email().ok_or("登录凭据里没有 email（id_token 缺失），无法确认身份；请改用 refresh_token 导入")?;
+    let email = payload
+        .email()
+        .ok_or("登录凭据里没有 email（id_token / id_token_email 均缺失），无法确认身份；请改用 refresh_token 导入")?;
+    // 快照统一带上邮箱：只有旧版 JWT 的凭据，切号写回后也能通过身份核验。
+    let payload = payload.with_email(&email);
     register(name, &email, &payload)?;
     let meta = reg::find_instance(APP, name).ok_or("账号登记失败")?;
     Ok(json!({ "msg": format!("已登记账号 {email}"), "account": email, "antigravity_auth": status(&meta) }))
@@ -359,9 +394,12 @@ fn import(name: &str, p: &Value) -> Result<Value, String> {
                 token_type: "Bearer".to_string(),
                 refresh_token: rt.to_string(),
                 expiry: String::new(),
+                extra: Default::default(),
             },
             auth_method: "consumer".to_string(),
             id_token: p["id_token"].as_str().map(str::to_string),
+            id_token_email: p["id_token_email"].as_str().map(str::to_string),
+            extra: Default::default(),
         }
     };
     if payload.clean_refresh_token().is_empty() {
@@ -372,6 +410,8 @@ fn import(name: &str, p: &Value) -> Result<Value, String> {
         .or_else(|| p["email"].as_str().map(|s| s.trim().to_string()))
         .filter(|e| !e.is_empty())
         .ok_or("无法从凭据里确认 email：请同时提供 email，或补上 id_token")?;
+    // 手工导入没有 JWT，邮箱要落进快照，否则之后切号写回就核验不过。
+    let payload = payload.with_email(&email);
     register(name, &email, &payload)?;
     let meta = reg::find_instance(APP, name).ok_or("账号登记失败")?;
     Ok(json!({ "msg": format!("已导入账号 {email}"), "account": email, "antigravity_auth": status(&meta) }))
@@ -408,7 +448,9 @@ fn materialize(name: &str, force: bool) -> Result<Value, Value> {
     if email.is_empty() {
         return Err(failure("该账号尚未登记登录凭据"));
     }
-    let payload = snapshot_for_email(&email).map_err(failure)?;
+    // 老快照可能只带 JWT、或压根没有身份字段；用卡片上已登记的邮箱补齐，
+    // 写回后回读核验才不会失败。
+    let payload = snapshot_for_email(&email).map_err(failure)?.with_email(&email);
     let serialized = serde_json::to_string(&payload).map_err(|_| failure("凭据序列化失败"))?;
 
     let restarted = stop(force)?;
@@ -425,12 +467,12 @@ fn materialize(name: &str, force: bool) -> Result<Value, Value> {
         .unwrap_or(false);
     if !verified {
         if restarted {
-            let _ = launch_native();
+            let _ = launch_app();
         }
         return Err(failure("登录核验失败：凭据已写入但身份不符，请检查该账号的 refresh_token 是否有效"));
     }
     if restarted {
-        launch_native().map_err(failure)?;
+        launch_app().map_err(failure)?;
     }
     Ok(json!({ "msg": "账号已切换", "account": email }))
 }
@@ -490,7 +532,9 @@ fn stop(force: bool) -> Result<bool, Value> {
     Err(json!({ "ok": false, "msg": "Antigravity 尚未退出，凭据未修改" }))
 }
 
-fn launch_native() -> Result<Value, String> {
+/// 打开客户端本体。Antigravity 共用一份档案，不给子进程加独立目录；
+/// 已经在跑时由客户端自己的 single-instance 激活已有窗口。
+pub fn launch_app() -> Result<Value, String> {
     let exe = reg::resolve_exe(&reg::app_def(APP).ok_or("未登记 Antigravity")?).ok_or("未找到 Antigravity 客户端")?;
     procs::launch_plain(&exe)?;
     Ok(json!({ "msg": "已打开 Antigravity" }))
@@ -671,29 +715,44 @@ fn first_version_in(bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// Google 端点走本地代理时，首次连接偶尔被掐断 TLS（2026-11-04 实测：
+/// `tls connection init failed: unexpected end of file`，同一代理第二次立刻成功）。
+/// 传输层错误重试一次；服务端明确回了状态码就不重试。
+const NETWORK_ATTEMPTS: usize = 2;
+
 fn http_post_json(url: &str, access_token: &str, body: &Value) -> Result<Value, String> {
     // User-Agent 必须带 `antigravity/` 前缀，否则 retrieveUserQuotaSummary 直接 403。
     let ua = format!("antigravity/{} windows/amd64", detect_ide_version());
-    let res = agent()
-        .post(url)
-        .set("Content-Type", "application/json")
-        .set("Accept", "application/json")
-        .set("Authorization", &format!("Bearer {access_token}"))
-        .set("User-Agent", &ua)
-        .set("x-goog-api-client", "gl-node/22.21.1")
-        .timeout(Duration::from_secs(25))
-        .send_string(&body.to_string());
-    match res {
-        Ok(r) => {
-            let text = r.into_string().unwrap_or_default();
-            serde_json::from_str(&text).map_err(|e| format!("响应不是 JSON：{e}"))
+    let payload = body.to_string();
+    let mut last_transport = String::new();
+    for attempt in 0..NETWORK_ATTEMPTS {
+        let res = agent()
+            .post(url)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {access_token}"))
+            .set("User-Agent", &ua)
+            .set("x-goog-api-client", "gl-node/22.21.1")
+            .timeout(Duration::from_secs(25))
+            .send_string(&payload);
+        match res {
+            Ok(r) => {
+                let text = r.into_string().unwrap_or_default();
+                return serde_json::from_str(&text).map_err(|e| format!("响应不是 JSON：{e}"));
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let text = r.into_string().unwrap_or_default();
+                return Err(format!("服务端拒绝（{code}）：{}", text.chars().take(200).collect::<String>()));
+            }
+            Err(e) => {
+                last_transport = format!("请求失败：{e}");
+                if attempt + 1 == NETWORK_ATTEMPTS {
+                    return Err(format!("{}（已重试 {} 次）", last_transport, NETWORK_ATTEMPTS));
+                }
+            }
         }
-        Err(ureq::Error::Status(code, r)) => {
-            let text = r.into_string().unwrap_or_default();
-            Err(format!("服务端拒绝（{code}）：{}", text.chars().take(200).collect::<String>()))
-        }
-        Err(e) => Err(format!("请求失败：{e}")),
     }
+    Err(last_transport)
 }
 
 /// form-urlencoded 转义（只放行 RFC 3986 的非保留字符）。
@@ -714,30 +773,40 @@ fn refresh_access_token(refresh_token: &str) -> Result<(String, Option<String>),
         urlencode(OAUTH_CLIENT_SECRET),
         urlencode(refresh_token)
     );
-    let res = agent()
-        .post(TOKEN_ENDPOINT)
-        .set("Content-Type", "application/x-www-form-urlencoded")
-        .set("Accept", "application/json")
-        .set("User-Agent", "agent-cockpit/2.1")
-        .send_string(&form);
-    let (status, text) = match res {
-        Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
-        Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
-        Err(e) => return Err(format!("刷新请求失败：{e}")),
-    };
-    if status >= 400 {
-        let msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v["error_description"].as_str().or_else(|| v["error"].as_str()).map(str::to_string))
-            .unwrap_or_else(|| text.chars().take(160).collect());
-        return Err(format!("刷新被拒（{status}）：{msg}"));
+    let mut last_transport = String::new();
+    for attempt in 0..NETWORK_ATTEMPTS {
+        let res = agent()
+            .post(TOKEN_ENDPOINT)
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .set("Accept", "application/json")
+            .set("User-Agent", "agent-cockpit/2.1")
+            .send_string(&form);
+        let (status, text) = match res {
+            Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+            Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
+            Err(e) => {
+                last_transport = format!("刷新请求失败：{e}");
+                if attempt + 1 == NETWORK_ATTEMPTS {
+                    return Err(format!("{}（已重试 {} 次）", last_transport, NETWORK_ATTEMPTS));
+                }
+                continue;
+            }
+        };
+        if status >= 400 {
+            let msg = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v["error_description"].as_str().or_else(|| v["error"].as_str()).map(str::to_string))
+                .unwrap_or_else(|| text.chars().take(160).collect());
+            return Err(format!("刷新被拒（{status}）：{msg}"));
+        }
+        let v: Value = serde_json::from_str(&text).map_err(|e| format!("刷新响应不是 JSON：{e}"))?;
+        let access = v["access_token"].as_str().unwrap_or("").trim().to_string();
+        if access.is_empty() {
+            return Err("刷新成功但没有 access_token".into());
+        }
+        return Ok((access, v["id_token"].as_str().map(str::to_string)));
     }
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("刷新响应不是 JSON：{e}"))?;
-    let access = v["access_token"].as_str().unwrap_or("").trim().to_string();
-    if access.is_empty() {
-        return Err("刷新成功但没有 access_token".into());
-    }
-    Ok((access, v["id_token"].as_str().map(str::to_string)))
+    Err(last_transport)
 }
 
 fn load_code_assist(host: &str, access_token: &str) -> Result<Value, String> {
@@ -1045,9 +1114,12 @@ fn finish_oauth(name: &str, access_token: &str, refresh_token: &str, id_token: O
             token_type: "Bearer".to_string(),
             refresh_token: refresh_token.to_string(),
             expiry,
+            extra: Default::default(),
         },
         auth_method: "consumer".to_string(),
         id_token,
+        id_token_email: Some(email.clone()),
+        extra: Default::default(),
     };
     let serialized = serde_json::to_string(&payload).map_err(|_| "凭据序列化失败")?;
     #[cfg(windows)]
@@ -1250,6 +1322,31 @@ pub fn action(act: &str, p: &Value) -> Option<Value> {
 mod tests {
     use super::*;
 
+    fn stub_token() -> Token {
+        Token {
+            access_token: String::new(),
+            token_type: "Bearer".into(),
+            refresh_token: "1//x".into(),
+            expiry: String::new(),
+            extra: Default::default(),
+        }
+    }
+
+    fn stub_payload() -> Payload {
+        Payload {
+            token: stub_token(),
+            auth_method: "consumer".into(),
+            id_token: None,
+            id_token_email: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn jwt_with_email(email: &str) -> String {
+        let body = b64url_encode(format!(r#"{{"email":"{email}"}}"#).as_bytes());
+        format!("e30.{body}.sig")
+    }
+
     #[test]
     fn b64url_decodes_jwt_payload_without_padding() {
         // "eyJlbWFpbCI6InhAeS5jb20ifQ" = base64url({"email":"x@y.com"})，无 padding
@@ -1260,40 +1357,21 @@ mod tests {
 
     #[test]
     fn email_extracted_from_id_token() {
-        let header = "e30"; // {}
-        let payload = b64url_encode(br#"{"email":"someone@gmail.com","sub":"1"}"#);
-        let id_token = format!("{header}.{payload}.sig");
-        assert_eq!(email_from_id_token(&id_token).as_deref(), Some("someone@gmail.com"));
+        assert_eq!(email_from_id_token(&jwt_with_email("someone@gmail.com")).as_deref(), Some("someone@gmail.com"));
     }
 
     #[test]
     fn refresh_token_splits_project_id_suffix() {
         let p = Payload {
-            token: Token {
-                access_token: String::new(),
-                token_type: "Bearer".into(),
-                refresh_token: "1//0gAbCdEf|rising-fact-p41fc".into(),
-                expiry: String::new(),
-            },
-            auth_method: "consumer".into(),
-            id_token: None,
+            token: Token { refresh_token: "1//0gAbCdEf|rising-fact-p41fc".into(), ..stub_token() },
+            ..stub_payload()
         };
         assert_eq!(p.clean_refresh_token(), "1//0gAbCdEf");
     }
 
     #[test]
-    fn payload_email_comes_from_id_token_only() {
-        let p = Payload {
-            token: Token {
-                access_token: String::new(),
-                token_type: "Bearer".into(),
-                refresh_token: "1//x".into(),
-                expiry: String::new(),
-            },
-            auth_method: "consumer".into(),
-            id_token: None,
-        };
-        assert!(p.email().is_none());
+    fn payload_without_identity_has_no_email() {
+        assert!(stub_payload().email().is_none());
     }
 
     #[test]
@@ -1302,6 +1380,55 @@ mod tests {
         assert!(parse_payload(bad).is_err());
         let good = r#"{"token":{"refresh_token":"1//x"},"auth_method":"consumer","id_token":"e30.e30.e30"}"#;
         assert!(parse_payload(good).is_ok());
+    }
+
+    /// 2026-11-04 本机凭据：没有 id_token，邮箱在 id_token_email，token 里还有 expires_in。
+    #[test]
+    fn parse_payload_reads_id_token_email_and_keeps_unknown_fields() {
+        let raw = r#"{"token":{"access_token":"ya29.x","token_type":"Bearer","refresh_token":"1//x","expiry":"2026-11-04T18:00:00.000Z","expires_in":3599},"auth_method":"consumer","id_token_email":"user@example.com"}"#;
+        let p = parse_payload(raw).unwrap();
+        assert_eq!(p.email().as_deref(), Some("user@example.com"));
+        // 切号写回不能把官方字段抹掉，否则下一次又认不出本机账号。
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back["id_token_email"], "user@example.com");
+        assert_eq!(back["token"]["expires_in"].as_i64(), Some(3599));
+    }
+
+    #[test]
+    fn email_falls_back_to_jwt_id_token() {
+        let p = Payload { id_token: Some(jwt_with_email("old@example.com")), ..stub_payload() };
+        assert_eq!(p.email().as_deref(), Some("old@example.com"));
+    }
+
+    #[test]
+    fn invalid_id_token_email_falls_back_to_jwt() {
+        let p = Payload {
+            id_token_email: Some("not-an-email".into()),
+            id_token: Some(jwt_with_email("old@example.com")),
+            ..stub_payload()
+        };
+        assert_eq!(p.email().as_deref(), Some("old@example.com"));
+    }
+
+    #[test]
+    fn with_email_backfills_snapshot_identity() {
+        let p = stub_payload().with_email("user@example.com");
+        assert_eq!(p.email().as_deref(), Some("user@example.com"));
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back["id_token_email"], "user@example.com");
+    }
+
+    #[test]
+    fn proxy_address_accepts_plain_and_scheme_forms() {
+        assert_eq!(proxy_address("127.0.0.1:7897").as_deref(), Some("http://127.0.0.1:7897"));
+        assert_eq!(proxy_address("http://127.0.0.1:7897").as_deref(), Some("http://127.0.0.1:7897"));
+        // 多协议写法优先取 https= 那一段
+        assert_eq!(
+            proxy_address("http=127.0.0.1:7897;https=127.0.0.1:7898").as_deref(),
+            Some("http://127.0.0.1:7898")
+        );
+        assert!(proxy_address("").is_none());
+        assert!(proxy_address("bad address").is_none());
     }
 
     fn b64url_encode(bytes: &[u8]) -> String {

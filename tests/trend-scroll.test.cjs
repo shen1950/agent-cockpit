@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
-const { chromium } = require('D:/npm-global/node_modules/@playwright/mcp/node_modules/playwright');
+const { chromium } = require('playwright');
 
 const root = path.resolve(__dirname, '../ui');
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
