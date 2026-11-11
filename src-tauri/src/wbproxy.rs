@@ -18,10 +18,11 @@
 //   ③ 头族**一律发全 28 个**，不做最小化。国内版 11 个头也能过，但国际版会 400/11128；
 //      更重要的是：把头发少只会让流量更像非官方客户端。可持续的前提是不可区分。
 //
-// 凭据：`$wbEncrypted` 信封（AES-256-GCM + 自定义 AAD），根密钥 atRestSecretKey 硬编码在
-// WorkBuddy.exe（TEA-18，RVA 0xA0F5798），对所有安装通用、国内版国际版共用同一把。
-// **该值不写在本文件里**，存在驾驶舱保管箱（secrets.rs：DPAPI + 可选主密码），
-// 首次由 `import_secret_from_agenthub()` 从本机 agenthub 读一次导入。
+// 凭据：`$wbEncrypted` 信封（AES-256-GCM + 自定义 AAD）。WorkBuddy 5.6 起根密钥不再
+// 静态落盘，而由正在运行的官方客户端加载。驾驶舱首次使用时读取本机 keyblob，
+// 只读扫描官方主进程里带 keyblob protectorKeyId 校验的候选，再用文件 framing
+// 解开 keyblob 做二次认证。通过后只把密钥存进本机 DPAPI 保管箱，源码和发布包
+// 都不含这个值；旧 agenthub 常量导入仅作兼容回退。
 // 也**绝不碰 refreshToken**（一次性，用一次就把客户端踢下线）；401 时重读登录态文件，
 // 客户端自己会续（本机那份 mtime 当天还在动），续不动就如实报「开一次客户端」。
 use crate::registry::{base_dir, load_config, load_instances};
@@ -202,17 +203,51 @@ fn lp(out: &mut Vec<u8>, s: &[u8]) {
     out.extend_from_slice(s);
 }
 
-pub fn aad_field(suite: u32, key_id: &str) -> Vec<u8> {
+fn aad_framed(suite: u32, key_id: &str, tag: &[u8], framing: u8) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"WB-AAD\x00");
     out.push(0x01);
-    lp(&mut out, b"WBEV1"); // framing tag：field
+    lp(&mut out, tag);
     lp(&mut out, b"sym-v1"); // scheme
     out.extend_from_slice(&suite.to_be_bytes());
     lp(&mut out, key_id.as_bytes());
-    out.push(0x02); // framing type：field=2
+    out.push(framing);
     out.extend_from_slice(&[0x00, 0x00]);
     out
+}
+
+pub fn aad_field(suite: u32, key_id: &str) -> Vec<u8> {
+    aad_framed(suite, key_id, b"WBEV1", 2)
+}
+
+fn aad_file(suite: u32, key_id: &str) -> Vec<u8> {
+    aad_framed(suite, key_id, b"WBEF1", 1)
+}
+
+fn decrypt_envelope(key: &[u8; 32], field: &Value, file_framing: bool) -> Result<Vec<u8>, String> {
+    let env_b64 = field
+        .as_str()
+        .ok_or_else(|| "信封不是 base64 字符串".to_string())?;
+    let raw = crate::secrets::b64_decode(env_b64)?;
+    let env: Value = serde_json::from_slice(&raw).map_err(|e| format!("信封不是 JSON：{e}"))?;
+    let suite = env["suite"].as_u64().unwrap_or(0) as u32;
+    if suite != 1 {
+        return Err(format!("不支持的加密套件 suite={suite}（只认 1）"));
+    }
+    let key_id = env["keyId"]
+        .as_str()
+        .ok_or_else(|| "信封里没有 keyId".to_string())?;
+    let nonce = crate::secrets::b64_decode(env["nonce"].as_str().unwrap_or(""))?;
+    let mut ct = crate::secrets::b64_decode(env["ciphertext"].as_str().unwrap_or(""))?;
+    let tag = crate::secrets::b64_decode(env["authTag"].as_str().unwrap_or(""))?;
+    ct.extend_from_slice(&tag);
+    let aad = if file_framing {
+        aad_file(suite, key_id)
+    } else {
+        aad_field(suite, key_id)
+    };
+    crate::qproxy::gcm_open(key, &nonce, &ct, &aad)
+        .ok_or_else(|| "GCM 解不开（密钥不对或 AAD 不符）".to_string())
 }
 
 /// 解一个 `$wbEncrypted` 字段。字段本来就是明文串时原样返回（客户端关闭加密时的形状）。
@@ -226,27 +261,11 @@ pub fn decrypt_field(key: &[u8; 32], field: &Value) -> Result<String, String> {
     if obj.get("$wbEncrypted").and_then(|v| v.as_u64()) != Some(1) {
         return Err("不是 $wbEncrypted 信封".into());
     }
-    let env_b64 = obj
+    let envelope = obj
         .get("envelope")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .ok_or_else(|| "信封里没有 envelope".to_string())?;
-    let raw = crate::secrets::b64_decode(env_b64)?;
-    let env: Value = serde_json::from_slice(&raw).map_err(|e| format!("信封不是 JSON：{e}"))?;
-    // suite 白名单：只认 1。出现别的值不许猜（cockpit-tools 同款纪律）。
-    let suite = env["suite"].as_u64().unwrap_or(0) as u32;
-    if suite != 1 {
-        return Err(format!("不支持的加密套件 suite={suite}（只认 1）"));
-    }
-    let key_id = env["keyId"]
-        .as_str()
-        .ok_or_else(|| "信封里没有 keyId".to_string())?;
-    let nonce = crate::secrets::b64_decode(env["nonce"].as_str().unwrap_or(""))?;
-    let mut ct = crate::secrets::b64_decode(env["ciphertext"].as_str().unwrap_or(""))?;
-    let tag = crate::secrets::b64_decode(env["authTag"].as_str().unwrap_or(""))?;
-    ct.extend_from_slice(&tag);
-    let aad = aad_field(suite, key_id);
-    let plain = crate::qproxy::gcm_open(key, &nonce, &ct, &aad)
-        .ok_or_else(|| "GCM 解不开（密钥不对或 AAD 不符）".to_string())?;
+    let plain = decrypt_envelope(key, &Value::String(envelope.to_string()), false)?;
     String::from_utf8(plain).map_err(|e| format!("明文不是 UTF-8：{e}"))
 }
 
@@ -275,6 +294,340 @@ pub fn secret_fingerprint() -> Option<String> {
     at_rest_secret().map(|s| hex(&sha256(s.as_bytes()))[..8].to_string())
 }
 
+#[derive(Debug, Clone)]
+struct KeyBlob {
+    key_id: String,
+    protector_key_id: String,
+    wrapped: Value,
+}
+
+fn keyblob_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for config in [".workbuddy-ai", ".workbuddy"] {
+        out.push(crate::registry::home().join(config).join("keyblob"));
+    }
+    out
+}
+
+fn load_keyblobs() -> Result<Vec<KeyBlob>, String> {
+    let mut found = Vec::new();
+    let mut errors = Vec::new();
+    for path in keyblob_candidates() {
+        if !path.is_file() {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                errors.push(format!("读取 {} 失败：{error}", path.display()));
+                continue;
+            }
+        };
+        let value: Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("{} 格式错误：{error}", path.display()));
+                continue;
+            }
+        };
+        let key_id = value["keyId"].as_str().unwrap_or("").to_ascii_lowercase();
+        for slot in value["slots"].as_array().into_iter().flatten() {
+            if slot["type"].as_str() != Some("static-v1") {
+                continue;
+            }
+            let protector = slot["protectorKeyId"].as_str().unwrap_or("").to_ascii_lowercase();
+            let Some(wrapped) = slot.get("wrapped").cloned() else {
+                continue;
+            };
+            if key_id.len() == 16 && protector.len() == 16 && wrapped.as_str().is_some() {
+                found.push(KeyBlob {
+                    key_id: key_id.clone(),
+                    protector_key_id: protector,
+                    wrapped,
+                });
+            }
+        }
+    }
+    if found.is_empty() {
+        if errors.is_empty() {
+            return Err("WorkBuddy keyblob 不存在或没有 static-v1 槽".into());
+        }
+        return Err(format!("WorkBuddy keyblob 无法读取：{}", errors.join("；")));
+    }
+    Ok(found)
+}
+
+fn validate_keyblob_key(key: &[u8; 32], blob: &KeyBlob) -> bool {
+    let key_id = &hex(&sha256(key))[..16];
+    if key_id != blob.protector_key_id {
+        return false;
+    }
+    let Ok(master) = decrypt_envelope(key, &blob.wrapped, true) else {
+        return false;
+    };
+    master.len() == 32 && hex(&sha256(&master))[..16] == blob.key_id
+}
+
+fn keyblob_secret(blob: &KeyBlob) -> Option<String> {
+    let current = at_rest_secret()?;
+    let key = at_rest_key()?;
+    validate_keyblob_key(&key, blob).then_some(current)
+}
+
+fn canonical_secret(candidate: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(candidate).ok()?;
+    let text = text.trim_matches(|ch: char| ch == '\0' || ch.is_whitespace());
+    if text.len() != 44
+        || !text.ends_with('=')
+        || !text.as_bytes()[..43]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+    {
+        return None;
+    }
+    let decoded = crate::secrets::b64_decode(text).ok()?;
+    if decoded.len() != 32 || crate::secrets::b64_encode(&decoded) != text {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+fn scan_bytes_for_secret(bytes: &[u8], blobs: &[KeyBlob]) -> Option<String> {
+    fn utf16_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/' || byte == b'='
+    }
+    fn decode_utf16_secret(bytes: &[u8], start: usize) -> Option<String> {
+        let end = start.checked_add(88)?;
+        if end > bytes.len() || bytes[start + 1] != 0 {
+            return None;
+        }
+        let mut text = String::with_capacity(44);
+        for pair in bytes[start..end].chunks_exact(2) {
+            if pair[1] != 0 || !utf16_byte(pair[0]) {
+                return None;
+            }
+            text.push(pair[0] as char);
+        }
+        canonical_secret(text.as_bytes())
+    }
+    for start in 0..bytes.len() {
+        if let Some(secret) = decode_utf16_secret(bytes, start) {
+            let key = sha256(secret.as_bytes());
+            if blobs.iter().any(|blob| validate_keyblob_key(&key, blob)) {
+                return Some(secret);
+            }
+        }
+        let byte = bytes[start];
+        if !(byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/') {
+            continue;
+        }
+        if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'+' | b'/' | b'=')) {
+            continue;
+        }
+        let Some(end) = start.checked_add(44).filter(|end| *end <= bytes.len()) else {
+            continue;
+        };
+        if end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'+' | b'/' | b'=')) {
+            continue;
+        }
+        let Some(secret) = canonical_secret(&bytes[start..end]) else {
+            continue;
+        };
+        let key = sha256(secret.as_bytes());
+        if blobs.iter().any(|blob| validate_keyblob_key(&key, blob)) {
+            return Some(secret);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn seal_for_test(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    nonce: &[u8; 12],
+    tag_magic: &[u8],
+    framing: u8,
+) -> Value {
+    let key_id = hex(&sha256(key))[..16].to_string();
+    let aad = aad_framed(1, &key_id, tag_magic, framing);
+    let h = u128::from_be_bytes(crate::qproxy::aes256_encrypt_block(key, &[0u8; 16]));
+    let mut j0 = [0u8; 16];
+    j0[..12].copy_from_slice(nonce);
+    j0[15] = 1;
+    let mut ciphertext = Vec::with_capacity(plaintext.len());
+    for (index, chunk) in plaintext.chunks(16).enumerate() {
+        let mut counter = j0;
+        counter[12..].copy_from_slice(&(2 + index as u32).to_be_bytes());
+        let stream = crate::qproxy::aes256_encrypt_block(key, &counter);
+        ciphertext.extend(chunk.iter().zip(stream.iter()).map(|(plain, mask)| plain ^ mask));
+    }
+    let mut authenticated = aad.clone();
+    if !aad.is_empty() {
+        authenticated.resize((aad.len() + 15) / 16 * 16, 0);
+    }
+    authenticated.extend_from_slice(&ciphertext);
+    authenticated.resize((authenticated.len() + 15) / 16 * 16, 0);
+    authenticated.extend_from_slice(&((aad.len() as u64) * 8).to_be_bytes());
+    authenticated.extend_from_slice(&((ciphertext.len() as u64) * 8).to_be_bytes());
+    let mut y = 0u128;
+    for chunk in authenticated.chunks(16) {
+        let mut block = [0u8; 16];
+        block.copy_from_slice(chunk);
+        y ^= u128::from_be_bytes(block);
+        let mut z = 0u128;
+        let mut v = h;
+        for bit in 0..128 {
+            if (y >> (127 - bit)) & 1 == 1 {
+                z ^= v;
+            }
+            v = if v & 1 == 1 {
+                (v >> 1) ^ 0xe100_0000_0000_0000_0000_0000_0000_0000u128
+            } else {
+                v >> 1
+            };
+        }
+        y = z;
+    }
+    let mask = u128::from_be_bytes(crate::qproxy::aes256_encrypt_block(key, &j0));
+    let tag = (mask ^ y).to_be_bytes();
+    let envelope = json!({
+        "suite": 1,
+        "keyId": key_id,
+        "nonce": crate::secrets::b64_encode(nonce),
+        "ciphertext": crate::secrets::b64_encode(&ciphertext),
+        "authTag": crate::secrets::b64_encode(&tag),
+    });
+    Value::String(crate::secrets::b64_encode(
+        serde_json::to_string(&envelope).unwrap().as_bytes(),
+    ))
+}
+
+#[cfg(windows)]
+fn scan_running_client_for_secret(blobs: &[KeyBlob]) -> Result<String, String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn ReadProcessMemory(
+            process: isize,
+            address: *const std::ffi::c_void,
+            buffer: *mut std::ffi::c_void,
+            size: usize,
+            read: *mut usize,
+        ) -> i32;
+        fn VirtualQueryEx(
+            process: isize,
+            address: *const std::ffi::c_void,
+            info: *mut MemoryBasicInformation,
+            size: usize,
+        ) -> usize;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryBasicInformation {
+        base: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        partition_id: u16,
+        _padding: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
+
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_PRIVATE: u32 = 0x20000;
+    const PAGE_GUARD: u32 = 0x100;
+    const PAGE_NOACCESS: u32 = 0x01;
+    const READABLE: u32 = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80;
+
+    let mut candidates = Vec::new();
+    let snapshot = crate::procs::snapshot_fresh();
+    for (pid, info) in &snapshot {
+        if !matches!(info.name.as_str(), "workbuddy.exe" | "workbuddyai.exe") {
+            continue;
+        }
+        // Try every matching process. The keyblob GCM validation below makes
+        // false matches harmless, and Electron versions differ on whether the
+        // key lives in the browser or utility process.
+        if info.cmdline.contains("--type=") || info.cmdline.contains("daemon-app-server-entry")
+            || info.cmdline.contains("sidecar-entry")
+        {
+            continue;
+        }
+        candidates.push(*pid);
+    }
+    if candidates.is_empty() {
+        return Err("没有发现正在运行的 WorkBuddy 主程序；请先启动并登录 WorkBuddy，再重试".into());
+    }
+
+    for pid in candidates {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        if handle == 0 {
+            continue;
+        }
+        let mut address = 0usize;
+        while address < 0x7fff_ffff_ffff {
+            let mut info = MemoryBasicInformation::default();
+            let asked = unsafe {
+                VirtualQueryEx(
+                    handle,
+                    address as *const std::ffi::c_void,
+                    &mut info,
+                    std::mem::size_of::<MemoryBasicInformation>(),
+                )
+            };
+            if asked == 0 {
+                break;
+            }
+            let base = info.base;
+            let size = info.region_size;
+            if size == 0 {
+                break;
+            }
+            if info.state == MEM_COMMIT
+                && info.kind == MEM_PRIVATE
+                && info.protect & PAGE_GUARD == 0
+                && info.protect & PAGE_NOACCESS == 0
+                && info.protect & READABLE != 0
+                && size <= 256 * 1024 * 1024
+            {
+                let mut bytes = vec![0u8; size];
+                let mut read = 0usize;
+                let ok = unsafe {
+                    ReadProcessMemory(
+                        handle,
+                        base as *const std::ffi::c_void,
+                        bytes.as_mut_ptr() as *mut std::ffi::c_void,
+                        size,
+                        &mut read,
+                    )
+                };
+                if ok != 0 && read > 0 {
+                    bytes.truncate(read);
+                    if let Some(secret) = scan_bytes_for_secret(&bytes, blobs) {
+                        let _ = unsafe { CloseHandle(handle as *mut std::ffi::c_void) };
+                        return Ok(secret);
+                    }
+                }
+            }
+            address = base.saturating_add(size);
+        }
+        let _ = unsafe { CloseHandle(handle as *mut std::ffi::c_void) };
+    }
+    Err("WorkBuddy 正在运行，但没有找到能通过 keyblob 校验的解密密钥；请确认客户端已完成登录，然后重启 WorkBuddy 再试".into())
+}
+
+#[cfg(not(windows))]
+fn scan_running_client_for_secret(_: &[KeyBlob]) -> Result<String, String> {
+    Err("当前平台不能从 WorkBuddy 进程恢复密钥".into())
+}
+
 /// 首次导入：从本机 agenthub 的源码里读一次常量，存进保管箱。
 /// 只在用户点「导入密钥」时调用，不在请求路径上。
 /// 从 `WORKBUDDY_AT_REST_SECRET_KEY = "…"` 这一行里取值。
@@ -301,20 +654,54 @@ fn parse_secret_line(line: &str) -> String {
         .to_string()
 }
 
-pub fn import_secret_from_agenthub() -> Result<String, String> {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    if home.is_empty() {
-        return Err("读不到 USERPROFILE，找不到家目录".into());
+pub fn import_secret_from_local_client() -> Result<String, String> {
+    let blobs = load_keyblobs();
+    let mut local_error = None;
+    if let Ok(blobs) = &blobs {
+        if blobs.iter().any(|blob| keyblob_secret(blob).is_some()) {
+            return Ok("保管箱里的 WorkBuddy 解密密钥仍然有效".into());
+        }
+        if crate::secrets::locked() {
+            return Err("保管箱此刻锁着，先解锁再导入".into());
+        }
+        match scan_running_client_for_secret(blobs) {
+            Ok(secret) => return set_secret(&secret),
+            Err(error) => local_error = Some(error),
+        }
     }
-    let p = PathBuf::from(home).join(".agenthub").join("agenthub.py");
-    let txt = std::fs::read_to_string(&p)
-        .map_err(|e| format!("读不到 {}：{e}（agenthub 没装？可以改用「手动粘贴」）", p.display()))?;
+    let p = crate::registry::home().join(".agenthub").join("agenthub.py");
+    let txt = std::fs::read_to_string(&p).map_err(|e| {
+        local_error
+            .or_else(|| blobs.err())
+            .unwrap_or_else(|| format!("读不到 {}：{e}", p.display()))
+    })?;
     let marker = "WORKBUDDY_AT_REST_SECRET_KEY";
     let line = txt
         .lines()
         .find(|l| l.contains(marker) && l.contains('='))
         .ok_or_else(|| format!("{} 里没有 {} 这一行", p.display(), marker))?;
     set_secret(&parse_secret_line(line))
+}
+
+/// Compatibility alias for callers from older UI builds.
+pub fn import_secret_from_agenthub() -> Result<String, String> {
+    import_secret_from_local_client()
+}
+
+/// Called from the background check-in loop, not the UI thread. A client update
+/// may rotate keyblob; refresh the DPAPI copy only after the new candidate
+/// authenticates against that keyblob.
+pub fn ensure_local_secret() -> Result<bool, String> {
+    let blobs = load_keyblobs()?;
+    if blobs.iter().any(|blob| keyblob_secret(blob).is_some()) {
+        return Ok(false);
+    }
+    if crate::secrets::locked() {
+        return Err("保管箱此刻锁着，暂不能更新 WorkBuddy 解密密钥".into());
+    }
+    let secret = scan_running_client_for_secret(&blobs)?;
+    set_secret(&secret)?;
+    Ok(true)
 }
 
 /// 手动粘贴 / 导入都走这里。校验形状后落保管箱。
@@ -2282,6 +2669,71 @@ mod tests {
     fn decrypt_rejects_non_envelope() {
         let k = [0u8; 32];
         assert!(decrypt_field(&k, &json!({ "foo": 1 })).is_err());
+    }
+
+    #[test]
+    fn keyblob_validation_and_memory_scan_accept_only_authenticated_secret() {
+        let secret = crate::secrets::b64_encode(&[0x5au8; 32]);
+        let key = sha256(secret.as_bytes());
+        let master = [0xa5u8; 32];
+        let blob = KeyBlob {
+            key_id: hex(&sha256(&master))[..16].to_string(),
+            protector_key_id: hex(&sha256(&key))[..16].to_string(),
+            wrapped: seal_for_test(
+                &key,
+                &master,
+                &[0x11u8; 12],
+                b"WBEF1",
+                1,
+            ),
+        };
+        assert!(validate_keyblob_key(&key, &blob));
+        let mut memory = b"prefix ".to_vec();
+        memory.extend_from_slice(crate::secrets::b64_encode(&[0u8; 32]).as_bytes());
+        memory.push(0);
+        memory.extend_from_slice(secret.as_bytes());
+        memory.push(0);
+        assert_eq!(
+            scan_bytes_for_secret(&memory, std::slice::from_ref(&blob)).as_deref(),
+            Some(secret.as_str())
+        );
+        let utf16: Vec<u8> = secret.bytes().flat_map(|byte| [byte, 0]).collect();
+        assert_eq!(
+            scan_bytes_for_secret(&utf16, std::slice::from_ref(&blob)).as_deref(),
+            Some(secret.as_str())
+        );
+        let wrong = KeyBlob {
+            key_id: blob.key_id.clone(),
+            protector_key_id: blob.protector_key_id.clone(),
+            wrapped: seal_for_test(&key, &master, &[0x22u8; 12], b"WBEF1", 1),
+        };
+        let mut tampered = wrong.wrapped.as_str().unwrap().as_bytes().to_vec();
+        let index = tampered.len() / 2;
+        tampered[index] ^= 1;
+        let bad_blob = KeyBlob {
+            key_id: wrong.key_id,
+            protector_key_id: wrong.protector_key_id,
+            wrapped: Value::String(String::from_utf8(tampered).unwrap()),
+        };
+        assert!(!validate_keyblob_key(&key, &bad_blob));
+        let secret_two = crate::secrets::b64_encode(&[0x6au8; 32]);
+        let key_two = sha256(secret_two.as_bytes());
+        let master_two = [0xb5u8; 32];
+        let blob_two = KeyBlob {
+            key_id: hex(&sha256(&master_two))[..16].to_string(),
+            protector_key_id: hex(&sha256(&key_two))[..16].to_string(),
+            wrapped: seal_for_test(
+                &key_two,
+                &master_two,
+                &[0x33u8; 12],
+                b"WBEF1",
+                1,
+            ),
+        };
+        assert_eq!(
+            scan_bytes_for_secret(secret_two.as_bytes(), &[bad_blob, blob_two]).as_deref(),
+            Some(secret_two.as_str())
+        );
     }
 
     #[test]

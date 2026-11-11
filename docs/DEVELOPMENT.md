@@ -107,10 +107,13 @@ export LOCALAPPDATA="$USERPROFILE/AppData/Local"
 python tools/privacy_check.py                     # 源码扫描：只报文件/行号/类别，不打印原文
 python tests/privacy-check.test.py
 python tests/license-report.test.py
-python tools/private_build.py build --release     # 编译路径映射为中性目录
+python tools/private_build.py build --release     # 编译路径映射为中性目录（安装包发布必须用这一步）
 python tools/privacy_check.py --binary <exe>      # 二进制扫描（UTF-8 / UTF-16）
+node node_modules/@tauri-apps/cli/tauri.js bundle --bundles nsis --no-sign --ci
 python tools/export_public_source.py <仓库外的目标.zip>
 ```
+
+安装版隔离验收要验证内置 Python 不依赖外部 Python 或 agenthub，同时保留系统 `powershell.exe`，因为快捷方式、外壳图标和 DPAPI 保管箱会调用它。可把 `PATH` 临时设成 `C:\Windows\System32\WindowsPowerShell\v1.0`，再用独立的 `AGENT_COCKPIT_HOME` 启动安装版；不要清空整个 `PATH`，否则程序会如实报告外壳快捷方式同步失败。
 
 | 工具 | 作用 |
 |---|---|

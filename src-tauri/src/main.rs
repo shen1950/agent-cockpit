@@ -497,11 +497,23 @@ fn checkin_loop(app: tauri::AppHandle) {
     // 待办不能等到下一轮全量——她点了「登录并领取」就在盯着那一行，等 5 分钟等于没做
     // （2026-10-17 她说的"我打开之后还要点一次领取，那我要你干什么"）。
     let mut slot = 0u32;
+    let mut secret_refreshed = false;
     loop {
+        // WorkBuddy 5.6+ keeps its at-rest key in the running desktop client
+        // and may rotate the keyblob after an update. This runs off the UI
+        // thread; the recovery path validates every candidate against the
+        // local keyblob before replacing the DPAPI copy.
+        if slot % 60 == 0 {
+            if matches!(wbproxy::ensure_local_secret(), Ok(true)) {
+                lifecycle::note("WorkBuddy 解密密钥已按本机 keyblob 更新");
+                secret_refreshed = true;
+            }
+        }
         if checkin::want_count() > 0 {
             checkin::poll_wants();
         }
-        if slot % 60 == 0 {
+        if slot % 60 == 0 || secret_refreshed {
+            secret_refreshed = false;
             let _ = checkin::refresh();
             checkin::tick(&app);
         }

@@ -6,6 +6,8 @@
 
 Tauri 2 桌面应用（Rust 后端 + WebView2 前端），提供 Windows x64 安装包和便携 ZIP。使用便携版时请完整解压，保留主程序同目录的 `codex-shared-resume.exe`。用量采集、会话索引与签到/额度后端随程序内置，无需单独安装 Python、AgentFind 或 agent-memory-suite；首次使用时会在驾驶舱数据目录解压运行时。程序不依赖 Electron，关窗后会驻留系统托盘继续监控额度。
 
+WorkBuddy 5.6 起把登录态改成客户端运行时密钥加密。驾驶舱只读检查本机 WorkBuddy `keyblob` 与正在运行的主进程，候选密钥通过 keyblob 的 GCM 校验后才写入 Windows DPAPI 保管箱；客户端升级或轮换密钥后会自动刷新。源码和发布包不保存厂商密钥。
+
 **直接下载**：[Releases](https://github.com/shen1950/agent-cockpit/releases) 里有免安装便携版和 NSIS 安装包，下载即用，不必自己编译。
 
 ---

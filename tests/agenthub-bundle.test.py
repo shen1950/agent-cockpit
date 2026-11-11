@@ -45,6 +45,20 @@ class AgenthubBundleTests(unittest.TestCase):
         self.assertNotIn("DOUBAO_CACHE", source)
         self.assertNotIn('WORKBUDDY_AT_REST_SECRET_KEY = "', source)
 
+    def test_workbuddy_runtime_key_recovery_is_local_and_verified(self):
+        source = (ROOT / "src-tauri/src/wbproxy.rs").read_text(encoding="utf-8")
+        self.assertIn("fn ensure_local_secret", source)
+        self.assertIn("fn load_keyblobs", source)
+        self.assertIn("blobs.iter().any", source)
+        self.assertIn("validate_keyblob_key", source)
+        self.assertIn("PROCESS_VM_READ", source)
+        self.assertIn("ReadProcessMemory", source)
+        self.assertNotIn("const WORKBUDDY_AT_REST_SECRET_KEY", source)
+        main = (ROOT / "src-tauri/src/main.rs").read_text(encoding="utf-8")
+        self.assertNotIn('lifecycle::note(&format!("WorkBuddy 密钥暂未更新', main)
+        self.assertIn("secret_refreshed = true", main)
+        self.assertIn("if slot % 60 == 0 || secret_refreshed", main)
+
 
 if __name__ == "__main__":
     unittest.main()
