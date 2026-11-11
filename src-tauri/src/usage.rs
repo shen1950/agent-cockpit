@@ -22,7 +22,16 @@ const PYTHON_ARCHIVE: &[u8] = include_bytes!("../vendor/python-embed.zip");
 const AGENTHUB_LIBS: &[u8] = include_bytes!("../vendor/agenthub-libs.zip");
 const AGENTHUB_SCRIPT: &str = include_str!("../vendor/agenthub.py");
 const AGENTHUB_CONSOLE: &str = include_str!("../vendor/console.html");
-const PYTHON_VERSION_DIR: &str = "python-3.14.10-90905e64a840557d-agenthub1";
+// Include every embedded payload in the identity: an app upgrade must not keep
+// executing the previous release's agenthub.py from an existing runtime folder.
+fn runtime_version_dir() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let digests = [PYTHON_ARCHIVE, AGENTHUB_LIBS, AGENTHUB_SCRIPT.as_bytes(), AGENTHUB_CONSOLE.as_bytes()]
+            .map(crate::wbproxy::sha256).concat();
+        format!("python-3.14.10-{}", crate::wbproxy::hex(&crate::wbproxy::sha256(&digests)))
+    })
+}
 const BOOTSTRAP: &str = "import io,json,sys; p=json.loads(sys.stdin.buffer.read().decode('utf-8')); sys.stdin=io.StringIO(json.dumps(p['request'])); exec(compile(p['script'],'<AgentCockpit usage>','exec'),{'__name__':'__main__'})";
 
 fn supported(app: &str) -> bool {
@@ -129,6 +138,10 @@ fn extract_agenthub_libs(dir: &Path) -> Result<(), String> {
             .enclosed_name()
             .ok_or("内置签到运行库包含无效路径。")?
             .to_path_buf();
+        if item.unix_mode().map(|m| m & 0o170000 == 0o120000).unwrap_or(false) {
+            return Err("内置签到运行库包含链接。".into());
+        }
+        reject_runtime_links(dir, &rel)?;
         let target = dir.join(&rel);
         if item.is_dir() {
             std::fs::create_dir_all(&target)
@@ -162,48 +175,70 @@ fn write_agenthub_script(dir: &Path) -> Result<(), String> {
 }
 
 fn validate_agenthub_libs(dir: &Path) -> Result<(), String> {
-    let pth = std::fs::read_to_string(dir.join("python314._pth")).unwrap_or_default();
-    let has_sp = pth.lines().any(|l| {
-        let n = l.trim().replace('/', "\\");
-        n.eq_ignore_ascii_case("Lib\\site-packages")
-    });
-    if !has_sp {
-        return Err("内置签到运行库路径未登记。".into());
-    }
-    for rel in [
-        "agenthub.py",
-        "console.html",
-        "Lib/site-packages/cryptography/__init__.py",
-        "Lib/site-packages/cffi/__init__.py",
-        "Lib/site-packages/pycparser/__init__.py",
-    ] {
-        if !dir.join(rel).is_file() {
-            return Err("内置签到运行库不完整。".into());
+    // Presence is insufficient: a modified _pth can add arbitrary import roots,
+    // and a changed Python module or DLL would run with access to credentials.
+    let mut expected_files = std::collections::HashSet::new();
+    for (kind, bytes) in [PYTHON_ARCHIVE, AGENTHUB_LIBS].into_iter().enumerate() {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+            .map_err(|_| "内置签到运行库损坏。".to_string())?;
+        for i in 0..archive.len() {
+            let mut item = archive.by_index(i).map_err(|_| "内置签到运行库损坏。".to_string())?;
+            let rel = item.enclosed_name().ok_or("内置签到运行库包含无效路径。")?.to_path_buf();
+            if item.unix_mode().map(|m| m & 0o170000 == 0o120000).unwrap_or(false) {
+                return Err("内置签到运行库包含链接。".into());
+            }
+            reject_runtime_links(dir, &rel)?;
+            if item.is_dir() { continue; }
+            expected_files.insert(rel.clone());
+            // The interpreter archive is verified separately; its _pth is
+            // deliberately replaced by the exact file in AGENTHUB_LIBS.
+            if kind == 0 { continue; }
+            if item.size() > 32 * 1024 * 1024 { return Err("内置签到运行库包含异常大文件。".into()); }
+            let mut expected = Vec::new();
+            item.read_to_end(&mut expected).map_err(|_| "内置签到运行库校验失败。")?;
+            verify_runtime_file(dir, &rel, &expected)?;
         }
     }
-    let sp = dir.join("Lib/site-packages");
-    let has_backend = std::fs::read_dir(&sp)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok()).any(|e| {
-                let n = e.file_name().to_string_lossy().to_ascii_lowercase();
-                n.starts_with("_cffi_backend") && n.ends_with(".pyd")
-            })
-        })
-        .unwrap_or(false);
-    if !has_backend {
-        return Err("内置签到运行库缺少 cffi 后端。".into());
+    for (name, bytes) in [("agenthub.py", AGENTHUB_SCRIPT.as_bytes()), ("console.html", AGENTHUB_CONSOLE.as_bytes())] {
+        let rel = Path::new(name);
+        verify_runtime_file(dir, rel, bytes)?;
+        expected_files.insert(rel.to_path_buf());
     }
-    for rel in [
-        "Lib",
-        "Lib/site-packages",
-        "Lib/site-packages/cryptography",
-        "Lib/site-packages/cffi",
-        "Lib/site-packages/pycparser",
-    ] {
-        if crate::registry::is_reparse_point(&dir.join(rel)) {
-            return Err("内置签到运行库目录包含链接。".into());
+    // Reject unshipped modules/bytecode too: Python could otherwise import an
+    // added .py or .pyc even when every shipped file is unchanged.
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(folder) = dirs.pop() {
+        for entry in std::fs::read_dir(&folder).map_err(|_| "无法检查内置签到运行库。")? {
+            let path = entry.map_err(|_| "无法检查内置签到运行库。")?.path();
+            if crate::registry::is_reparse_point(&path) { return Err("内置签到运行库包含链接。".into()); }
+            if path.is_dir() { dirs.push(path); }
+            else if !expected_files.contains(path.strip_prefix(dir).map_err(|_| "运行库路径无效。")?) {
+                return Err("内置签到运行库包含未验证文件。".into());
+            }
         }
     }
+    Ok(())
+}
+
+fn reject_runtime_links(dir: &Path, rel: &Path) -> Result<(), String> {
+    let mut path = dir.to_path_buf();
+    if crate::registry::is_reparse_point(&path) { return Err("内置签到运行库包含链接。".into()); }
+    for component in rel.components() {
+        if !matches!(component, std::path::Component::Normal(_)) { return Err("内置签到运行库路径无效。".into()); }
+        path.push(component);
+        if crate::registry::is_reparse_point(&path) { return Err("内置签到运行库包含链接。".into()); }
+    }
+    Ok(())
+}
+
+fn verify_runtime_file(dir: &Path, rel: &Path, expected: &[u8]) -> Result<(), String> {
+    reject_runtime_links(dir, rel)?;
+    let path = dir.join(rel);
+    if std::fs::metadata(&path).map_err(|_| "内置签到运行库不完整。")?.len() != expected.len() as u64 {
+        return Err("内置签到运行库文件不匹配。".into());
+    }
+    let actual = std::fs::read(path).map_err(|_| "内置签到运行库不完整。")?;
+    if actual != expected { return Err("内置签到运行库文件不匹配。".into()); }
     Ok(())
 }
 
@@ -213,7 +248,7 @@ fn prepare_runtime_at(base: &Path) -> Result<PathBuf, String> {
     if crate::registry::is_reparse_point(&parent) { return Err("用量运行环境目录包含链接，已停止读取。".into()); }
     std::fs::create_dir_all(&parent).map_err(|_| "无法创建内置运行环境目录，请检查磁盘空间和权限。".to_string())?;
     if crate::registry::is_reparse_point(&parent) { return Err("用量运行环境目录包含链接，已停止读取。".into()); }
-    let destination = parent.join(PYTHON_VERSION_DIR);
+    let destination = parent.join(runtime_version_dir());
     if destination.exists() {
         validate_runtime(&destination)?;
         validate_agenthub_libs(&destination)?;
@@ -275,7 +310,7 @@ fn bundled_python_at(base: &Path, runtime: &Mutex<Option<(PathBuf, PathBuf)>>) -
 
 fn run_helper(app_id: &str, data_dir: &Path) -> CollectResult {
     let mut command = Command::new(bundled_python()?);
-    command.args(["-I", "-X", "utf8", "-c", BOOTSTRAP])
+    command.args(["-I", "-B", "-X", "utf8", "-c", BOOTSTRAP])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)] {
         use std::os::windows::process::CommandExt;
@@ -416,7 +451,7 @@ mod tests {
         let script = python.parent().unwrap().join("agenthub.py");
         assert!(script.is_file(), "bundled agenthub script must be present");
         let aes = Command::new(&python)
-            .args(["-I", "-X", "utf8", "-c",
+            .args(["-I", "-B", "-X", "utf8", "-c",
                 "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print('aesgcm-ok')"])
             .env("PATH", "")
             .output()
@@ -424,7 +459,7 @@ mod tests {
         assert!(aes.status.success(), "stderr={}", String::from_utf8_lossy(&aes.stderr));
         assert!(String::from_utf8_lossy(&aes.stdout).contains("aesgcm-ok"));
         let help = Command::new(&python)
-            .args(["-I", "-X", "utf8"])
+            .args(["-I", "-B", "-X", "utf8"])
             .arg(&script)
             .arg("--help")
             .env("PATH", "")
@@ -432,7 +467,62 @@ mod tests {
             .expect("run bundled agenthub");
         assert!(help.status.success(), "stderr={}", String::from_utf8_lossy(&help.stderr));
         assert!(String::from_utf8_lossy(&help.stdout).contains("checkin"));
+        validate_agenthub_libs(python.parent().unwrap()).expect("imports must not create unverified bytecode");
         fs::remove_dir_all(base.canonicalize().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn runtime_rejects_modified_scripts_libraries_and_import_paths() {
+        let base = tempfile::tempdir().unwrap();
+        let python = prepare_runtime_at(base.path()).unwrap();
+        let dir = python.parent().unwrap();
+        for rel in ["agenthub.py", "python314._pth", "Lib/site-packages/cryptography/__init__.py",
+                    "Lib/site-packages/cryptography/hazmat/bindings/_rust.pyd"] {
+            let path = dir.join(rel);
+            let original = fs::read(&path).unwrap();
+            let mut modified = original.clone();
+            // Same-length corruption defeats a presence/size-only check.
+            modified[0] ^= 1;
+            fs::write(&path, modified).unwrap();
+            assert!(prepare_runtime_at(base.path()).is_err(), "tampered {rel} was accepted");
+            fs::write(path, original).unwrap();
+        }
+        let pth = dir.join("python314._pth");
+        let original = fs::read(&pth).unwrap();
+        let mut extra_path = original.clone();
+        extra_path.extend_from_slice(b"\n../untrusted\nimport site\n");
+        fs::write(&pth, extra_path).unwrap();
+        assert!(prepare_runtime_at(base.path()).is_err(), "expected site-packages line must not whitelist extra roots");
+        fs::write(pth, original).unwrap();
+        fs::write(dir.join("cryptography.py"), b"raise RuntimeError('untrusted module')").unwrap();
+        assert!(prepare_runtime_at(base.path()).is_err(), "unshipped importable files must be rejected");
+    }
+
+    #[test]
+    fn upgrade_uses_new_bundle_and_adapters_need_no_external_installation() {
+        let base = tempfile::tempdir().unwrap();
+        let legacy = base.path().join("usage-runtime/python-3.14.10-90905e64a840557d-agenthub1");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("agenthub.py"), b"raise RuntimeError('old bundle')").unwrap();
+        let python = prepare_runtime_at(base.path()).unwrap();
+        assert_ne!(python.parent().unwrap(), legacy);
+        let script = python.parent().unwrap().join("agenthub.py");
+        let profile = base.path().join("new-user");
+        fs::create_dir(&profile).unwrap();
+        let blocked_store = base.path().join("not-a-directory");
+        fs::write(&blocked_store, b"existing unrelated agenthub installation").unwrap();
+        for args in [vec!["checkin", "qoder-cn", "--json"], vec!["quota", "qoder-cn", "--local", "--json"],
+                     vec!["trae", "--token"]] {
+            let out = Command::new(&python).args(["-I", "-B", "-X", "utf8"]).arg(&script)
+                .args(args).arg("--profile").arg(&profile)
+                .env("PATH", "").env("USERPROFILE", &profile).env("HOME", &profile)
+                .env("APPDATA", &profile).env("LOCALAPPDATA", &profile)
+                .env("AGENTHUB_HOME", &blocked_store).env("AGENT_COCKPIT_HOME", base.path())
+                .output().unwrap();
+            assert!(out.status.success(), "adapter unexpectedly required external files: {}", String::from_utf8_lossy(&out.stderr));
+            let _: Value = serde_json::from_slice(&out.stdout).expect("missing login is structured JSON, not a Python dependency failure");
+        }
+        assert!(!profile.join(".agenthub").exists());
     }
 
     #[test]

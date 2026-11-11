@@ -2,7 +2,7 @@
 //!
 //! 发布版优先跑 `usage-runtime/` 里解压出来的 Python + agenthub.py，
 //! 这样签到/额度不再依赖用户另装 agent-memory-suite。
-//! 内置运行时损坏或被安全软件拦住时，退回 PATH 上的 `agenthub`（开发者机器仍可用自己的版本）。
+//! 内置运行时未通过校验时将错误返回调用方。
 use std::process::Command;
 
 #[cfg(windows)]
@@ -27,28 +27,21 @@ fn apply_astudio_env(c: &mut Command) {
     }
 }
 
-pub fn command(args: &[&str]) -> Command {
-    if let Ok((python, script)) = crate::usage::bundled_agenthub() {
-        let mut c = Command::new(python);
-        c.args(["-I", "-X", "utf8"]).arg(script).args(args);
-        c.env("PYTHONIOENCODING", "utf-8");
-        c.env("PYTHONUTF8", "1");
-        apply_astudio_env(&mut c);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            c.creation_flags(CREATE_NO_WINDOW);
-        }
-        return c;
+pub fn command(args: &[&str]) -> Result<Command, String> {
+    let (python, script) = crate::usage::bundled_agenthub()?;
+    let mut c = Command::new(python);
+    c.args(["-I", "-B", "-X", "utf8"]).arg(script).args(args);
+    let base = crate::registry::base_dir();
+    c.env("AGENTHUB_HOME", base.join("agenthub-state"));
+    c.env("AGENT_COCKPIT_HOME", base);
+    if let Some(secret) = crate::wbproxy::at_rest_secret() {
+        c.env("AGENTHUB_WORKBUDDY_AT_REST_SECRET", secret);
     }
-    // 退回外部安装：agenthub 是 .cmd 包装，CreateProcess 直接执行不了，必须经 cmd.exe。
-    let mut c = Command::new("cmd.exe");
-    c.args(["/d", "/c", "agenthub"]).args(args);
     apply_astudio_env(&mut c);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         c.creation_flags(CREATE_NO_WINDOW);
     }
-    c
+    Ok(c)
 }

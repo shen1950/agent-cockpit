@@ -185,7 +185,7 @@ fn fresh_recorded_port(dir: &Path, since: SystemTime) -> Option<u16> {
 
 fn python_command(python: &Path) -> Command {
     let mut command = Command::new(python);
-    command.args(["-I", "-u", "-X", "utf8"]);
+    command.args(["-I", "-B", "-u", "-X", "utf8"]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -263,6 +263,16 @@ pub async fn agentfind_port() -> Result<u16, String> {
         let (stdout, stderr) = service_log(&dir);
         let started = SystemTime::now();
         let mut cmd = python_command(&python);
+        if std::env::var_os("AGENTFIND_ASTUDIO_HOME").is_none() {
+            let root = std::env::var_os("ASTUDIO_HOME").map(std::path::PathBuf::from).or_else(|| {
+                let app = crate::registry::apps().into_iter().find(|a| a.id == "astudio")?;
+                let data = crate::registry::astudio_data_dir(&crate::registry::resolve_exe(&app)?)?;
+                data.parent().map(std::path::Path::to_owned)
+            });
+            if let Some(root) = root {
+                cmd.env("AGENTFIND_ASTUDIO_HOME", root.join("acode-home-overlay/sessions"));
+            }
+        }
         let mut child = cmd
             .arg(&script)
             .arg("--no-open")

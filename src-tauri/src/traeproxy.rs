@@ -46,11 +46,11 @@ pub fn app_display(app_id: &str) -> String {
 fn agenthub_json(extra: &[&str]) -> Result<Value, String> {
     let mut args: Vec<&str> = vec!["trae"];
     args.extend_from_slice(extra);
-    let mut c = crate::agenthub::command(&args);
+    let mut c = crate::agenthub::command(&args)?;
     let out = c
         .output()
         .map_err(|e| format!(
-            "调不到 Trae 后端（{e}）：内置运行时不可用，PATH 上也没有 agenthub"
+            "无法启动内置 Trae 后端：{e}"
         ))?;
     if !out.status.success() {
         let s = String::from_utf8_lossy(&out.stderr);

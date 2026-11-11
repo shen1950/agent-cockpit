@@ -318,7 +318,6 @@ pub fn fetch_for_instance(store: &str, app_id: &str, meta: &Value) -> Result<Quo
 }
 
 /// 跑 `agenthub quota --json <store>` 并把结果结构化。
-/// agenthub 是 .cmd 包装，CreateProcess 直接执行不了，必须经 cmd.exe 转一手。
 /// profile = 该账号自己的档案目录（按账号分别读的关键），None 则读产品当前默认档案。
 pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
     let zcode_root = profile.map(std::path::PathBuf::from).unwrap_or_else(crate::zcode::native_root);
@@ -328,7 +327,7 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
     } else { None };
     // profile 给了就读那个账号自己的档案目录——单实例产品靠 junction 换号，
     // 每个账号的数据就在它自己的 data_dir 里，这样才能一账号一读数。
-    let mut c = crate::agenthub::command(&["quota", "--json", store]);
+    let mut c = crate::agenthub::command(&["quota", "--json", store])?;
     if let Some(dir) = profile {
         if !dir.is_empty() {
             c.arg("--profile").arg(dir);
@@ -337,7 +336,7 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
     let out = c
         .output()
         .map_err(|e| format!(
-            "调不到额度后端（{e}）：内置运行时不可用，PATH 上也没有 agenthub"
+            "无法启动内置额度后端：{e}"
         ))?;
     if !out.status.success() {
         let s = String::from_utf8_lossy(&out.stderr);

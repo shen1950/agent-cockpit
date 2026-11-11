@@ -54,6 +54,7 @@ pub fn scan_stamp() -> String {
 /// 扫一遍开始菜单/桌面，把新装的 AI 程序并入列表；手工适配过的不覆盖。
 /// 命中一个本机还没装上的内置产品时，写成该产品的本机路径覆盖，不再造重复卡。
 pub fn do_rescan() -> usize {
+    // 启动/重新扫描与盘点共用注册表、PATH 和安装根探测，不能只有手动盘点才找得到。
     let skip = reg::local_claimed_names();
     let list = crate::discover::discover(&skip);
     let mut kept = Vec::new();
@@ -185,7 +186,7 @@ pub async fn add_app(exe: String, name: Option<String>) -> Value {
         .into_iter()
         .find(|a| {
             reg::exe_name(a).to_lowercase() == base
-                && (a.id.starts_with("custom-") || reg::resolve_exe(a).is_some())
+                && reg::resolve_exe(a).is_some()
         })
     {
         return json!({ "ok": false, "msg": format!("「{}」已经在列表里了（{}）", dup.name, dup.id) });
@@ -2801,7 +2802,10 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         }
 
         // 豆包：清单是本地固定的两个模式（默认/深度思考），不联网
-        "doubao_model_ids" => crate::doubao::model_ids(),
+        "doubao_model_ids" => {
+            let models = crate::doubao::models();
+            json!({"ok": true, "count": models.len(), "models": models})
+        },
         "doubao_test" => {
             let model = payload["model"].as_str().unwrap_or("doubao");
             let out = json!({ "ok": true, "result": crate::doubao::test(model) });

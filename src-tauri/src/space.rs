@@ -570,6 +570,7 @@ pub fn open_dir(path: &str) -> (bool, String) {
 /// 起始路径走环境变量传进去，避免把用户输入拼进命令行。
 pub fn pick_folder(current: &str) -> (bool, String) {
     const PS: &str = r#"
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -619,6 +620,7 @@ $owner.Dispose()
 /// 和 pick_folder 同一套隐藏 owner 窗口的写法，避免对话框弹到任务栏后面。
 pub fn pick_exe(current: &str) -> (bool, String) {
     const PS: &str = r#"
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing

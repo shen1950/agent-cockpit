@@ -5069,8 +5069,8 @@ function renderGuide(d) {
     if (S.guide.error) body.appendChild(pxNote(S.guide.error, true));
     if (S.guide.needSecret) {
       body.appendChild(el('div', { class: 'guide-actions' },
-        btn('导入 WorkBuddy 解码密钥', 'primary sm', wImportSecret,
-          '从本机 agenthub 读一次解码密钥，存进本机保管箱')));
+        btn('设置 WorkBuddy 解码密钥', 'primary sm', wImportSecret,
+          '输入本机解密密钥，仅保存到 Windows DPAPI 保护的保管箱')));
     }
   }
 
@@ -5174,8 +5174,11 @@ function wStateText(s) {
 }
 
 async function wImportSecret() {
-  const r = await invoke('action', { payload: { action: 'wproxy_import_secret' } });
-  toast(r.msg || (r.ok ? '已导入' : '导入失败'), !!r.ok);
+  const value = await askText('粘贴 WorkBuddy 本机解密密钥（base64，44 个字符）。密钥只保存在本机保管箱。',
+    '', { title: '设置 WorkBuddy 解码密钥', okText: '保存' });
+  if (!value) return;
+  const r = await invoke('action', { payload: { action: 'wproxy_set_secret', value: value.trim() } });
+  toast(r.msg || (r.ok ? '已保存到本机保管箱' : '保存失败'), !!r.ok);
   if (r.ok) load();
 }
 
@@ -8111,7 +8114,7 @@ function renderHelp(body, panel) {
 const TOUR = [
   { t: '首页', s: '#home-body', x: '先看今天要处理什么。往下是临期积分、今天还能领的、我的 Agent。' },
   { t: 'Agent 列表', s: '#applist', x: '本机已装的 AI 程序。绿点＝正在运行，⇄＝当前在用的号，徽章「多开」＝可同时开多个账号窗口，「换号」＝一次一个。' },
-  { t: '新装的程序', s: '#btn-add-app', x: '有快捷方式的点「重新扫描」自动收录；其余的在这里点「选择…」挑可执行文件。' },
+  { t: '新装的程序', s: '#btn-add-app', x: '点「重新扫描」查找本机安装的 Agent。没找到的程序可以点「选择…」指定可执行文件。' },
   { t: '账号卡片', s: '#cards', x: '一个账号一张卡，只放高频动作：能不能开、怎么开——「启动」/「启动客户端」/「结束」。' },
   { t: '账号设置', s: '#cards', x: '「账号设置」管账号信息，点额度进「额度与用量」；左侧六组：账号信息、额度与用量、运行与换号、目录与数据、凭据与反代、删除账号。' },
   { t: '添加账号', s: '#btn-new', x: '六步：登录方式 → 登录 → 基本信息 → 数据来源 → 额度 → 确认建卡。' },
@@ -9091,7 +9094,7 @@ function renderSettings() {
 
   if (setSection === 'advanced') {
     body.appendChild(panel('高级',
-      row('重新扫描本机程序', '扫开始菜单与桌面快捷方式；没快捷方式的用下面的「扫描登记」从注册表收',
+      row('重新扫描本机程序', '查找本机快捷方式、安装记录、已知 CLI 和登记的 AI 安装目录',
         actBtn('重新扫描', () => run('rescan'))),
       row('重置多开能力判定', '清掉实测记录，下次启动账号时重新判断该产品能否独立目录多开',
         actBtn('重置', () => run('reset_caps'))),
@@ -9135,7 +9138,7 @@ function renderSettings() {
     body.appendChild(el('section', { class: 'panel' },
       el('h2', {}, '本机 Agent 盘点'),
       el('p', { style: 'font-size:12.5px;color:var(--text-muted);margin-bottom:10px' },
-        '点「扫描登记」跑一次：查注册表、开始菜单与桌面快捷方式、安装根目录与 npm 全局。'
+        '点「扫描登记」查看安装记录、快捷方式、安装目录和已知 CLI 的变化。'
         + '与上次快照比对，报出新装、卸载；新认出的程序会直接收进列表，'
         + '内置清单里失效的路径会用痕迹里的新位置修好。'
         + '预存的各家索引信息在 ~/.agents/catalog.json（由 agenthub catalog build 生成）。'),

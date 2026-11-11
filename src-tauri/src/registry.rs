@@ -260,8 +260,8 @@ pub fn apps() -> Vec<AppDef> {
         //   {LOCALAPPDATA}\Doubao\User Data\Default\Network\Cookies（SQLite + os_crypt v10），
         // 所以档案目录取 {LOCALAPPDATA}\Doubao（换号整目录搬），不是 ~/Doubao
         // （那里面只有 chats/ 与 skills/，跟登录无关）。
-        // ⚠ 豆包运行时这个 Cookies 库是**独占**打开的，agenthub 复制会 PermissionError，
-        //   那边退到 ~/.agent-cockpit/doubao_auth.json 的缓存；缓存过期就得关掉豆包读一次。
+        // 豆包运行时 Cookies 库可能被独占打开。需要先退出客户端再刷新登录态。
+        // 不把会话 cookie 持久化到驾驶舱数据目录。
         // 直读走 agenthub 的 doubao store；签到见 ci_doubao（每天 200，周一翻倍，服务端幂等）。
         // 反代见 doubao.rs（进程内云端直连，不要求客户端常开）。
         // isolatable=false：没有实测 --user-data-dir 是否真能隔离出第二个账号。
@@ -401,12 +401,10 @@ pub fn manual_claimed_names() -> std::collections::HashSet<String> {
     skip
 }
 
-/// 本机实际可用的认领键：没装的内置条目不再占名字，手动登记的原样认领。
+/// 本机实际可用的认领键：失效的内置或自定义路径都不能挡住迁机后的扫描。
 pub fn local_claimed_names() -> std::collections::HashSet<String> {
-    let mut skip = claimed_names_for(&apps(), &|a| resolve_exe(a).is_some());
-    for a in custom_apps() {
-        add_claim_keys(&mut skip, &a);
-    }
+    let local: Vec<AppDef> = apps().into_iter().chain(custom_apps()).collect();
+    let mut skip = claimed_names_for(&local, &|a| resolve_exe(a).is_some());
     skip.insert(crate::discover::norm("agent-cockpit"));
     skip
 }
@@ -1105,7 +1103,9 @@ fn exe_override(app_id: &str) -> Option<PathBuf> {
 /// 盘点/快捷方式找回一个 exe：如果它对应某个本机还没装上的内置产品，
 /// 就写成该产品的本机路径覆盖，返回内置 id；否则返回 None 交给调用方登记成自定义程序。
 pub fn adopt_exe_for_candidate(name: &str, exe: &str) -> Option<String> {
-    let target = adoption_target(&apps(), &|a| resolve_exe(a).is_some(), name, exe)?;
+    // 先保留已有自定义条目的 id、账号与档案设置，只修它已经失效的启动路径。
+    let target = adoption_target(&custom_apps(), &|a| resolve_exe(a).is_some(), name, exe)
+        .or_else(|| adoption_target(&apps(), &|a| resolve_exe(a).is_some(), name, exe))?;
     set_exe_override(&target, exe);
     Some(target)
 }
@@ -1153,7 +1153,7 @@ pub fn newest_update(base: &Path) -> Option<PathBuf> {
 }
 
 pub fn exe_name(app: &AppDef) -> String {
-    PathBuf::from(&app.exes[0])
+    app.exes.first().map(PathBuf::from).unwrap_or_default()
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
@@ -1514,6 +1514,7 @@ pub fn has_login_data(dir: &Path) -> bool {
     dir.join("auth.v1.dat").is_file()
         || dir.join("auth-v2.dat").is_file()
         || dir.join("astron-session.json").is_file()
+        || dir.join("User Data/Default/Network/Cookies").is_file()
         || dir.join(".credentials.yaml").is_file()
         || dir.join("mobile_address.json").is_file()
         || dir.join("agent").join("config").join("auth.json").is_file()
@@ -2264,6 +2265,13 @@ mod tests {
         assert!(has_login_data(&new_shell));
         // 只有 Local State 还不算登录过
         assert!(!has_login_data(&new_shell.join("nonexistent")));
+
+        // CEF 产品（例如豆包）的登录态位于 User Data 下的 Network/Cookies。
+        let cef = tmp.join("CEF");
+        let cookies = cef.join("User Data/Default/Network/Cookies");
+        fs::create_dir_all(cookies.parent().unwrap()).unwrap();
+        fs::write(cookies, b"sqlite fixture").unwrap();
+        assert!(has_login_data(&cef));
 
         // 单个候选（不带 `|`）照旧可用
         let one = legacy.to_string_lossy().to_string();

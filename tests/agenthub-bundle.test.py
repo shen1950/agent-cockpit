@@ -1,4 +1,5 @@
 import pathlib
+import json
 import unittest
 import zipfile
 
@@ -31,6 +32,18 @@ class AgenthubBundleTests(unittest.TestCase):
         for name in ("CRYPTOGRAPHY-LICENSE.txt", "CFFI-LICENSE.txt", "PYCPARSER-LICENSE.txt"):
             text = (ROOT / "docs/third-party" / name).read_text(encoding="utf-8")
             self.assertTrue(text.strip(), name)
+
+    def test_release_config_contains_runtime_and_license_resources(self):
+        config = json.loads((ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+        resources = config["bundle"]["resources"]
+        self.assertEqual(resources["../LICENSE"], "LICENSE")
+        self.assertEqual(resources["../THIRD_PARTY_NOTICES.md"], "THIRD_PARTY_NOTICES.md")
+        self.assertEqual(resources["../docs/third-party/"], "licenses/")
+
+    def test_bundled_agenthub_has_no_plaintext_cookie_cache(self):
+        source = (VENDOR / "agenthub.py").read_text(encoding="utf-8")
+        self.assertNotIn("DOUBAO_CACHE", source)
+        self.assertNotIn('WORKBUDDY_AT_REST_SECRET_KEY = "', source)
 
 
 if __name__ == "__main__":

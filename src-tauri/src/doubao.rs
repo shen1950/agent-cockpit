@@ -16,10 +16,8 @@
 //!      web_id/tea_uuid 全省都能过（四种组合实测状态一致），不必去本机翻设备号。
 //!
 //! 凭据：cookies 库是 SQLite + os_crypt v10，Rust 这边没有 sqlite 依赖（全项目统一把
-//! 凭据解析放 agenthub）。agenthub 的 doubao store 读到 cookie 后会写一份
-//! `~/.agent-cockpit/doubao_auth.json`；这里只读那份。缓存不在或太旧就先调一次
-//! `agenthub quota doubao --json` 让它刷新（顺带把"豆包在运行、Cookies 被独占"这种情况
-//! 也交给它去退缓存，这里不重复一遍那套逻辑）。
+//! 凭据解析放 agenthub）。agenthub 从豆包的 Chromium 档案按需读取 cookie，
+//! 不把会话 cookie 另存到驾驶舱数据目录。
 //!
 //! 边界：只做**纯文本**对话。豆包 web 没有 OpenAI 那套 tool_calls 协议，硬塞工具会把
 //! 输出搅成一段自然语言里夹 JSON，所以这里明确不支持 tools（见到 tools 直接如实报错，
@@ -27,7 +25,6 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,7 +34,6 @@ pub const BASE_MARK: &str = "doubao://chat";
 pub const MAIN: &str = "https://www.doubao.com";
 
 const ROUND_TIMEOUT: Duration = Duration::from_secs(300);
-const CACHE_TTL: u64 = 7 * 86400; // 会话 cookie 按天算，7 天足够签到/反代，过期就重读
 
 pub fn is_doubao_base(base: &str) -> bool {
     base.trim().trim_end_matches('/') == BASE_MARK
@@ -57,46 +53,37 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn cache_path() -> PathBuf {
-    PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
-        .join(".agent-cockpit")
-        .join("doubao_auth.json")
-}
-
-/// 读 agenthub 落的那份缓存；过旧就当作没有
-fn cached_cookie() -> Option<String> {
-    let txt = std::fs::read_to_string(cache_path()).ok()?;
-    let v: Value = serde_json::from_str(&txt).ok()?;
-    let ck = v["cookie"].as_str()?.trim().to_string();
-    if ck.is_empty() {
-        return None;
-    }
-    let at = v["at"].as_f64().unwrap_or(0.0);
-    if now_secs() - at > CACHE_TTL as f64 {
-        return None;
-    }
-    Some(ck)
-}
-
-/// 让 agenthub 重读一次 cookies 库（它自己处理独占锁→缓存的回退）
-fn refresh_cookie() {
-    let _ = crate::agenthub::command(&["quota", "doubao", "--json"]).output();
-}
-
-/// 缓存里有没有可用凭据。**只看缓存不触发刷新**——列上游时调它，
-/// 触发 agenthub 重读要 1~2 秒，会把「上游列表」拖慢。
 pub fn auth_ready() -> bool {
-    cached_cookie().is_some()
+    crate::registry::profile_dir("doubao")
+        .is_some_and(|profile| {
+            let home = if profile.join("User Data").is_dir() {
+                profile.join("User Data")
+            } else {
+                profile
+            };
+            home.join("Default/Network/Cookies").is_file()
+        })
 }
 
 pub fn cookie() -> Result<String, String> {
-    if let Some(c) = cached_cookie() {
-        return Ok(c);
+    let output = crate::agenthub::command(&["cookie", "doubao", "--json"])
+        .and_then(|mut command| command.output().map_err(|error| error.to_string()))
+        .map_err(|error| format!("无法启动豆包登录态读取：{error}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("读取豆包登录态失败：{}", error.trim()));
     }
-    refresh_cookie();
-    cached_cookie().ok_or_else(|| {
-        "读不到豆包登录态：先在豆包里登录一次（凭据来自 Cookies 库，由 agenthub 解析）".to_string()
-    })
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("豆包登录态结果格式错误：{error}"))?;
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return Err(error.to_string());
+    }
+    value
+        .get("cookie")
+        .and_then(Value::as_str)
+        .filter(|cookie| !cookie.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "豆包登录态结果缺少会话凭据".into())
 }
 
 // ───────────────────────────── 模型 ─────────────────────────────
@@ -133,13 +120,11 @@ pub fn model_for_stream(raw: &str, _list: &[Value]) -> String {
     }
 }
 
-/// 界面「模型反代」页的状态段：ready 只看缓存（不触发 agenthub），
-/// 拿去决定这张卡能不能被选进上游组。
+/// 界面「模型反代」页的状态段：ready 只看本机档案是否存在，读取凭据留到实际请求。
 pub fn view() -> Value {
     json!({
         "ready": auth_ready(),
         "models": model_ids()["data"],
-        "cache": cache_path().to_string_lossy(),
     })
 }
 
@@ -152,6 +137,9 @@ pub fn test(model: &str) -> Value {
             let mut tr = DoubaoTranslator::new(r.reader(), "doubao");
             let out = collect_completion(&mut tr, "doubao");
             r.cleanup();
+            if let Some(error) = out.get("error") {
+                return json!({"ok": false, "model": used, "error": error["message"]});
+            }
             let text = out["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or("")
@@ -406,6 +394,7 @@ impl<R: Read> DoubaoTranslator<R> {
             // 结束事件：正文在 message.content 里，但也可能只是收尾标记
             let piece = self.text_of(&payload);
             if let Ok(mut s) = self.state.lock() {
+                s.text.push_str(&piece);
                 s.completed = true;
             }
             let mut out = Vec::new();
@@ -481,7 +470,19 @@ impl<R: Read> Iterator for DoubaoTranslator<R> {
                     return None;
                 }
                 self.done_sent = true;
-                let mut out = self.chunk(json!({}), Some("stop"));
+                let error = if let Ok(mut state) = self.state.lock() {
+                    if !state.completed && state.error.is_none() {
+                        state.error = Some(("upstream".into(), "豆包响应提前结束，未收到完成事件".into()));
+                    }
+                    state.error.clone()
+                } else {
+                    Some(("upstream".into(), "无法读取豆包响应状态".into()))
+                };
+                let mut out = if let Some((kind, message)) = error {
+                    format!("data: {}\n\n", json!({"error": {"type": kind, "message": message}})).into_bytes()
+                } else {
+                    self.chunk(json!({}), Some("stop"))
+                };
                 out.extend_from_slice(b"data: [DONE]\n\n");
                 return Some(out);
             }
@@ -531,6 +532,9 @@ pub fn collect_completion<R: Read>(tr: &mut DoubaoTranslator<R>, label: &str) ->
     let mut sink = Vec::new();
     let _ = tr.read_to_end(&mut sink);
     let s = tr.shared().lock().map(|g| g.clone()).unwrap_or_default();
+    if let Some((kind, message)) = s.error {
+        return json!({"error": {"type": kind, "message": message}});
+    }
     json!({
         "id": format!("chatcmpl-doubao-{}", now_ms()),
         "object": "chat.completion",
@@ -539,7 +543,7 @@ pub fn collect_completion<R: Read>(tr: &mut DoubaoTranslator<R>, label: &str) ->
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": s.text },
-            "finish_reason": if s.completed { "stop" } else { "stop" },
+            "finish_reason": "stop",
         }],
         // 豆包这条链路不返回 token 用量（只有字符流），不编数字，如实留空
         "usage": Value::Null,
@@ -549,6 +553,55 @@ pub fn collect_completion<R: Read>(tr: &mut DoubaoTranslator<R>, label: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event(kind: i32, text: &str) -> String {
+        format!("data: {}\n\n", json!({"event_type": kind,
+            "event_data": {"message": {"content": {"text": text}}}}))
+    }
+
+    #[test]
+    fn final_event_text_is_in_stream_and_nonstream_completion() {
+        for first in ["", "A"] {
+            let input = format!("{}{}", event(2001, first), event(2003, "B"));
+            let mut streaming = DoubaoTranslator::new(std::io::Cursor::new(input.clone()), "doubao");
+            let mut bytes = Vec::new();
+            streaming.read_to_end(&mut bytes).unwrap();
+            let stream = String::from_utf8(bytes).unwrap();
+            assert!(stream.contains("\"content\":\"B\""));
+            assert!(stream.contains("\"finish_reason\":\"stop\""));
+            let mut tr = DoubaoTranslator::new(std::io::Cursor::new(input), "doubao");
+            let out = collect_completion(&mut tr, "doubao");
+            assert_eq!(out["choices"][0]["message"]["content"], format!("{first}B"));
+        }
+    }
+
+    #[test]
+    fn truncated_stream_reports_error_instead_of_successful_stop() {
+        let input = event(2001, "partial");
+        let mut tr = DoubaoTranslator::new(std::io::Cursor::new(input.clone()), "doubao");
+        let mut bytes = Vec::new();
+        tr.read_to_end(&mut bytes).unwrap();
+        let stream = String::from_utf8(bytes).unwrap();
+        assert!(stream.contains("\"error\""));
+        assert!(!stream.contains("\"finish_reason\":\"stop\""));
+        assert!(tr.shared().lock().unwrap().error.is_some());
+        let mut tr = DoubaoTranslator::new(std::io::Cursor::new(input), "doubao");
+        assert!(collect_completion(&mut tr, "doubao").get("error").is_some());
+    }
+
+    #[test]
+    fn read_error_is_not_reported_as_a_completed_answer() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken fixture"))
+            }
+        }
+        let mut tr = DoubaoTranslator::new(Broken, "doubao");
+        let out = collect_completion(&mut tr, "doubao");
+        assert!(out["error"]["message"].as_str().unwrap().contains("broken fixture"));
+        assert!(out.get("choices").is_none());
+    }
 
     #[test]
     fn base_mark_matches() {

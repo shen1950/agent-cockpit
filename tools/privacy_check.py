@@ -15,8 +15,14 @@ USER_PATH = re.compile(r'(?i)[A-Z]:[\\/]+Users[\\/]+([^\\/\s"\'<>]+)')
 # 开发者机器的安装根（不是产品默认位置）。公开源码里出现就说明本机路径没清干净。
 DEV_ROOT = re.compile(r'(?i)\b[DE]:[\\/]+(?:Artificial_Intelligence|LenovoSoftstore|npm-global)\b')
 SECRET = re.compile(r'\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{25,}|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]{25,}\.[A-Za-z0-9_-]{25,}\.[A-Za-z0-9_-]{20,})')
+# A public copy of a client's application-wide at-rest key permits decrypting
+# every local profile. Keep the runtime able to accept a user-supplied key,
+# while rejecting the published constant and the unsafe fallback pattern.
+EMBEDDED_APP_KEY = re.compile(r'(?i)WORKBUDDY_AT_REST_SECRET_KEY\s*=\s*["\'][^"\']{32,}["\']')
 # Exact synthetic fixtures used by encoding tests (not a file-wide exemption).
 TEST_EMAILS = {'src-tauri/src/antigravity.rs': {'x@y.com', 'someone@gmail.com'}}
+# This parser fixture has the shape of a key but a repeated placeholder value.
+APP_KEY_FIXTURES = {'src-tauri/src/wbproxy.rs': {'AAAAbbbbCCCCddddEEEEffffGGGGhhhhIIIIkkkk='}}
 SYNTHETIC_KEYS = {
     'sk-aaaaaaaaaaaaaaaa1111', 'sk-bbbbbbbbbbbbbbbb2222', 'sk-cccccccccccccccc3333',
     'sk-tiez-0123456789abcdefghij', 'sk-pot-abcdefghijklmnopqrstuvwx',
@@ -55,6 +61,11 @@ def scan_text(text, name, terms=()):
         for match in SECRET.finditer(line):
             if match[0] not in SYNTHETIC_KEYS:
                 categories.add('credential-like-literal')
+        if any(
+            match[0].split('=', 1)[1].strip().strip('"\'') not in APP_KEY_FIXTURES.get(name, set())
+            for match in EMBEDDED_APP_KEY.finditer(line)
+        ):
+            categories.add('embedded-application-key')
         if re.search(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----', line):
             categories.add('private-key')
         findings.extend((name, line_number, category) for category in sorted(categories))

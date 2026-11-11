@@ -4817,16 +4817,13 @@ def _qoder_fetch_usage(appdata_name, token):
 # WorkBuddy 服务端实时余额（2026-10-10 打通）：静态破解了登录态加密。
 # 登录态在 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info，
 # accessToken 用 $wbEncrypted 信封（AES-256-GCM + 自定义 AAD）加密，
-# 根密钥 atRestSecretKey 硬编码在 WorkBuddy.exe（TEA-18 加密），对所有安装通用。
+# 根密钥 atRestSecretKey 由本机用户在驾驶舱保管箱里配置。
 #   K = SHA256(atRestSecretKey)，解密登录态字段（field framing）。
 #   额度接口：POST {endpoint}/billing/meter/get-user-resource-summary（body {}，
 #   Header: Bearer token + X-User-Id + User-Agent，国内版不带 UA 会 403）。
 #   workbuddy-desktop.info = 国内版（endpoint www.workbuddy.cn）
 #   workbuddy-desktop-ai.info = 国际版（endpoint www.workbuddy.ai）
 # ---------------------------------------------------------------------------
-WORKBUDDY_AT_REST_SECRET_KEY = "Sik9U5aXhCdwTVEwsEySDOmDoB9r9ntFxHF1fst9LQI="
-
-
 def _wb_aad(framing, scheme, suite, key_id):
     """逆向自 byteCrypto 的 buildAuthenticatedContextAad（sym-v1）。"""
     tag = {"file": "WBEF1", "field": "WBEV1", "record": "WBER1", "stream": "WBES1"}[framing]
@@ -4877,7 +4874,10 @@ def _wb_read_login(intl=False, auth_file=None):
         return None, f"登录态读不了：{e}"
     try:
         import hashlib as _h
-        K = _h.sha256(WORKBUDDY_AT_REST_SECRET_KEY.encode("utf-8")).digest()
+        secret = os.environ.get("AGENTHUB_WORKBUDDY_AT_REST_SECRET", "").strip()
+        if not secret:
+            raise RuntimeError("未配置 WorkBuddy 本机解密密钥")
+        K = _h.sha256(secret.encode("utf-8")).digest()
         token = _wb_decrypt_field(K, obj["auth"]["accessToken"])
         nickname = _wb_decrypt_field(K, obj["account"].get("nickname"))
     except Exception as e:      # noqa: BLE001
@@ -8116,12 +8116,6 @@ DOUBAO_COMMON = {
     "pkg_type": "release_version", "device_id": "", "region": "CN", "sys_region": "CN",
     "samantha_web": "1", "web_platform": "desktop", "use-olympus-account": "1",
 }
-# 豆包开着的时候 Cookies 库是独占打开的（复制直接 PermissionError），所以读到一次就留一份
-# 缓存：之后签到/反代可以拿缓存跑，不逼用户"为了签个到先关掉豆包"。
-DOUBAO_CACHE = (Path(os.environ.get("USERPROFILE") or str(Path.home()))
-                / ".agent-cockpit" / "doubao_auth.json")
-
-
 def doubao_home(profile=None):
     """档案目录。换号时驾驶舱把某个账号的 User Data 目录（或它的上级）指过来。"""
     if profile:
@@ -8157,17 +8151,7 @@ def doubao_cookie_header(profile=None):
     try:
         shutil.copy2(db, tmp)
     except (PermissionError, OSError):
-        # 豆包正在跑：退回上次成功读到的缓存（会话 cookie 按天算，够签到用）
-        try:
-            ck = json.loads(DOUBAO_CACHE.read_text(encoding="utf-8"))
-            if ck.get("cookie"):
-                age = time.time() - float(ck.get("at") or 0)
-                if age < 7 * 86400:
-                    return ck["cookie"], str(DOUBAO_CACHE) + f"（豆包在运行，{int(age // 3600)} 小时前读到）"
-        except Exception:       # noqa: BLE001
-            pass
-        raise RuntimeError("豆包正在运行，Cookies 库被独占锁住——关掉豆包读一次"
-                           "（读过一次就有缓存，之后开着也能签）")
+        raise RuntimeError("豆包正在运行，Cookies 库被独占锁住。请退出豆包后刷新登录态。")
     try:
         con = sqlite3.connect(str(tmp))
         rows = con.execute("select host_key, name, encrypted_value, value from cookies").fetchall()
@@ -8190,11 +8174,17 @@ def doubao_cookie_header(profile=None):
     if not parts:
         raise RuntimeError("豆包 Cookies 里没有 doubao.com 的会话——先在豆包里登录一次")
     cookie = "; ".join(parts)
-    with contextlib.suppress(OSError):
-        DOUBAO_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        DOUBAO_CACHE.write_text(json.dumps({"cookie": cookie, "at": time.time()},
-                                           ensure_ascii=False), encoding="utf-8")
     return cookie, str(db)
+
+
+def doubao_cookie_for_cockpit(profile=None):
+    """One-shot credential handoff for the in-process proxy.
+
+    The caller must keep this value in memory only. It is never persisted to the
+    cockpit data root, and the CLI quota command must not expose it on stdout.
+    """
+    cookie, _source = doubao_cookie_header(profile)
+    return cookie
 
 
 def _doubao_req(path, cookie, payload=None, tag=""):
@@ -11545,6 +11535,15 @@ def main():
     qt.add_argument("--write", action="store_true", help="把这次快照写进共享记忆，别的 Agent 也能看到")
     qt.set_defaults(fn=cmd_quota)
 
+    ck_cookie = sub.add_parser(
+        "cookie",
+        help="驾驶舱反代用：从指定产品档案按需读取一次会话凭据",
+    )
+    ck_cookie.add_argument("product", choices=["doubao"])
+    ck_cookie.add_argument("--profile", help="指定该产品的档案目录")
+    ck_cookie.add_argument("--json", action="store_true", help="输出机器可读结构")
+    ck_cookie.set_defaults(fn=None)
+
     ta = sub.add_parser("trae", help="Trae 反代专用：只读吐出 access token 或模型目录（不碰 refreshToken）")
     ta.add_argument("--token", action="store_true", help="输出 access token、到期时间与账号")
     ta.add_argument("--models", action="store_true",
@@ -11815,6 +11814,18 @@ def main():
         return
     if args.cmd == "console":
         cmd_console(None, args)  # 控制台每个请求自连数据库
+        return
+    if args.cmd == "cookie":
+        try:
+            value = doubao_cookie_for_cockpit(getattr(args, "profile", None))
+            print(json.dumps({"cookie": value}, ensure_ascii=False))
+        except Exception as error:  # noqa: BLE001
+            print(json.dumps({"error": str(error)}, ensure_ascii=False))
+        return
+    if args.cmd in ("checkin", "quota", "trae"):
+        # These adapters never use the memory DB. A missing, locked or corrupt
+        # external AgentHub store must not disable cockpit check-in and quota.
+        args.fn(None, args)
         return
     con = connect()
     try:

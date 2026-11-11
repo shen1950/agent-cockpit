@@ -95,14 +95,13 @@ fn run(extra: &[&str]) -> Result<Value, String> {
     let mut args: Vec<&str> = vec!["checkin"];
     args.extend_from_slice(extra);
     args.push("--json");
-    let mut c = crate::agenthub::command(&args);
-    let out = match c.output() {
+    let out = match crate::agenthub::command(&args)
+        .and_then(|mut c| c.output().map_err(|e| e.to_string())) {
         Ok(o) => o,
         Err(e) => {
             let msg = format!(
-                "调不到签到后端（{e}）：内置运行时不可用，PATH 上也没有 agenthub"
+                "无法启动内置签到后端：{e}"
             );
-            set_last_error(Some(msg.clone()));
             return Err(msg);
         }
     };
@@ -112,19 +111,16 @@ fn run(extra: &[&str]) -> Result<Value, String> {
             "签到后端失败：{}",
             s.trim().chars().take(180).collect::<String>()
         );
-        set_last_error(Some(msg.clone()));
         return Err(msg);
     }
     let parsed: Value = match serde_json::from_slice(&out.stdout) {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("签到后端输出不是 JSON：{e}");
-            set_last_error(Some(msg.clone()));
             return Err(msg);
         }
     };
-    set_last_error(None);
-    Ok(parsed)
+    if parsed.is_array() { Ok(parsed) } else { Err("签到后端结果格式错误。".into()) }
 }
 
 fn state_path() -> std::path::PathBuf {
@@ -369,6 +365,7 @@ pub fn stale() -> bool {
 pub fn refresh() -> Value {
     match run(&[]) {
         Ok(items) => {
+            set_last_error(None);
             let now = now_secs();
             // 产品行后面挂上各账号自己的行（只有"登录态按账号各存一份、且存了不止一个号"
             // 的产品才挂）。这一步是几次额外的 agenthub 调用，所以只在这一条后台路径上做，
@@ -391,7 +388,10 @@ pub fn refresh() -> Value {
             *CACHE.lock().unwrap() = Some(v.clone());
             v
         }
-        Err(e) => json!({ "ok": false, "msg": e }),
+        Err(e) => {
+            set_last_error(Some(e.clone()));
+            json!({ "ok": false, "msg": e })
+        }
     }
 }
 
@@ -1439,13 +1439,13 @@ fn remove_want(store: &str, account: &str) {
 /// 不能每次都去读一遍文件。
 pub fn snapshot() -> Value {
     if let Some(v) = CACHE.lock().unwrap().clone() {
-        return v;
+        return with_backend_error(v, last_error());
     }
     let now = now_secs();
     if let Ok(g) = FALLBACK.lock() {
         if let Some((at, v)) = g.as_ref() {
             if now - at < 15.0 {
-                return v.clone();
+                return with_backend_error(v.clone(), last_error());
             }
         }
     }
@@ -1459,7 +1459,6 @@ pub fn snapshot() -> Value {
     let items = filter_items(raw, &store_visible);
     let v = json!({
         "ok": true, "items": items,
-        "agenthub_error": last_error(),
         // 有几条「登录并领取」正在等（界面据此在那一行显示"等待登录"）
         "want": want_count(),
         "fetched_at": last["fetched_at"].as_f64().unwrap_or(0.0),
@@ -1470,7 +1469,12 @@ pub fn snapshot() -> Value {
     if let Ok(mut g) = FALLBACK.lock() {
         *g = Some((now, v.clone()));
     }
-    v
+    with_backend_error(v, last_error())
+}
+
+fn with_backend_error(mut cached: Value, error: Option<String>) -> Value {
+    cached["agenthub_error"] = json!(error);
+    cached
 }
 
 /// 领取日志导出：把界面拼好的 CSV 落成文件，返回完整路径给界面标出来。
@@ -1785,6 +1789,15 @@ pub fn tick(app: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backend_error_overlays_cached_rows_and_clears_after_recovery() {
+        let previous = json!({"ok": true, "items": [{"product": "qoder"}]});
+        let failed = with_backend_error(previous.clone(), Some("offline".into()));
+        assert_eq!(failed["items"], previous["items"]);
+        assert_eq!(failed["agenthub_error"], "offline");
+        let recovered = with_backend_error(failed, None);
+        assert!(recovered["agenthub_error"].is_null());
+    }
     /// 没装的产品和它名下的账号行都不该出现在签到页。
     #[test]
     fn hidden_products_and_their_account_rows_are_filtered() {

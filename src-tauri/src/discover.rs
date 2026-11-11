@@ -3,9 +3,6 @@ use crate::registry::{home, AppDef};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 /// 命中这些关键词的程序算 AI 客户端/Agent
 const AI_HINTS: &[&str] = &[
     "qoder", "workbuddy", "trae", "zcode", "codebuddy", "deepseek", "mimo", "opencode",
@@ -28,25 +25,31 @@ const SKIP_HINTS: &[&str] = &[
     "sogou", "搜狗", "皮肤盒子", "输入法", "microsoft input",
 ];
 
+/// Generic launcher names identify a path, not a product. A bare filename such
+/// as Launcher.exe must never claim an unrelated program on another path.
+pub(crate) fn generic_exe(name: &str) -> bool {
+    matches!(
+        norm(name).as_str(),
+        "launcher.exe" | "update.exe" | "updater.exe" | "uninstall.exe"
+    )
+}
+
 /// 用户自己登记的 AI 软件安装根目录（config.json 的 `ai_roots`）。
 /// 不再写死开发者机器上的盘符；默认安装位置 + 快捷方式 + 注册表盘点已经能覆盖大多数机器。
-fn ai_install_roots() -> Vec<PathBuf> {
-    static ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-    ROOTS
-        .get_or_init(|| {
-            crate::registry::load_config()
+pub(crate) fn ai_install_roots() -> Vec<PathBuf> {
+    crate::registry::load_config()
                 .get("ai_roots")
                 .and_then(|v| v.as_array())
                 .map(|a| {
                     a.iter()
                         .filter_map(|x| x.as_str())
                         .filter(|s| !s.trim().is_empty())
-                        .map(PathBuf::from)
+                        .map(|s| crate::registry::expand(s.trim()))
+                        .filter(|p| p.is_absolute())
+                        .take(32)
                         .collect()
                 })
                 .unwrap_or_default()
-        })
-        .clone()
 }
 
 /// 路径归一化：统一分隔符与大小写，便于前缀比较，也便于和手工适配条目按**绝对路径**去重。
@@ -67,7 +70,10 @@ pub(crate) fn is_ai_in(name: &str, exe: &str, roots: &[PathBuf]) -> bool {
     let exe_n = norm_path(exe);
     roots
         .iter()
-        .any(|r| exe_n.starts_with(&norm_path(&r.to_string_lossy())))
+        .any(|r| {
+            let root = norm_path(&r.to_string_lossy()).trim_end_matches('/').to_string();
+            !root.is_empty() && exe_n.starts_with(&format!("{root}/"))
+        })
 }
 
 pub(crate) fn is_ai(name: &str, exe: &str) -> bool {
@@ -159,21 +165,6 @@ pub(crate) fn detect_profile(name: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-fn scan_script() -> String {
-    r#"[Console]::OutputEncoding = [Text.Encoding]::UTF8
-$roots = @("$env:APPDATA\Microsoft\Windows\Start Menu\Programs", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs", "$env:PUBLIC\Desktop", "$env:USERPROFILE\Desktop")
-$sh = New-Object -ComObject WScript.Shell
-$seen = New-Object 'System.Collections.Generic.HashSet[string]'
-Get-ChildItem -Path $roots -Filter *.lnk -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-  $t = $null
-  try { $t = $sh.CreateShortcut($_.FullName).TargetPath } catch { }
-  if (-not $t) { return }
-  if ($t -notmatch '\.exe$') { return }
-  if ($seen.Add($t.ToLower())) { "{0}|{1}" -f $_.BaseName, $t }
-}"#
-        .to_string()
-}
-
 /// 这条扫描候选是不是已被手工适配（内置/手动登记）认领——三把键任一命中即算：
 /// ① 归一化显示名、② 归一化 exe 文件名、③ **归一化后的绝对路径**（大小写不敏感、
 /// 分隔符统一）。名字键会失效的场景靠后两把兜底：内置条目"WorkBuddy 国际版"归一化成
@@ -193,37 +184,15 @@ pub(crate) fn claimed_by_manual(skip: &HashSet<String>, name: &str, exe: &str) -
 
 /// 扫一遍开始菜单，返回去重后的 AI 程序（不含已手工适配的）
 pub fn discover(skip_exe_names: &HashSet<String>) -> Vec<AppDef> {
-    let mut c = std::process::Command::new("powershell");
-    c.args(["-NoProfile", "-Command", &scan_script()]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        c.creation_flags(CREATE_NO_WINDOW);
-    }
-    let out = match c.output() {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-    // 脚本内已把控制台输出编码设为 UTF-8；异常字节按 lossy 兜底，不让扫描崩掉
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-
     let mut seen_targets: HashSet<String> = HashSet::new();
     let mut result: Vec<AppDef> = Vec::new();
-    for line in text.lines() {
-        let (name, exe) = match line.split_once('|') {
-            Some(p) => p,
-            None => continue,
-        };
-        let name = name.trim();
-        let exe = exe.trim();
+    for (name, exe) in crate::inventory::discovery_candidates() {
+        let (name, exe) = (name.as_str(), exe.as_str());
         if name.is_empty() || exe.is_empty() || !Path::new(exe).exists() {
             continue;
         }
         // 手工适配过的（名称/主 exe 文件名/解析后的绝对路径任一命中）不再重复收录
         if claimed_by_manual(skip_exe_names, name, exe) {
-            continue;
-        }
-        if !is_ai(name, exe) {
             continue;
         }
         if !seen_targets.insert(exe.to_lowercase()) {
@@ -293,6 +262,13 @@ mod tests {
     fn uninstallers_and_plain_apps_stay_out() {
         assert!(!is_ai("Uninstall AStudio", r"C:\Apps\Curated\AStudio\Uninstall AStudio.exe"));
         assert!(!is_ai("Notepad", r"C:\Windows\notepad.exe"));
+    }
+
+    #[test]
+    fn generic_launchers_never_claim_other_products_by_bare_name() {
+        assert!(generic_exe("Launcher.exe"));
+        assert!(generic_exe("updater.EXE"));
+        assert!(!generic_exe("Qoder.exe"));
     }
 
     /// 真机才跑：真的扫一遍开始菜单，确认 AStudio / Antigravity 这类

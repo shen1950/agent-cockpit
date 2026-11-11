@@ -694,7 +694,7 @@ mod tests {
                             let out = crate::agenthub::command(&[
                                 "checkin", app, "--profile", &profile, "--json",
                             ])
-                            .output();
+                            .and_then(|mut command| command.output().map_err(|e| e.to_string()));
                             match out {
                                 Ok(o) => {
                                     let s = String::from_utf8_lossy(&o.stdout);

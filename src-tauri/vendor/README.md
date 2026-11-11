@@ -29,3 +29,9 @@ and written next to the unpacked Python runtime.
 that directory on `sys.path`. Licenses are included in `licenses/` inside the
 archive and in `docs/third-party/`. The archive is verified during extraction;
 nested paths are checked for zip-slip before writing.
+
+Both archives and the two agenthub source files are embedded in the executable.
+At runtime their combined content hash selects a versioned directory under the
+cockpit data root, and every extracted file is checked byte-for-byte before the
+interpreter is started. Missing or changed files fail closed, so an external
+Python installation or an old extracted runtime is not used as a fallback.

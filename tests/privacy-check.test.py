@@ -20,6 +20,17 @@ class PrivacyGateTests(unittest.TestCase):
         key = 'sk-' + 'X9sQ7pL2vR8mT4nB6hJ3zK5d'
         self.assertTrue(privacy.scan_text(key, 'ui/mock.js'))
 
+    def test_embedded_application_key_is_rejected(self):
+        line = 'WORKBUDDY_' + 'AT_REST_SECRET_KEY = "' + 'A' * 44 + '"'
+        self.assertEqual(
+            privacy.scan_text(line, 'src-tauri/vendor/agenthub.py'),
+            [('src-tauri/vendor/agenthub.py', 1, 'embedded-application-key')],
+        )
+
+    def test_parser_fixture_does_not_require_a_public_credential_exception(self):
+        line = 'WORKBUDDY_' + 'AT_REST_SECRET_KEY = "' + 'AAAAbbbbCCCCddddEEEEffffGGGGhhhhIIIIkkkk=' + '"'
+        self.assertEqual(privacy.scan_text(line, 'src-tauri/src/wbproxy.rs'), [])
+
     def test_private_terms_and_home_paths(self):
         self.assertTrue(privacy.scan_text('private-person', 'sample.txt', ['private-person']))
         personal_path = 'C:/Users/' + 'PrivatePerson/app'
