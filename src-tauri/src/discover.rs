@@ -14,6 +14,12 @@ const AI_HINTS: &[&str] = &[
     "huggingface", "comfyui", "stable diffusion", "jan", "msty", "furina", "chatbox",
     "perplexity", "grok", "mistral", "cohere",
     "antigravity", "astudio", "ai studio", "aistudio",
+    // 商汤小浣熊（`@raccoon/office-desktop`）：产品名「商汤小浣熊」和安装目录
+    // `@raccoonoffice-desktop` 都不含上面任何一个 AI 语义词。2.5.1 之前盘点能认出它，
+    // 是因为安装根探测曾经写死开发机目录；改成只读
+    // config 的 `ai_roots` 之后，没登记过安装根的老配置就断了这条路，于是装到非默认
+    // 盘的小浣熊在盘点和详情页都报「未找到可执行文件」。留关键词兜底，不依赖配置。
+    "raccoon", "浣熊",
 ];
 
 /// 这些一律排除（许可证工具、卸载器、云盘/同步类不算 Agent）
@@ -255,6 +261,32 @@ mod tests {
         assert!(is_ai(
             "Antigravity",
             r"C:\Users\x\AppData\Local\Programs\antigravity\Antigravity.exe"
+        ));
+    }
+
+    /// 商汤小浣熊装在非默认盘（没有登记 `ai_roots`）时也要被盘点认出来：
+    /// 2.5.1 之前它只靠写死的开发机安装根过筛，
+    /// 写死的根去掉后内置候选又只写了 C 盘 npm 默认位置，于是「未找到可执行文件」。
+    #[test]
+    fn raccoon_is_recognized_without_install_roots() {
+        let none: &[PathBuf] = &[];
+        // 装到自定义盘：安装目录名里的 raccoon 就够认了
+        assert!(is_ai_in(
+            "商汤小浣熊",
+            r"E:\Apps\@raccoonoffice-desktop\商汤小浣熊.exe",
+            none
+        ));
+        // 官方默认位置（C 盘 npm 布局）同样要认
+        assert!(is_ai_in(
+            "商汤小浣熊",
+            r"C:\Users\x\AppData\Local\Programs\@raccoonoffice-desktop\商汤小浣熊.exe",
+            none
+        ));
+        // 卸载器仍要排除，不能把 Uninstall 商汤小浣熊.exe 当成主程序
+        assert!(!is_ai_in(
+            "商汤小浣熊",
+            r"E:\Apps\@raccoonoffice-desktop\Uninstall 商汤小浣熊.exe",
+            none
         ));
     }
 
