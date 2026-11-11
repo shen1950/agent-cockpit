@@ -1004,6 +1004,21 @@ fn resolve_member(src: &str, member_base: &str, global_upstream: &str) -> Option
                 crate::pawbridge::BASE_MARK.to_string(),
             ));
         }
+        // bridge:doubao/<账号> —— 豆包同样是**进程内云端直连**（协议底账见 doubao.rs）：
+        // 凭据是 agenthub 解出来的 doubao.com 会话 cookie（落在 ~/.agent-cockpit/doubao_auth.json），
+        // 反代自己带着它打 /samantha/chat/completion，豆包桌面端不用开。
+        // 只看缓存在不在，不在这里触发 agenthub 重读（那要 1~2 秒，会把上游列表拖慢）；
+        // 真的过期了由 serve_doubao 现场报 401 并把话说清楚。
+        if crate::doubao::APPS.contains(&app_id) {
+            if !crate::doubao::auth_ready() {
+                return None;
+            }
+            return Some((
+                format!("直连/{}", app_name),
+                "local".to_string(),
+                crate::doubao::BASE_MARK.to_string(),
+            ));
+        }
         if app_id != "qoder-cn" || !crate::qproxy::cn_bridge_running() {
             return None;
         }

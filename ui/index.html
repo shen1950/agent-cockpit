@@ -59,10 +59,10 @@
       <ul id="applist" class="applist"></ul>
       <div class="sidebtns">
         <button class="btn sm" id="btn-scan" title="扫描开始菜单与桌面，收录新装的 AI 程序">重新扫描</button>
-        <button class="btn sm" id="btn-inv" title="盘点本机安装情况，与上次快照比对">扫描登记</button>
+        <button class="btn sm" id="btn-inv" title="盘点注册表/快捷方式/安装目录，把新认出的收进列表并修复失效路径">扫描登记</button>
       </div>
       <button class="btn addapp" id="btn-add-app"
-              title="登记一个本机程序：只需可执行文件路径。新装软件也可以点「重新扫描」自动收录">＋ 添加程序</button>
+              title="登记一个本机程序：选择或粘贴可执行文件路径。装到别处、没快捷方式的也可以在这里收进来">＋ 添加程序</button>
     </div>
     <!-- 下半截：首页 / 更多 / 设置 三行打底，「更多」收纳多余的管理项（默认
          协作/密钥管理/模型反代/每日签到/远程控制 + 分界线 + 编辑侧导菜单），「设置」收设置页分组；
@@ -350,7 +350,10 @@
     <h3 id="am-title">添加本机程序</h3>
     <div class="fields">
       <label for="am-exe">程序路径</label>
-      <input id="am-exe" placeholder="D:\Apps\Foo\Foo.exe" autocomplete="off" spellcheck="false">
+      <div class="filepick">
+        <input id="am-exe" placeholder="选择或粘贴 .exe 路径" autocomplete="off" spellcheck="false">
+        <button class="btn sm" id="am-pick" type="button" title="打开资源管理器选择可执行文件">选择…</button>
+      </div>
       <label for="am-name">显示名</label>
       <input id="am-name" placeholder="留空则用文件名" autocomplete="off">
     </div>

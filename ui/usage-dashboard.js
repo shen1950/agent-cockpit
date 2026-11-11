@@ -14,6 +14,20 @@
     start.setDate(start.getDate() - Math.max(0, Number(range || 30) - 1));
     return { from: dateKey(start), to: end };
   }
+  // The hero number is not always cumulative: it only sums the selected window.
+  // Name it after that window so two screenshots taken under different ranges
+  // can never look like the same metric.
+  function rangeLabel(range) {
+    if (range === 'all') return '累计 Token';
+    if (range === 'custom') return '自定义范围 Token';
+    const days = Number(range);
+    return days === 1 ? '今天 Token' : `近 ${Math.max(0, days || 30)} 天 Token`;
+  }
+  function rangeWindow(range, from = '', to = '', now = new Date()) {
+    if (range === 'all') return '';
+    const bounds = dateRange(range, now, from, to);
+    return `${bounds.from} 至 ${bounds.to}`;
+  }
   function normalizeSources(payload) {
     const result = new Map();
     for (const raw of Array.isArray(payload?.sources) ? payload.sources : []) {
@@ -246,7 +260,7 @@
     if (!day) return `${date}\n没有采集记录`;
     return `${date}\n实测 ${full(day.exact)} Token\n估算 ${full(day.estimated)} Token`;
   }
-  const api = { normalizeSources, scopedSources, aggregate, modelOptions, dateRange, fillDays, format, csvRows, monitorValues, scopedMonitor, historicalRates, heatTooltip, mergeSnapshot, pollDelay };
+  const api = { normalizeSources, scopedSources, aggregate, modelOptions, dateRange, rangeLabel, rangeWindow, fillDays, format, csvRows, monitorValues, scopedMonitor, historicalRates, heatTooltip, mergeSnapshot, pollDelay };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.UsageDashboard = api;
   if (typeof document === 'undefined') return;
@@ -257,7 +271,7 @@
   let preferences = {};
   try { preferences = JSON.parse(localStorage.getItem('cockpit-usage-preferences') || '{}') || {}; } catch (_) { /* Broken preferences do not hide usage. */ }
   const state = { active: false, mounted: false, pending: false, timer: null, bridge: null, data: null, error: '',
-    range: '30', from: dateKey(new Date()), to: dateKey(new Date()), app: '', sourceId: '', model: '', selectedDate: '', dimension: 'agent',
+    range: 'all', from: dateKey(new Date()), to: dateKey(new Date()), app: '', sourceId: '', model: '', selectedDate: '', dimension: 'agent',
     includeEstimated: preferences.includeEstimated !== false, ratios: preferences.ratios || {}, interval: [0, 15, 30, 60].includes(preferences.interval) ? preferences.interval : 30,
     monitorRange: '24h', selectedRatePoint: null };
   function persist() { try { localStorage.setItem('cockpit-usage-preferences', JSON.stringify({ ratios: state.ratios, includeEstimated: state.includeEstimated, interval: state.interval })); } catch (_) { /* Read-only webviews can still show charts. */ } }
@@ -442,7 +456,7 @@
     section.append(graphic, legend(data.groups, colors)); const note = selectedDayNote(data); if (note) section.append(note); return section;
   }
   function donut(data) {
-    const section = card(state.dimension === 'model' ? '模型用量占比' : 'Agent 用量占比', '与当前日期、来源和估算选项保持一致。');
+    const section = card(state.dimension === 'model' ? '模型用量占比' : 'Agent 用量占比', '与所选时间窗口、来源和估算选项保持一致。');
     if (!data.total) { empty(section); return section; }
     const colors = colorsFor(data.groups), chart = svg('svg', { viewBox: '0 0 240 220', role: 'img', 'aria-label': 'Token 用量环形图', class: 'ud-donut' });
     chart.append(svg('circle', { cx: 120, cy: 108, r: 75, fill: 'none', stroke: 'var(--track)', 'stroke-width': 27 }));
@@ -603,7 +617,9 @@
     const focusedId = focused && document.activeElement.id;
     const expanded = [...rootNode.querySelectorAll('details[open]')].map(node => node.id);
     const data = current(), metrics = dom('div', 'ud-metrics');
-    metrics.append(metric('累计 Token', format(data.total), state.includeEstimated ? `实测 ${format(data.exact)} · 估算 ${format(data.estimated)}` : `仅实测 · ${format(data.estimated)} 估算未计入`, 'ud-metric-primary'),
+    const window = rangeWindow(state.range, state.from, state.to);
+    const detail = state.includeEstimated ? `实测 ${format(data.exact)} · 估算 ${format(data.estimated)}` : `仅实测 · ${format(data.estimated)} 估算未计入`;
+    metrics.append(metric(rangeLabel(state.range), format(data.total), window ? `${window} · ${detail}` : detail, 'ud-metric-primary'),
       metric('模型用量记录', format(data.requests), '按模型调用或用量事件计数，口径随来源变化'),
       metric('单日峰值', format(data.peak), `${data.activeDays} 个活跃日`),
       metric('数据覆盖', `${data.sources.filter(s => s.days.length).length} / ${data.sources.length}`, '有历史记录的来源 / 已检查来源'));

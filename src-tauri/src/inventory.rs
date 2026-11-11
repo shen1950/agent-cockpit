@@ -46,13 +46,38 @@ foreach ($d in $lnkRoots) {
     try { Emit 'lnk' $_.BaseName ($sh.CreateShortcut($_.FullName).TargetPath) } catch {}
   }
 }
-foreach ($d in @("$env:LOCALAPPDATA\Programs", 'D:\Artificial_Intelligence', 'D:\LenovoSoftstore\Install', $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+foreach ($d in @("$env:LOCALAPPDATA\Programs", "$env:LOCALAPPDATA\LenovoSoftstore\Install", "$env:SystemDrive\LenovoSoftstore\Install", $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
   Get-ChildItem -Path $d -Directory | ForEach-Object {
     $exe = Get-ChildItem -Path $_.FullName -Filter *.exe -Depth 1 | Select-Object -First 1
     if ($exe) { Emit 'dir' $_.Name $exe.FullName }
   }
 }
-Get-ChildItem 'D:\npm-global' -Filter *.cmd | ForEach-Object { Emit 'npm' $_.BaseName $_.FullName }"#.to_string()
+Get-ChildItem "$env:APPDATA\npm" -Filter *.cmd | ForEach-Object { Emit 'npm' $_.BaseName $_.FullName }
+foreach ($d in ($env:PATH -split ';')) {
+  if (-not $d -or -not (Test-Path $d)) { continue }
+  Get-ChildItem -Path $d -Filter *.cmd | ForEach-Object { Emit 'path' $_.BaseName $_.FullName }
+}"#.to_string()
+}
+
+/// 注册表 DisplayIcon 常写成 `"C:\\...\\Foo.exe",0`；安装位置又可能是目录。
+/// 只接受真实存在的可执行文件，后面的收养/收录都靠它。
+pub(crate) fn trace_exe(raw: &str) -> Option<PathBuf> {
+    let mut s = raw.trim().trim_matches('"').trim().to_string();
+    if let Some((head, tail)) = s.rsplit_once(',') {
+        if tail.trim().parse::<i32>().is_ok() {
+            s = head.trim().trim_matches('"').to_string();
+        }
+    }
+    let p = PathBuf::from(s);
+    if !p.is_file() {
+        return None;
+    }
+    let ext = p
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "exe" | "cmd" | "bat").then_some(p)
 }
 
 fn probe() -> BTreeMap<String, Vec<(String, String)>> {
@@ -114,6 +139,75 @@ fn stale_paths(found: &BTreeMap<String, Vec<(String, String)>>) -> Vec<Value> {
     out
 }
 
+/// 内置条目的路径在别的机器上失效，但痕迹里找到了真身：写成本机路径覆盖。
+/// 这样不用改共享的内置清单，也不用再生成一张重复卡。
+fn repair_stale(stale: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for s in stale {
+        let Some(id) = s["id"].as_str() else { continue };
+        let Some(app) = reg::app_def(id) else { continue };
+        let want = reg::exe_name(&app).to_lowercase();
+        let Some(found) = s["found_at"].as_array() else { continue };
+        if let Some(path) = found
+            .iter()
+            .filter_map(|x| x.as_str())
+            .find(|p| p.to_lowercase().ends_with(&want) && trace_exe(p).is_some())
+        {
+            reg::set_exe_override(id, path);
+            out.push(json!({"id": id, "name": app.name, "path": path}));
+        }
+    }
+    out
+}
+
+/// 盘点出的程序：能对上本机没装的内置产品就收养，否则登记成自定义程序。
+/// 扫描的是**全部已检出条目**，不只是这次“新装”的：旧版本留下的基线里
+/// 早就记着这些程序（new=0），只处理 new 仍然收不进来。已收过的靠 known 去重。
+fn collect_detected(found: &BTreeMap<String, Vec<(String, String)>>) -> Vec<Value> {
+    let known: std::collections::HashSet<String> = reg::all_apps_raw()
+        .iter()
+        .filter(|a| a.id.starts_with("custom-") || reg::resolve_exe(a).is_some())
+        .flat_map(|a| {
+            let mut v = vec![reg::exe_name(a).to_lowercase()];
+            if let Some(p) = reg::resolve_exe(a) {
+                // 只认完整路径；覆盖后可能是通用的 Launcher.exe，裸名不能全局认领
+                v.push(crate::discover::norm_path(&p.to_string_lossy()));
+            }
+            if let Some(p) = a.exes.first() {
+                v.push(crate::discover::norm_path(p));
+            }
+            v
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (key, list) in found {
+        for (_kind, raw) in list {
+            let Some(p) = trace_exe(raw) else { continue };
+            let path = p.to_string_lossy().into_owned();
+            if let Some(app_id) = reg::adopt_exe_for_candidate(key, &path) {
+                out.push(json!({"name": key, "path": path, "app": app_id, "adopted": true}));
+                break;
+            }
+            let base = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if known.contains(&base) || known.contains(&crate::discover::norm_path(&path)) {
+                continue;
+            }
+            let display = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| key.to_string());
+            let def = reg::make_custom(&display, &path);
+            reg::save_custom(&def);
+            out.push(json!({"name": display, "path": path, "app": def.id, "adopted": false}));
+            break;
+        }
+    }
+    out
+}
+
 fn catalog() -> Value {
     let p = home().join(".agents").join("catalog.json");
     match fs::read_to_string(&p) {
@@ -156,13 +250,40 @@ pub fn scan() -> Value {
         .and_then(|a| a.as_array())
         .map(|v| v.len())
         .unwrap_or(0);
+    let stale = stale_paths(&found);
+    // 先修内置失效路径，再收新程序：收的时候 known 集合已经能看到修好的条目
+    let repaired = repair_stale(&stale);
+    let collected = collect_detected(&found);
     json!({
         "ok": true,
         "detected": now.len(),
         "new": new, "gone": gone,
         "first_run": prev.is_empty(),
-        "stale_paths": stale_paths(&found),
+        "stale_paths": stale,
+        "repaired": repaired,
+        "collected": collected,
         "catalog": { "loaded": in_catalog, "path": home().join(".agents").join("catalog.json").to_string_lossy() },
         "detail": now,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_exe_strips_icon_index_and_requires_executable() {
+        let tmp = std::env::temp_dir().join(format!("cockpit-trace-exe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let exe = tmp.join("Foo.exe");
+        fs::write(&exe, b"x").unwrap();
+        assert_eq!(trace_exe(&format!("{},0", exe.display())), Some(exe.clone()));
+        assert_eq!(trace_exe(&format!("\"{}\"", exe.display())), Some(exe.clone()));
+        let cmd = tmp.join("bar.cmd");
+        fs::write(&cmd, b"x").unwrap();
+        assert_eq!(trace_exe(&cmd.to_string_lossy()), Some(cmd));
+        assert_eq!(trace_exe(&tmp.to_string_lossy()), None, "目录不是可执行文件");
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

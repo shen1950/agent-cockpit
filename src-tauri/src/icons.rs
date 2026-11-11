@@ -263,8 +263,8 @@ mod tests {
     fn script_launchers_are_not_worth_extracting() {
         // CLI 的入口常常是个 .cmd 包装，抽出来只会是系统那张空白文档图
         for p in [
-            r"D:\npm-global\codex.cmd",
-            r"D:\npm-global\claude.CMD",
+            r"C:\Users\Example\AppData\Roaming\npm\codex.cmd",
+            r"C:\Users\Example\AppData\Roaming\npm\claude.CMD",
             r"C:\tools\run.bat",
             r"C:\tools\probe.ps1",
         ] {

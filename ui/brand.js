@@ -72,5 +72,5 @@ function brandSettings(body, panel, a) {
     await setSetting('appearance','icon_style','copper'); await setSetting('appearance','icon_tone','auto');
   }));
   body.append(panel('应用图标', row('图标外观', '默认跟随应用主题，也可以固定浅色或深色。', select), cards, uploads,
-    el('p', { class: 'settings-copy' }, '自定义图片仅保存在本机，未上传的一侧沿用 Copper。窗口、托盘和应用内图标即时更新；Windows 快捷方式图标可能需要重新打开或取消固定后再次固定。')));
+    el('p', { class: 'settings-copy' }, '自定义图片仅保存在本机，未上传的一侧沿用 Copper。窗口、托盘、应用内图标即时更新；桌面、开始菜单和任务栏固定项会在同一时刻被改写成当前这张图并刷新图标缓存（每次启动也会自查一遍，发现指歪的条目自动拉回）。任务栏上如果还挂着旧图，取消固定再固定一次即可，之后不会再变。')));
 }

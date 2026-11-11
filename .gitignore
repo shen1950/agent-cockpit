@@ -16,6 +16,12 @@ installer/
 # 调试草稿（本地留着，不入库）
 _dbg*.js
 _paste_parser.js
+_ci_intl_smoke.cjs
+
+# 本地设计草稿（图标候选/AI 生成图），不进入公开源码
+/Copper *.png
+/Gemini_Generated_Image_*.jpg
+/agentcockpit-icon-*.png
 
 # 改动前的回滚副本（留在磁盘上备查，不进历史）
 *.bak-*

@@ -386,25 +386,125 @@ fn write_lnk(exe: &Path, lnk: &Path) -> Result<(), String> {
     }
 }
 
-/// 生成/覆盖快捷方式。开始菜单一次写两条：中文名的正式项 + 英文名的搜索别名。
-pub fn refresh_brand_icons() -> Result<(), String> {
-    let t = gather()?;
-    let Some(icon) = crate::brand::icon_path() else { return Ok(()); };
-    let mut links = vec![t.desktop.clone(), t.start.clone(), start_alias_of(&t.start)];
-    let pinned = appdata_dir(&home_dir()).join("Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar");
-    if let Ok(entries) = std::fs::read_dir(pinned) {
-        links.extend(entries.flatten().map(|e| e.path()).filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lnk"))));
-    }
-    links.retain(|p| p.is_file());
-    let targets = read_targets(&links)?;
-    for (link, target) in links.iter().zip(targets) {
-        if !is_our_target(&target, &t.exe) { continue; }
-        // Change only the icon; preserve existing shortcut arguments and properties.
-        run_ps(&format!("$sh = New-Object -ComObject WScript.Shell; $s = $sh.CreateShortcut('{}'); $s.IconLocation = '{},0'; $s.Save()",
-            ps_quote(&link.to_string_lossy()), ps_quote(&icon.to_string_lossy())))?;
-    }
-    Ok(())
+/// 扫一遍所有可能承载本程序图标的目录。桌面和开始菜单是用户自己会加条目的地方；
+/// Win11 把任务栏固定项存放在 Taskband 注册表 blob 里，`User Pinned\TaskBar` 常年是空的，
+/// 但只要有 .lnk 就一并处理（老系统、组策略、以及"固定到「开始」屏幕"留下的副本）。
+fn shortcut_dirs(t: &Targets) -> Vec<PathBuf> {
+    let pinned = appdata_dir(&home_dir()).join("Microsoft/Internet Explorer/Quick Launch/User Pinned");
+    let mut dirs = Vec::new();
+    if let Some(d) = t.desktop.parent() { dirs.push(d.to_path_buf()); }
+    // start = <Programs>\<程序名>\<程序名>.lnk，往上两级才是 Programs 根
+    if let Some(programs) = t.start.parent().and_then(Path::parent) { dirs.push(programs.to_path_buf()); }
+    dirs.push(pinned.join("TaskBar"));
+    dirs.push(pinned.join("StartMenu"));
+    dirs
 }
+
+/// 一次同步把所有承载本程序图标的 .lnk 都指到当前 brand ico 上，并让外壳立刻重新取图。
+///
+/// 为什么不是"哪条变了改哪条"：Windows 外壳**不会**回落到运行中窗口的图标。桌面、开始菜单、
+/// 任务栏固定项各自去读 .lnk 的 IconLocation；只要有一条没跟上（后来新建的、从别的 exe 副本
+/// 复制的、AUMID 相同但目标指向 bin 而非当前 temp 副本的），界面上就是"设置里选了深色、
+/// 桌面还是浅色"。所以这里按「AUMID 是我们的 / 目标就是当前 exe / 目标 exe 同名」整片重扫，
+/// 并且只对 IconLocation 与目标值不同的那条 Save——幂等，启动时每次跑也不会闪图标。
+///
+/// 一次 PowerShell 处理完整批：逐条起进程在几十个快捷方式上要按秒算。
+pub fn sync_brand_icons() -> Result<usize, String> {
+    // 启动自查（后台线程）和设置页的图标应用（spawn_blocking）会同时走到这里，
+    // 两条同时去 CreateShortcut/Save 同一个 .lnk 会有一条 Save 失败、留下旧图。
+    // 串行化，poison 也照用——同步是幂等的，重跑一次就对了。
+    static SYNC: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = SYNC.lock().unwrap_or_else(|p| p.into_inner());
+    let t = gather()?;
+    let Some(icon) = crate::brand::icon_path() else { return Ok(0); };
+    let dirs: Vec<String> = shortcut_dirs(&t)
+        .into_iter()
+        .filter(|d| d.is_dir())
+        .map(|d| format!("'{}'", ps_quote(&d.to_string_lossy())))
+        .collect();
+    if dirs.is_empty() { return Ok(0); }
+    let leaf = t.exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // 占位符替换而不是 format!：PowerShell 的 { } 太多，全转义成 {{ }} 读不下去
+    let script = r#"[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$icon = '@ICON@'
+$exe = '@EXE@'
+$leaf = '@LEAF@'
+$appid = '@APPID@'
+$dirs = @(@DIRS@)
+$wsh = New-Object -ComObject WScript.Shell
+$shell = $null
+$seen = @{}
+foreach ($d in $dirs) {
+  if (-not (Test-Path -LiteralPath $d)) { continue }
+  foreach ($f in @(Get-ChildItem -LiteralPath $d -Filter '*.lnk' -Recurse -Force -ErrorAction SilentlyContinue)) {
+    $p = $f.FullName
+    if ($seen.ContainsKey($p)) { continue }
+    $seen[$p] = 1
+    $s = $null
+    try { $s = $wsh.CreateShortcut($p) } catch { continue }
+    if (-not $s) { continue }
+    $t = ''
+    try { $t = [string]$s.TargetPath } catch {}
+    if (-not $t) { continue }
+    $aumid = ''
+    try {
+      if (-not $shell) { $shell = New-Object -ComObject Shell.Application }
+      $item = $shell.Namespace($f.DirectoryName).ParseName($f.Name)
+      if ($item) { $aumid = [string]$item.ExtendedProperty('System.AppUserModel.ID') }
+    } catch {}
+    $ours = ($aumid -eq $appid) -or ($t -ieq $exe) -or ((Split-Path -Leaf $t) -ieq $leaf)
+    if (-not $ours) { continue }
+    if ([string]$s.IconLocation -ieq $icon) { continue }
+    try { $s.IconLocation = $icon; $s.Save(); 'W=' + $p } catch { 'E=' + $p }
+  }
+}"#
+    .replace("@ICON@", &ps_quote(&format!("{},0", icon.to_string_lossy())))
+    .replace("@EXE@", &ps_quote(&t.exe.to_string_lossy()))
+    .replace("@LEAF@", &ps_quote(&leaf))
+    .replace("@APPID@", &ps_quote(crate::shell_identity::APP_ID))
+    .replace("@DIRS@", &dirs.join(", "));
+    let out = run_ps(&script)?;
+    let rewritten: Vec<String> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("W="))
+        .map(|l| l.trim().to_string())
+        .collect();
+    if !rewritten.is_empty() { notify_shell(&rewritten); }
+    Ok(rewritten.len())
+}
+
+/// 告诉外壳这些条目换了图标。SHChangeNotify 只让资源管理器重新取图，
+/// 已缓存的 iconcache_*.db 不认它——所以还要 ie4uinit -show 重建一次图标缓存，
+/// 否则桌面还挂着旧图，得等下次登录才换。
+#[cfg(windows)]
+fn notify_shell(paths: &[String]) {
+    use std::ffi::c_void;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHChangeNotify(event: i32, flags: u32, item1: *const c_void, item2: *const c_void);
+    }
+    const SHCNE_UPDATEITEM: i32 = 0x0000_2000;
+    const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
+    const SHCNF_PATHW: u32 = 0x0005;
+    const SHCNF_IDLIST: u32 = 0x0000;
+    for path in paths {
+        let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, wide.as_ptr() as *const c_void, std::ptr::null());
+        }
+    }
+    unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, std::ptr::null(), std::ptr::null()); }
+    let mut c = std::process::Command::new("ie4uinit.exe");
+    c.arg("-show");
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = c.status();
+}
+
+#[cfg(not(windows))]
+fn notify_shell(_paths: &[String]) {}
 
 pub fn create(kind: &str) -> Value {
     // 先验 kind 再 gather：gather 要起 PowerShell，非法请求不该为它付子进程的钱

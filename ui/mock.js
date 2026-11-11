@@ -18,19 +18,17 @@ const inst = (app, app_name, name, kind, running, procs, q, extra = {}) => ({
   ...extra,
 });
 
-/* WorkBuddy 那种"一个大组底下几十笔各自到期"的形状（agenthub 从 free/paid-packages 拿回来的） */
-// 2026-10-11 真从 qoder.com.cn/account/usage 抓回来的形状：24 个 100 积分的赠送包，
-// 各自一个到期时间——这正是"本机接口看不到、只有官网有"的那一层。
-/* WorkBuddy 按天消耗：真从 ~/.workbuddy/workbuddy.db 的 session_usage 里聚合出来的
-   31 天（2026-06-20 ~ 2026-10-12，合计 10550.30 credits，峰值 9-09 那天 2668.24），
-   不是编的样例——界面预览要能跟 agenthub 实测数字逐位对上。 */
+/* WorkBuddy 那种"一个大组底下几十笔各自到期"的形状（agenthub 从 free/paid-packages 拿回来的）。
+   下面是**合成样例**，只保留形状，数值全部虚构。 */
+/* WorkBuddy 按天消耗：合成 6 个采样日，够验"热力图/柱状/趋势"三种画法；
+   不要放真实账号的用量序列。 */
 function wbTrend() {
-  const rows = [['2026-06-20', 178.97, 15], ['2026-06-26', 1.41, 5], ['2026-07-20', 3.86, 1], ['2026-07-21', 364.41, 3], ['2026-07-22', 1340.1, 3], ['2026-07-26', 3.52, 1], ['2026-07-27', 860.72, 4], ['2026-07-30', 49.79, 1], ['2026-07-31', 158.13, 1], ['2026-08-02', 574.33, 1], ['2026-08-18', 41.84, 1], ['2026-08-19', 59.95, 1], ['2026-08-25', 586.05, 4], ['2026-08-27', 322.99, 3], ['2026-08-28', 28.92, 1], ['2026-08-29', 121.82, 2], ['2026-09-02', 176.68, 1], ['2026-09-04', 102.67, 1], ['2026-09-09', 2668.24, 27], ['2026-09-13', 1200.34, 3], ['2026-09-25', 30.48, 3], ['2026-09-26', 73.37, 4], ['2026-09-27', 29.96, 2], ['2026-09-28', 30.88, 2], ['2026-09-30', 18.16, 1], ['2026-10-03', 0.21, 1], ['2026-10-04', 1.04, 1], ['2026-10-07', 76.73, 2], ['2026-10-09', 498.59, 6], ['2026-10-10', 941.27, 1], ['2026-10-12', 4.87, 1]];
+  const rows = [['2026-06-01', 120.5, 3], ['2026-06-15', 80.25, 2], ['2026-07-01', 200, 4], ['2026-07-20', 60.75, 2], ['2026-08-10', 320.5, 5], ['2026-09-05', 140, 3]];
   return {
     unit: 'credits',
-    total: 10550.3,
-    peak: 2668.24,
-    peak_date: '2026-09-09',
+    total: 922,
+    peak: 320.5,
+    peak_date: '2026-08-10',
     from: rows[0][0],
     to: rows[rows.length - 1][0],
     db: 'C:\\Users\\Example\\.workbuddy\\workbuddy.db',
@@ -38,9 +36,9 @@ function wbTrend() {
   };
 }
 
-/* Qoder 那条官网热力图接口的真实形状（2026-10-12 实测）：厂商自己把 371 天补零成连续
-   序列、带 unit/total/levels 四档阈值，items[] 只有 date+value，**没有场次数**。
-   数值用实测到的那两天，其余按形状补零——够验"厂商分档"和"没有会话数时不许编"这两条。 */
+/* Qoder 官网热力图接口的**形状**（合成样例）：厂商把 371 天补零成连续序列、
+   带 unit/total/levels 四档阈值，items[] 只有 date+value，**没有场次数**。
+   数值虚构，只验"厂商分档"和"没有会话数时不许编"这两条。 */
 function qoderTrend() {
   const pad = (x) => String(x).padStart(2, '0');
   const today = new Date();
@@ -51,12 +49,12 @@ function qoderTrend() {
     dt.setDate(dt.getDate() - i);
     days.push({ date: `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`, credits: 0 });
   }
-  const known = { '2026-10-05': 36.0456504078, '2026-10-10': 1190.5914247282, '2026-10-11': 206.69 };
+  const known = { '2026-10-05': 12.5, '2026-10-10': 88, '2026-10-11': 24 };
   for (const d of days) if (known[d.date] != null) d.credits = known[d.date];
   return {
-    unit: 'credits', total: 9836.16, peak: 1190.5914247282, peak_date: '2026-10-10',
-    levels: [29.35, 206.69, 879.14, 1190.59], from: days[0].date, to: days[days.length - 1].date,
-    source: '官网热力图接口', days,
+    unit: 'credits', total: 260, peak: 88, peak_date: '2026-10-10',
+    levels: [10, 24, 50, 88], from: days[0].date, to: days[days.length - 1].date,
+    source: '官网热力图接口（合成样例）', days,
   };
 }
 
@@ -87,8 +85,8 @@ function webGroups() {
       }],
     },
     {
-      name: '平台奖励积分', unit: 'credits', left: 1751, total: 2400, used: 649,
-      live_count: 21, expired_count: 3, live_left: 1751,
+      name: '平台奖励积分', unit: 'credits', left: 1200, total: 2000, used: 800,
+      live_count: 21, expired_count: 3, live_left: 1200,
       expires: bonus[3].expires_on, days_left: 0,
       items: bonus,
     },
@@ -103,7 +101,7 @@ function wbGroups() {
   const reward = [];
   for (let i = 0; i < 9; i++) {
     reward.push({
-      label: 'CodeBuddy个人版国内运营裂变包', pool: '资源包 TCACA_code_007_nzdH5h4Nl',
+      label: 'CodeBuddy个人版国内运营裂变包', pool: '资源包 DEMO_PACK_A',
       detail: '官方活动发放', total: [10, 100, 50, 9, 100, 7, 100, 8, 26][i],
       used: [10, 100, 50, 9, 40, 0, 100, 0, 26][i],
       left: [0, 0, 0, 0, 60, 7, 0, 8, 0][i],
@@ -112,7 +110,7 @@ function wbGroups() {
     });
   }
   reward.push({
-    label: 'CodeBuddy个人版拉新权益包', pool: '资源包 TCACA_code_030_BjSt89qTvr',
+    label: 'CodeBuddy个人版拉新权益包', pool: '资源包 DEMO_PACK_B',
     detail: '官方活动发放', total: 1000, used: 0, left: 1000, unit: 'credits',
     expires_on: at(51, 15, 12), days_left: 51, expired: false,
   });
@@ -122,13 +120,13 @@ function wbGroups() {
       live_count: 1, expired_count: 0, live_left: 500,
       expires: at(20, 23, 59), days_left: 20,
       items: [{
-        label: 'CodeBuddy个人体验版', pool: '资源包 TCACA_code_008_cfWoLwvjU', detail: '',
+        label: 'CodeBuddy个人体验版', pool: '资源包 DEMO_PACK_C', detail: '',
         total: 500, used: 0, left: 500, unit: 'credits', expires_on: at(20, 23, 59),
         days_left: 20, expired: false,
       }],
     },
     {
-      name: '平台奖励积分', unit: 'credits', left: 3694.84000019, total: 4443, used: 748.15999981,
+      name: '平台奖励积分', unit: 'credits', left: 1200.5, total: 2000, used: 799.5,
       live_count: 8, expired_count: 2, live_left: 3694.84,
       expires: at(0, 15, 31), days_left: 0,
       items: reward,
@@ -144,7 +142,7 @@ const DATA = {
       local_quota: true, web_quota: true, auth_switch: true,
       machine: { known: true, refreshing: false, value: {
         ok: true, account: 'demo_account_b', user_id: '00000000-0000-4000-8000-000000000002',
-        user_type: 'personal_standard', left: 1751, total: 2400, expires_on: '未给出',
+        user_type: 'personal_standard', left: 1200, total: 2000, expires_on: '未给出',
         source: 'server', auth_from: 'C:\\Users\\Example\\AppData\\Roaming\\com.qodercn.app.stable\\auth.v1.dat',
         profile_dir: 'C:\\Users\\Example\\AppData\\Roaming\\com.qodercn.app.stable' } } },
     { id: 'qoder-cn-ide', name: 'Qoder CN IDE', kind: 'electron', installed: true, swapped: '', swap_ok: true },
@@ -195,7 +193,7 @@ const DATA = {
     // 演示官网逐资源包读数：三个大组 + 组内逐笔各带自己的到期时间
     // 共用一份档案的产品：整棵进程树记在"现在登着的那个号"头上，不是磁盘换号记录里那个
     inst('qoder-cn', 'Qoder CN', 'demo_account_b', 'electron', true, 8, {
-      total: 2400, left: 1751, expires_on: '2026-10-24 21:13', days_left: 13,
+      total: 2000, left: 1200, expires_on: '2026-10-24 21:13', days_left: 13,
       local_account: 'demo_account_b', user_id: '00000000-0000-4000-8000-000000000002',
       source: 'web', plan_name: '体验版', fetched_at: now - 60,
       groups: webGroups(), detail_source: 'web', detail_at: now - 60, trend: qoderTrend(),
@@ -390,7 +388,7 @@ DATA.instances.forEach((x) => {
     x.logged_in = !!(mv.ok && mv.user_id && x.quota && x.quota.user_id === mv.user_id);
   }
 });
-DATA.hidden_apps = [{ id: 'auto-skinbox', name: '皮肤盒子', discovered: true, exe: 'D:/Artificial_Intelligence/skinbox/skin.exe' }];
+DATA.hidden_apps = [{ id: 'auto-skinbox', name: '皮肤盒子', discovered: true, exe: 'C:/Apps/skinbox/skin.exe' }];
 
 /* 两级结构：站点 → 该站下的多个 key（每个 key 有各自 base_url / 模型 / 用途标签） */
 DATA.keys = [
@@ -482,19 +480,19 @@ DATA.settings = {
   checkin: { enabled: false, window_start: 6, window_end: 12, auto: { workbuddy: true },
     remind: true, remind_at: '10:05', remind_mute: {} },
 };
-/* 六家今天的状态：2026-10-12 用本机凭据只读查到的真实返回，不是编的样例 */
+/* 六家今天的状态：**合成样例**，只保留返回形状，账号名与数值全部虚构 */
 const CI_ITEMS = [
   { product: 'workbuddy', account: 'demo_account_c', supported: true, auto: true, activity_on: true,
-    signed_today: true, claimable: false, streak: 13, reward: 100, today_credit: 100,
-    total: 1300, days_signed: 13, ends_on: '2026-10-15', unit: '积分',
+    signed_today: true, claimable: false, streak: 3, reward: 100, today_credit: 100,
+    total: 300, days_signed: 3, ends_on: '2026-12-31', unit: '积分',
     source: 'https://www.codebuddy.cn/v2/billing/meter/checkin-activity-status' },
   { product: 'workbuddy-activity', supported: true, auto: true, activity_on: true, mode: 'activity',
-    signed_today: false, claimable: true, streak: 100, unit: '活跃',
+    signed_today: false, claimable: true, streak: 7, unit: '活跃',
     words: { done: '今天已打卡', go: '今天还没打卡', act: '发一句对话', done_act: '今天已领完' },
     note: '活跃地图要「完成一次对话」才记录当天（连登 14 天可兑换奖励）；这一条只管打卡，签到是上面 WorkBuddy 那条' },
   { product: 'workbuddy-travel', supported: true, auto: true, activity_on: true, mode: 'travel',
     signed_today: true, claimable: true, travel_state: 'arrived', next_action: 'claim',
-    reward: 5, unit: '积分', arrive_at: '10-25 20:23',
+    reward: 5, unit: '积分', arrive_at: '示例 20:23',
     words: { done: '今天已领取', go: '今天可派可领', depart: '派出', wait: '等待中',
       claim: '领取', wait_badge: '猫猫在路上', done_act: '今天已领完',
       arrive_badge: '猫猫到了，待领取', home_badge: '猫猫在家，可派出' },
@@ -503,10 +501,10 @@ const CI_ITEMS = [
     mode: 'activity', signed_today: false, claimable: true, streak: 0, reward: 30, unit: '积分',
     words: { done: '今天已到账', go: '今天还没到账', act: '发一句对话', done_act: '今天已领完' },
     note: '30 积分/天是服务端按天结算的基础权益（历史发放时刻 00:20~08:02 不等）' },
-  { product: 'trae-cn', account: 'shen195', supported: true, auto: true, activity_on: true,
-    signed_today: true, claimable: false, reward: 100, extra: 100, unit: '积分' },
+  { product: 'trae-cn', account: 'demo_account_a', supported: true, auto: true, activity_on: true,
+    signed_today: true, claimable: false, reward: 50, extra: 0, unit: '积分' },
   { product: 'minimax', supported: true, auto: true, activity_on: true, signed_today: true,
-    claimable: false, streak: 6, reward: 400, unit: '积分' },
+    claimable: false, streak: 2, reward: 100, unit: '积分' },
   // MiniMax 在这台机器上有两个号，但登录态整机一份——账号行只能是占位行（shared），
   // 这正是 2026-10-17 要求的"通用管理"：不是只有 Qoder CN 才展开
   { product: 'minimax', scope: 'account', parent: 'minimax', account: 'acct-A',
@@ -524,10 +522,10 @@ const CI_ITEMS = [
   // 前端把 scope!=="account" 的当产品行，其余挂到它 parent 底下。
   { product: 'qoder-cn', scope: 'account', parent: 'qoder-cn', account: 'demo_account_b',
     supported: true, auto: false, activity_on: true, signed_today: true, claimable: false,
-    streak: 3, reward: 100, unit: '积分', ends_on: '2026-11-15 11:23' },
+    streak: 2, reward: 100, unit: '积分', ends_on: '2026-12-15 11:23' },
   { product: 'qoder-cn', scope: 'account', parent: 'qoder-cn', account: 'demo_account_a',
     supported: true, auto: true, activity_on: true, signed_today: false, claimable: true,
-    streak: 5, reward: 100, unit: '积分', ends_on: '2026-11-14 11:32' },
+    streak: 1, reward: 100, unit: '积分', ends_on: '2026-12-14 11:32' },
   { product: 'qoder', supported: true, auto: false, activity_on: false, signed_today: null,
     claimable: false, unit: '积分',
     note: '国际版只有活动开关，领取在网页里点，程序不代点' },
@@ -668,8 +666,8 @@ window.__TAURI__ = {
           catalog: { loaded: 12, path: 'C:/Users/x/.agents/catalog.json' },
           stale_paths: [
             { id: 'qoder', name: 'Qoder', recorded: ['{LOCALAPPDATA}/Programs/Qoder/Qoder.exe'],
-              found_at: ['D:/Artificial_Intelligence/Qoder/Qoder.exe'], has_profile: true },
-            { id: 'qoder-cn-ide', name: 'Qoder CN IDE', recorded: ['D:/Artificial_Intelligence/Qoder CN IDE/Qoder CN IDE.exe'],
+              found_at: ['C:/Apps/Qoder/Qoder.exe'], has_profile: true },
+            { id: 'qoder-cn-ide', name: 'Qoder CN IDE', recorded: ['C:/Apps/Qoder CN IDE/Qoder CN IDE.exe'],
               found_at: [], has_profile: false },
           ],
           detail: {},
@@ -684,6 +682,9 @@ window.__TAURI__ = {
       }
       if (cmd === 'get_meta') {
         return Promise.resolve({ token: 'sk-demo-xxxxxxxxxxxx', quota_url: '', quota_path: '', quota_headers: '{}', quota_adapter: 'openai' });
+      }
+      if (cmd === 'pick_exe') {
+        return Promise.resolve({ ok: true, path: 'C:\\Apps\\Demo\\Demo.exe' });
       }
       if (cmd === 'add_app') {
         const exe = String(args.exe || '');
@@ -992,12 +993,12 @@ window.__TAURI__ = {
       if (cmd === 'action' && args.payload?.action === 'machine_login') {
         return Promise.resolve({
           ok: true, account: 'demo_account_b', user_id: '00000000-0000-4000-8000-000000000002',
-          user_type: 'personal_standard', left: 1751, total: 2400, expires_on: '未给出',
+          user_type: 'personal_standard', left: 1200, total: 2000, expires_on: '未给出',
           source: 'server', stale: false, live_error: '',
           auth_from: 'C:\\Users\\Example\\AppData\\Roaming\\com.qodercn.app.stable\\auth.v1.dat',
           portions: [
             { label: '主额度', left: 0, total: 0, expires_on: '无限期', category: '套餐基础积分' },
-            { label: '平台奖励积分·平台赠送', left: 1751, total: 2400, expires_on: '2026-10-24 21:13', category: '平台奖励积分' },
+            { label: '平台奖励积分·平台赠送', left: 1200, total: 2000, expires_on: '2026-10-24 21:13', category: '平台奖励积分' },
           ],
         });
       }
@@ -1007,7 +1008,7 @@ window.__TAURI__ = {
         if (args.payload.app === 'qoder-cn') {
           return Promise.resolve({
             ok: true, source: 'web',
-            msg: '官网读数已刷新：剩 1751 / 共 2400 积分，已用 649 · 逐包 4 笔（最早 2026-10-22 09:30 作废）\n'
+            msg: '官网读数已刷新：剩 1200 / 共 2000 积分，已用 800 · 逐包 4 笔（最早 2026-10-22 09:30 作废）\n'
               + '套餐：体验版 · 每日消耗 371 天',
           });
         }
@@ -1019,18 +1020,18 @@ window.__TAURI__ = {
         });
       }
       if (cmd === 'action' && args.payload?.action === 'web_fetch') {
-        // 2026-10-11 真从 qoder.com.cn/account/usage 抓回来的形状（截两笔）
+        // 官网 usage 接口的形状（合成样例，截两笔）
         return Promise.resolve({
           ok: true,
           data: {
             ok: true, user_id: '00000000-0000-4000-8000-000000000002', account: 'demo_account_b',
             plan: 'PLAN_TIER_FREE', plan_name: '体验版', plan_expire: '无限期',
-            left: 1751, total: 2400, used: 649, quota_key: 'big_model_credits',
+            left: 1200, total: 2000, used: 800, quota_key: 'big_model_credits',
             page: 'https://qoder.com.cn/account/usage',
             groups: [
               { name: '套餐基础积分', unit: 'credits', left: 0, total: 0, used: 0, n: 1,
                 items: [{ label: '套餐额度', pool: '套餐基础积分', detail: 'PLAN', left: 0, total: 0, used: 0, expires_on: '未给出', unit: 'credits', status: 'ACTIVE' }] },
-              { name: '平台奖励积分', unit: 'credits', left: 1751, total: 2200, used: 449, n: 2,
+              { name: '平台奖励积分', unit: 'credits', left: 1200, total: 1800, used: 600, n: 2,
                 items: [
                   { label: '平台赠送', pool: '平台奖励积分', detail: 'RESOURCE_PACKAGE_SOURCE_BONUS', left: 51, total: 100, used: 49, expires_on: '2026-10-24 21:13', unit: 'credits', status: 'ACTIVE' },
                   { label: '平台赠送', pool: '平台奖励积分', detail: 'RESOURCE_PACKAGE_SOURCE_BONUS', left: 100, total: 100, used: 0, expires_on: '2026-11-10 13:13', unit: 'credits', status: 'ACTIVE' },

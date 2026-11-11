@@ -52,47 +52,54 @@ pub fn apps() -> Vec<AppDef> {
         //   ② ~/.qoder 只要有一个 agent 会话在跑就被占着，rename 直接「拒绝访问」。
         // 所以：候选里放上两个壳的目录，由 resolve_profile 挑真有登录数据的那个。
         curated("qoder", "Qoder", "electron",
-            &["{LOCALAPPDATA}/Programs/Qoder/Qoder.exe", "D:/Artificial_Intelligence/Qoder/Qoder.exe"],
+            &["{LOCALAPPDATA}/Programs/Qoder/Qoder.exe",
+              "{PROGRAMFILES}/Qoder/Qoder.exe",
+              "{PROGRAMFILES_X86}/Qoder/Qoder.exe"],
             "", Some("{APPDATA}/com.qoder.app.stable|{APPDATA}/Qoder"), false),
         curated("qoder-cn", "Qoder CN", "electron",
-            &["D:/Artificial_Intelligence/Qoder CN/Qoder CN.exe"], "",
+            &["{LOCALAPPDATA}/Programs/Qoder CN/Qoder CN.exe",
+              "{PROGRAMFILES}/Qoder CN/Qoder CN.exe",
+              "{PROGRAMFILES_X86}/Qoder CN/Qoder CN.exe"], "",
             Some("{APPDATA}/com.qodercn.app.stable|{APPDATA}/QoderCN"), false),
         curated("qoder-cn-ide", "Qoder CN IDE", "electron",
-            &["D:/Artificial_Intelligence/Qoder CN IDE/Qoder CN IDE.exe"], "", Some(".qoder-cn-ide"), true),
+            &["{LOCALAPPDATA}/Programs/Qoder CN IDE/Qoder CN IDE.exe",
+              "{PROGRAMFILES}/Qoder CN IDE/Qoder CN IDE.exe"],
+            "", Some(".qoder-cn-ide"), true),
         curated("workbuddy", "WorkBuddy", "electron",
-            &["D:/LenovoSoftstore/Install/WorkBuddy/WorkBuddy.exe"], "", Some(".workbuddy"), false),
-        // WorkBuddy 国际版是**独立的一份安装**，不是国内版的另一张卡。2026-10-11 磁盘证据：
-        //   国内版  D:\LenovoSoftstore\Install\WorkBuddy\WorkBuddy.exe（FileVersion 5.7.7，ProductName "WorkBuddy"），
-        //           站点 www.workbuddy.cn，档案 ~\.workbuddy（账号 demo_account_cn，用户目录 示例用户 A）
-        //   国际版  D:\Artificial_Intelligence\WorkBuddyAI\WorkBuddyAI.exe（FileVersion 5.7.6，ProductName "WorkBuddy AI"），
-        //           站点 www.workbuddy.ai，档案 ~\.workbuddy-ai（账号 demo_account_intl，用户目录 示例用户 B）
-        // 两份安装各自有 204,585,0xx 字节的 exe，只差那一个 "AI" 后缀——是两个安装、两套档案，程序同源。
-        // 登录态也各存各的：%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\ 下
-        //   国内版 workbuddy-desktop.info / 国际版 workbuddy-desktop-ai.info。
-        // 早先这条 curated 的 exe 和 profile 全抄了国内版（同一份档案的两张卡），
+            &["{LOCALAPPDATA}/Programs/WorkBuddy/WorkBuddy.exe",
+              "{PROGRAMFILES}/WorkBuddy/WorkBuddy.exe",
+              "{LOCALAPPDATA}/LenovoSoftstore/Install/WorkBuddy/WorkBuddy.exe",
+              "{SYSTEMDRIVE}/LenovoSoftstore/Install/WorkBuddy/WorkBuddy.exe"],
+            "", Some(".workbuddy"), false),
+        // WorkBuddy 国际版是**独立的一份安装**，不是国内版的另一张卡。
+        // 两个安装的 exe 只差一个 "AI" 后缀，站点、档案（~/.workbuddy vs ~/.workbuddy-ai）
+        // 和登录态文件都各存各的。早先这条 curated 的 exe 和 profile 全抄了国内版，
         // 真正的国际版安装被自动发现收成第三条 auto-workbuddyai，用户因此看到
         // 「WorkBuddy 国际版」和「WorkBuddy AI」并存——那是登记错了，不是重复收录。
         // 现在 exe/profile/lockers 三处都必须只认国际版自己那套（见 lockers() 的 workbuddy-intl）。
         curated("workbuddy-intl", "WorkBuddy 国际版", "electron",
-            &["D:/Artificial_Intelligence/WorkBuddyAI/WorkBuddyAI.exe"], "", Some(".workbuddy-ai"), false),
+            &["{LOCALAPPDATA}/Programs/WorkBuddyAI/WorkBuddyAI.exe",
+              "{PROGRAMFILES}/WorkBuddyAI/WorkBuddyAI.exe"],
+            "", Some(".workbuddy-ai"), false),
         // AStudio（科大讯飞 星辰/星火）：登录态明文落在安装目录**同级**的
         //   <安装目录上一级>/AStudio Data/userdata/astron-session.json
         // （asar 里 resolveWindowsDataLocationRoot：parent(dirname(installDir)) + "AStudio Data"）。
-        // 单实例产品，只能整目录换号。
+        // 单实例产品，只能整目录换号。装到非默认目录时由 resolve_profile 从 exe 位置推导。
         curated("astudio", "AStudio", "electron",
-            &["D:/Artificial_Intelligence/AStudio/AStudio.exe"], "",
-            Some("D:/Artificial_Intelligence/AStudio Data/userdata"), false),
+            &["{LOCALAPPDATA}/Programs/AStudio/AStudio.exe",
+              "{PROGRAMFILES}/AStudio/AStudio.exe"],
+            "", Some("{LOCALAPPDATA}/Programs/AStudio Data/userdata"), false),
         // MiniMax Code：OAuth 令牌落 ~/.minimax/auth/<env>/<region>/mcode-public/。
         // 家目录就是 ~/.minimax，单实例产品，整目录换号。
-        // exe 三处候选：只登 D:/Artificial_Intelligence 会漏掉联想软件商店的默认落点——
-        // 本机实际装在 E:/LenovoSoftstore/Install/MiniMaxCode（卸载项图标可证），
+        // exe 三处候选：官方默认位置 + 联想软件商店的默认落点。
         // 一旦认不到就判 installed=false：侧栏名字被 .missing 打到 --text-faint、
         // 详情页报「未找到可执行文件」，但额度/登录态照常能读（走 ~/.minimax 的令牌），
-        // 于是会出现"右边一切正常、只有名字灰"的怪相。顺带补 Electron 的 per-user 默认位置。
+        // 于是会出现"右边一切正常、只有名字灰"的怪相。
         curated("minimax", "MiniMax Code", "electron",
-            &["E:/LenovoSoftstore/Install/MiniMaxCode/MiniMax Code.exe",
-              "D:/Artificial_Intelligence/MiniMax Code/MiniMax Code.exe",
-              "{LOCALAPPDATA}/Programs/MiniMax Code/MiniMax Code.exe"], "", Some(".minimax"), false),
+            &["{LOCALAPPDATA}/Programs/MiniMax Code/MiniMax Code.exe",
+              "{LOCALAPPDATA}/LenovoSoftstore/Install/MiniMaxCode/MiniMax Code.exe",
+              "{SYSTEMDRIVE}/LenovoSoftstore/Install/MiniMaxCode/MiniMax Code.exe"],
+            "", Some(".minimax"), false),
         // TRAE CN（原 TraeWork）：2026-10-11 官方升级改了名，安装目录
         // TRAE SOLO CN → Trae CN，登录档案也跟着搬（%APPDATA%\Trae CN，migration-job.json
         // 记录了迁移；加密格式没变，仍是 byteCrypto）。exe 与档案候选都留两段：
@@ -100,14 +107,16 @@ pub fn apps() -> Vec<AppDef> {
         // ~/.trae-cn 依旧是运行时家目录（assistant/ 对话历史、extensions/ plugins/ skills/
         // mcps/ toolhost/），跟登录态无关——换它既换不动登录，又会把正在用的插件搬乱。
         curated("traework-cn", "TRAE CN", "electron",
-            &["D:/Artificial_Intelligence/Trae CN/Trae CN.exe",
-              "D:/Artificial_Intelligence/TRAE SOLO CN/TRAE SOLO CN.exe"], "",
+            &["{LOCALAPPDATA}/Programs/Trae CN/Trae CN.exe",
+              "{PROGRAMFILES}/Trae CN/Trae CN.exe",
+              "{LOCALAPPDATA}/Programs/TRAE SOLO CN/TRAE SOLO CN.exe"], "",
             Some("{APPDATA}/Trae CN|{APPDATA}/TRAE SOLO CN"), true),
         curated("zcode", "ZCode", "electron",
-            &["D:/Artificial_Intelligence/ZCode/ZCode.exe"], "", Some(".zcode"), true),
+            &["{LOCALAPPDATA}/Programs/ZCode/ZCode.exe",
+              "{PROGRAMFILES}/ZCode/ZCode.exe"], "", Some(".zcode"), true),
         // 千问办公（QwenWorkCN）：根目录那个 Launcher.exe 只是启动壳（同目录没有
         // resources.pak/locales，不是 Electron 主程序）；真正的 Electron 主程序在版本目录
-        //   D:\Artificial_Intelligence\QwenWorkCN\<版本>\QwenWorkCN.exe
+        //   <安装目录>\<版本>\QwenWorkCN.exe
         // （updater.cfg 的 currentVersion 指着哪个版本；exe 文件名不随版本变）。
         // 候选顺序：版本目录在前（拿到的是真主程序，进程名匹配/--user-data-dir 都按它算），
         // Launcher.exe 兜底（官方升级后版本目录改名，这里还能起得来，dedup 也靠
@@ -117,9 +126,10 @@ pub fn apps() -> Vec<AppDef> {
         // isolatable=false：未实测 --user-data-dir 隔离性，先按不可多开处理（猜错的后果是
         // "新建了账号2，点启动唤出的还是同一个账号"）。
         curated("qwenwork", "千问办公", "electron",
-            &["D:/Artificial_Intelligence/QwenWorkCN/1.2.5-26092902/QwenWorkCN.exe",
-              "D:/Artificial_Intelligence/QwenWorkCN/Launcher.exe"], "",
-            Some("{APPDATA}/QwenWorkCN|{APPDATA}/QwenWork|{LOCALAPPDATA}/QwenWorkCN"), false),
+            &["{LOCALAPPDATA}/Programs/QwenWorkCN/*/QwenWorkCN.exe",
+              "{LOCALAPPDATA}/Programs/QwenWorkCN/Launcher.exe",
+              "{PROGRAMFILES}/QwenWorkCN/*/QwenWorkCN.exe"],
+            "", Some("{APPDATA}/QwenWorkCN|{APPDATA}/QwenWork|{LOCALAPPDATA}/QwenWorkCN"), false),
         // 妙手（美团 CatPaw / CatDesk，product.json: applicationName=catpaw-moon,
         // appId=com.catx.catpaw, cliCommandName=paw, dataFolderName=.meituan-catpaw）。
         // 登录态 ~/.meituan-catpaw/auth.json 是**明文** accessToken（152 字符 Bearer），
@@ -128,14 +138,14 @@ pub fn apps() -> Vec<AppDef> {
         // 档案候选里两段：家目录（令牌与 desk 工作区）在前，Electron userData 在后，
         // resolve_profile 挑真有登录数据的那个。
         // isolatable=false：未实测 --user-data-dir 隔离性，先按不可多开处理。
-        // 2026-11-06 官方升级换装：Inno Setup 新布局装到 CatPaw\Apps\妙手\ 并把旧目录整个删了，
+        // 官方升级换装后 Inno Setup 新布局装到 CatPaw\Apps\妙手\ 并把旧目录整个删了，
         // 只认旧路径就断了（详情页报「未找到可执行文件」，额度/登录态走 ~/.meituan-catpaw
-        // 照常能读，跟 exe 在不在无关）。候选加一条 Apps 布局的通配兜底（glob_best 取
-        // 修改时间最新的那个）；本机另建了目录联接 D:\Artificial_Intelligence\妙手 →
-        // CatPaw\Apps\妙手，旧路径这条平时也能直接命中。
+        // 照常能读，跟 exe 在不在无关）。候选加 Apps 布局的通配兜底（glob_best 取
+        // 修改时间最新的那个）。
         curated("catpaw", "妙手", "electron",
-            &["D:/Artificial_Intelligence/妙手/妙手.exe",
-              "D:/Artificial_Intelligence/CatPaw/Apps/*/妙手.exe"], "",
+            &["{LOCALAPPDATA}/Programs/CatPaw/Apps/*/妙手.exe",
+              "{LOCALAPPDATA}/CatPaw/Apps/*/妙手.exe",
+              "{PROGRAMFILES}/CatPaw/Apps/*/妙手.exe"], "",
             Some(".meituan-catpaw|{APPDATA}/catpaw-moon"), false),
         // DeepSeek Harness：Electron（同目录有 resources.pak+locales，实测）。
         // 登录态是明文 ~/.dsh/.credentials.yaml（grant deepseek-account-platform/default 的 token），
@@ -143,7 +153,8 @@ pub fn apps() -> Vec<AppDef> {
         // resolve_profile 靠 has_login_data 认 .credentials.yaml 落在 ~/.dsh。
         // isolatable=false：未实测 --user-data-dir 隔离性，先按不可多开处理。
         curated("dsh", "DeepSeek Harness", "electron",
-            &["D:/Artificial_Intelligence/DeepSeek Harness/DeepSeek Harness.exe"], "",
+            &["{LOCALAPPDATA}/Programs/DeepSeek Harness/DeepSeek Harness.exe",
+              "{PROGRAMFILES}/DeepSeek Harness/DeepSeek Harness.exe"], "",
             Some(".dsh|{APPDATA}/@deepseek-ai/dsh-desktop"), false),
         // Marvis（腾讯）：Qt+CEF 壳，不是 Electron（安装目录没有 resources.pak/locales），按 plain 登记。
         // 档案 ~\.marvis **本身是个 symlink** → %APPDATA%\Tencent\Marvis\User\<openid>\，
@@ -153,18 +164,20 @@ pub fn apps() -> Vec<AppDef> {
         // 目前不成立。登录态 .marvis\mobile_address.json（明文 access_token/mobile_open_id）。
         // isolatable=false：未实测（而且 plain 壳本来就走不了 --user-data-dir）。
         curated("marvis", "Marvis", "plain",
-            &["D:/Artificial_Intelligence/Marvis/Application/MarvisLauncher.exe"], "", Some(".marvis"), false),
+            &["{LOCALAPPDATA}/Programs/Marvis/Application/MarvisLauncher.exe",
+              "{PROGRAMFILES}/Marvis/Application/MarvisLauncher.exe"],
+            "", Some(".marvis"), false),
         // Xiaomi MiMo：Electron（实测同目录有 resources.pak+locales）。
         // 档案 {APPDATA}\Xiaomi MiMo，登录态在 Partitions\xiaomi-account\Network\Cookies
-        // （SQLite，os_crypt 加密；userId=2802645431）——多分区 Electron 应用，
-        // 整机一份，不在账号实例目录（直读永远回落）。
+        // （SQLite，os_crypt 加密）——多分区 Electron 应用，整机一份，
+        // 不在账号实例目录（直读永远回落）。
         // isolatable=false：未实测多分区应用吃 --user-data-dir 的行为，先按不可多开处理。
         curated("xiaomi-mimo", "Xiaomi MiMo", "electron",
-            &["D:/Artificial_Intelligence/Xiaomi MiMo/Xiaomi MiMo.exe"], "",
+            &["{LOCALAPPDATA}/Programs/Xiaomi MiMo/Xiaomi MiMo.exe",
+              "{PROGRAMFILES}/Xiaomi MiMo/Xiaomi MiMo.exe"], "",
             Some("{APPDATA}/Xiaomi MiMo"), false),
-        // OpenCode：只登记档案目录，不接直读（这台机器它从未登录过官方账号——
-        // %USERPROFILE%\.local\share\opencode\opencode.db 的 account 三表 0 行；
-        // 而且产品自身没有任何余额接口，所以 LOCAL_STORES 里没有它）。
+        // OpenCode：只登记档案目录，不接直读（产品自身没有余额接口，
+        // 而且 %USERPROFILE%\.local\share\opencode\opencode.db 里不一定有登录态）。
         // 登记 profile 是为了换号/多开有落点：数据家目录 ~/.local/share/opencode，
         // Electron userData {APPDATA}\ai.opencode.desktop（两处都实测存在）。
         // isolatable=false：自动发现曾按 Chromium 特征给过 true，但没实测第二次启动是否
@@ -178,8 +191,8 @@ pub fn apps() -> Vec<AppDef> {
         // npm 壳报 Missing optional dependency）——原生 exe 走 node 壳里嵌的那层查找，
         // 直连 exe 省一次 node 启动；.cmd 兜底给壳装全但 vendor 目录不同的机器。
         curated("codex", "Codex CLI", "cli", &[
-            "D:/npm-global/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
-            "D:/npm-global/codex.cmd",
+            "{APPDATA}/npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+            "{APPDATA}/npm/codex.cmd",
         ], "CODEX_HOME", Some(".codex"), true),
         // ChatGPT / Codex 桌面版（MSIX 里的 Chromium PWA 壳，主程序叫 ChatGPT.exe）。
         // 多开靠 Chromium 自己的 --user-data-dir：不同目录＝不同进程组、各自一份登录态
@@ -187,23 +200,22 @@ pub fn apps() -> Vec<AppDef> {
         // 安装目录带版本号，登记只能写通配；profile 是 %APPDATA%\Codex\web\Codex（不是包内 LocalCache）。
         curated("codex-desktop", "ChatGPT", "pwa", &[
             "{PROGRAMFILES}/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
-            "D:/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
             "{LOCALAPPDATA}/Microsoft/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
         ], "", Some("{APPDATA}/Codex/web/Codex"), true),
-        curated("claude", "Claude Code CLI", "cli", &["D:/npm-global/claude.cmd"], "CLAUDE_CONFIG_DIR", Some(".claude"), true),
+        curated("claude", "Claude Code CLI", "cli", &["{APPDATA}/npm/claude.cmd"], "CLAUDE_CONFIG_DIR", Some(".claude"), true),
         // Claude 桌面版包含 Cowork / Code；Claude-3p 是它自行管理的资料目录，
         // 不能当安装目录或换号档案。保留官方包身份启动，不复制/接管这份资料。
         curated("claude-desktop", "Claude 桌面版", "plain", &[
             "{PROGRAMFILES}/WindowsApps/Claude_*_x64__pzs8sxrjxfjjc/app/Claude.exe",
-            "D:/WindowsApps/Claude_*_x64__pzs8sxrjxfjjc/app/Claude.exe",
+            "{LOCALAPPDATA}/Microsoft/WindowsApps/Claude_*_x64__pzs8sxrjxfjjc/app/Claude.exe",
         ], "", None, false),
         // ------------------------------------------------------------------
         // 以下这批是 2026-10-16 照着 jlcodes99/cockpit-tools 的平台清单补的：
         // Antigravity / Cursor / Kiro / Windsurf / GitHub Copilot / Zed / Grok Bot /
         // CodeBuddy(CN) / Trae(国际) / TRAE SOLO(CN)。
         // 路径一律先给**官方默认安装位置**（%LOCALAPPDATA%\Programs\<名> 或 %ProgramFiles%），
-        // 再把本机 D:\Artificial_Intelligence\ 下的实际位置作为候选兜底——
-        // 这份登记是要跟着仓库发出去的，别人机器上没有 D 盘那一层，默认位置必须排第一。
+        // 实际安装位置由盘点/本机覆盖兜底——
+        // 这份登记是要跟着仓库发出去的，默认安装位置必须排第一。
         // kind 一律 electron：这几个（除 Grok Bot 待定）都是 VS Code / Chromium 壳，
         // isolatable 先按"能吃 --user-data-dir"记 true，与本机实测过的 Trae CN / ZCode 同规格。
         curated("antigravity", "Antigravity", "electron",
@@ -218,11 +230,10 @@ pub fn apps() -> Vec<AppDef> {
         // isolatable=false：没实测 --user-data-dir 对这个壳生不生效，按规矩先收 false。
         curated("coze", "Coze", "electron",
             &["{LOCALAPPDATA}/Programs/Coze/Coze.exe",
-              "D:/Artificial_Intelligence/Coze/Coze.exe"], "",
+              "{PROGRAMFILES}/Coze/Coze.exe"], "",
             Some("{APPDATA}/Coze"), false),
         // 商汤小浣熊（@raccoon/office-desktop，SenseTime 办公小浣熊）：Electron
-        // （LICENSE.electron.txt + resources.pak + locales 实测在），2026-11-05 本机实测：
-        //   安装  D:\Artificial_Intelligence\@raccoonoffice-desktop\商汤小浣熊.exe
+        // （LICENSE.electron.txt + resources.pak + locales 实测在）。
         //   档案  ~/.office-raccoon（产品里 PROFILE_DIRECTORY='office-raccoon' +
         //         WINDOWS_PROFILE_DIRECTORY='.office-raccoon'；mac/linux 才落在
         //         %APPDATA%\office-raccoon，所以候选里两处都留着，由 has_login_data 钉住）
@@ -241,8 +252,23 @@ pub fn apps() -> Vec<AppDef> {
         // .raccoon-lab-client.json 标记），驾驶舱还没接这条，先按仅换号登记。
         curated("raccoon", "商汤小浣熊", "electron",
             &["{LOCALAPPDATA}/Programs/@raccoonoffice-desktop/商汤小浣熊.exe",
-              "D:/Artificial_Intelligence/@raccoonoffice-desktop/商汤小浣熊.exe"], "",
+              "{PROGRAMFILES}/@raccoonoffice-desktop/商汤小浣熊.exe"], "",
             Some(".office-raccoon|{APPDATA}/office-raccoon"), false),
+        // 豆包（doubao.com）：CEF/Chromium 147 壳（同目录有 app\ 与 147.0.7727.149.manifest，
+        // 主程序是 app\Doubao.exe，根目录那个 Doubao.exe 只是 1.8MB 的启动壳）。
+        // 登录态就是 doubao.com 的会话 cookie，在
+        //   {LOCALAPPDATA}\Doubao\User Data\Default\Network\Cookies（SQLite + os_crypt v10），
+        // 所以档案目录取 {LOCALAPPDATA}\Doubao（换号整目录搬），不是 ~/Doubao
+        // （那里面只有 chats/ 与 skills/，跟登录无关）。
+        // ⚠ 豆包运行时这个 Cookies 库是**独占**打开的，agenthub 复制会 PermissionError，
+        //   那边退到 ~/.agent-cockpit/doubao_auth.json 的缓存；缓存过期就得关掉豆包读一次。
+        // 直读走 agenthub 的 doubao store；签到见 ci_doubao（每天 200，周一翻倍，服务端幂等）。
+        // 反代见 doubao.rs（进程内云端直连，不要求客户端常开）。
+        // isolatable=false：没有实测 --user-data-dir 是否真能隔离出第二个账号。
+        curated("doubao", "豆包", "electron",
+            &["{LOCALAPPDATA}/Programs/Doubao/Doubao.exe",
+              "{PROGRAMFILES}/Doubao/Doubao.exe"], "",
+            Some("{LOCALAPPDATA}/Doubao"), false),
         curated("cursor", "Cursor", "electron",
             &["{LOCALAPPDATA}/Programs/cursor/Cursor.exe",
               "{LOCALAPPDATA}/Programs/Cursor/Cursor.exe",
@@ -269,7 +295,7 @@ pub fn apps() -> Vec<AppDef> {
         // CLI 那份 ~/.grok 是它自己的运行时家目录，一并放进候选，换号两处都算得到。
         curated("grok", "Grok Bot", "electron",
             &["{LOCALAPPDATA}/Programs/Grok Bot/Grok Bot.exe",
-              "D:/Artificial_Intelligence/Grok Bot/Grok Bot.exe"], "",
+              "{PROGRAMFILES}/Grok Bot/Grok Bot.exe"], "",
             Some("{APPDATA}/Grok Bot|.grok"), true),
         // CodeBuddy 有两个落点：登录态在 Electron userData `{APPDATA}\CodeBuddy`，
         // 而 CLI 内核的会话（`projects\<cwd>\*.jsonl`，逐条带 usage.inputTokens/
@@ -292,8 +318,8 @@ pub fn apps() -> Vec<AppDef> {
               "{PROGRAMFILES}/TRAE SOLO/TRAE SOLO.exe"], "",
             Some("{APPDATA}/TRAE SOLO"), true),
         curated("trae-solo-cn", "TRAE SOLO CN", "electron",
-            &["D:/Artificial_Intelligence/TRAE SOLO CN/TRAE SOLO CN.exe",
-              "{LOCALAPPDATA}/Programs/TRAE SOLO CN/TRAE SOLO CN.exe"], "",
+            &["{LOCALAPPDATA}/Programs/TRAE SOLO CN/TRAE SOLO CN.exe",
+              "{PROGRAMFILES}/TRAE SOLO CN/TRAE SOLO CN.exe"], "",
             Some("{APPDATA}/TRAE SOLO CN"), true),
     ]
 }
@@ -334,18 +360,99 @@ pub fn discovered_seen() -> Vec<AppDef> {
 /// 文件名太通用、不能按裸文件名全局认领（会误吞别家恰好叫 Launcher.exe 的程序），
 /// 但它落在候选里——按解析后的绝对路径认领，既摘掉快照里的 auto-千问办公，
 /// 又不动别的路径上的同名壳。
-pub fn manual_claimed_names() -> std::collections::HashSet<String> {
+fn add_claim_keys(skip: &mut std::collections::HashSet<String>, a: &AppDef) {
+    skip.insert(crate::discover::norm(&a.name));
+    // 主 exe 文件名认领（exes[0] 是产品真身；兜底候选只认领完整路径，见上）
+    skip.insert(crate::discover::norm(&exe_name(a)));
+    for x in &a.exes {
+        skip.insert(crate::discover::norm_path(&expand(x).to_string_lossy()));
+    }
+    // 本机覆盖后的真实 exe 也要认领：只认**完整路径**，不认裸文件名——
+    // 千问办公覆盖后可能是 Launcher.exe，裸文件名会误吞别家同名启动器。
+    if let Some(p) = resolve_exe(a) {
+        skip.insert(crate::discover::norm_path(&p.to_string_lossy()));
+    }
+}
+
+/// 内置条目的认领键。`installed` 决定哪些条目有资格占名字：
+/// 跨机收录只能让**本机真的能解析到 exe** 的条目认领；否则别的机器上新装的
+/// 同名程序会被直接跳过，而那个内置条目自己的路径又不存在，最后就是
+/// 「盘点看得见、列表收不进来」。测试用 `|_| true` 模拟"全部已安装"来验身份键。
+pub(crate) fn claimed_names_for(
+    curated: &[AppDef],
+    installed: &dyn Fn(&AppDef) -> bool,
+) -> std::collections::HashSet<String> {
     let mut skip: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for a in apps().into_iter().chain(custom_apps()) {
-        skip.insert(crate::discover::norm(&a.name));
-        // 主 exe 文件名认领（exes[0] 是产品真身；兜底候选只认领完整路径，见上）
-        skip.insert(crate::discover::norm(&exe_name(&a)));
-        for x in &a.exes {
-            skip.insert(crate::discover::norm_path(&expand(x).to_string_lossy()));
+    for a in curated {
+        if !installed(a) {
+            continue;
         }
+        add_claim_keys(&mut skip, a);
+    }
+    skip
+}
+
+pub fn manual_claimed_names() -> std::collections::HashSet<String> {
+    let mut skip = claimed_names_for(&apps(), &|_| true);
+    for a in custom_apps() {
+        add_claim_keys(&mut skip, &a);
     }
     skip.insert(crate::discover::norm("agent-cockpit"));
     skip
+}
+
+/// 本机实际可用的认领键：没装的内置条目不再占名字，手动登记的原样认领。
+pub fn local_claimed_names() -> std::collections::HashSet<String> {
+    let mut skip = claimed_names_for(&apps(), &|a| resolve_exe(a).is_some());
+    for a in custom_apps() {
+        add_claim_keys(&mut skip, &a);
+    }
+    skip.insert(crate::discover::norm("agent-cockpit"));
+    skip
+}
+
+/// 盘点/快捷方式找回的新 exe，能对应到一个**本机还没装上的内置条目**时，
+/// 返回该内置条目的 id，由调用方写成本机路径覆盖，而不是再生成一张重复卡。
+pub(crate) fn adoption_target(
+    curated: &[AppDef],
+    installed: &dyn Fn(&AppDef) -> bool,
+    name: &str,
+    exe: &str,
+) -> Option<String> {
+    let name_key = crate::discover::norm(name);
+    let exe_file = Path::new(exe)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let exe_key = crate::discover::norm(&exe_file);
+    let cli_script = Path::new(exe)
+        .extension()
+        .and_then(|x| x.to_str())
+        .map(|x| matches!(x.to_ascii_lowercase().as_str(), "cmd" | "bat"))
+        .unwrap_or(false);
+    // 先认显示名，再认 exe 文件名；只认本机还没装上的内置条目。
+    // id 兜底只给 CLI：codex / claude 这种盘点名和显示名（Codex CLI）不同；
+    // 不能拿 id 去认桌面版，否则 Claude.exe 会被塞进 Claude Code CLI。
+    if !name_key.is_empty() {
+        if let Some(a) = curated.iter().find(|a| {
+            !installed(a)
+                && (crate::discover::norm(&a.name) == name_key
+                    || (a.kind == "cli"
+                        && cli_script
+                        && crate::discover::norm(&a.id) == name_key))
+        }) {
+            return Some(a.id.clone());
+        }
+    }
+    if !exe_key.is_empty() {
+        if let Some(a) = curated
+            .iter()
+            .find(|a| !installed(a) && crate::discover::norm(&exe_name(a)) == exe_key)
+        {
+            return Some(a.id.clone());
+        }
+    }
+    None
 }
 
 fn save_discovered_seen(list: &[AppDef]) {
@@ -367,7 +474,7 @@ pub fn set_discovered(fresh: Vec<AppDef>) {
     // 原先被错误登记遮蔽的 auto-workbuddyai 也得跟着摘掉，不然它又浮出来和内置条目并列。
     // 主文件名按 norm 比、绝对路径按归一化（大小写/分隔符）比；不按显示名，
     // 同名不同 exe 的程序（便携版等）是两个东西，别误删。
-    let claimed = manual_claimed_names();
+    let claimed = local_claimed_names();
     let claimed_entry = |a: &AppDef| -> bool {
         if claimed.contains(&crate::discover::norm(&exe_name(a))) {
             return true;
@@ -567,15 +674,38 @@ pub fn remove_custom(app_id: &str) -> bool {
 /// QwenWorkCN.exe，自动发现那条记的是启动壳 Launcher.exe——名字键对不上，
 /// 靠 Launcher.exe 的完整路径键才能把它遮蔽掉。
 pub fn all_apps_raw() -> Vec<AppDef> {
-    let mut out = apps();
+    let extra: Vec<AppDef> = custom_apps().into_iter().chain(discovered()).collect();
+    merge_extra_apps(apps(), extra, &|a| resolve_exe(a).is_some())
+}
+
+/// 内置条目 + 手动/自动条目合并。`installed` 决定内置条目有没有资格按 exe 名去重：
+/// 没装的内置条目路径本来就是失效的，不能因为名字相同把本机真正能跑的那条藏掉。
+fn merge_extra_apps(
+    base: Vec<AppDef>,
+    extra: Vec<AppDef>,
+    installed: &dyn Fn(&AppDef) -> bool,
+) -> Vec<AppDef> {
+    let mut out = base;
     let mut taken: std::collections::HashSet<String> = out
         .iter()
+        // 只有本机能解析到的内置条目才占 exe 名；失效的内置条目不能把同名的
+        // 自动/手动条目藏掉（换台电脑装到官方默认位置时就是这种情况）。
+        .filter(|a| installed(a))
         .flat_map(|a| {
-            let n = a.exes.iter().map(|x| crate::discover::norm_path(&expand(x).to_string_lossy()));
-            std::iter::once(exe_name(a).to_lowercase()).chain(n).collect::<Vec<_>>()
+            let mut v = vec![exe_name(a).to_lowercase()];
+            if let Some(p) = resolve_exe(a) {
+                // 只按完整路径认覆盖后的 exe；裸文件名可能是通用的 Launcher.exe
+                v.push(crate::discover::norm_path(&p.to_string_lossy()));
+            }
+            v.extend(
+                a.exes
+                    .iter()
+                    .map(|x| crate::discover::norm_path(&expand(x).to_string_lossy())),
+            );
+            v
         })
         .collect();
-    for d in custom_apps().into_iter().chain(discovered()) {
+    for d in extra {
         let path_hit = d
             .exes
             .first()
@@ -697,7 +827,7 @@ pub fn show_uninstalled() -> bool {
 /// 大多数都没装——**它们必须被登记**（换台装了的机器要能自动认出来、路径与档案目录都是对的），
 /// 但不该在没装的机器上把侧栏塞满。想看得见去 设置 → 高级 → 「显示未安装的程序」。
 /// 判据只认三件磁盘事实，不看"登记表里有没有"——否则刚补进来的这批会全部冒出来。
-fn worth_showing(a: &AppDef) -> bool {
+pub(crate) fn worth_showing(a: &AppDef) -> bool {
     if a.discovered {
         return true;
     }
@@ -830,11 +960,16 @@ pub(crate) fn expand(p: &str) -> PathBuf {
     let la = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let ad = std::env::var("APPDATA").unwrap_or_default();
     let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+    let pf86 = std::env::var("ProgramFiles(x86)")
+        .unwrap_or_else(|_| r"C:\Program Files (x86)".into());
+    let sd = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
     let up = home().to_string_lossy().into_owned();
     let s = p
         .replace("{LOCALAPPDATA}", &la)
         .replace("{APPDATA}", &ad)
+        .replace("{PROGRAMFILES_X86}", &pf86)
         .replace("{PROGRAMFILES}", &pf)
+        .replace("{SYSTEMDRIVE}", &sd)
         .replace("{USERPROFILE}", &up);
     // 模板（和 exes 列表）里惯用正斜杠，这里统一落成 Windows 规范形式：
     // 界面上显示、写进 config.json 的路径才不会一半 `\` 一半 `/`
@@ -878,6 +1013,11 @@ fn glob_best(p: &Path) -> Option<PathBuf> {
 }
 
 pub fn resolve_exe(app: &AppDef) -> Option<PathBuf> {
+    // 本机修过的路径优先：内置候选写的是官方默认位置，换台机器/换安装盘后
+    // 由盘点或手动添加写一条覆盖，不必去改共享的内置清单。
+    if let Some(p) = exe_override(&app.id) {
+        return Some(newest_update(&p).unwrap_or(p));
+    }
     let base = app
         .exes
         .iter()
@@ -893,6 +1033,86 @@ pub fn resolve_exe(app: &AppDef) -> Option<PathBuf> {
         })
         .next()?;
     Some(newest_update(&base).unwrap_or(base))
+}
+
+fn exe_override_file() -> PathBuf {
+    base_dir().join("exe-overrides.json")
+}
+
+fn exe_overrides_cache() -> &'static std::sync::Mutex<Option<std::collections::HashMap<String, String>>> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::collections::HashMap<String, String>>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn exe_overrides() -> std::collections::HashMap<String, String> {
+    let mut g = exe_overrides_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(m) = &*g {
+        return m.clone();
+    }
+    let m: std::collections::HashMap<String, String> = fs::read_to_string(exe_override_file())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    *g = Some(m.clone());
+    m
+}
+
+fn save_exe_overrides(m: &std::collections::HashMap<String, String>) {
+    let _ = fs::create_dir_all(base_dir());
+    let p = exe_override_file();
+    let tmp = p.with_extension("json.tmp");
+    if let Ok(s) = serde_json::to_string_pretty(m) {
+        if fs::write(&tmp, s).is_ok() {
+            let _ = fs::rename(&tmp, &p);
+        }
+    }
+}
+
+/// 记下这台机器上某个内置产品的真实 exe 位置。文件独立存放，
+/// 不跟 config.json 抢写（那边有整份覆盖的老问题）。
+pub fn set_exe_override(app_id: &str, exe: &str) {
+    if app_id.is_empty() || exe.is_empty() {
+        return;
+    }
+    let mut m = exe_overrides();
+    m.insert(app_id.to_string(), exe.to_string());
+    save_exe_overrides(&m);
+    *exe_overrides_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(m);
+}
+
+pub fn clear_exe_override(app_id: &str) {
+    let mut m = exe_overrides();
+    if m.remove(app_id).is_none() {
+        return;
+    }
+    save_exe_overrides(&m);
+    *exe_overrides_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(m);
+}
+
+fn exe_override(app_id: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(exe_overrides().get(app_id)?.clone());
+    p.is_file().then_some(p)
+}
+
+/// 盘点/快捷方式找回一个 exe：如果它对应某个本机还没装上的内置产品，
+/// 就写成该产品的本机路径覆盖，返回内置 id；否则返回 None 交给调用方登记成自定义程序。
+pub fn adopt_exe_for_candidate(name: &str, exe: &str) -> Option<String> {
+    let target = adoption_target(&apps(), &|a| resolve_exe(a).is_some(), name, exe)?;
+    set_exe_override(&target, exe);
+    Some(target)
+}
+
+pub fn adopt_discovered(d: &AppDef) -> Option<String> {
+    let exe = d.exes.first()?;
+    adopt_exe_for_candidate(&d.name, exe)
 }
 
 /// MSIX 的启动身份独立于版本目录。由 Windows 激活已注册主应用，
@@ -953,7 +1173,28 @@ pub fn profile_dir(app_id: &str) -> Option<PathBuf> {
     if let Some(p) = adopted_profile_dir(app_id, spec) {
         return Some(p);
     }
+    if let Some(p) = derived_profile(app_id) {
+        return Some(p);
+    }
     resolve_profile(app_id, spec)
+}
+
+/// 有些产品的资料目录不是固定家目录，而是跟着安装位置走（AStudio 的
+/// `<安装目录上一级>/AStudio Data/userdata`）。内置候选只写默认安装位置，
+/// 装到别处时从本机 exe 推一次，不再把开发机的绝对路径写进登记表。
+fn derived_profile(app_id: &str) -> Option<PathBuf> {
+    if app_id != "astudio" {
+        return None;
+    }
+    let exe = resolve_exe(&app_def(app_id)?)?;
+    let p = astudio_data_dir(&exe)?;
+    p.is_dir().then_some(p)
+}
+
+pub(crate) fn astudio_data_dir(exe: &Path) -> Option<PathBuf> {
+    let install = exe.parent()?;
+    let parent = install.parent()?;
+    Some(parent.join("AStudio Data").join("userdata"))
 }
 
 /// 这个候选目录上的链接是不是**本产品换号挂上去的入口**。
@@ -1421,6 +1662,9 @@ pub fn lockers(app_id: &str) -> &'static [&'static str] {
         // 妙手：主程序就叫「妙手.exe」（product.json 的 nameShort），产品标识 catpaw-moon /
         // com.catx.catpaw；进程族里还有它自带的 CLI（paw.exe 是软链，实际还是它自己）。
         "catpaw" => &["妙手.exe", "catpaw.exe"],
+        // 豆包：主进程和它自己拉起的渲染/GPU/工具进程都叫 Doubao.exe（Chromium 那套
+        // --type=xxx 子进程同名），所以只认这一个名字就够。
+        "doubao" => &["doubao.exe"],
         _ => &[],
     }
 }
@@ -1713,6 +1957,116 @@ pub fn swaps_of(cfg: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_app(id: &str, name: &str, exe: &str, discovered: bool) -> AppDef {
+        AppDef {
+            id: id.into(),
+            name: name.into(),
+            kind: "electron".into(),
+            exes: vec![exe.into()],
+            env: String::new(),
+            discovered,
+            isolatable: true,
+            profile: None,
+            first_seen: 0,
+            seen: true,
+        }
+    }
+
+    /// 没装的内置条目不能占名字/exe 名；否则异机新装的同名程序会被 discovery 跳过。
+    #[test]
+    fn uninstalled_curated_does_not_claim_discovery_names() {
+        let app = fake_app(
+            "qoder-cn",
+            "Qoder CN",
+            r"C:\Apps\Curated\Qoder CN\Qoder CN.exe",
+            false,
+        );
+        let none = claimed_names_for(std::slice::from_ref(&app), &|_| false);
+        assert!(!none.contains(&crate::discover::norm("Qoder CN")));
+        assert!(!none.contains(&crate::discover::norm("Qoder CN.exe")));
+        let some = claimed_names_for(&[app], &|_| true);
+        assert!(some.contains(&crate::discover::norm("Qoder CN")));
+        assert!(some.contains(&crate::discover::norm("Qoder CN.exe")));
+    }
+
+    /// 内置条目没装时，同 exe 名的自动/手动条目必须能显示，不能被同名去重吞掉。
+    #[test]
+    fn uninstalled_curated_does_not_shadow_same_exe() {
+        let base = fake_app(
+            "qoder-cn",
+            "Qoder CN",
+            r"C:\Apps\Curated\Qoder CN\Qoder CN.exe",
+            false,
+        );
+        let extra = fake_app("auto-qoder", "Qoder CN", r"C:\Apps\Qoder CN\Qoder CN.exe", true);
+        let merged = merge_extra_apps(vec![base.clone()], vec![extra.clone()], &|a| a.id != "qoder-cn");
+        assert!(merged.iter().any(|a| a.id == "auto-qoder"));
+        let merged2 = merge_extra_apps(vec![base], vec![extra], &|_| true);
+        assert!(!merged2.iter().any(|a| a.id == "auto-qoder"));
+    }
+
+    /// 新 exe 优先收进本机没装上的内置条目，而不是再造一张重复卡。
+    #[test]
+    fn uninstalled_curated_adopts_matching_candidate() {
+        let app = fake_app(
+            "qoder-cn",
+            "Qoder CN",
+            r"C:\Apps\Curated\Qoder CN\Qoder CN.exe",
+            false,
+        );
+        let id = adoption_target(
+            std::slice::from_ref(&app),
+            &|_| false,
+            "Qoder CN",
+            r"C:\Apps\Qoder CN\Qoder CN.exe",
+        );
+        assert_eq!(id.as_deref(), Some("qoder-cn"));
+        assert!(adoption_target(
+            &[app],
+            &|_| true,
+            "Qoder CN",
+            r"C:\Apps\Qoder CN\Qoder CN.exe",
+        )
+        .is_none());
+        // CLI 盘点回来的是 codex（id），显示名是 Codex CLI；按 id 也要能认领
+        let codex = AppDef {
+            kind: "cli".into(),
+            ..fake_app("codex", "Codex CLI", r"C:\Apps\npm\codex.exe", false)
+        };
+        assert_eq!(
+            adoption_target(
+                &[codex],
+                &|_| false,
+                "codex",
+                r"C:\Apps\npm\codex.cmd"
+            )
+            .as_deref(),
+            Some("codex")
+        );
+        // 桌面版 Claude.exe 不能借 id 兜底塞进 Claude Code CLI
+        let cli = AppDef {
+            kind: "cli".into(),
+            ..fake_app("claude", "Claude Code CLI", r"C:\Apps\npm\claude.cmd", false)
+        };
+        assert!(adoption_target(
+            &[cli],
+            &|_| false,
+            "claude",
+            r"C:\Apps\Claude\Claude.exe"
+        )
+        .is_none());
+    }
+
+    /// AStudio 的资料目录跟着安装位置走，不能写死某个盘符。
+    #[test]
+    fn astudio_profile_follows_install_location() {
+        let exe = Path::new(r"C:\Apps\AStudio\AStudio.exe");
+        assert_eq!(
+            astudio_data_dir(exe),
+            Some(PathBuf::from(r"C:\Apps\AStudio Data\userdata"))
+        );
+    }
 
     /// 半截 JSON / 空文件必须退回上一份好数据，不能退回空默认值
     #[test]
@@ -2262,7 +2616,16 @@ mod tests {
         assert_eq!(d, home().join(".dsh"), "登录态在 ~/.dsh，不该漂到 APPDATA 那份 userData");
         let d = profile_dir("marvis").expect("marvis 该有档案目录");
         assert_eq!(d, home().join(".marvis"));
-        assert!(is_reparse_point(&d), ".marvis 是产品自建 symlink，换号判据走不通（见 apps() 注释）");
+        // ~/.marvis 是 Marvis 自己建的 symlink（指向腾讯用户目录）。**本机没装 Marvis 时
+        // 这条路径压根不存在**，此时"是不是 symlink"无从谈起——判红只会让所有人在
+        // 没装过 Marvis 的机器上编译不过（2026-11-10 踩到：本机 Marvis 已卸载）。
+        // 所以只在目录存在时验这条判据。
+        if d.exists() {
+            assert!(
+                is_reparse_point(&d),
+                ".marvis 是产品自建 symlink，换号判据走不通（见 apps() 注释）"
+            );
+        }
         let d = profile_dir("xiaomi-mimo").expect("xiaomi-mimo 该有档案目录");
         assert_eq!(d, PathBuf::from(&ad).join("Xiaomi MiMo"), "实际：{d:?}");
         // 国际版档案解析到 .workbuddy-ai，和国内版 .workbuddy 不撞车

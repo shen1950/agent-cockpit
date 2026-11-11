@@ -31,7 +31,8 @@ const gatewaySuppliers = (() => {
       } catch {}
     };
     let folded = readFold();
-    let providers = [], selected = localStorage.getItem('cockpit-gateway-supplier') || '', busy = false, providerSignature = '';
+    let providers = [], selected = '', busy = false, providerSignature = '';
+    let settingsDialog = null;
     let keyId = '', selectedModel = '', details = [], policies = {}, draft = {};
     let providerEditor = null, capabilityGeneration = 0, providerGeneration = 0, loading = false, modalOpen = false;
     let capabilitiesLoaded = false, capabilitiesLoading = false;
@@ -208,16 +209,51 @@ const gatewaySuppliers = (() => {
 
     function detailView(row) {
       const head = el('div', { class: 'gateway-supplier-head' },
-        el('button', { class: 'gateway-supplier-back', onclick: () => {
-          selected = ''; localStorage.removeItem('cockpit-gateway-supplier');
-          resetCapabilities(); paint();
-        } }, '‹ 返回供应商'),
-        el('b', {}, row.name || '供应商'),
+        el('b', { id: 'supplier-settings-title' }, row.name || '供应商'),
         el('span', { class: 'chip' + (row.off ? ' expired' : ' swap') }, row.off ? '已停用' : '已启用'),
         el('span', { class: 'sp' }),
         el('button', { class: 'btn sm', disabled: busy, onclick: () => toggleProvider(row) }, row.off ? '启用' : '停用'));
-      return el('section', { class: 'panel gateway-supplier-page' + (folded ? ' px-folded' : ''), aria: { label: row.name || '供应商详情' } },
+      return el('div', { class: 'gateway-supplier-settings-content' },
         head, detailPanel(row));
+    }
+
+    function openSettings(row, trigger) {
+      if (busy || modalOpen || settingsDialog) return;
+      selected = row.id;
+      resetCapabilities();
+      const signature = providerSignature;
+      const scroller = host.closest('.pagebody');
+      const scrollTop = scroller?.scrollTop;
+      const close = () => { if (!busy) dialog.close(); };
+      const dialog = el('dialog', { class: 'dialog gateway-supplier-settings',
+        aria: { labelledby: 'supplier-settings-title' } });
+      const footer = el('div', { class: 'gateway-supplier-settings-footer' },
+        el('span', { class: 'gateway-hint' }, '修改后请点击对应分组的保存按钮。'),
+        el('button', { class: 'btn', type: 'button', onclick: close }, '关闭'));
+      dialog.append(detailView(row), footer);
+      settingsDialog = dialog;
+      dialog.addEventListener('keydown', event => {
+        if (event.key === 'Escape') event.stopPropagation();
+      });
+      dialog.addEventListener('cancel', event => {
+        event.preventDefault();
+        close();
+      });
+      dialog.addEventListener('close', () => {
+        settingsDialog = null;
+        selected = '';
+        resetCapabilities();
+        dialog.remove();
+        if (signature !== providerSignature) paint();
+        const target = trigger.isConnected ? trigger : [...host.querySelectorAll('.gateway-supplier-row')]
+          .find(button => button.dataset.providerId === row.id);
+        target?.focus({ preventScroll: true });
+        if (scroller) scroller.scrollTop = scrollTop;
+      }, { once: true });
+      document.body.append(dialog);
+      dialog.showModal();
+      footer.querySelector('button').focus({ preventScroll: true });
+      if (keyId) loadCapabilities();
     }
 
     async function addSupplierModal() {
@@ -343,7 +379,7 @@ const gatewaySuppliers = (() => {
         el('b', {}, '供应商'), el('span', { class: 'sp' }),
         el('button', { class: 'btn sm', onclick: () => { folded = !folded; writeFold(folded); paint(); } }, folded ? '展开' : '收起'),
         el('button', { class: 'btn sm', disabled: busy, onclick: () => load(true) }, '刷新'),
-        el('button', { class: 'btn primary sm', disabled: busy, onclick: addSupplierModal }, '添加供应商')), message);
+        el('button', { class: 'btn primary sm', disabled: busy, onclick: addSupplierModal }, '添加供应商')), message.cloneNode(true));
       if (!providers.length) {
         section.append(el('p', { class: 'gateway-supplier-empty' },
           '暂无供应商。点击「添加供应商」，选择本机账号、API Key 或本地桥。'));
@@ -357,11 +393,9 @@ const gatewaySuppliers = (() => {
         });
         const unavailable = row.supported === false || !row.has_token;
         const item = el('div', { class: 'gateway-supplier-item' });
-        item.append(el('button', { class: 'gateway-supplier-row', disabled: busy, onclick: () => {
-          selected = row.id; localStorage.setItem('cockpit-gateway-supplier', selected);
-          resetCapabilities(); paint();
-          if (keyId) loadCapabilities();
-        } },
+        item.append(el('button', { class: 'gateway-supplier-row', disabled: busy,
+          data: { providerId: row.id }, aria: { haspopup: 'dialog' },
+          onclick: event => openSettings(row, event.currentTarget) },
           el('span', { class: 'gateway-supplier-label' },
             el('b', {}, row.name || '供应商'),
             el('small', {}, row.app_name || row.site_name || row.kind),
@@ -398,10 +432,11 @@ const gatewaySuppliers = (() => {
     }
 
     async function load(force = false) {
-      if (busy || loading) return;
+      if (busy || loading || settingsDialog) return;
       loading = true;
       try {
         const changed = await refreshProviders();
+        if (settingsDialog) return;
         if (changed || force) paint();
         if (selected && keyId && !capabilitiesLoaded && !details.length) loadCapabilities();
       } catch (error) {
@@ -414,10 +449,22 @@ const gatewaySuppliers = (() => {
 
     function paint() {
       if (!host) return;
-      const selectedRow = providers.find(row => row.id === selected);
+      if (settingsDialog) {
+        const selectedRow = providers.find(row => row.id === selected);
+        if (!selectedRow) { settingsDialog.close(); return; }
+        const previous = settingsDialog.querySelector('.gateway-supplier-settings-content');
+        const scrollTop = previous.querySelector('.gateway-supplier-detail').scrollTop;
+        const focusedLabel = settingsDialog.contains(document.activeElement)
+          ? document.activeElement.getAttribute('aria-label') : null;
+        const content = detailView(selectedRow);
+        previous.replaceWith(content);
+        if (focusedLabel) [...content.querySelectorAll('[aria-label]')]
+          .find(node => node.getAttribute('aria-label') === focusedLabel)?.focus({ preventScroll: true });
+        content.querySelector('.gateway-supplier-detail').scrollTop = scrollTop;
+        return;
+      }
       clear(host);
-      if (selectedRow) host.append(detailView(selectedRow));
-      else host.append(listView());
+      host.append(listView());
     }
 
     return { get providers() { return providers; }, load, paint };

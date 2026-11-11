@@ -206,3 +206,16 @@ test('in-flight background scans retain old charts and complete after a manual r
   assert.equal(usage.pollDelay(true, true, true, 30), 0);
   assert.equal(usage.pollDelay(true, false, false, 0), 0);
 });
+
+test('totals are labeled with the window they actually cover', () => {
+  const now = new Date(2026, 10, 11, 12, 0, 0);
+  assert.equal(usage.rangeLabel('all', '', '', now), '累计 Token');
+  assert.equal(usage.rangeLabel('1', '', '', now), '今天 Token');
+  assert.equal(usage.rangeLabel('7', '', '', now), '近 7 天 Token');
+  assert.equal(usage.rangeLabel('30', '', '', now), '近 30 天 Token');
+  assert.equal(usage.rangeLabel('365', '', '', now), '近 365 天 Token');
+  assert.equal(usage.rangeLabel('custom', '2026-10-01', '2026-10-29', now), '自定义范围 Token');
+  assert.equal(usage.rangeWindow('all', '', '', now), '');
+  assert.equal(usage.rangeWindow('30', '', '', now), '2026-10-13 至 2026-11-11');
+  assert.equal(usage.rangeWindow('custom', '2026-09-30', '2026-10-29', now), '2026-09-30 至 2026-10-29');
+});

@@ -28,18 +28,34 @@ const SKIP_HINTS: &[&str] = &[
     "sogou", "搜狗", "皮肤盒子", "输入法", "microsoft input",
 ];
 
-/// 用户自己的 AI 软件安装根目录：落在这里面的程序一律收录，新装即被发现
+/// 用户自己登记的 AI 软件安装根目录（config.json 的 `ai_roots`）。
+/// 不再写死开发者机器上的盘符；默认安装位置 + 快捷方式 + 注册表盘点已经能覆盖大多数机器。
 fn ai_install_roots() -> Vec<PathBuf> {
-    vec![PathBuf::from("D:/Artificial_Intelligence")]
+    static ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            crate::registry::load_config()
+                .get("ai_roots")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .clone()
 }
 
 /// 路径归一化：统一分隔符与大小写，便于前缀比较，也便于和手工适配条目按**绝对路径**去重。
-/// （Windows 传回的路径是反斜杠，如果直接和 "D:/Artificial_Intelligence" 比前缀永远不成立）
+/// （Windows 传回的路径是反斜杠，如果直接和正斜杠写的安装根比前缀永远不成立）
 pub(crate) fn norm_path(p: &str) -> String {
     p.to_lowercase().replace('\\', "/")
 }
 
-pub(crate) fn is_ai(name: &str, exe: &str) -> bool {
+pub(crate) fn is_ai_in(name: &str, exe: &str, roots: &[PathBuf]) -> bool {
     let hay = format!("{} {}", name, exe).to_lowercase();
     if SKIP_HINTS.iter().any(|s| hay.contains(s)) {
         return false;
@@ -47,11 +63,15 @@ pub(crate) fn is_ai(name: &str, exe: &str) -> bool {
     if AI_HINTS.iter().any(|s| hay.contains(s)) {
         return true;
     }
-    // 落在用户自己的 AI 安装根目录里的一律收录（分隔符/大小写无关）
+    // 落在用户登记的 AI 安装根目录里的一律收录（分隔符/大小写无关）
     let exe_n = norm_path(exe);
-    ai_install_roots()
+    roots
         .iter()
         .any(|r| exe_n.starts_with(&norm_path(&r.to_string_lossy())))
+}
+
+pub(crate) fn is_ai(name: &str, exe: &str) -> bool {
+    is_ai_in(name, exe, &ai_install_roots())
 }
 
 /// Electron/Chromium 判定：同目录有 resources.pak / locales 才能用 --user-data-dir 隔离
@@ -250,12 +270,14 @@ mod tests {
     }
 
     /// Windows 实际传回的是反斜杠路径：安装根目录规则必须照样命中，
-    /// 否则 D:\Artificial_Intelligence 下名字不含 AI 关键词的程序（AStudio 等）会被漏掉。
+    /// 否则登记根下名字不含 AI 关键词的程序（AStudio 等）会被漏掉。
     #[test]
     fn install_root_matches_windows_backslash_paths() {
-        assert!(is_ai("AStudio", r"D:\Artificial_Intelligence\AStudio\AStudio.exe"));
-        assert!(is_ai("SomeTool", r"D:\Artificial_Intelligence\SomeTool\SomeTool.exe"));
-        assert!(is_ai("AStudio", "D:/Artificial_Intelligence/AStudio/AStudio.exe"));
+        let roots = vec![PathBuf::from("C:/Apps/Curated")];
+        assert!(is_ai_in("AStudio", r"C:\Apps\Curated\AStudio\AStudio.exe", &roots));
+        assert!(is_ai_in("SomeTool", r"C:\Apps\Curated\SomeTool\SomeTool.exe", &roots));
+        assert!(is_ai_in("AStudio", "C:/Apps/Curated/AStudio/AStudio.exe", &roots));
+        assert!(!is_ai_in("Notepad", r"C:\Windows\notepad.exe", &roots));
     }
 
     /// 装在别处、但名字本身是 AI 产品的也要能认出来（Antigravity 装在 AppData 下）
@@ -269,7 +291,7 @@ mod tests {
 
     #[test]
     fn uninstallers_and_plain_apps_stay_out() {
-        assert!(!is_ai("Uninstall AStudio", r"D:\Artificial_Intelligence\AStudio\Uninstall AStudio.exe"));
+        assert!(!is_ai("Uninstall AStudio", r"C:\Apps\Curated\AStudio\Uninstall AStudio.exe"));
         assert!(!is_ai("Notepad", r"C:\Windows\notepad.exe"));
     }
 
@@ -303,11 +325,11 @@ mod tests {
         assert!(skip.contains(&norm("WorkBuddyAI.exe")), "exe 键没进认领集合：去重会漏");
         // ③ 完整判据拦住扫描候选（反斜杠路径、大小写都得认）
         assert!(
-            claimed_by_manual(&skip, "WorkBuddy AI", r"D:\Artificial_Intelligence\WorkBuddyAI\WorkBuddyAI.exe"),
+            claimed_by_manual(&skip, "WorkBuddy AI", r"C:\Apps\Curated\WorkBuddyAI\WorkBuddyAI.exe"),
             "内置 workbuddy-intl 存在时不得再生成 auto-workbuddyai"
         );
         assert!(
-            claimed_by_manual(&skip, "workbuddy ai", r"d:\ARTIFICIAL_INTELLIGENCE\workbuddyai\WORKBUDDYAI.EXE"),
+            claimed_by_manual(&skip, "workbuddy ai", r"c:\APPS\CURATED\workbuddyai\WORKBUDDYAI.EXE"),
             "比对是大小写不敏感的绝对路径/归一化名，换个写法也要拦住"
         );
         // ④ 国内版那条不能被国际版 exe 顶掉（两张卡是两个安装，各自认各自的）
@@ -337,13 +359,13 @@ mod tests {
         assert!(claimed_by_manual(
             &skip,
             "千问办公",
-            r"D:\Artificial_Intelligence\QwenWorkCN\Launcher.exe"
+            r"C:\Apps\Curated\QwenWorkCN\Launcher.exe"
         ));
-        assert!(claimed_by_manual(
-            &skip,
-            "QwenWork 启动器",
-            "d:/artificial_intelligence/qwenworkcn/launcher.exe"
-        ));
+        let launcher =
+            crate::registry::expand("{LOCALAPPDATA}/Programs/QwenWorkCN/Launcher.exe");
+        let launcher = launcher.to_string_lossy().into_owned();
+        assert!(claimed_by_manual(&skip, "QwenWork 启动器", &launcher));
+        assert!(claimed_by_manual(&skip, "QwenWork 启动器", &launcher.to_lowercase()));
         // 别的路径上的 Launcher.exe 不许被误吞
         assert!(
             !skip.contains(&norm("Launcher.exe")),

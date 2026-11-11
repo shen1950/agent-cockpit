@@ -22,7 +22,21 @@ Cockpit Tools 的具体对照入口另见 [ChatGPT 登录适配说明](docs/CHAT
 
 ### CPython 嵌入式运行时
 
-便携程序内含官方 CPython Windows x64 嵌入式归档，用于本地用量采集与会话索引，首次使用会在数据根解压。归档内的 `LICENSE.txt` 包含 Python Software Foundation 许可及所附第三方库声明，分发和解压时必须保留。版本、来源、文件摘要见 [src-tauri/vendor/README.md](src-tauri/vendor/README.md)。不能把“用户无需安装 Python”表述成“程序不包含第三方运行时”。
+便携程序内含官方 CPython Windows x64 嵌入式归档，用于本地用量采集、会话索引与签到/额度后端，首次使用会在数据根解压。归档内的 `LICENSE.txt` 包含 Python Software Foundation 许可及所附第三方库声明，分发和解压时必须保留。版本、来源、文件摘要见 [src-tauri/vendor/README.md](src-tauri/vendor/README.md)。不能把“用户无需安装 Python”表述成“程序不包含第三方运行时”。
+
+### 内置 agenthub 与 Python 加密库
+
+签到与额度直读由 [shen1950/agent-memory-suite](https://github.com/shen1950/agent-memory-suite) 的 `agenthub.py` 提供，**MIT**，Copyright (c) 2026 shen1950；源码随程序保存在 `src-tauri/vendor/agenthub.py` 与 `console.html`，许可原文见 [AGENTHUB-LICENSE.txt](docs/third-party/AGENTHUB-LICENSE.txt)。用户自己安装的 `agenthub` 只作为内置运行时损坏时的回退，不是运行必需。
+
+内置运行时另外包含以下 Python 包，打包在 `src-tauri/vendor/agenthub-libs.zip`，首次使用时解压到数据根的 `usage-runtime/`：
+
+| 组件 | 版本 | 许可 | 用途 |
+|---|---|---|---|
+| `cryptography` | 49.0.0 | Apache-2.0 OR BSD-3-Clause | AES-GCM / 客户端凭据解密 |
+| `cffi` | 2.1.0 | MIT | cryptography 的 C 扩展接口 |
+| `pycparser` | 3.0 | BSD-3-Clause | cffi 的 C 声明解析 |
+
+许可原文分别见 [CRYPTOGRAPHY-LICENSE.txt](docs/third-party/CRYPTOGRAPHY-LICENSE.txt)、[CFFI-LICENSE.txt](docs/third-party/CFFI-LICENSE.txt)、[PYCPARSER-LICENSE.txt](docs/third-party/PYCPARSER-LICENSE.txt)。
 
 ### AgentFind 会话索引服务
 

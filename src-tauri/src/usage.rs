@@ -17,7 +17,12 @@ const SCRIPT: &str = include_str!("../scripts/usage-local.py");
 // 90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159.
 // The original distribution includes LICENSE.txt and third-party notices.
 const PYTHON_ARCHIVE: &[u8] = include_bytes!("../vendor/python-embed.zip");
-const PYTHON_VERSION_DIR: &str = "python-3.14.10-90905e64a840557d";
+// Bundled agenthub (agent-memory-suite, MIT) + cryptography/cffi/pycparser.
+// Kept in a separate archive because the official Python embed zip is flat-only.
+const AGENTHUB_LIBS: &[u8] = include_bytes!("../vendor/agenthub-libs.zip");
+const AGENTHUB_SCRIPT: &str = include_str!("../vendor/agenthub.py");
+const AGENTHUB_CONSOLE: &str = include_str!("../vendor/console.html");
+const PYTHON_VERSION_DIR: &str = "python-3.14.10-90905e64a840557d-agenthub1";
 const BOOTSTRAP: &str = "import io,json,sys; p=json.loads(sys.stdin.buffer.read().decode('utf-8')); sys.stdin=io.StringIO(json.dumps(p['request'])); exec(compile(p['script'],'<AgentCockpit usage>','exec'),{'__name__':'__main__'})";
 
 fn supported(app: &str) -> bool {
@@ -84,6 +89,14 @@ fn validate_runtime(dir: &Path) -> Result<(), String> {
         if entry.components().count() != 1 || item.is_dir() || item.size() > 100 * 1024 * 1024 {
             return Err("内置运行环境包含无效文件。".into());
         }
+        // `python314._pth` 会被 agenthub 的 site-packages 路径改写，
+        // 不能按官方归档逐字节比对；内容由 validate_agenthub_libs 校验。
+        if entry == Path::new("python314._pth") {
+            if !dir.join(&entry).is_file() {
+                return Err("内置运行环境不完整，请检查磁盘与权限。".into());
+            }
+            continue;
+        }
         let target = dir.join(entry);
         if crate::registry::is_reparse_point(&target) { return Err("内置运行环境文件包含链接。".into()); }
         let mut file = std::fs::File::open(&target).map_err(|_| "内置运行环境不完整，请检查磁盘与权限。".to_string())?;
@@ -104,6 +117,96 @@ fn validate_runtime(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 内置签到运行库（cryptography/cffi/pycparser）是嵌套目录，不能塞进官方的扁平
+/// Python embed zip。单独解压到同一个 staging，并覆盖 `python314._pth` 把
+/// `Lib\site-packages` 加进 sys.path。
+fn extract_agenthub_libs(dir: &Path) -> Result<(), String> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(AGENTHUB_LIBS))
+        .map_err(|_| "内置签到运行库损坏。".to_string())?;
+    for i in 0..archive.len() {
+        let mut item = archive.by_index(i).map_err(|_| "内置签到运行库损坏。".to_string())?;
+        let rel = item
+            .enclosed_name()
+            .ok_or("内置签到运行库包含无效路径。")?
+            .to_path_buf();
+        let target = dir.join(&rel);
+        if item.is_dir() {
+            std::fs::create_dir_all(&target)
+                .map_err(|_| "无法创建内置签到运行库目录。".to_string())?;
+            continue;
+        }
+        if item.size() > 32 * 1024 * 1024 {
+            return Err("内置签到运行库包含异常大文件。".into());
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|_| "无法创建内置签到运行库目录。".to_string())?;
+        }
+        if crate::registry::is_reparse_point(&target) {
+            return Err("内置签到运行库文件包含链接。".into());
+        }
+        let mut out = std::fs::File::create(&target)
+            .map_err(|_| "无法解压内置签到运行库。".to_string())?;
+        std::io::copy(&mut item, &mut out)
+            .map_err(|_| "无法解压内置签到运行库。".to_string())?;
+    }
+    Ok(())
+}
+
+fn write_agenthub_script(dir: &Path) -> Result<(), String> {
+    std::fs::write(dir.join("agenthub.py"), AGENTHUB_SCRIPT)
+        .map_err(|_| "无法写入内置 agenthub。".to_string())?;
+    std::fs::write(dir.join("console.html"), AGENTHUB_CONSOLE)
+        .map_err(|_| "无法写入内置 agenthub 页面。".to_string())?;
+    Ok(())
+}
+
+fn validate_agenthub_libs(dir: &Path) -> Result<(), String> {
+    let pth = std::fs::read_to_string(dir.join("python314._pth")).unwrap_or_default();
+    let has_sp = pth.lines().any(|l| {
+        let n = l.trim().replace('/', "\\");
+        n.eq_ignore_ascii_case("Lib\\site-packages")
+    });
+    if !has_sp {
+        return Err("内置签到运行库路径未登记。".into());
+    }
+    for rel in [
+        "agenthub.py",
+        "console.html",
+        "Lib/site-packages/cryptography/__init__.py",
+        "Lib/site-packages/cffi/__init__.py",
+        "Lib/site-packages/pycparser/__init__.py",
+    ] {
+        if !dir.join(rel).is_file() {
+            return Err("内置签到运行库不完整。".into());
+        }
+    }
+    let sp = dir.join("Lib/site-packages");
+    let has_backend = std::fs::read_dir(&sp)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+                n.starts_with("_cffi_backend") && n.ends_with(".pyd")
+            })
+        })
+        .unwrap_or(false);
+    if !has_backend {
+        return Err("内置签到运行库缺少 cffi 后端。".into());
+    }
+    for rel in [
+        "Lib",
+        "Lib/site-packages",
+        "Lib/site-packages/cryptography",
+        "Lib/site-packages/cffi",
+        "Lib/site-packages/pycparser",
+    ] {
+        if crate::registry::is_reparse_point(&dir.join(rel)) {
+            return Err("内置签到运行库目录包含链接。".into());
+        }
+    }
+    Ok(())
+}
+
 fn prepare_runtime_at(base: &Path) -> Result<PathBuf, String> {
     if !base.is_absolute() { return Err("驾驶舱数据目录无效。".into()); }
     let parent = base.join("usage-runtime");
@@ -111,7 +214,11 @@ fn prepare_runtime_at(base: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&parent).map_err(|_| "无法创建内置运行环境目录，请检查磁盘空间和权限。".to_string())?;
     if crate::registry::is_reparse_point(&parent) { return Err("用量运行环境目录包含链接，已停止读取。".into()); }
     let destination = parent.join(PYTHON_VERSION_DIR);
-    if destination.exists() { validate_runtime(&destination)?; return Ok(destination.join("python.exe")); }
+    if destination.exists() {
+        validate_runtime(&destination)?;
+        validate_agenthub_libs(&destination)?;
+        return Ok(destination.join("python.exe"));
+    }
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let staging = parent.join(format!(".install-{}-{nonce}", std::process::id()));
     std::fs::create_dir(&staging).map_err(|_| "无法创建内置运行环境临时目录。".to_string())?;
@@ -126,16 +233,34 @@ fn prepare_runtime_at(base: &Path) -> Result<PathBuf, String> {
             .map_err(|_| "无法解压内置运行环境，请检查磁盘空间和权限。".to_string())?;
         std::io::copy(&mut item, &mut out).map_err(|_| "无法解压内置运行环境。".to_string())?;
     }
+    extract_agenthub_libs(&staging)?;
+    write_agenthub_script(&staging)?;
     validate_runtime(&staging)?;
+    validate_agenthub_libs(&staging)?;
     if std::fs::rename(&staging, &destination).is_err() {
         // Another process may have completed installation first; accept only a verified copy.
         validate_runtime(&destination)?;
+        validate_agenthub_libs(&destination)?;
     }
     Ok(destination.join("python.exe"))
 }
 
 pub(crate) fn bundled_python() -> Result<PathBuf, String> {
     bundled_python_at(&crate::registry::base_dir(), &RUNTIME)
+}
+
+/// 内置 agenthub 的 (python.exe, agenthub.py)。运行时首次使用时会解压到
+/// 数据根的 `usage-runtime/`，和用量采集共用同一份。
+pub(crate) fn bundled_agenthub() -> Result<(PathBuf, PathBuf), String> {
+    let py = bundled_python()?;
+    let script = py
+        .parent()
+        .ok_or("内置运行环境路径无效。")?
+        .join("agenthub.py");
+    if !script.is_file() {
+        return Err("内置 agenthub 缺失。".into());
+    }
+    Ok((py, script))
 }
 
 fn bundled_python_at(base: &Path, runtime: &Mutex<Option<(PathBuf, PathBuf)>>) -> Result<PathBuf, String> {
@@ -282,6 +407,35 @@ mod tests {
     }
 
     #[test]
+    fn bundled_agenthub_has_cryptography_and_script() {
+        let temp = std::env::temp_dir();
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = temp.join(format!("cockpit-agenthub-runtime-{}-{stamp}", std::process::id()));
+        fs::create_dir(&base).expect("create isolated agenthub test directory");
+        let python = prepare_runtime_at(&base).expect("unpack embedded runtime with agenthub libs");
+        let script = python.parent().unwrap().join("agenthub.py");
+        assert!(script.is_file(), "bundled agenthub script must be present");
+        let aes = Command::new(&python)
+            .args(["-I", "-X", "utf8", "-c",
+                "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print('aesgcm-ok')"])
+            .env("PATH", "")
+            .output()
+            .expect("run bundled interpreter");
+        assert!(aes.status.success(), "stderr={}", String::from_utf8_lossy(&aes.stderr));
+        assert!(String::from_utf8_lossy(&aes.stdout).contains("aesgcm-ok"));
+        let help = Command::new(&python)
+            .args(["-I", "-X", "utf8"])
+            .arg(&script)
+            .arg("--help")
+            .env("PATH", "")
+            .output()
+            .expect("run bundled agenthub");
+        assert!(help.status.success(), "stderr={}", String::from_utf8_lossy(&help.stderr));
+        assert!(String::from_utf8_lossy(&help.stdout).contains("checkin"));
+        fs::remove_dir_all(base.canonicalize().unwrap()).unwrap();
+    }
+
+    #[test]
     fn runtime_follows_data_directory_changes() {
         let temp = std::env::temp_dir();
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -303,11 +457,29 @@ mod tests {
         fs::remove_dir_all(resolved).unwrap();
     }
 
+    fn isolated_usage_profile() -> Option<tempfile::TempDir> {
+        let thread = std::thread::current();
+        let test = thread.name().expect("named test thread");
+        if std::env::var("COCKPIT_USAGE_FIXTURE").as_deref() == Ok(test) {
+            return Some(tempfile::tempdir().expect("create isolated profile"));
+        }
+        let root = tempfile::tempdir().expect("create isolated cockpit home");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("AGENT_COCKPIT_HOME", root.path())
+            .env("COCKPIT_USAGE_FIXTURE", test)
+            .status().unwrap();
+        assert!(status.success(), "{test} failed in isolated cockpit home");
+        assert!(root.path().join("usage-cache").is_dir(), "collector must use the isolated home");
+        None
+    }
+
     #[test]
     fn parse_codex_token_count() {
-        let dir = std::env::temp_dir().join("cockpit-usage-test");
+        let Some(profile) = isolated_usage_profile() else { return };
+        let dir = profile.path();
         let sessions = dir.join("sessions");
-        let _ = fs::create_dir_all(&sessions);
+        fs::create_dir_all(&sessions).unwrap();
         let f = sessions.join("rollout.jsonl");
         let mut lines = vec![
             r#"{"type":"session_meta","payload":{}}"#,
@@ -320,7 +492,7 @@ mod tests {
         lines.push(
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":6,"total_tokens":230}}}}"#,
         );
-        let _ = fs::write(&f, lines.join("\n"));
+        fs::write(&f, lines.join("\n")).unwrap();
 
         let v = compute("codex", dir.to_string_lossy().as_ref()).expect("应能聚合出用量");
         assert_eq!(v["total"].as_f64(), Some(230.0), "应取最后一次累计值");
@@ -330,14 +502,14 @@ mod tests {
 
         // 非 codex（空目录）返回 None：claude 只在 projects/ 有日志时才给得出
         assert!(compute("marvis", dir.to_string_lossy().as_ref()).is_none());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn trend_groups_by_local_day_and_sessions() {
-        let dir = std::env::temp_dir().join("cockpit-trend-test");
+        let Some(profile) = isolated_usage_profile() else { return };
+        let dir = profile.path();
         let sessions = dir.join("sessions");
-        let _ = fs::create_dir_all(&sessions);
+        fs::create_dir_all(&sessions).unwrap();
         let f = sessions.join("rollout.jsonl");
         // 同一天两轮（增量 70 + 80），另一天一轮（增量 40）；
         // 2026-05-27T16:20:00Z 在北京时间已是 5-28，按本机时区归日
@@ -346,7 +518,7 @@ mod tests {
             r#"{"type":"event_msg","timestamp":"2026-05-27T07:00:00.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":80},"total_token_usage":{"total_tokens":150}}}}"#,
             r#"{"type":"event_msg","timestamp":"2026-05-27T16:20:00.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":40},"total_token_usage":{"total_tokens":40}}}}"#,
         ];
-        let _ = fs::write(&f, lines.join("\n"));
+        fs::write(&f, lines.join("\n")).unwrap();
         let t = compute_trend("codex", dir.to_string_lossy().as_ref()).expect("应能聚出按天序列");
         assert_eq!(t["unit"], "tokens");
         assert_eq!(t["total"].as_f64(), Some(190.0));
@@ -359,29 +531,28 @@ mod tests {
         assert_eq!(t["peak"].as_f64(), Some(150.0));
         assert_eq!(t["peak_date"], "2026-05-27");
         assert_eq!(t["source"], "本机 Codex 会话日志");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn trend_reads_claude_projects_logs() {
-        let dir = std::env::temp_dir().join("cockpit-trend-claude");
+        let Some(profile) = isolated_usage_profile() else { return };
+        let dir = profile.path();
         let projs = dir.join("projects");
-        let _ = fs::create_dir_all(&projs);
+        fs::create_dir_all(&projs).unwrap();
         let f = projs.join("s1.jsonl");
-        let _ = fs::write(
+        fs::write(
             &f,
             concat!(
                 r#"{"type":"user","timestamp":"2026-10-01T02:00:00.000Z","message":{"role":"user"}}"#,
                 "\n",
                 r#"{"type":"assistant","timestamp":"2026-10-01T02:00:05.000Z","message":{"role":"assistant","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":5}}}"#,
             ),
-        );
+        ).unwrap();
         let t = compute_trend("claude", dir.to_string_lossy().as_ref()).expect("应能聚出按天序列");
         assert_eq!(t["total"].as_f64(), Some(155.0), "四种 usage 全计入");
         assert_eq!(t["days"][0]["sessions"].as_i64(), Some(1));
         assert_eq!(t["source"], "本机 Claude Code 会话日志");
         // 没日志的产物：整块不出现，不摆空图
-        assert!(compute_trend("claude", std::env::temp_dir().join("cockpit-trend-none").to_string_lossy().as_ref()).is_none());
-        let _ = fs::remove_dir_all(&dir);
+        assert!(compute_trend("claude", dir.join("missing").to_string_lossy().as_ref()).is_none());
     }
 }

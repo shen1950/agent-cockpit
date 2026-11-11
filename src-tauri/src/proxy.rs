@@ -664,6 +664,11 @@ impl Proxy {
             self.serve_paw(req, &method, &path, &body, &up, &via, &route.dist_id, model.clone());
             return;
         }
+        // 豆包：进程内云端直连（www.doubao.com/samantha/chat/completion），翻译层在 doubao.rs
+        if crate::doubao::is_doubao_base(&up.base_url) {
+            self.serve_doubao(req, &method, &path, &body, &up, &via, &route.dist_id, model.clone());
+            return;
+        }
         let t0 = std::time::Instant::now();
         let qoder = crate::qproxy::is_qoder_base(&up.base_url);
 
@@ -1603,6 +1608,123 @@ impl Proxy {
         }
     }
 
+    /// 豆包上游：**进程内云端直连**（协议底账见 doubao.rs）。
+    /// OpenAI 进 → /samantha/chat/completion 出 → 豆包 SSE 翻回 OpenAI SSE。
+    /// 与妙手那条同形，但两处不同：
+    ///   * 豆包 web 没有 tool_calls 协议，见 tools 就直接拒（不假装支持，免得客户端拿到
+    ///     一段"看起来像回答、其实把 JSON 夹在自然语言里"的输出）；
+    ///   * 不返回 token 用量，usage 如实留空，别编数字。
+    fn serve_doubao(
+        &self,
+        req: crate::gateway_cost::Metered,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        up: &crate::gateway::Upstream,
+        via: &str,
+        dist_id: &str,
+        model: Option<String>,
+    ) {
+        let trimmed = path.trim_end_matches('/');
+        if method == "GET" && trimmed.ends_with("models") {
+            self.push_log(method, path, None, 200, "-", "-", via);
+            let _ = req.respond(text_response(
+                200,
+                &crate::doubao::model_ids().to_string(),
+            ));
+            return;
+        }
+        let v: Value = serde_json::from_slice(body).unwrap_or(json!({}));
+        if crate::doubao::wants_tools(&v) {
+            self.push_log(method, path, model, 400, &up.label, &up.pool, via);
+            let _ = req.respond(text_response(
+                400,
+                &json!({ "error": {
+                    "message": "豆包这条上游只支持纯文本对话：豆包 web 没有 tools/function calling 协议，\
+                                硬翻译会把回答搅成自然语言夹 JSON。请把它用在不需要工具的客户端上。",
+                    "type": "unsupported" } })
+                .to_string(),
+            ));
+            return;
+        }
+        let prompt = crate::doubao::flatten(&v["messages"]);
+        if prompt.trim().is_empty() {
+            self.push_log(method, path, model, 400, &up.label, &up.pool, via);
+            let _ = req.respond(text_response(
+                400,
+                &json!({ "error": { "message": "messages 里没有可用文本" } }).to_string(),
+            ));
+            return;
+        }
+        let want = model.as_deref().unwrap_or("doubao");
+        let used = crate::doubao::model_for_stream(want, &crate::doubao::models());
+        let display = want.rsplit_once('/').map(|(_, b)| b).unwrap_or(want);
+        let stream = v["stream"].as_bool().unwrap_or(false);
+
+        let mut round = match crate::doubao::DoubaoRound::open(&prompt, &used) {
+            Ok(r) => r,
+            Err(e) => {
+                let status = if e.contains("拒了会话") || e.contains("读不到豆包登录态") {
+                    401
+                } else {
+                    502
+                };
+                self.push_log(method, path, model, status, &up.label, &up.pool, via);
+                let _ = req.respond(text_response(
+                    status,
+                    &json!({ "error": { "message": e, "type": "auth_or_upstream" } }).to_string(),
+                ));
+                return;
+            }
+        };
+
+        let mut tr = crate::doubao::DoubaoTranslator::new(round.reader(), display);
+        let state = tr.shared();
+        if !stream {
+            let out = crate::doubao::collect_completion(&mut tr, display);
+            round.cleanup();
+            let s = state.lock().map(|g| g.clone()).unwrap_or_default();
+            if let Some((kind, msg)) = &s.error {
+                let status = if kind == "auth" { 401 } else { 502 };
+                self.push_log(method, path, model, status, &up.label, &up.pool, via);
+                let _ = req.respond(text_response(
+                    status,
+                    &json!({ "error": { "message": msg, "type": kind } }).to_string(),
+                ));
+                return;
+            }
+            self.push_log(method, path, model, 200, &up.label, &up.pool, via);
+            if !dist_id.is_empty() {
+                gateway::bump_dist(dist_id, &up.label);
+            }
+            let _ = req.respond(text_response(200, &out.to_string()));
+            return;
+        }
+        // 流式：边读边翻，respond 返回（流写完）后才收场与记账
+        let _ = req.respond(Response::new(
+            StatusCode(200),
+            vec![
+                header("Content-Type", "text/event-stream; charset=utf-8"),
+                header("Cache-Control", "no-cache"),
+                cors_header(),
+            ],
+            tr,
+            None,
+            None,
+        ));
+        round.cleanup();
+        let s = state.lock().map(|g| g.clone()).unwrap_or_default();
+        let status = match &s.error {
+            Some((kind, _)) if kind == "auth" => 401,
+            Some(_) => 502,
+            None => 200,
+        };
+        self.push_log(method, path, model, status, &up.label, &up.pool, via);
+        if !dist_id.is_empty() && s.error.is_none() {
+            gateway::bump_dist(dist_id, &up.label);
+        }
+    }
+
     /// WorkBuddy 上游：OpenAI 进、OpenAI 出。上游本身就是 OpenAI 形状，
     /// 我们只改头族 + 少量 body 字段（system 首条 / prompt_cache_key / 模型别名）。
     ///
@@ -1869,7 +1991,7 @@ fn known_owners() -> &'static [&'static str] {
     // 前缀在这张表里，客户端填 `owner/模型` 才会被切成「按这家挑上游 + 报文里剥成裸名」。
     // 少登记一家的后果是：同名模型在几家之间互相漂（glm-5.3-flash 谁都有）。
     &["workbuddy", "workbuddy-intl", "trae", "qoder", "qoder-cn", "opencode", "astudio",
-      "qwenwork", "catpaw", "minimax", "zcode"]
+      "qwenwork", "catpaw", "minimax", "zcode", "doubao"]
 }
 
 /// 给一家自己的模型清单打上 `owner/` 前缀（幂等：已经带过的不重复加）。
@@ -1947,6 +2069,10 @@ pub(crate) fn owner_of_base(base: &str) -> Option<&'static str> {
     // 妙手：进程内云端直连，靠协议标记认
     if crate::pawbridge::is_paw_base(base) {
         return Some("catpaw");
+    }
+    // 豆包：同样靠协议标记（doubao://chat），不指向任何真实主机
+    if crate::doubao::is_doubao_base(base) {
+        return Some("doubao");
     }
     None
 }
@@ -2112,6 +2238,19 @@ fn models_for(ups: &[Upstream]) -> Vec<Value> {
                         "name": m["name"].clone(),
                         "free": m["free"].clone(),
                         "rate": m["rate"].clone(),
+                        "vision": m["vision"].clone(),
+                    }),
+                );
+            }
+        } else if crate::doubao::is_doubao_base(&up.base_url) {
+            // 豆包：只有"默认/深度思考"两个模式，本地应答，不联网
+            for m in crate::doubao::models() {
+                push(
+                    m["id"].as_str().unwrap_or(""),
+                    "doubao",
+                    json!({
+                        "name": m["name"].clone(),
+                        "free": m["free"].clone(),
                         "vision": m["vision"].clone(),
                     }),
                 );

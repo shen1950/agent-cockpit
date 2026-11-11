@@ -42,3 +42,16 @@
 .gateway-supplier-editor h3,.gateway-supplier-editor h4{font-size:14px;margin:14px 0 8px}
 .gateway-supplier-editor input[type=number]{width:100%}
 .gateway-provider{min-width:0}
+.gateway-supplier-settings{width:min(920px,calc(100vw - 40px));height:min(820px,calc(100dvh - 40px));max-height:none;
+  margin:auto;padding:0;color:var(--text);overflow:hidden;box-sizing:border-box}
+.gateway-supplier-settings[open]{display:flex;flex-direction:column}
+.gateway-supplier-settings::backdrop{background:rgba(8,10,16,.5)}
+html[data-theme="light"] .gateway-supplier-settings::backdrop{background:rgba(60,55,48,.32)}
+.gateway-supplier-settings-content{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}
+.gateway-supplier-settings .gateway-supplier-head{flex:none}
+.gateway-supplier-settings .gateway-supplier-head b{min-width:0;overflow-wrap:anywhere}
+.gateway-supplier-settings .gateway-supplier-detail{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+.gateway-supplier-settings-footer{display:flex;align-items:center;justify-content:space-between;gap:16px;flex:none;
+  padding:12px 18px;border-top:1px solid var(--line)}
+.gateway-supplier-settings-footer .btn{flex:none}
+.gateway-supplier-settings .gateway-supplier-select select{min-width:0;max-width:100%;flex:1}

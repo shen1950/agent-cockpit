@@ -79,12 +79,15 @@ pub async fn set_brand_icon(app: tauri::AppHandle, rgba: Vec<u8>) -> Result<(), 
         let mut hash = 0xcbf29ce484222325u64;
         for byte in &rgba { hash = (hash ^ *byte as u64).wrapping_mul(0x100000001b3); }
         let name = format!("icon-v2-{hash:016x}.ico");
-        let changed = fs::read_to_string(dir.join("active.txt")).unwrap_or_default() != name;
         fs::write(dir.join(&name), ico(&rgba)).map_err(|e| e.to_string())?;
         fs::write(dir.join("active.rgba"), &rgba).map_err(|e| e.to_string())?;
         fs::write(dir.join("active.txt"), name).map_err(|e| e.to_string())?;
         apply(&app, rgba)?;
-        if changed { crate::shelllink::refresh_brand_icons()?; }
+        // 每次都同步，不再看"内容是否变了"。外壳（桌面/开始菜单/任务栏固定项）读的是各自
+        // 快捷方式里的 IconLocation，运行中的窗口图标顶不了它们；只要有一条没指到当前 ico，
+        // 界面上就是"设置里换了、桌面没换"。同步本身幂等：已指对的不重写。
+        crate::shelllink::sync_brand_icons()
+            .map_err(|e| format!("图标已应用，但外壳快捷方式同步失败：{e}"))?;
         Ok(())
     }).await.map_err(|e| e.to_string())?
 }

@@ -11,10 +11,7 @@ use crate::settings;
 use tauri_plugin_notification::NotificationExt;
 use serde_json::{json, Value};
 use std::fs;
-use std::process::Command;
 use std::sync::Mutex;
-
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 支持签到的产品目录。**只用来在"一次都还没查到过"时先把表格的行画出来**——
 /// 列表（产品 / 操作 / 自动领 / 提醒）本身是纯 UI，没有任何理由等六家接口。
@@ -34,6 +31,10 @@ pub const CATALOG: &[(&str, &str)] = &[
     ("raccoon", "商汤小浣熊"),
     ("qoder-cn", "Qoder CN"),
     ("qoder", "Qoder"),
+    // 每天 200 额度（周一翻倍），连签 30 天约 8800。领取＝POST /alice/ug/campaign/landing/checkin，
+    // 纯 cookie 鉴权、无签名，**服务端自带幂等**（重复请求回 idempotent:true），重试安全。
+    // 只有累计口径（progress.total_amount），没有剩余额度接口。见 agenthub 的 ci_doubao。
+    ("doubao", "豆包"),
 ];
 
 /// 哪几家能**按账号各查一次**。判据是两条都成立：
@@ -51,6 +52,19 @@ static CACHE: Mutex<Option<Value>> = Mutex::new(None);
 
 /// 缓存还没建起来时用的回落快照（落盘的"上次结果"或静态目录），带 15 秒 TTL
 static FALLBACK: Mutex<Option<(f64, Value)>> = Mutex::new(None);
+/// 上一次调 agenthub 的失败原因。界面用它显示一条全局提示，
+/// 而不是让每一行都孤零零地报“读不到”。
+static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn last_error() -> Option<String> {
+    LAST_ERROR.lock().ok().and_then(|g| g.clone())
+}
+
+fn set_last_error(msg: Option<String>) {
+    if let Ok(mut g) = LAST_ERROR.lock() {
+        *g = msg;
+    }
+}
 static LEDGER_WRITE: Mutex<()> = Mutex::new(());
 static CLAIM_WRITE: Mutex<()> = Mutex::new(());
 
@@ -78,29 +92,38 @@ fn num_text(v: f64) -> String {
 }
 
 fn run(extra: &[&str]) -> Result<Value, String> {
-    // agenthub 是 .cmd 包装，CreateProcess 直接执行不了，必须经 cmd.exe 转一手
-    let mut c = Command::new("cmd.exe");
-    let mut args: Vec<&str> = vec!["/d", "/c", "agenthub", "checkin"];
+    let mut args: Vec<&str> = vec!["checkin"];
     args.extend_from_slice(extra);
     args.push("--json");
-    c.args(&args);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        c.creation_flags(CREATE_NO_WINDOW);
-    }
-    let out = c
-        .output()
-        .map_err(|e| format!("调不到 agenthub（{e}）：本机需要先装 agent-memory-suite"))?;
+    let mut c = crate::agenthub::command(&args);
+    let out = match c.output() {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = format!(
+                "调不到签到后端（{e}）：内置运行时不可用，PATH 上也没有 agenthub"
+            );
+            set_last_error(Some(msg.clone()));
+            return Err(msg);
+        }
+    };
     if !out.status.success() {
         let s = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "agenthub checkin 失败：{}",
+        let msg = format!(
+            "签到后端失败：{}",
             s.trim().chars().take(180).collect::<String>()
-        ));
+        );
+        set_last_error(Some(msg.clone()));
+        return Err(msg);
     }
-    let parsed: Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("agenthub 输出不是 JSON：{e}"))?;
+    let parsed: Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("签到后端输出不是 JSON：{e}");
+            set_last_error(Some(msg.clone()));
+            return Err(msg);
+        }
+    };
+    set_last_error(None);
     Ok(parsed)
 }
 
@@ -350,7 +373,11 @@ pub fn refresh() -> Value {
             // 产品行后面挂上各账号自己的行（只有"登录态按账号各存一份、且存了不止一个号"
             // 的产品才挂）。这一步是几次额外的 agenthub 调用，所以只在这一条后台路径上做，
             // 界面那 4 秒一轮读的是缓存。
-            let mut items = expand_accounts(items);
+            let expanded = expand_accounts(items);
+            let mut items = Value::Array(filter_items(
+                expanded.as_array().cloned().unwrap_or_default(),
+                &store_visible,
+            ));
             let _guard = LEDGER_WRITE.lock().unwrap();
             let mut st = load_state();
             apply_workbuddy_statuses(&mut items, &st);
@@ -594,8 +621,13 @@ pub fn view() -> Value {
 
 /// 一次都没查到过时的占位行：把产品名先摆出来，状态列由界面写"查询中"。
 fn catalog_items() -> Vec<Value> {
+    catalog_items_for(&store_visible)
+}
+
+fn catalog_items_for(visible: &dyn Fn(&str) -> bool) -> Vec<Value> {
     CATALOG
         .iter()
+        .filter(|(p, _)| visible(p))
         .map(|(p, n)| {
             json!({
                 "product": p, "name": n, "pending": true, "supported": true,
@@ -604,6 +636,36 @@ fn catalog_items() -> Vec<Value> {
                 "app": crate::local_quota::app_for_store(p).unwrap_or(p),
                 "auto": false, "activity_on": true, "signed_today": false, "claimable": false,
             })
+        })
+        .collect()
+}
+
+/// 签到页只摆本机真的装了、或名下已经有账号卡的产品。
+/// WorkBuddy 的活跃地图/旅行猫不是独立安装，跟着 workbuddy 走。
+pub(crate) fn store_visible(store: &str) -> bool {
+    let app_id = match store {
+        "workbuddy-activity" | "workbuddy-travel" => "workbuddy",
+        _ => match crate::local_quota::app_for_store(store) {
+            Some(id) => id,
+            None => return false,
+        },
+    };
+    crate::registry::app_def(app_id)
+        .map(|a| crate::registry::worth_showing(&a))
+        .unwrap_or(false)
+}
+
+/// 产品行按可见性过滤；账号行跟着它的 parent 走。
+pub(crate) fn filter_items(items: Vec<Value>, visible: &dyn Fn(&str) -> bool) -> Vec<Value> {
+    items
+        .into_iter()
+        .filter(|it| {
+            let store = it["product"].as_str().unwrap_or("");
+            if visible(store) {
+                return true;
+            }
+            let parent = it["parent"].as_str().unwrap_or("");
+            !parent.is_empty() && visible(parent)
         })
         .collect()
 }
@@ -1389,13 +1451,15 @@ pub fn snapshot() -> Value {
     }
     let st = load_state();
     let last = &st["last"];
-    let items = last["items"]
+    let raw = last["items"]
         .as_array()
         .filter(|a| !a.is_empty())
         .cloned()
         .unwrap_or_else(catalog_items);
+    let items = filter_items(raw, &store_visible);
     let v = json!({
         "ok": true, "items": items,
+        "agenthub_error": last_error(),
         // 有几条「登录并领取」正在等（界面据此在那一行显示"等待登录"）
         "want": want_count(),
         "fetched_at": last["fetched_at"].as_f64().unwrap_or(0.0),
@@ -1721,6 +1785,35 @@ pub fn tick(app: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    /// 没装的产品和它名下的账号行都不该出现在签到页。
+    #[test]
+    fn hidden_products_and_their_account_rows_are_filtered() {
+        use super::*;
+        let items = json!([
+            {"product":"workbuddy","scope":"product"},
+            {"product":"workbuddy","scope":"account","parent":"workbuddy"},
+            {"product":"qoder-cn","scope":"product"},
+            {"product":"qoder-cn","scope":"account","parent":"qoder-cn"}
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+        let out = filter_items(items, &|s| s == "workbuddy");
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|x| x["product"] == "workbuddy"));
+    }
+
+    /// 占位行也不能把本机没装的产品全铺出来。
+    #[test]
+    fn catalog_placeholders_follow_visibility() {
+        use super::*;
+        let rows = catalog_items_for(&|s| {
+            matches!(s, "workbuddy" | "workbuddy-activity" | "workbuddy-travel")
+        });
+        let names: Vec<&str> = rows.iter().filter_map(|x| x["product"].as_str()).collect();
+        assert_eq!(names, vec!["workbuddy", "workbuddy-activity", "workbuddy-travel"]);
+    }
+
     #[test]
     fn workbuddy_rename_keeps_each_accounts_history_and_pending() {
         use super::*;

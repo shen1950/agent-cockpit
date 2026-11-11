@@ -690,12 +690,11 @@ mod tests {
                         // 真读一次：铺出来的档案目录交给 agenthub，看它报的是不是**这个号**。
                         // 这一条才是"按账号查"成立的证据——只铺得出来不等于解得开。
                         if app.starts_with("qoder") {
-                            let out = std::process::Command::new("cmd.exe")
-                                .args([
-                                    "/d", "/c", "agenthub", "checkin", app,
-                                    "--profile", &d.to_string_lossy(), "--json",
-                                ])
-                                .output();
+                            let profile = d.to_string_lossy().into_owned();
+                            let out = crate::agenthub::command(&[
+                                "checkin", app, "--profile", &profile, "--json",
+                            ])
+                            .output();
                             match out {
                                 Ok(o) => {
                                     let s = String::from_utf8_lossy(&o.stdout);

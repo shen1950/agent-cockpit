@@ -1003,6 +1003,10 @@ html[data-theme="light"] .modal { background: rgba(60, 55, 48, .32) }
 .fieldexp { display: flex; gap: 6px; align-items: center; width: 100%; min-width: 0 }
 .fieldexp input { flex: 1 1 auto; min-width: 0 }
 .fieldexp .btn { flex: none }
+/* 添加程序：路径框 + 资源管理器选择按钮 */
+.filepick { display: flex; gap: 6px; align-items: center; width: 100%; min-width: 0 }
+.filepick input { flex: 1 1 auto; min-width: 0 }
+.filepick .btn { flex: none }
 /* 借原生 date 弹日历的那个输入框：不参与布局也不可见，只负责把日期选出来 */
 #k-exp-native, #qp-native {
   position: absolute; width: 0; height: 0; padding: 0; border: 0;

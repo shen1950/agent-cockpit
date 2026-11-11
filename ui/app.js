@@ -1602,7 +1602,7 @@ function renderCheckin() {
   // 4 秒一轮的状态报文内容没变就别整页重建：日志列表（.cilogrows）自己有滚动条，
   // 每次重建都是新元素，scrollTop 归零——往下翻日志时整页每 4 秒闪回一次顶部，
   // 下面的部分永远翻不到（2026-11-04）。内容真的变了才重建。
-  const sig = JSON.stringify([d && d.items, d && d.state, d && d.placeholder,
+  const sig = JSON.stringify([d && d.items, d && d.state, d && d.placeholder, d && d.agenthub_error,
     // ciLoading 不进签名：它只是状态栏的"正在刷新…"字样，跳过重建时那行
     // 文字会单独更新；进签名会让每次点补记/刷新都白重建一遍
     d && d.refreshing, st, S.ciLogRange, S.ciFold, S.ciWait,
@@ -1657,6 +1657,9 @@ function renderCheckin() {
   }));
   bar.appendChild(el('span', { class: 'cilab ci-status' }, ciStatusText(d)));
   host.appendChild(bar);
+  if (d && d.ok && d.agenthub_error) {
+    host.appendChild(el('div', { class: 'qempty' }, `签到后端不可用：${d.agenthub_error}`));
+  }
   if (!d || !d.ok) {
     host.appendChild(el('div', { class: 'qempty' }, `读不到签到状态：${(d && d.msg) || '没数据'}`));
     return;
@@ -1681,7 +1684,10 @@ function renderCheckin() {
     ? '正在读各家状态…'
     : `${prods.filter((x) => x.signed_today === true).length} 家已签 · ${go.length} 家可领`
       + (nAcc ? ` · 另有 ${nAcc} 个账号单独看着` : '');
-  if (!items.length) host.appendChild(el('div', { class: 'qempty' }, '一个都没查到'));
+  if (!items.length) {
+    host.appendChild(el('div', { class: 'qempty' },
+      '本机没有可签到的产品：先在侧栏收进一个 Agent，或到 设置 → 高级 点「扫描登记」。'));
+  }
   // 表头 + 所有行共用这一个 grid：列宽定义一次，同类内容不可能错位。
   // **列表本身是纯 UI，不等任何接口**：一次都没查到时后端会先给一份占位行（状态列写"查询中"），
   // 查过的直接把上次那份摆出来——以前这里要等六家接口全回来才画第一行。
@@ -3846,6 +3852,7 @@ function proxyKind(appId) {
   if (appId === 'minimax') return 'mm';
   if (appId === 'qwenwork') return 'qw';
   if (appId === 'catpaw') return 'paw';
+  if (appId === 'doubao') return 'db';
   if (appId === 'zcode') return 'zc';
   return '';
 }
@@ -3955,6 +3962,22 @@ async function loadAgentModelIds(appId) {
       st.ids = r.ok
         ? { models: r.models || [], count: r.count || 0 }
         : { models: [], count: 0, note: r.msg || '桥没在跑，列不出模型' };
+    } catch (e) {
+      st.ids = { models: [], count: 0, error: String(e) };
+    }
+    st.idsLoading = false;
+    replacePxIds(appId);
+    return;
+  }
+  // 豆包：清单是本地固定的两个模式，直接问后端要（顺便验证模块已接进包）
+  if (appId === 'doubao') {
+    st.idsLoading = true;
+    replacePxIds(appId);
+    try {
+      const r = await invoke('action', { payload: { action: 'doubao_model_ids' } });
+      st.ids = r.ok
+        ? { models: r.models || [], count: r.count || 0 }
+        : { models: [], count: 0, note: r.msg || '豆包模型清单没读到' };
     } catch (e) {
       st.ids = { models: [], count: 0, error: String(e) };
     }
@@ -4237,6 +4260,7 @@ async function pxTestModelCard(m, owner) {
     const actions = {
       astudio: 'astudio_test', minimax: 'minimax_test', opencode: 'opencode_test',
       qwenwork: 'qwbridge_test', catpaw: 'pawbridge_test', zcode: 'zcproxy_test',
+      doubao: 'doubao_test',
       qoder: 'qproxy_probe', 'qoder-cn': 'qproxy_probe',
       workbuddy: 'wproxy_test', 'workbuddy-intl': 'wproxy_test', trae: 'trae_probe',
     };
@@ -4516,6 +4540,16 @@ function guideModels(d, appId) {
       error: b && b.ok ? '' : (b && b.error ? b.error : '本地桥还没通，先启动并登录 OpenCode'),
     };
   }
+  // 豆包只有"默认/深度思考"两个模式（不是模型），清单是本地固定的，不用联网
+  if (kind === 'db') {
+    return {
+      models: [
+        { id: 'doubao', name: '豆包', free: true, default: true },
+        { id: 'doubao-think', name: '豆包·深度思考', free: true },
+      ],
+      error: '',
+    };
+  }
   return { models: [], error: '' };
 }
 
@@ -4579,6 +4613,13 @@ function guideAgents(d) {
       out.push({
         app: a.id, name: a.name, kind, count: accts.length, usable, blocked: false,
         detail: usable ? `${usable} 个可用` : (accts.length ? '需要刷新/登录' : '还没有账号'),
+      });
+    } else if (kind === 'db') {
+      // 豆包：一条上游就够（进程内直连，不按账号分支）。凭据读没读到决定能不能选。
+      const ready = !!d.proxy.doubao?.ready;
+      out.push({
+        app: a.id, name: a.name, kind, count: 1, usable: ready ? 1 : 0, blocked: false,
+        detail: ready ? '直连可用（客户端不用开）' : '需要先在豆包里登录一次',
       });
     }
   }
@@ -6157,9 +6198,23 @@ function openAddApp() {
   $('amodal').hidden = false;
   $('am-exe').focus();
 }
+async function pickExePath() {
+  const cur = $('am-exe').value.trim().replace(/^"|"$/g, '');
+  const r = await invoke('pick_exe', { current: cur || null })
+    .catch((e) => ({ ok: false, msg: String(e) }));
+  if (r && r.ok && r.path) {
+    $('am-exe').value = r.path;
+    if (!$('am-name').value.trim()) {
+      const base = r.path.split(/[\\/]/).pop() || '';
+      $('am-name').value = base.replace(/\.[^.]+$/, '');
+    }
+  } else if (r && r.msg && r.msg !== '已取消') {
+    toast(r.msg, false);
+  }
+}
 async function doAddApp() {
   const exe = $('am-exe').value.replace(/^"|"$/g, '').trim();
-  if (!exe) { toast('先把程序路径贴进来', false); $('am-exe').focus(); return; }
+  if (!exe) { toast('先选择或填入程序路径', false); $('am-exe').focus(); return; }
   const r = await invoke('add_app', { exe, name: $('am-name').value.trim() || null });
   toast(r.msg, r.ok);
   if (r.ok) { $('amodal').hidden = true; load(); }
@@ -8036,7 +8091,7 @@ const HELP = [
   },
   {
     t: '程序收录与数据存放',
-    h: `<p>启动时扫开始菜单与桌面的快捷方式，命中 AI 关键词或装在 <code>D:\\Artificial_Intelligence</code> 下的自动收录；没建快捷方式的用「＋ 添加程序」填可执行文件路径，误收的右键「隐藏程序」。能否多开由内核实测（同目录有 <code>resources.pak</code> + <code>locales</code> 才认 Chromium）。</p>
+    h: `<p>启动时扫开始菜单与桌面的快捷方式，命中 AI 关键词或装在登记的 AI 安装根下的自动收录；没建快捷方式的用「＋ 添加程序」选可执行文件，盘点也会把注册表里认出的新程序收进列表。误收的右键「隐藏程序」。能否多开由内核实测（同目录有 <code>resources.pak</code> + <code>locales</code> 才认 Chromium）。</p>
       <p>数据只在本机数据根（默认 <code>~/.agent-cockpit</code>，可在 设置 → 存储 迁到别的盘）：<code>instances/</code> 只放另建的账号，<code>backups/</code> 是 zip 备份，<code>shared/</code> 放多账号共用的大文件，<code>config.json</code> 存程序列表与换号记录，<code>vault.json</code> 是 DPAPI 加密的 Key。界面与反代只绑 127.0.0.1。</p>`,
   },
   {
@@ -8056,7 +8111,7 @@ function renderHelp(body, panel) {
 const TOUR = [
   { t: '首页', s: '#home-body', x: '先看今天要处理什么。往下是临期积分、今天还能领的、我的 Agent。' },
   { t: 'Agent 列表', s: '#applist', x: '本机已装的 AI 程序。绿点＝正在运行，⇄＝当前在用的号，徽章「多开」＝可同时开多个账号窗口，「换号」＝一次一个。' },
-  { t: '新装的程序', s: '#btn-add-app', x: '有快捷方式的点「重新扫描」自动收录；其余的在这里填可执行文件路径。' },
+  { t: '新装的程序', s: '#btn-add-app', x: '有快捷方式的点「重新扫描」自动收录；其余的在这里点「选择…」挑可执行文件。' },
   { t: '账号卡片', s: '#cards', x: '一个账号一张卡，只放高频动作：能不能开、怎么开——「启动」/「启动客户端」/「结束」。' },
   { t: '账号设置', s: '#cards', x: '「账号设置」管账号信息，点额度进「额度与用量」；左侧六组：账号信息、额度与用量、运行与换号、目录与数据、凭据与反代、删除账号。' },
   { t: '添加账号', s: '#btn-new', x: '六步：登录方式 → 登录 → 基本信息 → 数据来源 → 额度 → 确认建卡。' },
@@ -9036,7 +9091,7 @@ function renderSettings() {
 
   if (setSection === 'advanced') {
     body.appendChild(panel('高级',
-      row('重新扫描本机程序', '扫开始菜单与桌面快捷方式，收录新装的 AI 程序',
+      row('重新扫描本机程序', '扫开始菜单与桌面快捷方式；没快捷方式的用下面的「扫描登记」从注册表收',
         actBtn('重新扫描', () => run('rescan'))),
       row('重置多开能力判定', '清掉实测记录，下次启动账号时重新判断该产品能否独立目录多开',
         actBtn('重置', () => run('reset_caps'))),
@@ -9048,8 +9103,18 @@ function renderSettings() {
     if (inv) {
       invKids.push(el('div', { class: 'invt' },
         `本机认出 ${inv.detected} 家 · 目录收录 ${inv.catalog.loaded} 家 · `
-        + (inv.first_run ? '第一次跑，只存基线不报增减' : `新装 ${inv.new.length} · 卸载 ${inv.gone.length}`)));
+        + (inv.first_run ? '第一次跑，只存基线不报增减' : `新装 ${inv.new.length} · 卸载 ${inv.gone.length}`)
+        + (inv.collected && inv.collected.length ? ` · 已收进 ${inv.collected.length} 个` : '')
+        + (inv.repaired && inv.repaired.length ? ` · 修复 ${inv.repaired.length} 条失效路径` : '')));
       if (inv.new.length) invKids.push(el('div', { class: 'invline ok' }, '新装：', inv.new.join('、')));
+      if (inv.collected && inv.collected.length) {
+        invKids.push(el('div', { class: 'invline ok' }, '已收进列表：',
+          inv.collected.map((x) => `${x.name}（${x.path}）`).join('；')));
+      }
+      if (inv.repaired && inv.repaired.length) {
+        invKids.push(el('div', { class: 'invline ok' }, '已修复内置路径：',
+          inv.repaired.map((x) => `${x.name} → ${x.path}`).join('；')));
+      }
       if (inv.gone.length) {
         invKids.push(el('div', { class: 'invline warn' }, '这次没扫到（可能已卸载，档案与备份都还在）：', inv.gone.join('、')));
       }
@@ -9071,7 +9136,8 @@ function renderSettings() {
       el('h2', {}, '本机 Agent 盘点'),
       el('p', { style: 'font-size:12.5px;color:var(--text-muted);margin-bottom:10px' },
         '点「扫描登记」跑一次：查注册表、开始菜单与桌面快捷方式、安装根目录与 npm 全局。'
-        + '与上次快照比对，报出新装、卸载，以及内置清单里已经指不到文件的路径。'
+        + '与上次快照比对，报出新装、卸载；新认出的程序会直接收进列表，'
+        + '内置清单里失效的路径会用痕迹里的新位置修好。'
         + '预存的各家索引信息在 ~/.agents/catalog.json（由 agenthub catalog build 生成）。'),
       ...invKids));
 
@@ -10019,7 +10085,9 @@ function bind() {
     toast(r.first_run
       ? `本机盘点完成：认出 ${r.detected} 家（第一次跑，只存基线，不报增减）`
       : `本机盘点完成：${r.detected} 家 · 新装 ${r.new.length} · 卸载 ${r.gone.length}`
-        + (r.stale_paths.length ? ` · 内置路径失效 ${r.stale_paths.length}` : ''));
+        + (r.stale_paths.length ? ` · 内置路径失效 ${r.stale_paths.length}` : '')
+        + (r.collected?.length ? ` · 已收进 ${r.collected.length} 个` : '')
+        + (r.repaired?.length ? ` · 已修复 ${r.repaired.length} 条` : ''));
     setSection = 'advanced';
     S.view = 'settings';
     render();
@@ -10046,6 +10114,7 @@ function bind() {
   $('im-x').addEventListener('click', closeDetail);
   $('im-save').addEventListener('click', saveDetail);
   $('imodal').addEventListener('click', (e) => { if (e.target.id === 'imodal') closeDetail(); });
+  $('am-pick').addEventListener('click', pickExePath);
   $('am-cancel').addEventListener('click', () => { $('amodal').hidden = true; });
   $('amodal').addEventListener('click', (e) => { if (e.target.id === 'amodal') $('amodal').hidden = true; });
   $('am-add').addEventListener('click', doAddApp);

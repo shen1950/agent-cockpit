@@ -50,6 +50,9 @@ const server = http.createServer((req, res) => {
         {...common,scope:'account',parent:'workbuddy-intl',name:'Gerald Fabinhu',account:'Gerald Fabinhu'},
         {...qoder,scope:'product',name:'Qoder CN'}],
         state:{pending:{},log:logRows}};
+      // 这几条日志固定写在 2026-11-04；默认只看“今天”会让它们随时间推移被筛掉，
+      // 这组用例验的是补记/重绘/滚动，不是日期筛选，所以显式看全部。
+      S.ciLogRange = 'all';
       renderCheckin();
     });
     // ① 有账号子行的产品，补记只在账号行上；无子行的产品行也有

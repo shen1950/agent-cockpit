@@ -1,6 +1,6 @@
 [package]
 name = "agent-cockpit"
-version = "2.4.0"
+version = "2.5.0"
 description = "Agent 驾驶舱：国内 AI Agent 多开 / 额度过期提醒 / 本地反代"
 edition = "2021"
 # src/bin/codex-shared-resume.rs 是第二个 bin 目标；不指明主程序 tauri build 会报

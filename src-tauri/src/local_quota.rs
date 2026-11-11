@@ -2,10 +2,6 @@
 // 这里负责调用、换算成驾驶舱的多笔积分结构，并做"账号绑定"校验防止串号。
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::Command;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 驾驶舱程序 id → agenthub 认识的产品名。只有确证能本机直读的才列进来。
 pub const LOCAL_STORES: &[(&str, &str)] = &[
@@ -49,6 +45,13 @@ pub const LOCAL_STORES: &[(&str, &str)] = &[
     // 每日 300 积分；当天登录过桌面客户端的那笔有效期 7 天。
     // 登录态就在档案目录里，所以**不**进 falls_back_to_default：按账号目录读得到各自的号。
     ("raccoon", "raccoon"),
+    // 豆包（2026-11-10 实测）：登录态是 doubao.com 会话 cookie，存在
+    // {LOCALAPPDATA}\Doubao\User Data\Default\Network\Cookies（SQLite，os_crypt v10，
+    // 明文前 32 字节是 SHA256(host_key) 的 domain 绑定）。agenthub 的 doubao store 解出
+    // cookie 后打 /passport/account/info/v2 认人、/alice/ug/campaign/v3/detail 读签到进度。
+    // **只出账号、不出额度**：签到活动只给 progress.total_amount（累计获得），厂商没有
+    // "还剩多少"的接口——所以 left/total 报 None，别把累计值当余额画出来。
+    ("doubao", "doubao"),
 ];
 
 pub fn store_for(app_id: &str) -> Option<&'static str> {
@@ -323,27 +326,23 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
     let zcode_identity = if store == crate::zcode::APP {
         Some(crate::zcode::identity_at(&zcode_root)?)
     } else { None };
-    let mut c = Command::new("cmd.exe");
     // profile 给了就读那个账号自己的档案目录——单实例产品靠 junction 换号，
     // 每个账号的数据就在它自己的 data_dir 里，这样才能一账号一读数。
-    c.args(["/d", "/c", "agenthub", "quota", "--json", store]);
+    let mut c = crate::agenthub::command(&["quota", "--json", store]);
     if let Some(dir) = profile {
         if !dir.is_empty() {
             c.arg("--profile").arg(dir);
         }
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        c.creation_flags(CREATE_NO_WINDOW);
-    }
     let out = c
         .output()
-        .map_err(|e| format!("调不到 agenthub（{e}）：本机需要先装 agent-memory-suite"))?;
+        .map_err(|e| format!(
+            "调不到额度后端（{e}）：内置运行时不可用，PATH 上也没有 agenthub"
+        ))?;
     if !out.status.success() {
         let s = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
-            "agenthub quota 失败：{}",
+            "额度后端失败：{}",
             s.trim().chars().take(180).collect::<String>()
         ));
     }

@@ -4,6 +4,54 @@
 
 ## [Unreleased]
 
+## [2.5.0] — 2026-11-11
+
+**新增**
+
+- 签到/额度后端随程序内置：`agenthub.py` 与 cryptography/cffi/pycparser 打进内置 Python 运行时，
+  新电脑不再需要另装 agent-memory-suite。只有内置运行时损坏或被安全软件拦住时，才回退到 PATH 上的 agenthub。
+- 接入豆包（doubao.com）：卡片/换号/签到/反代四件套。
+  - 登记：CEF/Chromium 147 壳，档案 `{LOCALAPPDATA}\Doubao`，登录态是 doubao.com 会话 cookie
+    （`User Data\Default\Network\Cookies`，os_crypt v10）。
+  - 查看额度：agenthub 的 `doubao` store 解 cookie 后打 `/passport/account/info/v2` 认人、
+    `/alice/ug/campaign/v3/detail` 读签到进度。**只出账号、不出余额**——签到活动只给累计获得
+    （`progress.total_amount`），厂商没有"还剩多少"的接口，所以 left/total 报 null 而不是 0。
+  - 签到：每天 200 额度（周一翻倍），`POST /alice/ug/campaign/landing/checkin`，纯 cookie 鉴权、
+    **无 a_bogus/msToken 签名、服务端自带幂等**，重试安全。
+  - 反代：`doubao.rs` 进程内云端直连 `POST /samantha/chat/completion`（同样是纯 cookie、
+    不要签名），把豆包 SSE 翻成 OpenAI chunk，**豆包客户端不用开着**。只支持纯文本：
+    豆包 web 没有 tools/function calling 协议，见到 tools 直接 400，不假装支持。
+
+**修复**
+
+- 会话看板不再被旧的 AgentFind 进程顶替：驾驶舱复用已在跑的服务前，先比对服务自报的脚本指纹
+  与程序内置那份是否一致，不一致就收掉重起。此前只要端口上有个同名服务就照单全收，
+  升级后界面会一直停在旧版（新加的按钮不出现），且内置脚本根本不会被释放。
+- 会话看板的 Agent 场数不再谎报 0：客户端升级时把自己的 SQLite 短暂挪走，那个 Agent 会掉进
+  「没探到数据目录」的兜底分支，场数被写死成 0，看着像历史全没了。现在一律按索引里的真实场数报。
+- 会话看板在索引还很稀疏时不再卡住：首页示例线索补不足 6 条会陷进死循环，把整个 `/api/meta`
+  拖死，页面一直转圈。改成有界补齐。
+- 换台电脑装了 AI 程序却收不进来：内置条目只在本机真的解析到 exe 时按名字认领；没装的条目
+  不再抢占名字。盘点/快捷方式找到的新 exe 会写成该产品的本机路径覆盖，不再造重复卡。
+- 「扫描登记」现在会收进所有已检出但不在列表里的程序，并修复内置清单里失效的安装路径；
+  旧基线里 `new=0` 的记录也能收进来。
+- 签到页不再无条件铺 11 家：只显示本机已安装或名下已有账号卡的产品；WorkBuddy 活跃地图/
+  旅行猫跟着 WorkBuddy 走。签到后端不可用时显示一条全局提示，不再每行报错。
+- 手动「添加程序」不再被同名内置条目吞掉；路径正好属于某个没装上的内置产品时，直接修好该条目。
+- 开源源码和二进制里的开发机路径、真实样例用量、真实账号名/ userId 已清理；隐私门禁增加
+  “开发机安装根”规则，发布构建改用路径重映射。
+
+**改进**
+
+- 「添加本机程序」的路径框旁新增「选择…」，直接打开资源管理器挑 `.exe/.cmd/.bat`，并自动带出显示名。
+- 内置产品的登记路径补全官方默认安装位置（`%LOCALAPPDATA%\Programs`、`%ProgramFiles%`、
+  `%APPDATA%\npm` 等），不再依赖某个开发机的 D/E 盘布局。
+
+**内部**
+
+- `agenthub.py` / `console.html` 与 cryptography 49.0.0、cffi 2.1.0、pycparser 3.0 以独立
+  `agenthub-libs.zip` 随程序分发；解压时校验 zip-slip、链接和完整性。许可与来源见 THIRD_PARTY_NOTICES.md。
+
 ## [2.4.0] — 2026-11-08
 
 **新增**
@@ -64,8 +112,8 @@
   （收起时顺手改了卡片内边距，现在两种状态边距一致）。
 - 「正在等到账」里同一个账号欠着两天时，两行不再都写「今天这份积分还没到账」：日期按各自的活跃日现算
   （昨天 / 今天 / 超过前天写具体日期），等得最久的排最前。
-- 妙手 2026-11-06 官方升级把安装目录从 `D:\Artificial_Intelligence\妙手\` 换到
-  `D:\Artificial_Intelligence\CatPaw\Apps\妙手\`（旧目录被安装器删除），驾驶舱报
+- 妙手 2026-11-06 官方升级把安装目录从旧布局换到
+  `CatPaw\Apps\妙手\`（旧目录被安装器删除），驾驶舱报
   「未找到可执行文件」无法启动；现在候选路径会自动落到新安装位置，能重新找到并启动。
 
 **内部**

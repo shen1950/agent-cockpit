@@ -51,12 +51,22 @@ pub fn scan_stamp() -> String {
         .unwrap_or_default()
 }
 
-/// 扫一遍开始菜单/桌面，把新装的 AI 程序并入列表；手工适配过的不覆盖
+/// 扫一遍开始菜单/桌面，把新装的 AI 程序并入列表；手工适配过的不覆盖。
+/// 命中一个本机还没装上的内置产品时，写成该产品的本机路径覆盖，不再造重复卡。
 pub fn do_rescan() -> usize {
-    let skip = reg::manual_claimed_names();
+    let skip = reg::local_claimed_names();
     let list = crate::discover::discover(&skip);
-    let n = list.len();
-    reg::set_discovered(list);
+    let mut kept = Vec::new();
+    let mut adopted = 0usize;
+    for d in list {
+        if reg::adopt_discovered(&d).is_some() {
+            adopted += 1;
+        } else {
+            kept.push(d);
+        }
+    }
+    let n = kept.len() + adopted;
+    reg::set_discovered(kept);
     // 顺手抽出各程序真实图标，侧栏要用
     let pairs: Vec<(String, String)> = reg::all_apps()
         .iter()
@@ -158,13 +168,25 @@ pub async fn add_app(exe: String, name: Option<String>) -> Value {
     if name.is_empty() {
         return json!({ "ok": false, "msg": "给这个程序起个名字" });
     }
+    // 这个 exe 属于某个内置产品、但本机原登记路径失效：直接修内置条目，
+    // 不再新增一张同名卡（以前会被下面的同名检查挡成“已经在列表里了”）。
+    if let Some(app_id) = reg::adopt_exe_for_candidate(&name, &exe) {
+        let shown = reg::app_def(&app_id).map(|a| a.name).unwrap_or(app_id.clone());
+        return json!({
+            "ok": true, "app": app_id,
+            "msg": format!("已把「{}」接到这台机器的安装位置：{}", shown, exe),
+        });
+    }
     let base = p
         .file_name()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     if let Some(dup) = reg::all_apps_raw()
         .into_iter()
-        .find(|a| reg::exe_name(a).to_lowercase() == base)
+        .find(|a| {
+            reg::exe_name(a).to_lowercase() == base
+                && (a.id.starts_with("custom-") || reg::resolve_exe(a).is_some())
+        })
     {
         return json!({ "ok": false, "msg": format!("「{}」已经在列表里了（{}）", dup.name, dup.id) });
     }
@@ -191,6 +213,17 @@ pub fn scan_inventory() -> Value {
 #[tauri::command]
 pub fn pick_folder(current: Option<String>) -> Value {
     let (o, m) = space::pick_folder(&current.unwrap_or_default());
+    if o {
+        json!({ "ok": true, "path": m })
+    } else {
+        json!({ "ok": false, "msg": m })
+    }
+}
+
+/// 选一个可执行文件回填「添加本机程序」的路径框
+#[tauri::command]
+pub fn pick_exe(current: Option<String>) -> Value {
+    let (o, m) = space::pick_exe(&current.unwrap_or_default());
     if o {
         json!({ "ok": true, "path": m })
     } else {
@@ -409,6 +442,8 @@ pub fn service_action(handle: &tauri::AppHandle, payload: &Value) -> Result<Valu
             | "qwbridge_start" | "qwbridge_stop" | "qwbridge_test" | "qwbridge_oneclick"
             // 妙手的 test 要等整个云端回合跑完（最坏几十秒）、oneclick 要起反代
             | "pawbridge_test" | "pawbridge_probe" | "pawbridge_oneclick"
+            // 豆包的 test 一样要等一整轮云端 SSE 收完（首次还可能先跑一次 agenthub 刷凭据）
+            | "doubao_test" | "doubao_model_ids"
             // 签到这三条要等上游回话（本机网络被 TLS 停等拖的时候一次十几秒）：
             // 只改 checkin.json，自己已经用 LEDGER_WRITE / CLAIM_WRITE 串行，
             // 不该再把整台驾驶舱压在 CMD_LOCK 后面
@@ -2762,6 +2797,16 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             let out = json!({ "ok": true, "result": crate::pawbridge::test(model) });
             // 外层 ok 恒 true，真正的成败在 result.ok（见 probe_ok）
             record_probe(&out, "catpaw", model);
+            out
+        }
+
+        // 豆包：清单是本地固定的两个模式（默认/深度思考），不联网
+        "doubao_model_ids" => crate::doubao::model_ids(),
+        "doubao_test" => {
+            let model = payload["model"].as_str().unwrap_or("doubao");
+            let out = json!({ "ok": true, "result": crate::doubao::test(model) });
+            // 外层 ok 恒 true，真正的成败在 result.ok（同 pawbridge_test）
+            record_probe(&out, "doubao", model);
             out
         }
 

@@ -615,6 +615,52 @@ $owner.Dispose()
     }
 }
 
+/// 选可执行文件：添加本机程序时不用手打路径。
+/// 和 pick_folder 同一套隐藏 owner 窗口的写法，避免对话框弹到任务栏后面。
+pub fn pick_exe(current: &str) -> (bool, String) {
+    const PS: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.StartPosition = 'Manual'
+$owner.Location = New-Object System.Drawing.Point(-32000, -32000)
+$owner.Size = New-Object System.Drawing.Size(0, 0)
+$owner.Show() | Out-Null
+$dlg = New-Object System.Windows.Forms.OpenFileDialog
+$dlg.CheckFileExists = $true
+$dlg.Multiselect = $false
+$dlg.Filter = 'Executable (*.exe;*.cmd;*.bat)|*.exe;*.cmd;*.bat|All files (*.*)|*.*'
+$start = $env:COCKPIT_PICK_START
+if ($start -and (Test-Path -LiteralPath $start)) { $dlg.InitialDirectory = (Split-Path -Parent $start) }
+if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::Out.Write($dlg.FileName)
+}
+$owner.Dispose()
+"#;
+    let mut c = std::process::Command::new("powershell");
+    c.args(["-NoProfile", "-STA", "-Command", PS]);
+    c.env("COCKPIT_PICK_START", current);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    match c.output() {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                (false, "已取消".into())
+            } else {
+                (true, s)
+            }
+        }
+        Err(e) => (false, format!("打不开选择对话框：{}", e)),
+    }
+}
+
 /// 备份清单：每个 zip 的大小、时间、属于哪个 Agent/账号
 pub fn list_backups() -> Vec<serde_json::Value> {
     let mut out = Vec::new();

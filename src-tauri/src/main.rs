@@ -3,6 +3,7 @@
 // 默认 128 层递归展开不下
 #![recursion_limit = "256"]
 
+mod agenthub;
 mod ai;
 mod brand;
 mod antigravity;
@@ -19,6 +20,7 @@ mod claude_gateway;
 mod agentfind;
 mod companion;
 mod discover;
+mod doubao;
 mod expiry;
 mod gateway;
 mod gateway_cleanup;
@@ -217,8 +219,17 @@ fn main() {
             // 客户端在清理时还开着，只能等它退出再补：这里每 20 秒看一眼待清理台账。
             std::thread::spawn(move || gateway_cleanup::watch_pending(port));
             // 便携 exe 不进开始菜单就搜不到，而搜不到就没人能进设置去点那个按钮——
-            // 启动后自己在后台补一条（要起 PowerShell，不放启动路径上）
-            std::thread::spawn(shelllink::ensure_start_menu);
+            // 启动后自己在后台补一条（要起 PowerShell，不放启动路径上）。
+            // 补完顺手把全部外壳入口的图标对齐到当前 brand：桌面/开始菜单里后来新建的、
+            // 指到另一份 exe 副本的、被系统重新生成的条目，都会在这一步被拉回同一张图。
+            std::thread::spawn(|| {
+                shelllink::ensure_start_menu();
+                match shelllink::sync_brand_icons() {
+                    Ok(0) => {}
+                    Ok(n) => lifecycle::note(&format!("外壳图标已同步 {n} 条快捷方式")),
+                    Err(e) => lifecycle::note(&format!("外壳图标同步失败：{e}")),
+                }
+            });
             // 反代**不在启动时自动恢复**：8788 起来就是在把各家账号的模型往外放行，
             // 开机静默监听不是她想要的默认（2026-10-21 她明确要求改成用时自己点）。
             // 要恢复这条得先想清楚：她客户端填的地址连不上时会明说「模型连不上」，
@@ -239,6 +250,7 @@ fn main() {
             commands::add_app,
             commands::scan_inventory,
             commands::pick_folder,
+            commands::pick_exe,
             commands::remove_app,
             commands::get_settings,
             commands::set_settings,

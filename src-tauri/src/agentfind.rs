@@ -10,13 +10,29 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
 
 static START: Mutex<()> = Mutex::new(());
 const SCRIPT: &str = include_str!("../scripts/agentfind.py");
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// FNV-1a over the embedded script, matching `_script_fingerprint()` on the
+/// Python side. A live service reporting a different value is another build.
+fn script_fingerprint() -> &'static str {
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT.get_or_init(|| format!("{:016x}", fnv1a(SCRIPT.as_bytes())))
+}
 
 fn absolute(path: PathBuf) -> PathBuf {
     if path.is_absolute() {
@@ -118,7 +134,11 @@ fn probe_ports(dir: &Path, default: u16) -> (Option<u16>, bool) {
             .call()
             .ok()
             .and_then(|r| r.into_json::<Value>().ok());
-        if identity.is_some_and(|id| id["service"] == "AgentFind" && id["sessions_ui"] == 1) {
+        if identity.is_some_and(|id| {
+            id["service"] == "AgentFind"
+                && id["sessions_ui"] == 1
+                && id["script"] == script_fingerprint()
+        }) {
             return (Some(port), legacy);
         }
         let meta = http
@@ -137,9 +157,10 @@ fn running(dir: &Path, default: u16) -> Option<u16> {
     probe_ports(dir, default).0
 }
 
-/// Older AgentFind builds have no `/api/agentfind` identity but still answer
-/// `/api/meta`. Keeping one of those running would make a fresh child exit
-/// immediately with "already running", so detect it before spawning.
+/// A service we must stop before spawning: either an older build with no
+/// `/api/agentfind` identity, or one whose script fingerprint is not ours. Both
+/// would make a fresh child exit immediately with "already running", and the
+/// latter would keep serving its own outdated page.
 fn legacy_running(dir: &Path, default: u16) -> bool {
     probe_ports(dir, default).1
 }
@@ -310,6 +331,21 @@ mod tests {
         assert!(SCRIPT.len() > 100_000, "AgentFind source must be compiled in");
         assert!(SCRIPT.contains("\"service\": \"AgentFind\""));
         assert!(SCRIPT.contains("\"sessions_ui\": 1"));
+    }
+
+    #[test]
+    fn fingerprint_uses_standard_fnv1a_so_python_can_reproduce_it() {
+        assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a(b"a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(fnv1a(b"foobar"), 0x85944171f73967e8);
+        assert_eq!(script_fingerprint().len(), 16);
+    }
+
+    #[test]
+    fn service_identity_carries_the_script_fingerprint() {
+        assert!(SCRIPT.contains("0xcbf29ce484222325"));
+        assert!(SCRIPT.contains("0x100000001b3"));
+        assert!(SCRIPT.contains("\"script\": SCRIPT_FINGERPRINT"));
     }
 
     #[test]

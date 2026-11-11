@@ -25,5 +25,14 @@ class PrivacyGateTests(unittest.TestCase):
         personal_path = 'C:/Users/' + 'PrivatePerson/app'
         self.assertTrue(privacy.scan_text(personal_path, 'sample.txt'))
 
+    def test_developer_install_roots_are_reported(self):
+        # 拼出来，避免测试文件本身又成为“公开源码里的开发机路径”
+        roots = ('Artificial' + '_Intelligence', 'Leno' + 'vo' + 'Softstore', 'npm' + '-global')
+        for root in roots:
+            self.assertTrue(
+                privacy.scan_text('D:/' + root + '/Foo/Foo.exe', 'fixture.txt'), root
+            )
+        self.assertEqual(privacy.scan_text('D:/Apps/Foo/Foo.exe', 'fixture.txt'), [])
+
 if __name__ == '__main__':
     unittest.main()

@@ -16,3 +16,16 @@ Keep the archive tracked in source control so offline release builds do not
 depend on a developer's Python installation. The executable contains the
 archive, and the extracted copy is verified against it before use. The local
 unpacked runtime occupies about 30 MB; the archive includes its license.
+
+## Bundled agenthub runtime
+
+`agenthub.py` and `console.html` are the MIT-licensed
+[agent-memory-suite](https://github.com/shen1950/agent-memory-suite) backend
+used for check-in and local quota reads. They are compiled into the executable
+and written next to the unpacked Python runtime.
+
+`agenthub-libs.zip` adds `cryptography` 49.0.0, `cffi` 2.1.0 and
+`pycparser` 3.0 under `Lib/site-packages`, plus a `python314._pth` that puts
+that directory on `sys.path`. Licenses are included in `licenses/` inside the
+archive and in `docs/third-party/`. The archive is verified during extraction;
+nested paths are checked for zip-slip before writing.

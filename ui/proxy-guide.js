@@ -8,7 +8,7 @@
     ['qoder-cn', 'Qoder CN'], ['qoder', 'Qoder'], ['workbuddy', 'WorkBuddy'],
     ['workbuddy-intl', 'WorkBuddy 国际版'], ['traework-cn', 'TRAE CN'],
     ['opencode', 'OpenCode'], ['astudio', 'AStudio'], ['minimax', 'MiniMax Code'],
-    ['qwenwork', '千问办公'], ['catpaw', '妙手'],
+    ['qwenwork', '千问办公'], ['catpaw', '妙手'], ['doubao', '豆包'],
   ];
   const update = () => renderGuide(S.data);
   const go = n => { wizard.step = n; wizard.error = ''; update(); };

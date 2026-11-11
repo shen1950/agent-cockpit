@@ -879,6 +879,8 @@ pub fn build_state(proxy: &Proxy) -> Value {
             "qwbridge": crate::qwbridge::view(),
             // 妙手：本地桥（catpaw-bridge）探活 + 管道闸门 + 登录态 + 有没有进上游组
             "pawbridge": crate::pawbridge::view(),
+            // 豆包：进程内云端直连（doubao.rs），ready 只看凭据缓存，不触发重读
+            "doubao": crate::doubao::view(),
             "logs": proxy.recent_logs(30),
         },
         "now": chrono::Local::now().format("%H:%M:%S").to_string(),

@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 EMAIL = re.compile(r'[\w.+*-]+@[\w.-]+\.[A-Za-z]{2,}')
 USER_PATH = re.compile(r'(?i)[A-Z]:[\\/]+Users[\\/]+([^\\/\s"\'<>]+)')
+# 开发者机器的安装根（不是产品默认位置）。公开源码里出现就说明本机路径没清干净。
+DEV_ROOT = re.compile(r'(?i)\b[DE]:[\\/]+(?:Artificial_Intelligence|LenovoSoftstore|npm-global)\b')
 SECRET = re.compile(r'\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{25,}|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]{25,}\.[A-Za-z0-9_-]{25,}\.[A-Za-z0-9_-]{20,})')
 # Exact synthetic fixtures used by encoding tests (not a file-wide exemption).
 TEST_EMAILS = {'src-tauri/src/antigravity.rs': {'x@y.com', 'someone@gmail.com'}}
@@ -43,6 +45,8 @@ def scan_text(text, name, terms=()):
         for match in USER_PATH.finditer(line):
             if match[1].lower() not in {'example', 'test', 'x', 'me', 'public', 'default'}:
                 categories.add('personal-home-path')
+        if DEV_ROOT.search(line):
+            categories.add('developer-install-root')
         for match in EMAIL.finditer(line):
             address = match[0]
             domain = address.split('@')[-1].lower()

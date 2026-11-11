@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentHub Console</title>
+<link rel="icon" href="data:,">
+<style>
+:root{
+  --bg:#0C0E14; --panel:#12151D; --panel2:#171B25; --line:#252B38; --line2:#323A4A;
+  --text:#E8E4DB; --muted:#9A968C; --dim:#6F6D67;
+  --gold:#C8956C; --gold2:#E4BE95; --ok:#77B295; --warn:#D6A35C; --bad:#C96A5F;
+  --serif:Georgia,"Songti SC","Noto Serif CJK SC",serif;
+  --sans:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+  --mono:"Cascadia Code",Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:radial-gradient(900px 420px at 18% -8%,rgba(200,149,108,.12),transparent 60%),var(--bg);
+  color:var(--text);font:14px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+.app{max-width:1440px;margin:0 auto;padding:26px 24px 48px}
+header{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;padding-bottom:18px;border-bottom:1px solid var(--line)}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.18em;color:var(--gold);text-transform:uppercase}
+h1{font-family:var(--serif);font-weight:500;font-size:clamp(30px,4vw,48px);line-height:1.05;margin:6px 0 6px;letter-spacing:-.02em}
+h1 span{color:var(--gold);font-style:italic}
+.lede{color:var(--muted);font-size:12.5px;margin:0}
+.chips{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.chip{font-family:var(--mono);font-size:10px;color:var(--gold2);border:1px solid rgba(200,149,108,.35);
+  background:rgba(200,149,108,.07);border-radius:999px;padding:4px 9px;white-space:nowrap}
+.tabs{display:flex;gap:2px;margin:20px 0 18px;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;
+  background:rgba(12,14,20,.92);backdrop-filter:blur(10px);overflow-x:auto}
+.tab{appearance:none;border:0;background:transparent;color:var(--muted);font:13px var(--sans);padding:11px 15px;
+  cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--gold2);border-bottom-color:var(--gold)}
+.panel{display:none}.panel.active{display:block}
+.metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
+.metric{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:13px 15px}
+.metric .n{font-family:var(--serif);font-size:28px;color:var(--gold2);line-height:1}
+.metric .l{font-size:11px;color:var(--muted);margin-top:5px}
+.metric .s{font-family:var(--mono);font-size:9.5px;color:var(--dim);margin-top:3px}
+.cols{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}
+.card{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:15px}
+.card h2{font-family:var(--serif);font-weight:500;font-size:20px;margin:0 0 10px}
+.card .sub{font-size:11.5px;color:var(--muted);margin:-4px 0 12px}
+.card-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+.ticket{border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.025),transparent);border-radius:10px;padding:11px 12px;margin:8px 0}
+.ticket:first-child{margin-top:0}
+.ticket-top{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.ticket h3{font-size:13.5px;font-weight:600;margin:6px 0 3px}
+.meta{font-family:var(--mono);font-size:9.5px;color:var(--dim);word-break:break-all}
+.attention{margin-top:6px;padding:6px 8px;border-left:2px solid var(--warn);background:rgba(214,163,92,.07);color:var(--gold2);font-size:11.5px}
+.badge{font-family:var(--mono);font-size:9px;border-radius:999px;padding:2px 7px;border:1px solid var(--line2);color:var(--muted);white-space:nowrap}
+.badge.person{border-color:rgba(214,163,92,.5);color:var(--warn);background:rgba(214,163,92,.08)}
+.badge.ok{border-color:rgba(119,178,149,.45);color:var(--ok);background:rgba(119,178,149,.07)}
+.badge.bad{border-color:rgba(201,106,95,.45);color:var(--bad);background:rgba(201,106,95,.07)}
+.badge.dim{color:var(--dim)}
+.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+button{font:12px var(--sans);border-radius:8px;padding:6px 10px;cursor:pointer;border:1px solid var(--line2);background:var(--panel2);color:var(--text)}
+button:hover{border-color:var(--gold);color:var(--gold2)}
+button.primary{background:rgba(200,149,108,.14);border-color:rgba(200,149,108,.55);color:var(--gold2)}
+button.danger{border-color:rgba(201,106,95,.4);color:var(--bad)}
+button:disabled{opacity:.5;cursor:wait}
+input,select,textarea{width:100%;background:#0A0C11;border:1px solid var(--line2);border-radius:8px;color:var(--text);
+  font:12.5px var(--sans);padding:8px 9px;outline:none}
+input:focus,select:focus,textarea:focus{border-color:rgba(200,149,108,.65)}
+textarea{min-height:110px;resize:vertical}
+label{display:block;font-size:11px;color:var(--muted);margin:9px 0 4px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.check{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);margin:8px 0}
+.check input{width:auto}
+.agent-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}
+.agent{border:1px solid var(--line);border-radius:10px;padding:10px;background:var(--panel2);cursor:pointer}
+.agent:hover{border-color:var(--gold)}
+.agent .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--dim);margin-right:6px}
+.agent .dot.on{background:var(--ok)}
+.agent h3{font-size:12.5px;margin:4px 0 2px}
+.agent p{font-size:10.5px;color:var(--muted);margin:0}
+.tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}
+.tags span{font-family:var(--mono);font-size:8.5px;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:1px 5px}
+pre.job{background:#080A0E;border:1px solid var(--line);border-radius:9px;padding:10px;min-height:90px;max-height:320px;overflow:auto;
+  color:#D9D4C8;font:11px/1.55 var(--mono);white-space:pre-wrap;word-break:break-word;margin:10px 0 0}
+.run{display:flex;gap:9px;align-items:flex-start;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.045)}
+.run:last-child{border-bottom:0}
+.run b{font-size:12px;font-weight:600}
+.health{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.health span{font-family:var(--mono);font-size:9.5px;border:1px solid var(--line);border-radius:999px;padding:3px 7px;color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+th,td{text-align:left;border-bottom:1px solid var(--line);padding:7px 6px;vertical-align:top}
+th{font-family:var(--mono);font-size:9px;color:var(--gold);text-transform:uppercase;letter-spacing:.08em;font-weight:500}
+td{color:var(--muted)}
+td:first-child{color:var(--text)}
+.ev{display:grid;grid-template-columns:48px 150px 150px 1fr;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.045);
+  font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+.ev b{color:var(--gold2);font-weight:500}
+.toast{position:fixed;right:20px;bottom:20px;max-width:420px;border:1px solid var(--line2);background:var(--panel2);color:var(--text);
+  border-radius:10px;padding:10px 12px;font-size:12px;box-shadow:0 15px 40px rgba(0,0,0,.45);opacity:0;transform:translateY(8px);
+  transition:.18s;pointer-events:none;z-index:20}
+.toast.show{opacity:1;transform:none}
+.toast.bad{border-color:rgba(201,106,95,.55);color:#E6B3AC}
+.empty{color:var(--dim);font-size:12px;padding:12px 0}
+.hint{font-size:10.5px;color:var(--dim);margin-top:8px}
+footer{margin-top:26px;padding-top:12px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:12px;
+  color:var(--dim);font-family:var(--mono);font-size:9.5px;flex-wrap:wrap}
+@media(max-width:1100px){.cols{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(3,1fr)}.agent-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:700px){.app{padding:18px 14px 36px}.metrics{grid-template-columns:repeat(2,1fr)}.agent-grid{grid-template-columns:1fr}.row{grid-template-columns:1fr}header{display:block}.chips{justify-content:flex-start;margin-top:10px}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div>
+      <div class="eyebrow">LOCAL AGENT OPERATIONS · 127.0.0.1</div>
+      <h1>AgentHub <span>Console</span></h1>
+      <p class="lede">一个页面看工单、派 Agent、跑工作流、查策略和 trace。数据不出本机。</p>
+    </div>
+    <div class="chips">
+      <span class="chip" id="clock">—</span>
+      <span class="chip">Policy → Ticket → Run → Report</span>
+      <span class="chip" id="health-chip">health —</span>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="overview">总览</button>
+    <button class="tab" data-tab="inbox">收件箱 <span id="inbox-count"></span></button>
+    <button class="tab" data-tab="agents">Agent 调用</button>
+    <button class="tab" data-tab="workflows">工作流</button>
+    <button class="tab" data-tab="policy">策略</button>
+    <button class="tab" data-tab="trace">追踪</button>
+  </nav>
+
+  <main>
+    <section class="panel active" id="panel-overview">
+      <div class="metrics" id="metrics"></div>
+      <div class="cols">
+        <div class="card">
+          <div class="card-head"><h2>需要人</h2><button class="ghost" data-goto="inbox">全部 →</button></div>
+          <p class="sub">只列 person_answer / review / blocked / failed，进度默认静默。</p>
+          <div id="overview-inbox"><div class="empty">加载中…</div></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>最近运行</h2><button class="ghost" data-goto="workflows">全部 →</button></div>
+          <p class="sub">run 是执行层，工单是工作层。</p>
+          <div id="overview-runs"><div class="empty">加载中…</div></div>
+          <div class="health" id="health-list"></div>
+          <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+            <button class="primary" id="run-effects">处理到期 effects</button>
+            <button data-goto="agents">去调用 Agent</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-inbox">
+      <div class="card">
+        <div class="card-head"><h2>注意力收件箱</h2><button class="ghost" id="refresh-inbox">刷新</button></div>
+        <p class="sub">回答会恢复/继续工单；重试会清掉 blocked/failed；停止会撤回这张工单的授权。</p>
+        <div id="inbox-list"><div class="empty">加载中…</div></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-agents">
+      <div class="cols">
+        <div class="card">
+          <h2>Agent 能力</h2>
+          <p class="sub">点一张卡会填进右侧表单。CLI 无头，桥接走桌面收件箱。</p>
+          <div class="agent-grid" id="agent-grid"><div class="empty">加载中…</div></div>
+        </div>
+        <div class="card">
+          <h2>发起调用</h2>
+          <p class="sub">和命令行走同一条链路，控制台只负责收集参数和展示输出。</p>
+          <form id="call-form">
+            <label>Agent</label>
+            <select name="product" id="call-product" required></select>
+            <label>任务</label>
+            <textarea name="task" placeholder="例如：把 README 里的错别字改掉" required></textarea>
+            <div class="row">
+              <div><label>关联工单（可选）</label><input name="ticket" placeholder="tk-..."></div>
+              <div><label>工作目录（可选）</label><input name="cwd" placeholder="D:/某项目"></div>
+            </div>
+            <div class="check"><input type="checkbox" name="write"> 允许写文件（codex --write）</div>
+            <div class="check"><input type="checkbox" name="yolo"> 跳过权限确认（claude --yolo）</div>
+            <div class="check"><input type="checkbox" name="approval"> 派工前等人工审批</div>
+            <div class="check"><input type="checkbox" name="no_wait"> 桥接投递后立即返回</div>
+            <label>超时秒数</label><input name="timeout" type="number" placeholder="900">
+            <div style="display:flex;gap:8px;margin-top:12px"><button class="primary" type="submit">派工</button><button type="reset">清空</button></div>
+          </form>
+          <pre class="job" id="call-log">等待派工…</pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-workflows">
+      <div class="cols">
+        <div class="card">
+          <div class="card-head"><h2>运行记录</h2><button class="ghost" id="refresh-runs">刷新</button></div>
+          <p class="sub">点一条运行去追踪事件。</p>
+          <div id="workflow-runs"><div class="empty">加载中…</div></div>
+        </div>
+        <div class="card">
+          <h2>跑一个工作流</h2>
+          <p class="sub">先 dry-run 看计划；绑定工单后结束会自动写 ready/waiting/failed。</p>
+          <form id="workflow-form">
+            <label>工作流 YAML 路径</label><input name="file" placeholder="D:/项目/workflow.yaml" required>
+            <div class="row">
+              <div><label>关联工单（可选）</label><input name="ticket" placeholder="tk-..."></div>
+              <div><label>工作目录（可选）</label><input name="cwd" placeholder="D:/项目"></div>
+            </div>
+            <div class="check"><input type="checkbox" name="dry_run" checked> 只 dry-run，不派工</div>
+            <div style="display:flex;gap:8px;margin-top:12px"><button class="primary" type="submit">启动</button></div>
+          </form>
+          <pre class="job" id="workflow-log">等待启动…</pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-policy">
+      <div class="cols">
+        <div class="card">
+          <div class="card-head"><h2>准入策略</h2><span class="badge dim" id="policy-version">—</span></div>
+          <p class="sub">先判断谁可以发起、以什么强度发起；auto 只放行带结构化研判的 inferred。</p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button data-mode="off">off</button><button data-mode="observe">observe</button><button data-mode="auto">auto</button>
+          </div>
+          <p class="hint" id="policy-mode-hint"></p>
+          <label>允许来源 / 发起人</label>
+          <div class="row"><input id="allow-source" placeholder="cli / github"><input id="allow-actor" placeholder="user / alice"></div>
+          <div style="display:flex;gap:8px;margin-top:8px"><button id="allow-btn">允许</button><button id="disallow-btn">移除</button></div>
+          <label>新增/更新规则</label>
+          <div class="row"><input id="rule-id" placeholder="small-fix"><input id="rule-instruction" placeholder="允许小范围文案修改"></div>
+          <div style="margin-top:8px"><button id="rule-btn">保存规则</button></div>
+        </div>
+        <div class="card">
+          <h2>来源与规则</h2>
+          <p class="sub">来源是流；规则决定哪些主动工作可以接。</p>
+          <div id="policy-sources"><div class="empty">加载中…</div></div>
+          <div id="policy-rules" style="margin-top:12px"><div class="empty">加载中…</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-trace">
+      <div class="card">
+        <div class="card-head"><h2>事件追踪</h2><button class="ghost" id="refresh-trace">刷新</button></div>
+        <p class="sub">run_events 是事实源：开始、结束、重试、打回、预算都在这里。</p>
+        <div class="row"><div><label>运行</label><select id="trace-run"></select></div><div><label>&nbsp;</label><button class="primary" id="trace-load">加载事件</button></div></div>
+        <div id="trace-events" style="margin-top:12px"><div class="empty">选择一条运行</div></div>
+      </div>
+    </section>
+  </main>
+
+  <footer><span>AgentHub Console · 127.0.0.1 · 单文件后端</span><span id="footer-state">ready</span></footer>
+  <div class="toast" id="toast"></div>
+</div>
+<script>
+const $ = (s, root=document) => root.querySelector(s);
+const $$ = (s, root=document) => [...root.querySelectorAll(s)];
+const state = { overview: null, runs: [], tab: 'overview' };
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const stageLabel = {working:'working', working_queued:'queued', idle:'idle', ended:'ended',
+  person_answer:'awaiting answer', person_review:'awaiting review', person_blocked:'blocked', person_failed:'failed'};
+const stageClass = s => s && s.startsWith('person_') ? 'person' : s === 'ended' ? 'dim' : s === 'failed' ? 'bad' : 'ok';
+function toast(msg, bad=false){ const t=$('#toast'); t.textContent=msg; t.className='toast show'+(bad?' bad':''); clearTimeout(t._t); t._t=setTimeout(()=>t.className='toast',2600); }
+async function api(path, opts={}){
+  const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = {error:text}; }
+  if (!r.ok) throw new Error(data.error || ('HTTP '+r.status));
+  return data;
+}
+function setTab(name){
+  state.tab = name;
+  $$('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  $$('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
+  if (name === 'inbox') loadInbox();
+  if (name === 'policy') loadPolicy();
+  if (name === 'workflows') loadRuns();
+  if (name === 'trace') fillRunSelect();
+}
+$$('.tab').forEach(b => b.onclick = () => setTab(b.dataset.tab));
+$$('[data-goto]').forEach(b => b.onclick = () => setTab(b.dataset.goto));
+
+function renderMetrics(o){
+  const t = o.tickets || {};
+  $('#metrics').innerHTML = [
+    [t.open ?? 0, '未结束工单', 'policy → ticket'],
+    [t.inbox ?? 0, '待人工', 'inbox 只列 person_*'],
+    [o.effects ?? 0, '副作用待处理', 'effects queue'],
+    [(o.agents||[]).filter(a=>a.available).length + '/' + (o.agents||[]).length, '可用 Agent', 'CLI + 桥接'],
+    [(o.runs||[]).length, '最近运行', '最近记录'],
+  ].map(([n,l,s]) => `<div class="metric"><div class="n">${esc(n)}</div><div class="l">${esc(l)}</div><div class="s">${esc(s)}</div></div>`).join('');
+  $('#inbox-count').textContent = t.inbox ? `(${t.inbox})` : '';
+  $('#clock').textContent = (o.now || '').replace('T',' ').slice(0,19);
+  const bad = (o.health||[]).filter(h=>h.state==='error').length;
+  $('#health-chip').textContent = bad ? `health ${bad} error` : 'health ok';
+  $('#footer-state').textContent = bad ? `${bad} 个健康项异常` : 'ready';
+}
+function ticketCard(t, compact=false){
+  const attention = t.attention ? `<div class="attention">${esc(t.attention)}</div>` : '';
+  return `<article class="ticket">
+    <div class="ticket-top"><span class="badge ${stageClass(t.stage)}">${esc(stageLabel[t.stage] || t.stage)}</span><span class="meta">${esc(t.source)} · ${esc(t.requester || '-')}</span></div>
+    <h3>${esc(t.title)}</h3>
+    <div class="meta">${esc(t.id)}${t.run_id ? ' · run '+esc(t.run_id) : ''}${t.workspace ? ' · '+esc(t.workspace) : ''}</div>
+    ${attention}
+    <div class="actions">
+      <button data-act="answer" data-id="${esc(t.id)}">回答</button>
+      <button data-act="retry" data-id="${esc(t.id)}">重试</button>
+      <button data-act="stop" data-id="${esc(t.id)}" class="danger">停止</button>
+    </div>
+  </article>`;
+}
+function renderTicketList(el, list){
+  el.innerHTML = list && list.length ? list.map(t=>ticketCard(t)).join('') : '<div class="empty">没有需要处理的工单。</div>';
+}
+function renderRuns(list){
+  const html = list && list.length ? list.map(r=>`<div class="run"><span class="badge ${r.status==='done'?'ok':r.status==='failed'?'bad':'dim'}">${esc(r.status)}</span><div><b>${esc(r.workflow)}</b><div class="meta">${esc(r.project)} · ${esc(r.run_id)} · ${esc(r.updated_at)}</div></div></div>`).join('') : '<div class="empty">还没有运行记录。</div>';
+  $('#overview-runs').innerHTML = html;
+  $('#workflow-runs').innerHTML = html;
+}
+function renderHealth(list){
+  $('#health-list').innerHTML = (list||[]).map(h=>`<span>${esc(h.kind)}: ${esc(h.state)}</span>`).join('') || '<span>health: 暂无记录</span>';
+}
+function renderAgents(list){
+  $('#agent-grid').innerHTML = (list||[]).map(a=>`<button type="button" class="agent" data-product="${esc(a.id)}">
+    <div><span class="dot ${a.available?'on':''}"></span><span class="meta">${esc(a.kind)}</span></div>
+    <h3>${esc(a.name)}</h3><p>${esc(a.desc)}</p>
+    <div class="tags">${(a.tags||[]).map(x=>`<span>${esc(x)}</span>`).join('')}</div>
+  </button>`).join('');
+  $$('.agent').forEach(b=>b.onclick=()=>{ $('#call-product').value=b.dataset.product; toast('已选 '+b.dataset.product); });
+  const sel = $('#call-product');
+  const current = sel.value;
+  sel.innerHTML = (list||[]).map(a=>`<option value="${esc(a.id)}">${esc(a.name)} (${esc(a.kind)}${a.available?' · 可用':' · 未检测到'})</option>`).join('');
+  if (current) sel.value = current;
+}
+function fillRunSelect(){
+  const runs = state.runs || [];
+  const sel = $('#trace-run');
+  const old = sel.value;
+  sel.innerHTML = runs.map(r=>`<option value="${esc(r.project)}|${esc(r.run_id)}">${esc(r.project)} · ${esc(r.run_id)} · ${esc(r.status)}</option>`).join('');
+  if (old) sel.value = old;
+}
+async function loadOverview(){
+  try {
+    const o = await api('/api/overview');
+    state.overview = o; state.runs = o.runs || [];
+    renderMetrics(o); renderTicketList($('#overview-inbox'), o.inbox_tickets); renderRuns(o.runs); renderHealth(o.health); renderAgents(o.agents);
+    if (state.tab === 'trace') fillRunSelect();
+  } catch(e) { toast('总览加载失败：'+e.message, true); }
+}
+async function loadInbox(){
+  try { const list = await api('/api/tickets?stage='+encodeURIComponent('person_%')+'&open=1&limit=100'); renderTicketList($('#inbox-list'), list); }
+  catch(e){ toast('收件箱加载失败：'+e.message, true); }
+}
+async function loadRuns(){
+  try { const runs = await api('/api/runs'); state.runs = runs; renderRuns(runs); }
+  catch(e){ toast('运行记录加载失败：'+e.message, true); }
+}
+async function loadPolicy(){
+  try {
+    const p = await api('/api/policy');
+    $('#policy-version').textContent = 'policy ' + p.version;
+    $('#policy-mode-hint').textContent = '当前模式：' + p.mode;
+    $$('[data-mode]').forEach(b=>b.classList.toggle('primary', b.dataset.mode === p.mode));
+    const src = Object.entries(p.sources || {}).map(([name,v])=>`<div class="run"><b>${esc(name)}</b><div class="meta">allowed ${esc((v.allowed||[]).join(', ')||'（空）')} · admission ${esc(v.admission||'-')}</div></div>`).join('');
+    $('#policy-sources').innerHTML = src || '<div class="empty">没有来源。</div>';
+    const rules = (p.rules||[]).map(r=>`<div class="run"><span class="badge ${r.enabled?'ok':'dim'}">${r.enabled?'on':'off'}</span><div><b>${esc(r.id)}</b><div class="meta">${esc(r.instruction||'')}</div></div></div>`).join('');
+    $('#policy-rules').innerHTML = rules || '<div class="empty">没有规则。</div>';
+  } catch(e){ toast('策略加载失败：'+e.message, true); }
+}
+async function loadTrace(){
+  const val = $('#trace-run').value;
+  if (!val) { $('#trace-events').innerHTML = '<div class="empty">没有可追踪的运行。</div>'; return; }
+  const [project, run] = val.split('|');
+  try {
+    const evs = await api('/api/trace?project='+encodeURIComponent(project)+'&run='+encodeURIComponent(run));
+    $('#trace-events').innerHTML = evs.length ? evs.map(e=>`<div class="ev"><span>${e.seq}</span><b>${esc(e.type)}</b><span>${esc(e.step_id||'-')}</span><span>${esc(JSON.stringify(e.payload||{}))}</span></div>`).join('') : '<div class="empty">没有事件。</div>';
+  } catch(e){ toast('追踪加载失败：'+e.message, true); }
+}
+function watchJob(jobId, el){
+  el.textContent = '启动中…';
+  const timer = setInterval(async ()=>{
+    try {
+      const j = await api('/api/job?id='+encodeURIComponent(jobId));
+      el.textContent = j.output || '(暂无输出)';
+      el.scrollTop = el.scrollHeight;
+      if (j.status !== 'running') {
+        clearInterval(timer);
+        el.textContent += `\n\n[${j.status}] exit=${j.code}`;
+        toast(`任务 ${j.status}`);
+        loadOverview();
+      }
+    } catch(e) { clearInterval(timer); el.textContent = '任务查询失败：'+e.message; }
+  }, 900);
+}
+$('#call-form').onsubmit = async (e)=>{
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = {product:f.get('product'), task:f.get('task'), ticket:f.get('ticket'), cwd:f.get('cwd'),
+    write:f.get('write')==='on', yolo:f.get('yolo')==='on', approval:f.get('approval')==='on',
+    no_wait:f.get('no_wait')==='on', timeout:f.get('timeout')};
+  try { const r = await api('/api/call',{method:'POST',body:JSON.stringify(body)}); watchJob(r.job.id, $('#call-log')); }
+  catch(err){ toast('派工失败：'+err.message, true); }
+};
+$('#workflow-form').onsubmit = async (e)=>{
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = {file:f.get('file'), ticket:f.get('ticket'), cwd:f.get('cwd'), dry_run:f.get('dry_run')==='on'};
+  try { const r = await api('/api/workflow',{method:'POST',body:JSON.stringify(body)}); watchJob(r.job.id, $('#workflow-log')); }
+  catch(err){ toast('工作流启动失败：'+err.message, true); }
+};
+document.addEventListener('click', async (e)=>{
+  const b = e.target.closest('[data-act]');
+  if (!b) return;
+  const id = b.dataset.id, act = b.dataset.act;
+  try {
+    if (act === 'answer') {
+      const text = prompt('输入回答（会恢复/继续这张工单）');
+      if (!text) return;
+      await api('/api/ticket',{method:'POST',body:JSON.stringify({id,action:'answer',text})});
+    } else if (act === 'retry') {
+      await api('/api/ticket',{method:'POST',body:JSON.stringify({id,action:'retry'})});
+    } else if (act === 'stop') {
+      if (!confirm('确定停止这张工单？停止后需要新的请求才能继续。')) return;
+      await api('/api/ticket',{method:'POST',body:JSON.stringify({id,action:'stop',reason:'console stop'})});
+    }
+    toast('已提交'); loadOverview(); loadInbox();
+  } catch(err){ toast('操作失败：'+err.message, true); }
+});
+$$('[data-mode]').forEach(b=>b.onclick=async ()=>{
+  try { await api('/api/policy',{method:'POST',body:JSON.stringify({action:'mode',mode:b.dataset.mode})}); toast('模式已切到 '+b.dataset.mode); loadPolicy(); }
+  catch(e){ toast('切换失败：'+e.message, true); }
+});
+$('#allow-btn').onclick = async ()=>{
+  const source=$('#allow-source').value.trim(), actor=$('#allow-actor').value.trim();
+  if (!source || !actor) return toast('source 和 actor 都要填', true);
+  try { await api('/api/policy',{method:'POST',body:JSON.stringify({action:'allow',source,actor})}); toast('已允许'); loadPolicy(); }
+  catch(e){ toast('操作失败：'+e.message, true); }
+};
+$('#disallow-btn').onclick = async ()=>{
+  const source=$('#allow-source').value.trim(), actor=$('#allow-actor').value.trim();
+  if (!source || !actor) return toast('source 和 actor 都要填', true);
+  try { await api('/api/policy',{method:'POST',body:JSON.stringify({action:'disallow',source,actor})}); toast('已移除'); loadPolicy(); }
+  catch(e){ toast('操作失败：'+e.message, true); }
+};
+$('#rule-btn').onclick = async ()=>{
+  const id=$('#rule-id').value.trim(), instruction=$('#rule-instruction').value.trim();
+  if (!id || !instruction) return toast('规则 id 和说明都要填', true);
+  try { await api('/api/policy',{method:'POST',body:JSON.stringify({action:'rule',id,instruction,enabled:true})}); toast('规则已保存'); loadPolicy(); }
+  catch(e){ toast('保存失败：'+e.message, true); }
+};
+$('#run-effects').onclick = async ()=>{
+  try { const r=await api('/api/effects/run',{method:'POST',body:JSON.stringify({limit:30})}); toast(`处理 ${r.processed} 条`); loadOverview(); }
+  catch(e){ toast('处理失败：'+e.message, true); }
+};
+$('#refresh-inbox').onclick = loadInbox;
+$('#refresh-runs').onclick = loadRuns;
+$('#refresh-trace').onclick = loadTrace;
+$('#trace-load').onclick = loadTrace;
+$('#trace-run').onchange = loadTrace;
+loadOverview();
+setTimeout(loadInbox, 200);
+setInterval(loadOverview, 5000);
+</script>
+</body>
+</html>

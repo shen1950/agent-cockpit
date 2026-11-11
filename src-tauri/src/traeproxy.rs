@@ -13,14 +13,8 @@ use crate::registry::{base_dir, load_instances, now_secs};
 use serde_json::{json, Map, Value};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 驾驶舱程序 id（只有一个：TRAE CN 的登录态整机一份，多开不共存）
 pub const APPS: [&str; 1] = ["traework-cn"];
@@ -50,24 +44,22 @@ pub fn app_display(app_id: &str) -> String {
 // ───────────────────────── 调 agenthub ─────────────────────────
 
 fn agenthub_json(extra: &[&str]) -> Result<Value, String> {
-    // agenthub 是 .cmd 包装，CreateProcess 直接执行不了，必须经 cmd.exe 转一手
-    let mut c = Command::new("cmd.exe");
-    let mut args: Vec<&str> = vec!["/d", "/c", "agenthub", "trae"];
+    let mut args: Vec<&str> = vec!["trae"];
     args.extend_from_slice(extra);
-    c.args(&args);
-    #[cfg(windows)]
-    c.creation_flags(CREATE_NO_WINDOW);
+    let mut c = crate::agenthub::command(&args);
     let out = c
         .output()
-        .map_err(|e| format!("调不到 agenthub（{e}）：本机需要先装 agent-memory-suite"))?;
+        .map_err(|e| format!(
+            "调不到 Trae 后端（{e}）：内置运行时不可用，PATH 上也没有 agenthub"
+        ))?;
     if !out.status.success() {
         let s = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
-            "agenthub trae 失败：{}",
+            "Trae 后端失败：{}",
             s.trim().chars().take(180).collect::<String>()
         ));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("agenthub 输出不是 JSON：{e}"))
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("Trae 后端输出不是 JSON：{e}"))
 }
 
 // ───────────────────────── 凭据 ─────────────────────────

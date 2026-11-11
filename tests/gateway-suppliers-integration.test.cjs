@@ -239,7 +239,19 @@ async function exercise(browser, viewport) {
     await admission.waitFor({ state: 'hidden' });
 
     // Retain existing model/settings integration coverage.
-    await item(customName).locator('.gateway-supplier-row').click();
+    const trigger = item(customName).locator('.gateway-supplier-row');
+    await trigger.scrollIntoViewIfNeeded();
+    const listBounds = await panel.boundingBox();
+    const listScroll = await panel.evaluate(node => node.closest('.pagebody').scrollTop);
+    const rowCount = await panel.locator('.gateway-supplier-item').count();
+    await trigger.click();
+    const settings = page.locator('dialog.gateway-supplier-settings');
+    await settings.waitFor({ state: 'visible' });
+    const settingsBounds = await settings.boundingBox();
+    assert.deepEqual(await panel.boundingBox(), listBounds, 'opening settings must preserve list geometry');
+    assert.equal(await panel.locator('.gateway-supplier-item').count(), rowCount, 'all suppliers must remain mounted behind settings');
+    assert.equal(await panel.evaluate(node => node.closest('.pagebody').scrollTop), listScroll);
+    assert.ok(settingsBounds.x >= 0 && settingsBounds.y >= 0 && settingsBounds.x + settingsBounds.width <= viewport.width && settingsBounds.y + settingsBounds.height <= viewport.height);
     const detail = page.locator('.gateway-supplier-detail');
     await detail.getByLabel('接入密钥', { exact: true }).selectOption({ index: 1 });
     await detail.getByLabel('设置模型', { exact: true }).waitFor();
@@ -248,9 +260,23 @@ async function exercise(browser, viewport) {
       assert.ok(await detail.getByLabel(label, { exact: true }).isVisible(), label + ' must be present');
     }
     await detail.getByLabel('上下文窗口', { exact: true }).fill('1M');
+    const focusedInput = await detail.getByLabel('上下文窗口', { exact: true }).elementHandle();
+    await page.evaluate(() => window.supplierPage.load(true));
+    assert.equal(await focusedInput.evaluate(node => node === document.activeElement && node.isConnected), true, 'refresh must preserve focused draft input');
+    assert.equal(await detail.getByLabel('上下文窗口', { exact: true }).inputValue(), '1M');
+    assert.deepEqual(await settings.boundingBox(), settingsBounds, 'model loading must not resize the settings dialog');
     await detail.getByRole('button', { name: '保存模型设置', exact: true }).click();
     await page.waitForFunction(async () => (await window.supplierBaseInvoke('get_state')).proxy.mockPolicies?.['mock/vision']?.context_window === 1000000);
     await page.screenshot({ path: path.join(evidence, 'supplier-detail-' + label + '.png') });
+    await settings.getByRole('button', { name: '关闭', exact: true }).click();
+    await settings.waitFor({ state: 'detached' });
+    assert.equal(await trigger.evaluate(node => document.activeElement === node), true, 'closing must restore focus to the original supplier');
+    assert.equal(await panel.evaluate(node => node.closest('.pagebody').scrollTop), listScroll, 'closing must restore list scroll');
+    await trigger.click();
+    await settings.waitFor({ state: 'visible' });
+    await page.keyboard.press('Escape');
+    await settings.waitFor({ state: 'detached' });
+    assert.equal(await trigger.evaluate(node => document.activeElement === node), true);
     assert.deepEqual(errors, [], 'no page or console errors: ' + errors.join(' | '));
     console.log(JSON.stringify({ result: 'PASS', viewport, checks: 'CRUD, admission scope, unavailable sources, errors, double submit, model settings' }));
   } finally {

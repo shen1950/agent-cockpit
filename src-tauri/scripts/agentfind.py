@@ -74,6 +74,19 @@ class _NoLock:
 NO_LOCK = _NoLock()
 
 
+def _script_fingerprint():
+    """FNV-1a over this file's bytes. The desktop launcher compares it before
+    reusing a live service, so a leftover older build cannot keep serving a
+    stale UI. Must stay byte-identical to script_fingerprint() in agentfind.rs."""
+    h = 0xcbf29ce484222325
+    for b in Path(__file__).read_bytes():
+        h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
+
+
+SCRIPT_FINGERPRINT = _script_fingerprint()
+
+
 # --------------------------------------------------------------------------
 # 运行环境
 # --------------------------------------------------------------------------
@@ -480,9 +493,12 @@ def discover_sources():
     add("dsh", "DeepSeek DSH", "dsh_jsonl_zst", [HOME / ".dsh/sessions"])
 
     # AStudio（Acode / 科大讯飞星辰）：rollout JSONL 在 acode-home-overlay/sessions/
-    astudio_sessions = Path(os.environ.get("AGENTFIND_ASTUDIO_HOME")
-                            or "D:/Artificial_Intelligence/AStudio Data/acode-home-overlay/sessions")
-    add("astudio", "AStudio", "astudio_rollout", [astudio_sessions])
+    astudio_home = os.environ.get("AGENTFIND_ASTUDIO_HOME")
+    if not astudio_home:
+        local = os.environ.get("LOCALAPPDATA", "")
+        astudio_home = str(Path(local) / "Programs/AStudio Data/acode-home-overlay/sessions") if local else ""
+    if astudio_home:
+        add("astudio", "AStudio", "astudio_rollout", [Path(astudio_home)])
 
     # ---- AgentCockpit registry 的 Agent：有数据根目录的照常扫，没数据的留给 overview 补 0 场 ----
     APPDATA = Path(os.environ.get("APPDATA", ""))
@@ -2052,10 +2068,11 @@ def example_terms(con):
                 push(base)
         if len(out) >= 6:
             break
-    while len(out) < 6:
-        for fb in ("报错", "总结", "README"):
-            if fb not in seen:
-                push(fb)
+    for fb in ("报错", "总结", "README"):
+        if len(out) >= 6:
+            break
+        if fb not in seen:
+            push(fb)
     return out[:6]
 
 
@@ -2078,14 +2095,16 @@ def overview(con):
                 "n": c["n"] if c else 0,
                 "b": c["b"] if c else None,
             })
-        # AgentCockpit registry 里有、但本地没有数据目录的（没装/没聊过）：
-        # 也列出来显示 0 场，别让用户以为「没查到 = 没聊过」。
+        # AgentCockpit registry 里有、但此刻没探到数据目录的：仍然按索引里的真实场数报。
+        # 客户端升级会把 SQLite 文件短暂挪走，写死 0 会让用户以为历史没了。
         for rid, rlabel in AGENT_REGISTRY:
             sid = REGISTRY_MAP.get(rid, rid)
             if sid in seen:
                 continue
             seen.add(sid)
-            all_srcs.append({"source": sid, "label": rlabel, "n": 0, "b": None})
+            c = counts.get(sid)
+            all_srcs.append({"source": sid, "label": rlabel,
+                             "n": c["n"] if c else 0, "b": c["b"] if c else None})
         # 有数据的排前面，没数据的排后面；各自按数量/名称排
         all_srcs.sort(key=lambda s: (-s["n"], s["label"]))
         tot = con.execute("select count(*) c from session").fetchone()["c"]
@@ -2245,7 +2264,8 @@ def serve(port, open_browser, initial_query):
                 elif u.path == "/api/desktop-feed":
                     self._json(desktop_feed(read_con()))
                 elif u.path == "/api/agentfind":
-                    self._json({"service": "AgentFind", "sessions_ui": 1})
+                    self._json({"service": "AgentFind", "sessions_ui": 1,
+                                "script": SCRIPT_FINGERPRINT})
                 elif u.path == "/api/meta":
                     ov = overview(read_con())
                     ov.update(progress=STATE["progress"], ready=STATE["ready"], pid=os.getpid(),

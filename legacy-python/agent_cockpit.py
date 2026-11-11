@@ -25,22 +25,21 @@ BACKUP_DIR = BASE_DIR / "backups"
 CONFIG_FILE = BASE_DIR / "config.json"
 
 LOCAL = Path(os.environ.get("LOCALAPPDATA", ""))
-NPM_GLOBAL = Path("D:/npm-global")
+NPM_GLOBAL = Path(os.environ.get("APPDATA", "")) / "npm"
 
 APPS = {
     "qoder": {"name": "Qoder", "kind": "electron",
-              "exe": [LOCAL / "Programs/Qoder/Qoder.exe",
-                      Path("D:/Artificial_Intelligence/Qoder/Qoder.exe")]},
+              "exe": [LOCAL / "Programs/Qoder/Qoder.exe"]},
     "qoder-cn": {"name": "Qoder CN", "kind": "electron",
-                 "exe": [Path("D:/Artificial_Intelligence/Qoder CN/Qoder CN.exe")]},
+                 "exe": [LOCAL / "Programs/Qoder CN/Qoder CN.exe"]},
     "qoder-cn-ide": {"name": "Qoder CN IDE", "kind": "electron",
-                     "exe": [Path("D:/Artificial_Intelligence/Qoder CN IDE/Qoder CN IDE.exe")]},
+                     "exe": [LOCAL / "Programs/Qoder CN IDE/Qoder CN IDE.exe"]},
     "workbuddy": {"name": "WorkBuddy", "kind": "electron",
-                  "exe": [Path("D:/LenovoSoftstore/Install/WorkBuddy/WorkBuddy.exe")]},
+                  "exe": [LOCAL / "Programs/WorkBuddy/WorkBuddy.exe"]},
     "traework-cn": {"name": "TraeWork CN", "kind": "electron",
-                    "exe": [Path("D:/Artificial_Intelligence/TRAE SOLO CN/TRAE SOLO CN.exe")]},
+                    "exe": [LOCAL / "Programs/Trae CN/Trae CN.exe"]},
     "zcode": {"name": "ZCode", "kind": "electron",
-              "exe": [Path("D:/Artificial_Intelligence/ZCode/ZCode.exe")]},
+              "exe": [LOCAL / "Programs/ZCode/ZCode.exe"]},
     "codex": {"name": "Codex CLI", "kind": "cli", "exe": [NPM_GLOBAL / "codex.cmd"],
               "env": "CODEX_HOME"},
     "claude": {"name": "Claude Code CLI", "kind": "cli", "exe": [NPM_GLOBAL / "claude.cmd"],
