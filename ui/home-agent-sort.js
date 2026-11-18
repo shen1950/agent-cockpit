@@ -6,6 +6,35 @@
   let saving = false;
   let drag = null;
   let blockClick = false;
+  let orderRevision = 0;
+  let confirmedOrder = [];
+  let readingOrder = null;
+
+  function applyConfirmedOrder() {
+    if (!S.data?.apps) return;
+    const positions = new Map(confirmedOrder.map((id, i) => [id, i]));
+    S.data.apps.sort((a, b) => (positions.get(a.id) ?? positions.size) - (positions.get(b.id) ?? positions.size));
+    if (S.data.settings) S.data.settings.app_order = confirmedOrder.slice();
+  }
+
+  // get_state 耗时可能跨过一次排序保存。只保护这类旧请求，下一次正常
+  // 刷新仍接受后端顺序；在 render 前修正，避免先闪回旧位置再挪回来。
+  const loadState = load;
+  load = async function (...args) {
+    if (S.busy) return loadState(...args);
+    const reading = { revision: orderRevision };
+    readingOrder = reading;
+    try { return await loadState(...args); }
+    finally { if (readingOrder === reading) readingOrder = null; }
+  };
+  const renderState = render;
+  render = function (...args) {
+    if (readingOrder && readingOrder.revision < orderRevision) applyConfirmedOrder();
+    return renderState(...args);
+  };
+  // 侧栏拖拽也使用同一保存入口，不能让两个入口各自覆盖对方的顺序。
+  applyNavSort = (fromId, toId, after) => saveOrder(fromId, toId, after);
+
   const cards = () => [...host.querySelectorAll('.hagents .hacard')];
   const apps = () => (S.data?.apps || []).filter(a => !a.hidden);
   const clearMarks = () => host.querySelectorAll('.ha-drag-source, .ha-drop-before, .ha-drop-after')
@@ -24,6 +53,7 @@
   });
 
   async function saveOrder(fromId, toId, after) {
+    if (saving) return;
     const ids = (S.data?.apps || []).map(a => a.id);
     const from = ids.indexOf(fromId);
     if (from < 0 || !ids.includes(toId) || fromId === toId) return;
@@ -34,8 +64,9 @@
     try {
       const result = await invoke('action', { payload: { action: 'app_reorder', app: fromId, ids } });
       if (!result.ok) throw new Error(result.msg || '保存失败');
-      const positions = new Map(ids.map((id, i) => [id, i]));
-      S.data.apps.sort((a, b) => (positions.get(a.id) ?? ids.length) - (positions.get(b.id) ?? ids.length));
+      confirmedOrder = ids;
+      orderRevision += 1;
+      applyConfirmedOrder();
       render();
     } catch (error) {
       toast(`排序未保存：${error.message || error}`, false);
