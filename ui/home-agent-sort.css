@@ -1,0 +1,17 @@
+.hagents .hacard { cursor: grab; user-select: none }
+.ha-sorting, .ha-sorting * { cursor: grabbing !important; user-select: none !important }
+.hagents .hacard.ha-drag-source { opacity: .35 }
+.hagents .hacard.ha-drop-before,
+.hagents .hacard.ha-drop-after { border-color: var(--accent); opacity: 1 }
+.hacard.ha-drop-before::after, .hacard.ha-drop-after::after {
+  content: ''; position: absolute; top: 3px; bottom: 3px; width: 4px;
+  background: var(--accent); border-radius: 3px; z-index: 3; pointer-events: none;
+}
+.hacard.ha-drop-before::after { left: 1px }
+.hacard.ha-drop-after::after { right: 1px }
+.ha-sort-ghost {
+  position: fixed; z-index: 10001; pointer-events: none;
+  max-width: 240px; padding: 6px 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text); background: var(--bg-sunken); border: 2px solid var(--accent);
+  border-radius: var(--r-md); box-shadow: 0 4px 16px #0003; font-weight: 600;
+}
