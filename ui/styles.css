@@ -2740,3 +2740,24 @@ table.tbl td.acts > *:last-child { margin-right: 0 }
   #im-body .setrow { grid-template-columns: minmax(0, 1fr); gap: 6px }
   #im-body .ctl { justify-content: flex-start }
 }
+
+/* 启动工具页：这类程序没有账号卡，页面摆它自己读到的信息。
+   两块并排摆，窗口窄了叠成一列。 */
+.cards > .launch-tool { grid-column: 1 / -1 }
+.launch-tool-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+  gap: var(--sp-5); align-items: start;
+}
+.launch-block { min-width: 0 }
+.launch-block h3 { font: 600 13px/1.4 var(--font-heading); margin: 0 0 var(--sp-1); color: var(--text-muted) }
+.launch-block .setrow {
+  grid-template-columns: minmax(6em, 7em) minmax(0, 1fr);
+  gap: var(--sp-3); padding: 7px 0;
+}
+.launch-block .ctl { justify-content: flex-start; min-width: 0 }
+.launch-block .kv { overflow-wrap: anywhere; word-break: normal }
+.launch-path {
+  display: block; min-width: 0; max-width: 100%; overflow-wrap: anywhere;
+  font: 12px/1.5 var(--font-mono); color: var(--text-muted);
+}
+.launch-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; padding-top: var(--sp-3) }

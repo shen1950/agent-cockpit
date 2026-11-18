@@ -3397,7 +3397,12 @@ function renderCards(d) {
   const app = d.apps.find((a) => a.id === S.cur);
   const wrap = $('cards');
   clear(wrap);
-  if (!app || isLaunchTool(app)) return;
+  if (!app) return;
+  // 启动工具没有账号卡，但页面上要摆它能读到的信息，不能留一片空白
+  if (isLaunchTool(app)) {
+    wrap.appendChild(launchToolPanel(app, d));
+    return;
+  }
   // 启动体检：换号记录和磁盘对不上、默认档案入口成断链这类，程序自己修了什么必须当场说出来。
   // 不按当前选中的产品过滤——修的是别的程序的话，更应该让你看见。
   for (const msg of (d.selfcheck || [])) {

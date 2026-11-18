@@ -123,7 +123,20 @@ pub fn build_state(proxy: &Proxy) -> Value {
     let mut app_list = all_apps();
     crate::registry::sort_apps(&mut app_list);
     for app in app_list {
-        let installed = resolve_exe(&app).is_some();
+        let exe_path = resolve_exe(&app);
+        let installed = exe_path.is_some();
+        // 可执行文件的大小和最后修改时间：启动工具那一类程序没有账号和额度，
+        // 界面上能读到的就剩这些，得给出去
+        let exe_meta = exe_path.as_ref().and_then(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            let modified = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some((meta.len(), modified))
+        });
         // 自动发现且 exe 已消失 = 已卸载；首次收录 7 天内且**没被点开看过** = 新装
         // （点开一次就置 seen，标记消失——否则这个「新」会挂满一星期很吵）
         let removed = app.discovered && !installed;
@@ -187,7 +200,12 @@ pub fn build_state(proxy: &Proxy) -> Value {
             "swap_ok": app.id != "codex-desktop" && app.kind != "plain" && profile_dir(&app.id).is_some(),
             "local_quota": crate::local_quota::store_for(&app.id).is_some(),
             "icon": crate::icons::get(&app.id),
-            "exe": resolve_exe(&app).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            "exe": exe_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            // 可执行文件本身的信息：启动工具这类程序没有账号和额度，
+            // 界面上能读到的就剩这些（文件多大、什么时候换过版、什么时候被收录的）
+            "exe_size": exe_meta.map(|(size, _)| size).unwrap_or(0),
+            "exe_modified": exe_meta.map(|(_, at)| at).unwrap_or(0),
+            "first_seen": app.first_seen,
             "native_data_dir": crate::registry::native_data_dir(&app.id).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         }));
 

@@ -153,6 +153,13 @@ const DATA = {
     { id: 'claude', name: 'Claude Code CLI', kind: 'cli', installed: false, swapped: '', swap_ok: true },
     { id: 'auto-deepseekharness', name: 'DeepSeek Harness', kind: 'electron', installed: true, swapped: '', swap_ok: true, discovered: true, isolatable: true, short: 'DSH' },
     { id: 'auto-ollama', name: 'Ollama', kind: 'plain', installed: true, swapped: '', swap_ok: false, discovered: true, isolatable: false, short: 'OL' },
+    // 启动工具：没有账号也没有额度，界面上摆的是程序本身的信息和运行状态
+    { id: 'auto-magpie', name: 'Magpie', kind: 'plain', installed: true, swapped: '', swap_ok: false,
+      discovered: true, isolatable: false, exe: 'D:\\Artificial_Intelligence\\magpie-windows-amd64.exe',
+      exe_size: 49434880, exe_modified: 1756000000, first_seen: 1755000000 },
+    { id: 'auto-cockpittools', name: 'Cockpit Tools', kind: 'plain', installed: true, swapped: '', swap_ok: false,
+      discovered: true, isolatable: false, exe: 'D:\\Artificial_Intelligence\\Cockpit Tools\\cockpit-tools.exe',
+      exe_size: 129761280, exe_modified: 1757000000, first_seen: 1750000000 },
   ],
   instances: [
     // 演示"读到旧档案"这个失败态：现在正常情况会读到 0.4.x 新壳的
@@ -221,6 +228,7 @@ const DATA = {
     { app: 'Qoder', app_id: 'qoder', detail: '12 个进程（含渲染/GPU 子进程）', pids: '8400,11200,21276,24404,24500,29496', count: 12 },
     { app: 'Qoder CN', app_id: 'qoder-cn', detail: '8 个进程（含渲染/GPU 子进程）', pids: '3011,3020,3155,3400', count: 8 },
     { app: 'Codex CLI / 账号1', app_id: 'codex', detail: 'D:\\Projects\\Example', pids: '17820', count: 1 },
+    { app: 'Magpie', app_id: 'auto-magpie', detail: '1 个窗口 · 3 个进程（含渲染/GPU 子进程）', windows: 1, pids: '24512,24560,24601', count: 3 },
   ],
   alerts: [
     // 旧缓存不产生"临期"提醒（后端 state.rs 里 quota_stale 会跳过），所以这里也不列 Qoder
