@@ -2723,3 +2723,20 @@ table.tbl td.acts > *:last-child { margin-right: 0 }
 .legalack { display: flex; align-items: flex-start; gap: var(--sp-2); margin: var(--sp-4) 0 var(--sp-2); font: 400 13px/1.6 var(--font-sans); color: var(--text); cursor: pointer }
 .legalack input { flex-shrink: 0; margin-top: 3px }
 .legal-fine { margin-top: var(--sp-2); font: 400 12px/1.7 var(--font-sans); color: var(--text-muted) }
+
+/* Account details keep the field label legible when values contain long paths. */
+#im-body { container-type: inline-size }
+#im-body .setrow { grid-template-columns: minmax(7em, .65fr) minmax(0, 1.35fr); gap: 12px }
+#im-body .ctl, #im-body .ctlrow { min-width: 0; max-width: 100%; flex-wrap: wrap }
+#im-body .kv { overflow-wrap: anywhere; word-break: normal }
+#im-body input, #im-body select { max-width: 100% }
+#im-body .subsec { margin: 20px 0 4px; color: var(--text-muted) }
+#claude-runtime { display: grid; gap: 10px }
+#claude-runtime[hidden], #cards:empty { display: none }
+#claude-runtime p { margin: 0; color: var(--text-muted); line-height: 1.6 }
+.runtime-choices { display: flex; flex-wrap: wrap; gap: 8px }
+.runtime-choices [aria-pressed="true"] { border-color: var(--accent); color: var(--accent) }
+@container (max-width: 360px) {
+  #im-body .setrow { grid-template-columns: minmax(0, 1fr); gap: 6px }
+  #im-body .ctl { justify-content: flex-start }
+}

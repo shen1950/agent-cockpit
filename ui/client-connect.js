@@ -72,23 +72,23 @@ const gatewayClient = (() => {
       const s = state.status;
       host.append(el('header', { class: 'panelhead' },
         el('h2', {}, '接入本地网关'),
-        el('span', { class: 'sub' }, '改客户端配置，让它走本机 127.0.0.1 网关'),
+        el('span', { class: 'sub' }, '客户端模型路由配置'),
         el('span', { class: 'sp' }),
         chip(s?.connected ? '已接入' : s?.managed ? '待核对' : s?.supported ? '未接入' : '客户端配置', s?.connected ? 'ok' : '')));
       const row = el('div',{class:'gateway-controls'});
       if (accounts.length) row.append(selector('档案',[['','本机默认'],...accounts.map(n=>[n,n])],state.name,n=>{
-        state.name=n;loadStatus();
+        state={...state,name:n,status:null,model:'',models:[],details:[],fetching:false};provider.clear();loadStatus();
       }));
       if (s) {
           row.append(selector('密钥',[['','选择接入密钥'],...keys.map(k=>[k.id,k.name])],state.keyId,id=>{
             state.keyId=id; state.model=''; provider.clear();loadModels();
           }));
           if (s.supported && (!s.managed || !s.single)) {
-            row.append(selector('接入模型',[['',state.fetching ? '读取中…' : s.single ? '请选择模型' : '网关全部模型'],...state.models.map(m=>[m,m])],state.model,m=>{
+            row.append(selector('接入模型',[['',state.fetching ? '读取中…' : s.single || app.id === 'claude' ? '选择模型' : '网关全部模型'],...state.models.map(m=>[m,m])],state.model,m=>{
               state.model=m; paint();
             }));
             const button=btn(s.managed ? '更新接入配置' : '一键接入','primary sm',()=>act(s.managed ? 'refresh':'connect'));
-            button.disabled=state.busy || !d.proxy?.running || !state.keyId || !app.installed || state.fetching || !state.models.length || (s.single && !state.model);
+            button.disabled=state.busy || !d.proxy?.running || !state.keyId || !app.installed || state.fetching || !state.models.length || ((s.single || app.id === 'claude') && !state.model);
             row.append(button);
           }
           if (s.managed) row.append(btn('断开并恢复','sm',()=>act('disconnect')));
@@ -99,6 +99,7 @@ const gatewayClient = (() => {
       host.append(el('p',{},state.message || (!s ? '正在读取本机配置…' : !s.supported ? '此客户端尚未适配自动写入。网关设置中可复制地址、密钥和模型 ID。' :
         s.managed ? (s.connected ? '当前配置使用 ' + s.model + '。' : '配置已变化，请核对后恢复。') :
         !d.proxy?.running ? '请先在网关设置中启动模型反代。' : !keys.length ? '请先在网关设置中生成接入密钥。' :
+        app.id === 'claude' ? '所选模型将应用于当前档案中的 Claude Code 会话。' :
         s.single ? 'Claude 桌面版会进入第三方网关模式，使用下方所选模型。断开后恢复原档案。' :
         '选择密钥和模型后接入。读图、上下文和调度设置在模型反代页的供应商详情里。')),row);
       if (s && !s.supported) host.append(manualPanel());
@@ -115,7 +116,7 @@ const gatewayClient = (() => {
         const res=await call('models');
         if (!alive(snapshot) || seq!==state.loading) return;
         state.models=res.models; state.details=res.details || [];
-        if (!state.models.includes(state.model)) state.model=state.models.includes(state.status?.model) ? state.status.model : state.status?.single ? state.models[0] || '' : '';
+        if (!state.models.includes(state.model)) state.model=state.models.includes(state.status?.model) ? state.status.model : (state.status?.single || app.id === 'claude') ? state.models[0] || '' : '';
         if (!state.models.length) state.message='这把密钥没有列出模型，请检查关联的上游组。';
       } catch(e) { if (alive(snapshot) && seq===state.loading) state.message=String(e); }
       finally { if (alive(snapshot) && seq===state.loading) {state.fetching=false; paint();} }
@@ -141,7 +142,7 @@ const gatewayClient = (() => {
       const previous=host;
       host=nextHost; d=data;
       app=(d.apps || []).find(a=>a.id===options.app);
-      if (!app) {host.hidden=true;state=null;signature='';generation++;return;}
+      if (!app || isLaunchTool(app)) {host.hidden=true;clear(host);state=null;signature='';generation++;return;}
       host.hidden=false;host.classList.add('gateway-client');
       accounts=['codex','codex-desktop','claude'].includes(app.id) ? (d.instances || []).filter(i=>i.app===app.id).map(i=>i.name) : [];
       keys=(d.proxy?.dist || []).filter(k=>k.enabled!==false);

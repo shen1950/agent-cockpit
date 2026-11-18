@@ -62,7 +62,7 @@ test('API credentials stay out of generic metadata and are cleared after submiss
 test('native account never offers credential replacement', () => {
   const s = setup('token', true);
   assert.equal(s.nodes.some(n => n.tag === 'textarea'), false);
-  assert.equal(s.nodes.some(n => n.tag === 'button' && text(n) === '导入这份凭据'), false);
+  assert.equal(s.nodes.some(n => n.tag === 'button' && text(n) === '导入凭据'), false);
   assert.ok(s.nodes.some(n => n.tag === 'button' && text(n) === '新建独立账号'));
 });
 test('device authorization and cancellation carry only the selected account', async () => {
@@ -250,7 +250,7 @@ test('ChatGPT detail navigation follows use order and does not expose a generic 
   s.context.renderDetail();
   const nav = s.dom.get('im-nav');
   assert.deepEqual(descendants(nav).filter(n => n.tag === 'button').map(text),
-    ['概览', '额度与用量', '运行管理', '对话与项目', '文件位置', '登录管理', '移除账号']);
+    ['账号概览', '登录管理', '运行管理', '额度与用量', '对话与项目', '文件位置', '移除账号']);
   assert.equal(s.dom.get('im-save').hidden, true);
   await button(nav, '文件位置').action();
   assert.equal(s.context.S.detail.sec, 'data');

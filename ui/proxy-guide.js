@@ -94,7 +94,7 @@
     body.appendChild(actions(prev(2), next(4, '下一步：接入本地网关')));
   }
   function drawClient(body, d) {
-    const clients = d.apps || [];
+    const clients = (d.apps || []).filter(app => !isLaunchTool(app));
     if (!clients.some(a => a.id === wizard.client)) {
       wizard.client = clients.find(a => a.id === 'codex' && a.installed)?.id || clients.find(a => a.installed)?.id || clients[0]?.id || '';
     }

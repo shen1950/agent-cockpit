@@ -605,7 +605,7 @@ function forgetProxyApp() {
   localStorage.removeItem('cockpit-proxy-app');
 }
 function proxyJumpApp(d) {
-  const ids = new Set((d.apps || []).map((a) => a.id));
+  const ids = new Set((d.apps || []).filter(a => !isLaunchTool(a)).map(a => a.id));
   return S.proxyApp && ids.has(S.proxyApp) ? S.proxyApp : '';
 }
 
@@ -753,12 +753,14 @@ function renderNav(d) {
   const box = ul.closest('.side-scroll');
   const keep = box ? box.scrollTop : 0;   // 重建列表会让滚动条弹回顶部，先记住
   clear(ul);
-  for (const a of d.apps) {
-    const n = d.instances.filter((i) => i.app === a.id).length;
+  for (const a of productEntries(d.apps)) {
+    const ids = a.runtimeIds || [a.id];
+    const accounts = !isLaunchTool(a) && (a.id !== 'claude-desktop' || !!a.runtimeIds);
+    const n = accounts ? d.instances.filter(i => ids.includes(i.app)).length : 0;
     // 只有"有窗口"才算这个程序开着：后台驻留的进程不该让侧栏亮绿灯
-    const running = d.instances.some((i) => i.app === a.id && i.running)
-      || d.procs.some((p) => p.app_id === a.id && (p.windows ?? 1) > 0);
-    const cap = a.id === 'claude-desktop' ? '桌面客户端' : a.kind === 'cli' ? '终端' : (a.isolatable ? '可多开' : '仅换号');
+    const running = d.instances.some((i) => ids.includes(i.app) && i.running)
+      || d.procs.some((p) => ids.includes(p.app_id) && (p.windows ?? 1) > 0);
+    const cap = capabilityLabel(a);
     // 「现在用的是哪个号」：共用一份档案的产品以客户端登录态为准（磁盘换号记录不随登录变化）；
     // 只有这个产品压根没有本机直读通道、登录态读不到时，才退回按档案认领关系标。
     const mv = (a.machine && a.machine.value) || {};
@@ -775,7 +777,7 @@ function renderNav(d) {
     const b = el('button', {
       class: `nav-btn${n ? ' counted' : ''}${running ? ' running' : ''}${a.installed ? '' : ' missing'}`,
       data: { app: a.id },
-      aria: { current: S.view === 'agents' && a.id === S.cur },
+      aria: { current: S.view === 'agents' && ids.includes(S.cur) },
       title: `${a.name}\n`
         + `${a.installed ? '已安装' : (a.removed ? '已卸载（可执行文件不存在）' : '未找到可执行文件')} · ${cap}`
         + (a.new ? '\n最近新收录' : '')
@@ -790,18 +792,18 @@ function renderNav(d) {
       n ? el('span', { class: 'badge count' }, n) : null,
       // 第二行只保留能力标和账号名
       el('span', { class: 'nav-badges' },
-        (cur.name || a.swap_orphan) ? el('span', {
+        accounts && (cur.name || a.swap_orphan) ? el('span', {
           class: `badge swap${a.swap_orphan ? ' orphan' : ''}`,
           title: a.swap_orphan
             ? `档案目录还指向已删除的账号「${a.swapped}」，点进该程序用「还原默认档案」修好`
             : `${cur.tag}：${cur.name}`,
         }, `⇄${cur.name || a.swapped}`) : null,
         el('span', { class: `cap ${a.id === 'claude-desktop' ? 'cli' : a.isolatable ? 'yes' : (a.kind === 'cli' ? 'cli' : 'no')}`, title: cap },
-          a.id === 'claude-desktop' ? '客户端' : a.isolatable ? '多开' : (a.kind === 'cli' ? '终端' : '换号'))));
+          cap)));
     b.addEventListener('click', () => {
       if (dragMoved) { dragMoved = false; return; }   // 刚拖完别顺手选中这一项
       S.view = 'agents';
-      S.cur = a.id;
+      S.cur = ids.includes(S.cur) ? S.cur : a.id;
       if (a.new) {
         // 点开看过一次就摘掉「新」：先就地改内存（立刻消失），再让后端记下
         a.new = false;
@@ -1032,22 +1034,24 @@ function renderHome(d) {
   // 卡面用的短词：那一格只有 44px，"活动未开""状态未知"会顶到隔壁的「账号」列。
   // 完整说法留给悬停提示（signTip 用的是这张表之外的原文）。
   const ciWord = { done: '已签', claimable: '可领', off: '未开', error: '读不到' };
-  const apps = (d.apps || []).filter((a) => !a.hidden);
+  const apps = productEntries(d.apps || []);
   let runningApps = 0;
   const cards = apps.map((a) => {
-    const insts = (d.instances || []).filter((i) => i.app === a.id);
+    const ids = a.runtimeIds || [a.id];
+    const tool = isLaunchTool(a);
+    const insts = tool ? [] : (d.instances || []).filter(i => ids.includes(i.app));
     const mv = (a.machine && a.machine.value) || {};
     const logged = a.shared_profile
       ? (insts.find((x) => x.logged_in)?.name || (mv.ok ? mv.account || '' : ''))
       : (a.swapped || '');
     const run = insts.some((i) => i.running)
-      || (d.procs || []).some((p) => p.app_id === a.id && (p.windows ?? 1) > 0);
+      || (d.procs || []).some((p) => ids.includes(p.app_id) && (p.windows ?? 1) > 0);
     if (run) runningApps += 1;
     const aAlerts = alerts.filter((x) => x.app_id === a.id).length;
     const ci = insts.map((i) => i.checkin).find((c) => c && c.state);
     // 桌面客户端不是"多开/换号"那套，单独说一句（跟账号页 topbar 上的能力标一致）
-    const desktop = a.id === 'claude-desktop';
-    const cap = desktop ? '客户端' : a.kind === 'cli' ? '终端' : a.isolatable ? '多开' : '换号';
+    const desktop = !a.runtimeIds && a.id === 'claude-desktop';
+    const cap = capabilityLabel(a);
     // 档案不占卡面（她 11-05："档案和临期可以省略了"）：这一列拿掉之后，
     // 名字能多分到 ~85px，长名字（DeepSeek Harness / Claude Code CLI）才不用截断。
     const archive = desktop ? '桌面客户端' : !insts.length ? '没有账号' : a.shared_profile ? '共用一份档案' : '各自独立档案';
@@ -1070,8 +1074,8 @@ function renderHome(d) {
       type: 'button',
       onclick: () => homeGo(a.id),
       title: `${a.name}\n${run ? '有窗口在跑' : '没在跑'}`
-        + (desktop ? ' · 桌面客户端' : ` · ${a.isolatable ? '可多开' : '仅可换号'}`)
-        + `\n${insts.length ? `${insts.length} 个账号` : '还没有账号'} · 档案${archive}`
+        + ` · ${cap}`
+        + (desktop || tool ? '' : `\n${insts.length} 个账号 · ${archive}`)
         + (logged ? `\n当前登录：${logged}` : '')
         + (aAlerts ? `\n${aAlerts} 笔临期` : '')
         + (a.installed ? '' : '\n可执行文件已不存在'),
@@ -1091,7 +1095,7 @@ function renderHome(d) {
             aAlerts ? el('i', { class: 'hacard-alert', title: `${aAlerts} 笔临期` }, String(aAlerts)) : null),
           el('span', { class: 'hacard-sub' },
             el('span', { class: 'hacard-cap' }, cap),
-            meta))));
+            desktop || tool ? null : meta))));
   });
   host.appendChild(el('section', { class: 'panel' },
     el('header', { class: 'panelhead' },
@@ -2135,20 +2139,34 @@ async function ensureCollab(force) {
 /* ---------------- 账号库 ---------------- */
 function renderToolbar(d) {
   const app = d.apps.find((a) => a.id === S.cur);
-  $('cur-title').textContent = app ? app.name : '—';
+  renderClaudeRuntime(app, d.apps);
+  const tool = isLaunchTool(app);
+  const direct = tool || app?.id === 'claude-desktop';
+  $('cur-title').textContent = isClaudeRuntime(app) ? 'Claude' : app?.name || '程序';
+  for (const id of ['btn-hide', 'btn-reload', 'btn-agent-sessions']) $(id).hidden = tool || !app;
+  const nb = $('btn-new');
+  nb.hidden = !app;
+  nb.textContent = direct ? '启动程序' : '添加账号';
+  nb.title = direct ? '启动已安装的程序' : '创建账号档案';
+  nb.disabled = !app?.installed;
   const list = d.instances.filter((i) => i.app === S.cur);
-  $('cur-count').textContent = list.length ? `${list.length} 个账号` : '';
+  $('cur-count').textContent = !direct && list.length ? `${list.length} 个账号` : '';
   const cap = $('cur-cap');
   const hint = $('cur-hint');
   clear(cap); clear(hint);
   if (!app) { cap.hidden = true; hint.hidden = true; return; }
   cap.hidden = false;
-  cap.className = app.id === 'claude-desktop' ? 'pill' : `pill ${app.isolatable ? 'yes' : 'no'}`;
+  cap.className = direct ? 'pill' : `pill ${app.isolatable ? 'yes' : 'no'}`;
   cap.title = '';
-  cap.append(app.id === 'claude-desktop' ? '桌面客户端' : app.id === 'zcode' || app.id === 'antigravity' ? '共享对话，可切换' : app.isolatable ? '可多开' : (app.shared_profile ? '账号共用一份档案' : '仅可换号'));
+  cap.textContent = capabilityLabel(app);
   hint.hidden = false;
   const forget = $('btn-forget');
-  if (forget) forget.hidden = !(app.removed);
+  if (forget) forget.hidden = tool || !app.removed;
+  if (tool) {
+    if (!app.installed) hint.append('未找到可执行文件。');
+    hint.hidden = !hint.childNodes.length;
+    return;
+  }
   if (!app.installed) {
     hint.append(app.removed
       ? '可执行文件已不存在；记录保留，可点右上「清理记录」移除。'
@@ -2208,11 +2226,6 @@ function renderToolbar(d) {
   }
   // 可多开的产品现在一句话都不写：空盒子别摆出来
   hint.hidden = !hint.childNodes.length;
-  const nb = $('btn-new');
-  clear(nb);
-  nb.append(app.id === 'claude-desktop' ? '打开客户端' : '＋ 添加账号');
-  nb.title = app.id === 'claude-desktop' ? '打开已安装的 Claude 桌面客户端' : '为这个程序再加一个账号档案；向导会带你完成建目录、登录、读额度';
-  nb.disabled = app.id === 'claude-desktop' && !app.installed;
 }
 
 // 服务端读不成、只剩客户端旧缓存时（典型：Qoder 登录令牌过期，本地只剩 8 月的快照）：
@@ -3317,7 +3330,7 @@ function identLine(i) {
   const id = i.identity || { state: 'none', label: '' };
   // elsewhere：登录态不在档案目录里的产品（WorkBuddy 存在系统凭据位置）。
   // 这种卡没有"没登录"这回事，颜色跟 init 一样走中性，话术后端已经写清楚了。
-  return el('div', { class: `ident ${id.state === 'elsewhere' ? 'init' : id.state}` }, id.label);
+  return el('div', { class: `ident ${id.state === 'elsewhere' ? 'init' : id.state}` }, profileStatus(i));
 }
 // 「现在用的是哪个号」这一枚标记：能多开/靠 junction 换目录的产品看磁盘（⇄当前账号），
 // 几个账号共用一份档案的产品看客户端登录态（⇄本机登录中）——磁盘记录不会随登录变化。
@@ -3384,6 +3397,7 @@ function renderCards(d) {
   const app = d.apps.find((a) => a.id === S.cur);
   const wrap = $('cards');
   clear(wrap);
+  if (!app || isLaunchTool(app)) return;
   // 启动体检：换号记录和磁盘对不上、默认档案入口成断链这类，程序自己修了什么必须当场说出来。
   // 不按当前选中的产品过滤——修的是别的程序的话，更应该让你看见。
   for (const msg of (d.selfcheck || [])) {
@@ -3396,7 +3410,7 @@ function renderCards(d) {
   const list = d.instances.filter((i) => i.app === S.cur);
   if (!list.length) {
     wrap.appendChild(el('div', { class: 'empty' },
-      '还没有账号　点右上「＋ 添加账号」'));
+      '暂无已登记的账号。'));
     return;
   }
   // 按存下来的手工顺序排；不在表里的（新加的账号）排最后，保持后端给的先后
@@ -3419,8 +3433,7 @@ function claudeDesktopPanel(app) {
   const open = btn('打开目录', 'sm', () => run('claude_desktop_open_data', { app: app.id }));
   open.disabled = !path;
   return el('section', { class: 'panel', data: { product: 'claude-desktop' } },
-    el('div', { class: 'panelhead' }, el('h2', {}, 'Claude 桌面版'),
-      qhelp('包含 Cowork 与 Code。登录、配置和会话由 Claude 客户端管理。')),
+    el('div', { class: 'panelhead' }, el('h2', {}, '客户端资料')),
     el('div', { class: 'cpt-location' },
       el('h3', {}, '资料位置'),
       path ? el('code', { class: 'cpt-path' }, path) : el('span', {}, '未找到资料位置'),
@@ -3523,7 +3536,8 @@ function originText(i) {
 function kindLabel(kind) {
   // Codex 是 CLI 起家，但按客户端管（每个账号一个 CODEX_HOME，可多开可切换）；
   // ChatGPT 桌面版是 Chromium PWA 壳。卡片上都不写"命令行"
-  if (kind === 'cli' || kind === 'pwa') return '客户端';
+  if (kind === 'cli') return '命令行';
+  if (kind === 'pwa') return '桌面客户端';
   return kind === 'plain' ? '桌面端（不可隔离）' : '桌面端';
 }
 
@@ -3537,7 +3551,7 @@ function card(i, app) {
   // 还会在进程表里赖上一分钟左右，那期间把主按钮留在「■ 结束」上，看着就像按钮卡住了。
   let primary;
   if (i.app === 'codex-desktop') {
-    primary = btn(i.running || i.resident ? '打开窗口' : '▶ 启动', 'primary sm',
+    primary = btn(i.running || i.resident ? '打开窗口' : '启动', 'primary sm',
       () => run('chatgpt_show_window', { app: i.app, name: i.name }),
       '打开这张卡片对应的账号窗口。窗口隐藏或关闭后也可恢复，不影响其他账号。');
   } else if (i.app === 'zcode') {
@@ -3545,41 +3559,43 @@ function card(i, app) {
   } else if (i.app === 'antigravity') {
     primary = antigravityOpenButton(i);
   } else if (i.running) {
-    primary = btn('■ 结束', 'sm', () => run('kill', { app: i.app, name: i.name }),
+    primary = btn('结束运行', 'sm', () => run('kill', { app: i.app, name: i.name }),
       canIso
         ? '只结束这个账号自己的窗口，不影响同程序其它实例；未保存的内容会被强制中断'
         : '该程序不能多开，这会结束整个程序的窗口；未保存的内容会被强制中断');
   } else if (canIso) {
-    primary = btn('▶ 启动', 'primary sm', () => run('launch', { app: i.app, name: i.name }),
+    primary = btn('启动', 'primary sm', () => run('launch', { app: i.app, name: i.name }),
       '用这个账号自己的数据目录开一个新窗口，可以和其它账号同时开着');
   } else if (shared) {
     // 共用一份档案的产品：切号＝把那个号存过的登录态放回档案位置。
     // 没存过的号只能先去登一次（登进来驾驶舱会自动收下那份登录态），我们绝不替她猜密码。
     if (i.logged_in) {
-      primary = btn('▶ 打开', 'primary sm', () => openClient(i.app, i.name),
+      primary = btn('打开客户端', 'primary sm', () => openClient(i.app, i.name),
         `这份档案现在登的就是「${i.name}」，打开就是它。不用换号，也不会动任何进程。`);
     } else if (i.pack_foreign) {
       // 这张卡存的其实是另一个号的登录态：切过去只会把别人再登一次，得先找回它自己的
-      primary = btn('找回它的登录态', 'primary sm', () => recoverAuthPack(i.app, i.name),
+      primary = btn('恢复登录凭据', 'primary sm', () => recoverAuthPack(i.app, i.name),
         `这张卡里存的是「${(i.quota && i.quota.pack_account) || i.pack_account}」的登录态，不是「${i.name}」。\n`
         + '从换号前的自动备份里把它自己的登录态找回来；找不到就只能在客户端里登它一次。');
     } else if (app.auth_switch && i.auth_pack) {
-      primary = btn('⇄ 切换到此账号', 'primary sm', () => authSwitch(i.app, i.name),
+      primary = btn('切换账号', 'primary sm', () => authSwitch(i.app, i.name),
         `把「${i.name}」存过的登录态写回 ${i.app_name} 的档案位置，然后自动重开客户端。\n`
         + `会重启一次 ${i.app_name}（它只在启动时读登录文件），当前这个号的登录态在写之前会先收好，随时切得回来。`);
     } else {
-      primary = btn('▶ 启动客户端', 'primary sm', () => openClient(i.app, i.name),
+      primary = btn('启动客户端', 'primary sm', () => openClient(i.app, i.name),
         `打开 ${i.app_name}，在里面退出登录、再登「${i.name}」。\n`
         + (app.auth_switch
           ? '登进来后驾驶舱自动收下这个号的登录态（约 45 秒）。'
           : '所有账号共用一份档案，切换在客户端里完成。'));
     }
   } else if (i.swapped) {
-    primary = btn('▶ 启动', 'primary sm', () => run('launch_app', { app: i.app, name: i.name }),
+    primary = btn('启动', 'primary sm', () => run('launch_app', { app: i.app, name: i.name }),
       `默认入口现在挂的就是「${i.name}」，打开就是它`);
+  } else if (!app?.swap_ok) {
+    primary = btn('启动程序', 'primary sm', () => openClient(i.app, i.name));
   } else {
     // 不能多开的产品，"打开这个账号"必须先换号——合成一个动作，省掉"先点设为当前再点启动"两步
-    primary = btn('▶ 切到本账号并打开', 'primary sm', () => swapSetAndLaunch(i.app, i.name),
+    primary = btn('切换并启动', 'primary sm', () => swapSetAndLaunch(i.app, i.name),
       `先把默认档案切到「${i.name}」，再打开该程序（换号前先关掉程序窗口）。`
       + (i.app_running ? '\n注意：该程序有窗口在跑，需要先关掉——换号会提示你。' : ''));
   }
@@ -3587,10 +3603,10 @@ function card(i, app) {
   // 原地账号本来就是这台机器的默认档案，磁盘上没有让位备份可还原——摆这颗按钮只会骗人
   const swapBtn = i.app === 'zcode' || !app || !app.swap_ok || i.in_place ? null
     : i.swapped
-      ? btn('还原默认', 'danger sm', () => run('swap_clear', { app: i.app }),
+      ? btn('恢复默认档案', 'danger sm', () => run('swap_clear', { app: i.app }),
         '默认入口换回你的原档案（需先关掉程序窗口）；账号目录保留，可随时再切回来')
       : (canIso
-        ? btn('设为当前', 'sm', () => swapSet(i.app, i.name),
+        ? btn('设为默认', 'sm', () => swapSet(i.app, i.name),
           '通常不需要换号；想让开始菜单/任务栏直接打开这个账号时才用')
         : null);
   // 一颗按钮读全部：能走官网就走官网（只有那里给得出每个积分包各自的到期时间），
@@ -3603,7 +3619,7 @@ function card(i, app) {
   // 能多开的产品（ZCode 这类）主按钮留给「启动」，一键切号作为次按钮放在旁边：
   // 它们的登录态同样是全机一份，多开只是窗口多开，账号还是那一个
   const jumpBtn = !['zcode', 'antigravity'].includes(i.app) && canIso && app && app.auth_switch && i.auth_pack && !i.logged_in
-    ? btn('⇄ 切换到此账号', 'sm', () => authSwitch(i.app, i.name),
+    ? btn('切换账号', 'sm', () => authSwitch(i.app, i.name),
       `把「${i.name}」存过的登录态写回 ${i.app_name}，然后自动重开它。\n`
       + '登录态全机一份，多开窗口不多开账号；当前号的登录态写之前会先收好。')
     : null;
@@ -3611,24 +3627,18 @@ function card(i, app) {
   const reap = i.app === 'zcode'
     ? (i.resident && i.zcode_auth?.current ? btn('结束后台', 'sm', () => zcodeAction('kill', i.name)) : null)
     : i.app === 'antigravity'
-    ? (i.running || i.resident ? btn(i.resident ? '结束后台' : '■ 结束', 'sm', () => antigravityAction('kill', i.name), '结束 Antigravity 进程。请先保存尚未完成的内容。') : null)
+    ? (i.running || i.resident ? btn(i.resident ? '结束后台' : '结束运行', 'sm', () => antigravityAction('kill', i.name), '结束 Antigravity 进程。请先保存尚未完成的内容。') : null)
     : i.app === 'codex-desktop'
-    ? (i.running || i.resident ? btn(i.resident ? '结束后台' : '■ 结束', 'sm',
+    ? (i.running || i.resident ? btn(i.resident ? '结束后台' : '结束运行', 'sm',
       () => run('kill', { app: i.app, name: i.name }), '结束这个账号的进程。请先保存尚未完成的内容。') : null)
     : i.resident
-    ? btn(`■ 清残留 ×${i.procs}`, 'sm', () => run('kill', { app: i.app, name: i.name }),
-      '窗口已关但这几个进程还挂着，会挡住换号和改名；要立刻腾出来就点这一下')
+    ? btn('结束后台进程', 'sm', () => run('kill', { app: i.app, name: i.name }), '结束此实例的后台进程。')
     : null;
-  const detail = btn('账号设置 ⚙', 'sm', () => openDetail(i.app, i.name), i.app === 'codex-desktop'
+  const detail = btn('账号设置', 'sm', () => openDetail(i.app, i.name), i.app === 'codex-desktop'
     ? '概览 / 额度与用量 / 运行管理 / 对话与项目 / 文件位置 / 登录管理'
     : '账号信息 / 额度与用量 / 运行与换号 / 目录与数据 / 凭据与反代 / 删除账号');
   const usageDetail = btn('用量趋势', 'sm', () => openDetail(i.app, i.name, 'quota'),
     '查看这个实例可读取的用量趋势；没有记录时会说明原因');
-  // 删除放在这一行最外侧：它属于"整个账号"的级别，不该藏在设置里绕一圈
-  const delBtn = i.app === 'codex-desktop' ? null : i.app === 'zcode' || i.app === 'antigravity'
-    ? btn('移除', 'sm del', () => del(i.app, i.name), '仅移除卡片，保留登录凭据和本机数据。')
-    : btn('删除', 'sm del', () => del(i.app, i.name), '删除账号及其数据目录，操作前备份。');
-
   // 额度那一块单独可点：它讲的是"还剩多少、什么时候作废"，点它就该直接落到额度页，
   // 不用先落在设置首页再去左边找分组
   const qbox = i.app === 'codex-desktop' ? chatgptQuotaPanel(i, { compact: true })
@@ -3648,9 +3658,6 @@ function card(i, app) {
           accountMark(i, app, shared),
           checkinMark(i),
           i.app !== 'zcode' && i.app !== 'antigravity' && i.released && !i.logged_in ? el('span', { class: 'swapmark off' }, '已让位') : null),
-        el('div', { class: 'meta' },
-          `${i.app_name} · ${kindLabel(i.kind)} · 建于 ${i.created}`),
-        !['codex-desktop', 'zcode', 'antigravity'].includes(i.app) && originText(i) ? el('div', { class: 'orig', title: i.seeded_from || '' }, originText(i)) : null,
         identLine(i),
         mismatchLine(i, app),
         i.usage && i.usage.total != null
@@ -3676,8 +3683,7 @@ function card(i, app) {
           : (i.resident ? `后台驻留 ×${i.procs}` : '未运行'))),
     qbox,
     el('div', { class: 'acts' },
-      el('div', { class: 'acts-main' }, primary, reap, jumpBtn, swapBtn, i.app === 'codex-desktop' ? null : pull, usageDetail, detail),
-      delBtn));
+      el('div', { class: 'acts-main' }, primary, jumpBtn, swapBtn, reap, i.app === 'codex-desktop' ? null : pull, usageDetail, detail)));
   // 卡片表头/空白处 = 账号设置首页；只有额度那块跳到额度页。
   // 刚拖完卡片的那一下不算点击——否则拖到一半松手就弹开账号设置
   node.addEventListener('click', (e) => {
@@ -6117,12 +6123,8 @@ async function bdDelete() {
    最后一项是不可撤销的动作，单独一档、红字、前面有分隔线——菜单里"改设置"和
    "删东西"永远不该长得一样。每一项底下的内容也按同一节奏排：小标题 → 说明 → 一行一项。 */
 const IN_SECTIONS = [
-  ['info', '概览'],
-  ['quota', '额度与用量'],
-  ['run', '运行与账号切换'],
-  ['data', '目录与数据'],
-  ['auth', '凭据与接入'],
-  ['danger', '删除账号'],
+  ['info', '账号概览'], ['run', '运行与切换'], ['quota', '额度与用量'],
+  ['auth', '凭据与接口'], ['data', '存储与备份'], ['danger', '删除账号'],
 ];
 
 /* CLI 产品（Codex）的登录方式区：API Key / ChatGPT 账号(OAuth) / 设备码，全走官方
@@ -6138,10 +6140,10 @@ function cliLoginRows(app, name, i) {
   const a = i.cli_auth || {};
   const cur = el('span', { class: 'kv' }, S.cliStatus || cliAuthLabel(a));
   return [
-    sub('登录方式', '三种都走官方 codex login；登录态存在这个账号自己的目录里。'),
-    row('当前登录', '官方原话',
+    el('h3', { class: 'subsec' }, 'Codex 登录方式'),
+    row('当前登录', '读取 Codex 报告的登录状态。',
       el('div', { class: 'ctlrow' }, cur,
-        btn('读状态', 'sm', async () => {
+        btn('刷新状态', 'sm', async () => {
           const r = await run('codex_status', { app: app.id, name });
           if (r && r.ok) { S.cliStatus = (r.status.text || '').replace(/^WARNING.*\n?/gm, '').trim() || cliAuthLabel(a); renderDetail(); }
         }),
@@ -6156,14 +6158,14 @@ function cliLoginRows(app, name, i) {
           : null)),
     row('ChatGPT 账号', '开一个终端跑 codex login，在浏览器里授权',
       btn('登录', 'sm', () => run('codex_login', { app: app.id, name, mode: 'chatgpt' }).then((r) => {
-        if (r && r.ok) ask({ msg: '已打开登录终端。\n在里面的浏览器完成授权后，回这里点「读状态」。', title: 'ChatGPT 账号登录', okText: '知道了' });
+        if (r && r.ok) ask({ msg: '已打开登录终端。\n在里面的浏览器完成授权后，回这里点「刷新状态」。', title: 'ChatGPT 账号登录', okText: '知道了' });
       }))),
     row('设备码', '没有浏览器时用',
       btn('登录', 'sm', () => run('codex_login', { app: app.id, name, mode: 'device' }).then((r) => {
-        if (r && r.ok) ask({ msg: '已打开登录终端。\n按终端里的地址输入设备码，完成后回这里点「读状态」。', title: '设备码登录', okText: '知道了' });
+        if (r && r.ok) ask({ msg: '已打开登录终端。\n按终端里的地址输入设备码，完成后回这里点「刷新状态」。', title: '设备码登录', okText: '知道了' });
       }))),
     row('API Key', '从输入框读，走 stdin，不出现在命令行里',
-      btn('用 Key 登录', 'sm', async () => {
+      btn('使用密钥登录', 'sm', async () => {
         const k = await askText('OpenAI API Key', '', { title: 'API Key 登录', okText: '登录' });
         if (!k || !k.trim()) return;
         const r = await run('codex_login', { app: app.id, name, mode: 'apikey', key: k.trim() });
@@ -6175,7 +6177,7 @@ function cliLoginRows(app, name, i) {
 }
 
 async function openDetail(app, name, sec = 'info') {
-  S.detail = { app, name, sec, dirty: false, meta: {}, size: null, scroll: 0 };
+  const d = S.detail = { app, name, sec, dirty: false, meta: {}, f: {}, size: null, scroll: 0 };
   // 上一张卡读回来的官方登录话术不许带到下一张卡上
   S.cliStatus = '';
   // 换一张卡就把选中的天清掉：上一张卡选中的日期在这张卡的序列里可能根本没有，
@@ -6183,9 +6185,9 @@ async function openDetail(app, name, sec = 'info') {
   S.trendSel = '';
   $('imodal').hidden = false;
   renderDetail();
-  try { S.detail.meta = await invoke('get_meta', { app, name }) || {}; }
-  catch { /* 读不到就按空配置显示 */ }
-  if (S.detail && !S.detail.dirty) renderDetail();
+  try { d.meta = await invoke('get_meta', { app, name }) || {}; }
+  catch { /* Only explicitly edited fields are saved. */ }
+  if (S.detail === d && !editingIn('#im-body')) renderDetail();
 }
 async function closeDetail() {
   if (S.detail?.dirty
@@ -6223,12 +6225,17 @@ async function doAddApp() {
   if (r.ok) { $('amodal').hidden = true; load(); }
 }
 
+function markDetailChange(key, value) {
+  S.detail.f[key] = value;
+  S.detail.dirty = true;
+  $('im-save').hidden = false;
+}
+
 function dField(key, value, attrs = {}) {
   const f = S.detail.f;
   const v = key in f ? f[key] : (value ?? '');
   const inp = el('input', { value: v, ...attrs });
-  inp.addEventListener('input', () => { f[key] = inp.value; S.detail.dirty = true; });
-  f[key] = v;
+  inp.addEventListener('input', () => markDetailChange(key, inp.value));
   return inp;
 }
 
@@ -6257,12 +6264,12 @@ function renderDetail() {
   d._renderedSection = d.sec;
   d._renderRevision = (d._renderRevision || 0) + 1;
   const { app, name, meta } = d;
-  $('im-save').hidden = app === 'codex-desktop' && ['auth', 'data', 'danger'].includes(d.sec);
+  $('im-save').hidden = !d.dirty;
   const i = S.data.instances.find((x) => x.app === app && x.name === name);
   if (!i) { closeDetailNow(); return; }
   const a = S.data.apps.find((x) => x.id === app) || {};
   d.f = d.f || {};
-  const q = i.quota;
+  const q = i.quota || {};
 
   const title = $('im-title');
   clear(title);
@@ -6284,101 +6291,46 @@ function renderDetail() {
   const sub = (t, note) => [el('h3', { class: 'subsec' }, t, note ? qhelp(note) : null)];
 
   const shared = !!a.shared_profile;
-  const launchDesc = i.running
-    ? (a.isolatable
-      ? '只结束这个账号自己的窗口，不动同程序的其它实例；未保存的内容会被强制中断'
-      : '该程序不能多开，这会结束整个程序的窗口；未保存的内容会被强制中断')
-    : (a.isolatable
-      ? '用该账号独立的数据目录开一个新窗口，可与其他账号同时运行；首次打开需在窗口里登录'
-      : shared
-        ? (i.logged_in
-          ? `这份档案现在登的就是「${name}」，打开就是它`
-          : `打开程序，在里面退出登录、再登「${name}」。共用一份档案的产品切号就在客户端里做：不用关程序，也不动任何文件`)
-        : '直接打开主程序（走默认档案）。唤出来的可能是当前默认账号；要指定这个账号请先换号');
-  // 多开能力决定下面两个按钮走哪条路，所以放在最前面当上下文，别混在动作里
+  const value = text => el('span', { class: 'kv' }, text);
   const runRows = [
-    ...sub('多开能力', '这个程序能不能同时开多个账号的窗口——它决定了下面「启动」走哪条路。'
-      + '判定由内核实测得出。'),
-    row('多开能力', a.isolatable
-    ? '接受独立数据目录，可以和别的账号同屏开窗口'
-    : shared
-      ? '一次一个账号；几个账号共用一份档案，'
-        + '切换账号在程序里退出登录再登录，驾驶舱不搬文件、不结束你的进程。'
-        + '判定错了可在 设置 → 高级 → 重置多开判定 重来'
-      : '一次一个账号，换号靠把默认档案指向账号目录。'
-        + '判定错了可在 设置 → 高级 → 重置多开判定 重来',
-    chip(a.isolatable ? '可多开' : (shared ? '共用一份档案' : (a.kind === 'cli' ? '终端' : '仅可换号')), a.isolatable ? 'official' : 'soon'))];
-  runRows.push(...sub('启动与结束', i.running
-    ? '现在有窗口在跑，这一行是把它结束掉。'
-    : '这一行是把这个账号打开——共用一份档案的产品，打开的就是程序本身。'));
-  runRows.push(row(i.running ? '结束运行' : (a.isolatable ? '启动这个账号' : '打开主程序'), launchDesc,
-    btn(i.running ? '■ 结束' : '▶ 启动', i.running ? 'danger sm' : 'primary sm',
-      () => run(i.running ? 'kill' : (a.isolatable ? 'launch' : 'launch_app'), { app, name }))));
+    row('运行方式', '', value(capabilityLabel(a))),
+    row('运行状态', '', value(i.running ? '运行中' : i.resident ? '后台运行' : '未运行')),
+    row('实例操作', i.running ? '结束运行前请保存当前工作。' : '',
+      btn(i.running ? '结束运行' : a.isolatable ? '启动实例' : '启动程序',
+        i.running ? 'danger sm' : 'primary sm',
+        () => run(i.running ? 'kill' : a.isolatable ? 'launch' : 'launch_app', { app, name }))),
+  ];
   if (shared) {
     const pack = i.auth_pack;
-    runRows.push(...sub('换到这个账号 / 换回去', '一次只登一个号的产品，切号就是这一件事。'));
-    // 这张卡存的包到底是谁的：后端按"包里的账号名正对着另一张卡"判定（pack_foreign）。
-    // 这种情况点「切换到此账号」写回去还是原来那个号，必须当场说清，
-    // 并给一条把真身找回来的路——换号前的自动备份里有。
-    // 两个位置都读：这个字段早先挂在 quota 底下，挪到顶层后老版本内核仍然只发 quota 里那份。
-    const packOther = !!(i.pack_foreign || (i.quota && i.quota.pack_foreign));
-    const packAcct = i.pack_account || (i.quota && i.quota.pack_account) || '';
-    runRows.push(row('切换账号',
-      i.logged_in
-        ? `这份档案现在登的就是「${name}」，不用切。`
-        : packOther
-          ? `这张卡里存的是「${packAcct}」的登录态，不是「${name}」——写回去只会把「${packAcct}」再登一次。`
-            + '先用「找回它的登录态」把它自己的登录态从换号备份里取回来；找不到就在客户端里退出登录、登它一次。'
-          : pack
-            ? `${a.name} 存过这个号的登录态（收在 ${stampTime(pack.at)}）。点「切换到此账号」依次是：`
-              + '收好当前号的登录态 → 结束客户端 → 把这份写回档案位置 → 重新打开。'
-              + '客户端只在启动时读这份文件，所以这一次重启是必要的；换完这张卡会自己标成「本机登录中」。'
-            : `这个号还没存过登录态。${a.name} 几个账号共用默认位置那一份档案，所以先在程序里退出登录、登它一次——`
-              + '登进来驾驶舱会自动收下这份登录态（约 45 秒内），以后来回切都是一键。',
-      i.logged_in ? chip('本机登录中', 'official')
-        : packOther
-          ? btn('找回它的登录态', 'primary sm', () => recoverAuthPack(app, name), '从换号前的自动备份里把这个号自己的登录态找回来')
-          : a.auth_switch && pack
-            ? btn('⇄ 切换到此账号', 'primary sm', () => authSwitch(app, name), '写回这个号存过的登录态，并自动重开客户端')
-            : btn('启动客户端', 'primary sm', () => openClient(app, name), '只把程序打开，不做任何换号动作')));
-    // 这个程序下的其它账号：一次只登一个号，所以"切到谁"应当在一处就能选完，
-    // 不必先退出去点另一张卡、再进它的设置。
-    const mates = (S.data.instances || []).filter((x) => x.app === app && x.name !== name);
-    if (mates.length) {
-      const mv = (a.machine && a.machine.value) || {};
-      const list = el('div', { class: 'ctlrow wrap' });
-      for (const m of mates) {
-        const mp = m.auth_pack;
-        const foreign = !!(m.pack_foreign || (m.quota && m.quota.pack_foreign));
-        const mAcct = m.pack_account || (m.quota && m.quota.pack_account) || '';
-        const hint = m.logged_in
-          ? `这份档案现在登的就是「${m.name}」`
-          : foreign
-            ? `「${m.name}」那张卡里存的是「${mAcct}」的登录态，切不过去；先回它那张卡点「找回它的登录态」`
-            : mp
-              ? `把「${m.name}」存过的登录态写回 ${a.name}，并自动重开客户端`
-              : `「${m.name}」还没存过登录态：先在客户端里登它一次，驾驶舱会自动收下`;
-        list.appendChild(btn(`⇄ 切到「${m.name}」`, 'sm', () => {
-          if (m.logged_in) { toast(`现在登的就是「${m.name}」`, true); return; }
-          if (foreign) { toast(`「${m.name}」存的是「${mAcct}」的登录态，先回那张卡把它自己的登录态找回来`, false); return; }
-          if (!mp) { openClient(app, m.name); return; }
-          authSwitch(app, m.name);
-        }, hint));
-      }
-      runRows.push(row('切到别的账号',
-        `这个程序的其它账号都在这里${mv.account ? `（现在登的是「${mv.account}」）` : ''}。`
-        + '一次只登一个号，所以切过去＝把那个号存过的登录态写回档案并重启一次客户端。',
-        list));
+    const foreign = i.pack_foreign || q.pack_foreign;
+    const active = a.machine?.value;
+    runRows.push(...sub('账号切换'),
+      row('当前登录账号', '', value(active?.ok && active.account || (i.logged_in ? name : '未确认'))),
+      row('实例凭据', '', value(foreign ? '凭据与账号不匹配' : pack ? '已保存' : '未保存')));
+    if (!i.logged_in) {
+      const action = foreign ? btn('恢复登录凭据', 'sm', () => recoverAuthPack(app, name))
+        : a.auth_switch && pack ? btn('切换账号', 'primary sm', () => authSwitch(app, name))
+        : btn('打开客户端登录', 'sm', () => openClient(app, name));
+      runRows.push(row('切换至本账号', a.auth_switch && pack && !foreign
+        ? '保存当前登录凭据后重启客户端，并载入所选账号。' : '在客户端完成身份验证。', action));
     }
-  } else if (a.swap_ok) {
-    // 标题是"还原"时描述必须讲还原，别一套话术挂在两个相反的动作上
-    runRows.push(row(i.swapped ? '还原默认档案' : '设为当前账号（换号）',
-      i.swapped
-        ? '这个账号现在是默认档案。还原＝换回你原来那份；账号目录保留，可随时切回。需先关掉程序窗口'
-        : '默认档案指向这个账号目录，之后从开始菜单/任务栏打开都是它。需先关掉程序窗口，可随时「还原默认」',
-      i.swapped
-        ? btn('还原默认', 'danger sm', () => run('swap_clear', { app }), '换回你原来的账号目录')
-        : btn('设为当前', 'primary sm', () => swapSet(app, name), '切换到这个账号')));
+    const others = (S.data.instances || []).filter(m => m.app === app && m.name !== name);
+    if (others.length) {
+      const list = el('div', { class: 'ctlrow wrap' });
+      for (const m of others) {
+        const foreign = m.pack_foreign || m.quota?.pack_foreign;
+        const button = btn(m.name, 'sm', () => foreign ? recoverAuthPack(app, m.name)
+          : a.auth_switch && m.auth_pack ? authSwitch(app, m.name) : openClient(app, m.name),
+          foreign ? '恢复登录凭据' : a.auth_switch && m.auth_pack ? '切换账号并重启客户端' : '打开客户端登录');
+        button.disabled = !!m.logged_in;
+        list.append(button);
+      }
+      runRows.push(row('其他账号', '选择账号后载入其凭据，未保存凭据的账号需在客户端登录。', list));
+    }
+  } else if (a.swap_ok && !i.in_place) {
+    runRows.push(row('默认启动账号', '更改系统默认入口前，请关闭客户端。',
+      i.swapped ? btn('恢复默认档案', 'sm', () => run('swap_clear', { app }))
+        : btn('设为默认', 'sm', () => swapSet(app, name))));
   }
   // 本地会话用量是"用了多少"，归到额度那一组去。按天序列（波形图/热力图）
   // 也在这里一起刷：Codex / Claude Code 的本机日志带了时间戳，聚得出"哪天用了多少"
@@ -6391,97 +6343,67 @@ function renderDetail() {
           await closeDetail(); if (S.detail) return;
           S.view = 'usage'; render(); globalThis.UsageDashboard?.selectApp(app);
         })));
-  secs.info = () => secPanel('概览',
-    ...sub('这是哪个号', '这一组只说"它是谁"：属于哪个程序、在驾驶舱里叫什么名字。'),
-    row('所属程序', '「建于」是这张卡在驾驶舱里登记的日子，不是这个产品的安装时间',
-      el('span', { class: 'kv' }, `${i.app_name} · ${kindLabel(i.kind)} · 建于 ${i.created}`)),
-    row('账号名', '列表、临期提醒、备份文件名都用这个名字。程序在跑时目录改名会延后',
-      btn('改名', 'sm', () => renameAccount(app, name))),
-    ...sub('登录与档案', '这个号现在登没登、这份档案从哪来——换号、删号之前先看这两行。'),
-    row('登录状态', i.app === 'codex-desktop' ? '读取这个账号自己的登录凭据。'
-      : i.identity && i.identity.state === 'elsewhere'
-      ? '这个产品的登录态不在档案目录里（WorkBuddy 存在系统凭据位置），这一行只说档案建没建起来；现在登的是谁看上方「本机登录」'
-      : i.identity && i.identity.state === 'logged'
-      ? '已检测到登录痕迹，可以直接用'
-      : '还没检测到登录：换号切到空目录会让程序显示未登录甚至黑屏，属正常，登录一次即可',
-      i.app === 'codex-desktop' ? identLine(i) : el('span', { class: 'kv' }, i.identity ? i.identity.label || '—' : '—')),
-    row('本机账号', i.quota.local_account || meta.quota_account
-      ? '从这份档案里读出来的登录名，用来核对"卡片上的号"和"客户端里登的号"是不是同一个'
-      : '还没从任何数据源读到过登录名',
-      el('span', { class: 'kv' }, i.app === 'codex-desktop' ? (i.chatgpt_auth?.mode === 'apikey' ? 'API Key' : i.chatgpt_auth?.account || '未读取到邮箱') : i.quota.local_account || meta.quota_account || '—')),
-    row('档案来源', originText(i) === '沿用本机原有档案'
-      ? '这张卡认领的就是这台机器上原本那份档案，驾驶舱没有搬动过它'
-      : i.app === 'codex-desktop' ? '新建时复制对话与项目，账号的资料目录保持固定。' : '这张卡的档案是怎么来的；换号时搬来搬去的都是这个目录',
-      el('span', { class: 'kv', title: i.seeded_from || '' }, originText(i) || '未登记')),
-    // CLI 产品（Codex）的三种登录方式，全部走官方 codex login。
-    // 登录态落在**这个账号自己的 CODEX_HOME** 里，所以换号＝换目录、多开各登各的。
-    ...(app.id === 'codex' ? cliLoginRows(app, name, i) : []));
+  secs.info = () => secPanel('账号概览',
+    row('账号名称', '', el('div', { class: 'ctlrow' }, value(name),
+      btn('重命名', 'sm', () => renameAccount(app, name)))),
+    row('所属程序', '', value(i.app_name)),
+    row('登记日期', '', value(i.created || '未记录')),
+    ...sub('身份与档案'),
+    row('登录状态', '', value(i.logged_in ? '本机当前登录' : i.cli_auth
+      ? cliAuthLabel(i.cli_auth) : i.auth_pack ? '凭据已保存' : '未确认')),
+    ...(shared || q.local_account || meta.quota_account ? [
+      row('关联账号', '', value(q.local_account || meta.quota_account || '未读取')),
+      ...(a.machine?.value?.ok ? [row('本机登录账号', '', value(a.machine.value.account || '未读取'))] : []),
+    ] : []),
+    row('档案状态', '', value(profileStatus(i))),
+    row('档案来源', '', value(originText(i) || '未登记')));
 
-  secs.run = () => secPanel('运行与换号', ...runRows);
+  secs.run = () => secPanel('运行与切换', ...runRows);
 
   secs.quota = () => {
     const rows = [
       // ① 额度明细：读进来什么样就照那样画——档名、单位、使用范围都用厂商自己的口径
-      ...sub('额度明细 · 逐笔到期',
-        '档名和单位照各产品自己的叫法列（通用积分 / 星火专属积分 / 每日签到 / Token 钱包 / 充值余额…），'
-        + '带「专属」标记的那档只能花在说明里写的那些东西上。每档再点「查看明细」看逐笔资源包：'
-        + '有效期内几笔、已过期几笔、各自什么时候作废（按到期时间从最早的要作废的排起）。'
-        + '官方接口没给的数就写"没给"，不当 0 算比例。30 天内变黄、7 天内变红，顶栏「临期 N」汇总，7 天内弹窗提醒一次。'),
       quotaPanel(i),
-      ...sub('数据从哪来', '读数只有卡片上那颗「↻ 刷新额度」：能走官网就读逐包明细（各包自己的到期时间），读不到退本机/服务端汇总。'),
-      ...(a.local_quota || a.web_quota ? [row(a.web_quota ? '这个号的官网会话' : '本机直读',
+      usageRow,
+      ...sub('额度更新'),
+      ...(a.local_quota || a.web_quota ? [row(a.web_quota ? '官网账号' : '本机客户端',
         a.web_quota
           ? '每个号一份独立会话（数据根 webprofile/<产品>/<账号>/），读出来的就是这个号的真数，跟本机客户端登的是谁无关；登一次即可。'
           : '直接解本机客户端自己存的积分（不联网、不改产品文件）；首次读绑定 userId 并校验，号不符就拒绝写入。',
         el('div', { class: 'ctlrow' },
           el('span', { class: 'kv' }, meta.quota_account ? `已绑定 ${meta.quota_account}` : '未绑定'),
           btn('↻ 刷新额度', 'sm', () => refreshQuota(app, name)),
-          ...(a.web_quota ? [btn('登录这个号', 'sm', () => webLogin(app, name),
+          ...(a.web_quota ? [btn('登录官网', 'sm', () => webLogin(app, name),
             '只开这个号自己的官网窗口；登一次，之后刷新额度就带着这份会话去读')] : [])))] : []),
-      row('额度来源', '留空＝不联网抓。OpenAI 官方 billing 需填「凭据与反代」里的 API Token',
-        (() => {
-          const s = el('select', {},
-            el('option', { value: '' }, '无'),
-            el('option', { value: 'openai' }, 'OpenAI 官方 billing'));
-          s.value = meta.quota_adapter || '';
-          s.addEventListener('change', () => { meta.quota_adapter = s.value; S.detail.dirty = true; });
-          return s;
-        })()),
-      row('额度接口 URL', '填了任何来源，后台都会按 设置 → 额度提醒 里的间隔自动抓，也可手动立即抓',
-        dField('quota_url', meta.quota_url, { placeholder: 'https://…/quota', spellcheck: 'false' })),
-      row('取值路径', '从返回的 JSON 里取哪个字段，如 data.remaining；留空自动猜常见字段名',
-        dField('quota_path', meta.quota_path, { placeholder: 'data.remaining', spellcheck: 'false' })),
-      ...sub('立即取数', '平时靠后台按 设置 → 额度提醒 里的间隔自动取，这里只是手动催一次。'),
       row('截图识别', '官网才显示数的产品：截图识别成逐笔积分，核对后保存。浮窗开着时 Ctrl+V 直接贴，或用右边的「选图片…」',
         pasteHint('quota')),
-      row('立即抓一次', '向上面配置的接口查一次剩余额度并回填',
-        btn('抓取', 'sm', () => run('fetch_quota', { app, name }),
+      row('接口查询', '向上面配置的接口查一次剩余额度并回填',
+        btn('查询额度', 'sm', () => run('fetch_quota', { app, name }),
           q.quota_url || q.adapter ? '' : '需先选择额度来源或填写额度接口')),
-      row('上次抓取', q.fetched_at ? '后台每轮自动抓取后会更新这里' : '还没抓过',
+      row('上次查询', q.fetched_at ? '后台每轮自动抓取后会更新这里' : '还没抓过',
         el('span', { class: 'kv' }, q.fetched_at ? stampTime(q.fetched_at) : '—')),
-      usageRow,
     ].filter(Boolean);
     return secPanel('额度与用量', ...rows);
   };
 
-  secs.data = () => a.id === 'codex-desktop' ? chatgptDataPanel(app, name, i) : secPanel('目录与数据',
-    ...sub('路径', '这个账号在哪打开、档案实际存在哪。'),
+  secs.data = () => secPanel('存储与备份',
+    ...sub('目录位置'),
     (() => {
-      const wd = dField('workdir', i.workdir, { placeholder: 'D:\\Projects\\…', spellcheck: 'false' });
+      const wd = dField('workdir', meta.workdir ?? i.workdir, { placeholder: 'D:\\Projects\\…', spellcheck: 'false' });
       return row('工作目录', '启动时默认打开的项目文件夹，不影响登录',
         el('div', { class: 'ctlrow browse' }, wd,
-          browseBtn(() => wd.value, (v) => { wd.value = v; S.detail.f.workdir = v; S.detail.dirty = true; })));
+          browseBtn(() => wd.value, (v) => { wd.value = v; markDetailChange('workdir', v); })));
     })(),
     row('数据目录', i.in_place
       ? '本机默认档案本身，数据在程序正常位置，驾驶舱没有搬动。在资源管理器里打开'
       : '这个账号的独立档案（登录态、设置、缓存）实际存放位置，在资源管理器里打开',
       btn('打开目录', 'sm', () => run('open_dir', { app, name }))),
-    ...(i.rehome_to ? [row('把数据搬回原位',
+    ...(i.rehome_to ? [row('还原档案位置',
       `早先「接管原有档案」把这个账号的档案搬进了驾驶舱数据根（${meta.data_dir || ''}），`
       + `而 ${i.rehome_to} 才是这个程序自己一直在读的位置。归位＝同盘改名搬回去，不复制；`
       + '搬完它就是原地账号，换号只在同级改名让位。需先关闭该程序窗口',
-      btn('归位', 'sm', () => rehomeAccount(app, name)))] : []),
-    ...sub('空间', '缓存类都可再生，清掉不会丢登录状态；动手前先关掉该账号窗口。'),
+      btn('还原位置', 'sm', () => rehomeAccount(app, name)))] : []),
+    ...sub('磁盘空间'),
     row('磁盘占用', '这个账号目录实际占用',
       el('div', { class: 'ctlrow' },
         el('span', { class: 'kv' }, d.size ?? '未统计'),
@@ -6499,7 +6421,9 @@ function renderDetail() {
     row('从备份恢复', '用最近一次备份覆盖当前账号目录，备份之后新产生的改动会丢失；需先关闭该账号窗口',
       btn('恢复', 'sm', () => restoreConfirm(app, name))));
 
-  secs.auth = () => a.id === 'codex-desktop' ? chatgptAuthPanel(app, name, i) : secPanel('凭据与反代',
+  secs.auth = () => secPanel('凭据与接口',
+    ...(app === 'codex' ? cliLoginRows(a, name, i) : []),
+    ...sub('接口凭据'),
     row('API Token', 'OpenAI billing 抓额度、反代上游替换 Authorization，都用它',
       dField('token', meta.token, { type: 'password', placeholder: 'sk-…', autocomplete: 'off' })),
     (() => {
@@ -6511,16 +6435,24 @@ function renderDetail() {
           ? `已加入上游组：${inPools.join('、')} —— 要调整去「模型反代」页的上游组`
           : '填了 Token 就能用；要让它参与分流，去「模型反代」页把它勾进一个上游组');
       const tag = state === 'none' ? '无 Token' : (state === 'in' ? '已加入' : '未加入');
-      return row('反代可用性', desc, chip(tag, state === 'none' ? 'expired' : (state === 'in' ? 'official' : 'soon')));
-    })());
+      return row('网关上游状态', desc, chip(tag, state === 'none' ? 'expired' : (state === 'in' ? 'official' : 'soon')));
+    })(),
+    ...sub('额度接口'),
+    row('数据来源', '', (() => {
+      const select = el('select', {}, el('option', { value: '' }, '自定义或未配置'),
+        el('option', { value: 'openai' }, 'OpenAI Billing'));
+      select.value = d.f.quota_adapter ?? meta.quota_adapter ?? '';
+      select.onchange = () => markDetailChange('quota_adapter', select.value);
+      return select;
+    })()),
+    row('接口地址', '按额度提醒设置中的间隔更新。', dField('quota_url', meta.quota_url, { placeholder: 'https://…/quota' })),
+    row('数值字段', 'JSON 响应中的字段路径。留空时自动识别。', dField('quota_path', meta.quota_path, { placeholder: 'data.remaining' })));
 
   // 「隐藏整个程序」是程序级动作、内容区右上本来就有那颗按钮，不放进"这个账号"的设置里；
   // 改名已挪到「账号信息」，这一组只剩不可回退的那一件事，所以留在最后
-  secs.danger = () => a.id === 'codex-desktop' ? secPanel('移除账号登记', row('移除登记', '账号资料和登录凭据保留。', btn('移除登记', 'danger sm', async () => { if (await del(app, name)) closeDetailNow(); }))) : secPanel('删除账号',
-    row('删除账号', '删除这个账号的档案与整个数据目录（含登录状态），不可恢复。只想隐藏整个程序用右上「隐藏程序」',
-      btn('删除账号', 'danger sm', async () => {
-        if (await del(app, name)) closeDetailNow();
-      })));
+  secs.danger = () => secPanel('删除账号',
+    el('p', {}, '此操作将删除账号档案及其数据目录，包括登录凭据。请先备份需要保留的数据。'),
+    btn('删除账号', 'danger sm', async () => { if (await del(app, name)) closeDetailNow(); }));
 
   /* ---- 左侧分组导航 + 当前分组内容 ---- */
   const nav = $('im-nav');
@@ -6549,25 +6481,21 @@ function latestBackupLabel(app, name) {
   return `最近 ${b.at} · ${b.mb} MB`;
 }
 
-function saveDetail() {
-  const { app, name, meta, f } = S.detail;
-  // 额度数值不在这里保存：界面上已经没有手填入口，而 save_meta 是"带了字段就覆盖"——
-  // 顺手把 credits_left/expires_on 带上去等于每次保存都把本机读到的余额抹掉。
-  const payload = {
-    app, name,
-    workdir: f.workdir ?? '',
-    token: f.token ?? '',
-    quota_url: f.quota_url ?? '',
-    quota_path: f.quota_path ?? '',
-    quota_adapter: meta.quota_adapter ?? '',
-  };
-  run('save_meta', payload);
-  // 后端回写后 meta 与界面必须同源，否则下次轮询重绘会把刚填的接口又清空
-  Object.assign(meta, {
-    token: payload.token, quota_url: payload.quota_url,
-    quota_path: payload.quota_path, quota_adapter: payload.quota_adapter,
-  });
-  S.detail.dirty = false;
+async function saveDetail() {
+  const d = S.detail;
+  if (!d?.dirty || d.saving) return;
+  const changes = { ...d.f };
+  d.saving = true;
+  try {
+    const result = await run('save_meta', { app: d.app, name: d.name, ...changes });
+    if (!result?.ok || S.detail !== d) return;
+    Object.assign(d.meta, changes);
+    for (const [key, val] of Object.entries(changes)) {
+      if (d.f[key] === val) delete d.f[key];
+    }
+    d.dirty = Object.keys(d.f).length > 0;
+    renderDetail();
+  } finally { d.saving = false; }
 }
 
 
@@ -7412,10 +7340,13 @@ function factsLine(s) {
   if (f.mb) bits.push(`${f.mb} MB`);
   return bits.join(' · ');
 }
-const ORIGIN_TXT = { adopt: '接着用本机原来那份', copy: '复制一份带来对话与记忆', fresh: '从零开始，空目录' };
+const ORIGIN_TXT = { adopt: '使用本机现有档案', copy: '复制一份带来对话与记忆', fresh: '从零开始，空目录' };
 function openWizard() {
   const selectedApp = S.data.apps.find((a) => a.id === S.cur);
-  if (selectedApp?.id === 'claude-desktop') { run('launch_app', { app: selectedApp.id }); return; }
+  if (isLaunchTool(selectedApp) || selectedApp?.id === 'claude-desktop') {
+    if (selectedApp.installed) run('launch_app', { app: selectedApp.id });
+    return;
+  }
   if (selectedApp?.id === 'codex-desktop') { openChatgptAdd(selectedApp); return; }
   if (selectedApp?.id === 'zcode') { openZcodeAdd(); return; }
   if (selectedApp?.id === 'antigravity') { openAntigravityAdd(); return; }
@@ -7558,7 +7489,7 @@ function renderWizard() {
   const next = $('wz-next');
   clear(next);
   next.append(
-    sid === 'done' ? '确认无误，建这张卡'
+    sid === 'done' ? '创建账号'
       : (sid === 'login' && w.m !== 'apikey'
         ? (w.login && w.login.ok && w.login.account ? '继续' : '读取登录状态')
         : '继续'));
@@ -7584,7 +7515,7 @@ function renderWizard() {
   if (sid === 'setup') {
     const nameIn = el('input', { value: w.name, placeholder: '账号名称，如 备用号 / 公司号' });
     nameIn.addEventListener('input', () => { w.name = nameIn.value; w.nameTouched = true; });
-    const wdIn = el('input', { value: w.workdir, placeholder: '该账号默认打开的工作目录，D 盘也行（可留空）' });
+    const wdIn = el('input', { value: w.workdir, placeholder: '默认工作目录（可选）' });
     wdIn.addEventListener('input', () => { w.workdir = wdIn.value; });
     const L = w.login || {};
     const who = L.ok && L.account
@@ -7594,7 +7525,7 @@ function renderWizard() {
           + `${L.user_id ? ` · ID ${String(L.user_id).slice(0, 8)}…` : ''}`
           + (L.card ? `。这个号已经有卡片「${L.card}」了，建议别再建重复的。` : '。想改成别的名字直接编辑上面这格。'))
       : el('div', { class: 'hintline bad' },
-          '没读到登录身份，名字先占位。可回上一步重读，或先起个名，之后在「账号设置」里改。');
+          '未能确认登录身份。可返回登录步骤重新读取，也可手动填写账号名称。');
     body.append(
       who,
       el('div', { class: 'row' }, el('label', {}, '名称'), nameIn),
@@ -7613,7 +7544,7 @@ function renderWizard() {
     } else {
       const srcs = w.sources;
       if (!srcs) {
-        body.appendChild(el('div', { class: 'hintline' }, '正在看本机有哪些档案、分别是谁在用…'));
+        body.appendChild(el('div', { class: 'hintline' }, '正在读取本机档案及关联账号…'));
       } else if (!w.app.isolatable) {
         /* 单窗口换号的产品：这台机器上就一份档案，账号在客户端里切。
            对话与记忆是所有账号共用的，不存在"这个账号自己的数据"，
@@ -7633,7 +7564,7 @@ function renderWizard() {
           el('div', { class: 'hintline' },
             `档案位置：${prof ? prof.path : '（没登记到路径）'}`
             + (prof && prof.has_data ? ` · ${factsLine(prof)}` : '')),
-          el('p', { style: 'margin-top:14px' }, '这张卡跟这份档案怎么对应？'));
+          el('p', { style: 'margin-top:14px' }, '账号与档案的关联方式'));
         const pick = (v, title, desc, mark) => {
           const c = el('div', { class: 'choice', aria: { checked: (w.plan || 'new') === v } },
             el('div', {},
@@ -7659,7 +7590,7 @@ function renderWizard() {
       } else {
         const prof = srcs.find((s) => s.kind === 'profile');
         const insts = srcs.filter((s) => s.kind === 'instance' && s.has_data);
-        body.appendChild(el('p', {}, '这个账号打开时，要接着用你本机原来那份对话和记忆，还是从零开始？'));
+        body.appendChild(el('p', {}, '选择新实例使用的档案。'));
         const mkChoice = (origin, title, desc, path, enabled, from) => {
           const c = el('div', {
             class: `choice${enabled ? '' : ' off'}`,
@@ -7673,7 +7604,7 @@ function renderWizard() {
           return c;
         };
         if (prof) {
-          body.appendChild(mkChoice('adopt', '接着用本机原来那份',
+          body.appendChild(mkChoice('adopt', '使用本机现有档案',
             `${factsLine(prof)}。${prof.note}。不搬家、不复制：这张卡就挂在程序现在用的那份档案上，`
             + '以后换到别的号，是在它同级把它改名让位，随时换得回来。',
             prof.path, prof.has_data && !prof.junction, prof.path));
@@ -7683,29 +7614,30 @@ function renderWizard() {
           // API Key / ChatGPT 令牌原样带进新号，登进去还是旧号
           const cli = w.app.kind === 'cli';
           body.appendChild(mkChoice('copy', `从已有账号「${insts[0].name}」复制一份`,
-            cli ? 'CLI 产品的登录态在目录里，复制会把上一个号的登录带进来——不给选'
+            cli ? '命令行实例的配置目录包含凭据，已禁用复制。'
               : `${insts.map((s) => `${s.title || s.name}：${factsLine(s)}`).join('；')}。`
                 + '整份复制过来，原来那张卡不动。想拿旧号的对话开一个新号时才选这个。',
             insts.length === 1 ? insts[0].path : '', !cli, insts[0].path));
         }
-        body.appendChild(mkChoice('fresh', '从零开始，给它一个干净的空目录',
-          '这个账号打开时没有任何历史对话与记忆。原来那份完全不动。',
+        body.appendChild(mkChoice('fresh', '创建空白档案',
+          '新实例使用独立的空目录，首次启动需登录。',
           '', true));
-        body.appendChild(el('p', { style: 'margin-top:14px' }, '这个账号怎么管？'));
+        body.appendChild(el('p', { style: 'margin-top:14px' }, '实例运行方式'));
         const iso = el('div', { class: 'choice', aria: { checked: w.mode === 'isolate' } },
           el('div', {},
-            el('div', { class: 't' }, '独立数据目录（真多开）'),
+            el('div', { class: 't' }, '独立实例'),
             // 隔离参数各家不同：electron 系 --user-data-dir，CLI 系是环境变量
             el('div', { class: 'd' }, w.app.kind === 'cli'
               ? `启动时把 ${w.app.env || '数据目录'} 指向这个账号的目录，可以同时开多个账号窗口。`
               : '启动时传 --user-data-dir，可以同时开多个账号窗口。')));
         const swp = el('div', { class: 'choice', aria: { checked: w.mode === 'swap' } },
           el('div', {},
-            el('div', { class: 't' }, '换号（一次一个账号）'),
+            el('div', { class: 't' }, '切换默认档案'),
             el('div', { class: 'd' }, '把默认档案目录指向这个账号（NTFS junction，零额外空间）。')));
-        if (w.app.isolatable) iso.addEventListener('click', () => { w.mode = 'isolate'; renderWizard(); });
-        else swp.addEventListener('click', () => { w.mode = 'swap'; renderWizard(); });
-        body.append(iso, swp);
+        iso.addEventListener('click', () => { w.mode = 'isolate'; renderWizard(); });
+        if (w.app.swap_ok) swp.addEventListener('click', () => { w.mode = 'swap'; renderWizard(); });
+        body.appendChild(iso);
+        if (w.app.swap_ok) body.appendChild(swp);
       }
     }
   }
@@ -7842,7 +7774,7 @@ function renderWizard() {
       el('p', {}, '额度这一页没有手填框——读到的样子就是卡片上的样子。三处都读不到就先跳过，'
         + '建好卡之后在「账号设置 → 额度与用量 → 截图识别」把官网积分页截一张图贴进去。'),
       el('div', { class: 'ctlrow' },
-        btn('↻ 重新读一次额度', 'sm', () => wzLoadQuota(true),
+        btn('刷新额度', 'sm', () => wzLoadQuota(true),
           w.app.web_quota
             ? '一次读全：先读官网的逐资源包明细（各包到期时间只有官网有），读不到退服务端与本机。'
             : '这个产品没有登记官网用量页，直接读服务端与本机。'),
@@ -7870,7 +7802,7 @@ function renderWizard() {
     const src = (w.sources || []).find((s) => s.origin === chosen);
     const n = (w.credits || []).length;
     body.append(
-      el('p', {}, '确认无误就建卡：只在驾驶舱数据根写一个账号文件，不动这个程序的任何档案。'),
+      el('p', {}, '请核对账号名称、档案来源与启动方式。'),
       el('ol', { class: 'wl' },
         el('li', { class: L.ok ? 'ok' : '' }, `账号：${w.name}${L.ok ? `（登录账号 ${L.account}）` : '（没读到登录账号）'}`),
         el('li', {}, `工作目录：${w.workdir || '（留空，用程序默认）'}`),
@@ -7878,7 +7810,7 @@ function renderWizard() {
         w.claimer && w.claimer !== w.name.trim()
           ? el('li', {}, `原来认领这份档案的「${w.claimer}」会被标成"已让位"，卡片留着、历史额度还能看（也不会动它的文件）`)
           : null,
-        el('li', {}, `管理方式：${w.mode === 'isolate' ? '独立数据目录（真多开）' : '换号（一次一个账号）'}`),
+        el('li', {}, `管理方式：${w.mode === 'isolate' ? '独立实例' : '切换默认档案'}`),
         el('li', { class: n ? 'ok' : '' }, n
           ? `额度：逐笔 ${n} 包，最早到期 ${dtxt((w.credits || []).map((c) => c.expires_on).filter(Boolean).sort()[0] || '')}`
           : '额度：这步没填，之后在卡片「账号设置 → 额度与用量」里补'),

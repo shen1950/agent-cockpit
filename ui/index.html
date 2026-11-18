@@ -145,6 +145,7 @@
         <button class="btn" id="btn-reload" title="立即刷新账号与进程状态">刷新</button>
       </div>
       <div class="pagebody">
+      <section class="panel" id="claude-runtime" aria-label="Claude 运行环境" hidden></section>
       <div class="hintline" id="cur-hint" hidden></div>
       <div class="cards" id="cards"></div>
 
@@ -639,6 +640,7 @@
 
 <div class="toasts" id="toast" aria-live="polite"></div>
 
+<script src="instance-presentation.js"></script>
 <script src="chatgpt.js"></script>
 <script src="zcode.js"></script>
 <script src="antigravity.js"></script>

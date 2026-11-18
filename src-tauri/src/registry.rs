@@ -202,7 +202,10 @@ pub fn apps() -> Vec<AppDef> {
             "{PROGRAMFILES}/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
             "{LOCALAPPDATA}/Microsoft/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
         ], "", Some("{APPDATA}/Codex/web/Codex"), true),
-        curated("claude", "Claude Code CLI", "cli", &["{APPDATA}/npm/claude.cmd"], "CLAUDE_CONFIG_DIR", Some(".claude"), true),
+        curated("claude", "Claude Code CLI", "cli", &[
+            "{APPDATA}/npm/claude.cmd",
+            "{USERPROFILE}/.local/bin/claude.exe",
+        ], "CLAUDE_CONFIG_DIR", Some(".claude"), true),
         // Claude 桌面版包含 Cowork / Code；Claude-3p 是它自行管理的资料目录，
         // 不能当安装目录或换号档案。保留官方包身份启动，不复制/接管这份资料。
         curated("claude-desktop", "Claude 桌面版", "plain", &[

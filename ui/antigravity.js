@@ -1,5 +1,5 @@
 /* Antigravity 账号：登录态整机一份（Windows 凭据管理器），切换只切凭据 + 重启客户端。 */
-const ANTIGRAVITY_SECTIONS = [['info', '概览'], ['quota', '额度与用量'], ['auth', '登录管理'], ['l10n', '界面汉化'], ['danger', '移除账号']];
+const ANTIGRAVITY_SECTIONS = [['info', '账号概览'], ['auth', '登录管理'], ['quota', '额度与用量'], ['l10n', '界面汉化'], ['danger', '移除账号']];
 const ANTIGRAVITY_BUSY = new Set();
 
 async function antigravityAction(action, name = '', extra = {}) {
@@ -30,7 +30,7 @@ function antigravityOpenButton(instance) {
   const auth = instance.antigravity_auth || {};
   if (auth.current) return btn('打开窗口', 'primary sm', () => antigravityAction('launch', instance.name));
   if (auth.ready) return btn('切换并打开', 'primary sm', () => antigravityAction('antigravity_switch', instance.name));
-  return btn('录入登录', 'primary sm', () => openDetail('antigravity', instance.name, 'auth'));
+  return btn('添加登录凭据', 'primary sm', () => openDetail('antigravity', instance.name, 'auth'));
 }
 
 function antigravityDetailPanel(instance, section) {

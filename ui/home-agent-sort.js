@@ -36,7 +36,7 @@
   applyNavSort = (fromId, toId, after) => saveOrder(fromId, toId, after);
 
   const cards = () => [...host.querySelectorAll('.hagents .hacard')];
-  const apps = () => (S.data?.apps || []).filter(a => !a.hidden);
+  const apps = () => productEntries(S.data?.apps || []);
   const clearMarks = () => host.querySelectorAll('.ha-drag-source, .ha-drop-before, .ha-drop-after')
     .forEach(node => node.classList.remove('ha-drag-source', 'ha-drop-before', 'ha-drop-after'));
 

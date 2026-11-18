@@ -31,6 +31,7 @@ const context = {
   proxyRiskNote:()=>make('div', {class:'legalnote'}, make('b', {}, '用前须知')),
 };
 vm.createContext(context);
+vm.runInContext(fs.readFileSync('ui/instance-presentation.js','utf8'), context);
 vm.runInContext(fs.readFileSync('ui/proxy-guide.js','utf8'), context);
 context.renderGuide(d);
 assert.match(text(host), /来源 A/);

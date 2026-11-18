@@ -267,8 +267,8 @@ function openChatgptAdd(app, options = {}) {
 }
 
 const CHATGPT_DETAIL_SECTIONS = [
-  ['info', '概览'], ['quota', '额度与用量'], ['run', '运行管理'],
-  ['history', '对话与项目'], ['data', '文件位置'], ['auth', '登录管理'], ['danger', '移除账号']
+  ['info', '账号概览'], ['auth', '登录管理'], ['run', '运行管理'], ['quota', '额度与用量'],
+  ['history', '对话与项目'], ['data', '文件位置'], ['danger', '移除账号']
 ];
 const chatgptQuotaRequests = new Map();
 const chatgptQuotaAttempts = new Set();
@@ -436,7 +436,7 @@ function chatgptSettingsPanel(app, name, instance, detail) {
   }
   if (detail.sec === 'danger') return secPanel('移除账号', el('div', { class: 'cpt-settings' },
     el('p', {}, '仅移除账号登记，保留对话、项目和登录数据。'),
-    el('div', { class: 'cpt-actions' }, btn('移除这张卡片', 'danger sm', async () => { if (await del(app, name)) closeDetailNow(); }))));
+    el('div', { class: 'cpt-actions' }, btn('移除账号', 'danger sm', async () => { if (await del(app, name)) closeDetailNow(); }))));
   return secPanel('账号概览', el('div', { class: 'cpt-settings' },
     el('div', { class: 'cpt-account-head' }, el('strong', { class: name.includes('@') ? 'account-email' : 'account-title' }, name), el('span', { class: `cpt-status ${auth.has_auth ? 'is-ready' : ''}` }, auth.has_auth ? '登录信息已保存' : '尚未登录')),
     chatgptInfoRow('登录方式', mode),
@@ -548,7 +548,7 @@ function chatgptAuthPanel(app, name, instance) {
     const prefix = field('batchPrefix', { placeholder: '批量账号名前缀，例如 工作账号', maxLength: 48, aria: { label: '批量账号名前缀' } });
     const results = el('pre', { class: 'cpt-progress', hidden: !fields.batchResults, role: 'status' }, fields.batchResults || '');
     body.append(el('label', {}, el('span', { class: 'cpt-field-label' }, '登录凭据', qhelp('支持 auth.json、Token JSON、ChatGPT session JSON 或单个令牌。')), text), file,
-      btn('导入这份凭据', 'primary sm', async () => { const r = await act('chatgpt_import', { text: text.value }); if (r?.ok) { fields.importText = ''; text.value = ''; file.value = ''; renderDetail(); } }),
+      btn('导入凭据', 'primary sm', async () => { const r = await act('chatgpt_import', { text: text.value }); if (r?.ok) { fields.importText = ''; text.value = ''; file.value = ''; renderDetail(); } }),
       el('label', {}, el('span', { class: 'cpt-field-label' }, '批量导入', qhelp('使用 JSON 数组或每行一个令牌。新账号按“前缀-01”命名，现有账号保留。')), prefix),
       btn('批量创建独立账号', 'sm', async () => {
         if (!prefix.value.trim()) { prefix.focus(); toast('请填写批量账号名前缀', false); return; }
@@ -572,7 +572,7 @@ function chatgptAuthPanel(app, name, instance) {
     body.append(source,
       btn('从本机导入', 'primary sm', () => act('chatgpt_local_import', { source: source.value })));
   }
-  return secPanel(initial.has_auth ? '更新登录信息' : '登录这个账号',
+  return secPanel(initial.has_auth ? '更新登录信息' : '账号登录',
     initial.has_auth ? el('div', { class: 'cpt-actions' }, btn('返回当前登录', 'sm', () => { detail.chatgptEditLogin = false; detail.chatgptFields = {}; renderDetail(); })) : null,
     status, tabs, body, progress);
 }

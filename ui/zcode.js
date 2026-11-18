@@ -1,6 +1,6 @@
 /* ZCode keeps one local conversation store; each login has its own saved identity. */
-const ZCODE_SECTIONS = [['info', '概览'], ['quota', '额度与用量'], ['run', '运行管理'],
-  ['auth', '登录管理'], ['data', '文件位置'], ['danger', '移除账号']];
+const ZCODE_SECTIONS = [['info', '账号概览'], ['auth', '登录管理'], ['run', '运行管理'],
+  ['quota', '额度与用量'], ['data', '文件位置'], ['danger', '移除账号']];
 const ZCODE_BUSY = new Set();
 
 function zcodeProvider(provider) { return provider === 'bigmodel' ? 'BigModel' : provider === 'zai' ? 'Z.ai' : '未识别'; }
@@ -36,7 +36,7 @@ function zcodeOpenButton(instance) {
   const current = auth.current || instance.logged_in;
   if (current) return btn('打开窗口', 'primary sm', () => zcodeAction('launch_app', instance.name));
   if (auth.has_auth) return btn('切换并打开', 'primary sm', () => zcodeAction('zcode_switch', instance.name));
-  return btn('录入登录', 'primary sm', () => openDetail('zcode', instance.name, 'auth'));
+  return btn('添加登录凭据', 'primary sm', () => openDetail('zcode', instance.name, 'auth'));
 }
 
 function zcodeQuotaPanel(instance, options = {}) {
@@ -60,7 +60,7 @@ function zcodeDetailPanel(instance, section) {
   if (section === 'run') return secPanel('运行管理', el('div', { class: 'cpt-settings cpt-run' },
     el('div', { class: 'cpt-run-summary' },
       el('div', { class: 'cpt-run-state' }, el('span', { class: 'cpt-field-label' }, '运行状态'),
-        el('strong', {}, instance.running ? '运行中' : current ? '当前账号' : '未运行')), zcodeOpenButton(instance)),
+        el('strong', {}, instance.running ? '运行中' : instance.resident ? '后台运行' : '未运行')), zcodeOpenButton(instance)),
     info('账号模式', '共享对话，独立凭据', '切换账号需重启 ZCode；本机对话和项目保留。'),
     current && (instance.running || instance.resident) ? el('div', { class: 'cpt-run-stop' },
       el('div', { class: 'cpt-run-stop-label' }, el('strong', {}, '结束运行'), qhelp('请先保存未完成内容。')),

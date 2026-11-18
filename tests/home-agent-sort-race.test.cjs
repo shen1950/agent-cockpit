@@ -66,6 +66,7 @@ function harness() {
   });
   vm.runInContext(loadSource + '\n' + navSource, ctx);
   ctx.render();
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../ui/instance-presentation.js'), 'utf8'), ctx);
   vm.runInContext(sort, ctx);
   const pointer = (node, x) => ({ target: node, clientX: x, clientY: 25,
     pointerId: 1, pointerType: 'mouse', button: 0, isPrimary: true, preventDefault() {} });
