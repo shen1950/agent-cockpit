@@ -102,11 +102,14 @@ def attach_log():
         sys.stdout = sys.stderr = stream
 
 
-def _meta_at(port, timeout=3.0):
+def _identity_at(port, timeout=3.0):
+    """轻量身份接口：不碰数据库。自证/探活都走它——/api/meta 要现算 overview()，
+    索引库大或出错时慢到超时甚至回 500，曾把归我们的好端口误判成"影子绑定"、
+    漂完 10 口进程自杀（2026-11-19 实录：overview 里一处 NameError 就放倒了整个服务）。"""
     try:
-        with local_open(f"http://127.0.0.1:{port}/api/meta", timeout=timeout) as r:
-            meta = json.loads(r.read().decode("utf-8"))
-        return meta if isinstance(meta, dict) else None
+        with local_open(f"http://127.0.0.1:{port}/api/agentfind", timeout=timeout) as r:
+            info = json.loads(r.read().decode("utf-8"))
+        return info if isinstance(info, dict) and info.get("service") == "AgentFind" else None
     except Exception:
         return None
 
@@ -114,8 +117,7 @@ def _meta_at(port, timeout=3.0):
 def already_running(port):
     """本机端口上已有 AgentFind 在跑就返回 True（避免重复启动去抢同一个端口）。"""
     for _ in range(2):
-        meta = _meta_at(port)
-        if meta and "total" in meta:
+        if _identity_at(port):
             return True
     return False
 
@@ -127,13 +129,10 @@ def is_me_running(port):
     所以 bind() 成功不等于抢到端口。2026-10-29 实录：qwenwork-bridge 先占了 8765，
     agentfind 影子绑在同一个口上，进程活着、端口"在听"、一个请求都收不到，
     桌面启动器探到的是桥的 404，于是弹"等了 12 秒服务端口还是没响应"。
-
-    要重试而不是单发一次：/api/meta 首次得现算一遍 overview()，实测冷启动 2.9s，
-    探得太急会把本来就归我们的好端口误判成"没抢到"，白往后漂。
     """
     for attempt in range(VERIFY_TRIES):
-        meta = _meta_at(port, timeout=VERIFY_TIMEOUT)
-        if meta and meta.get("pid") == os.getpid():
+        info = _identity_at(port, timeout=VERIFY_TIMEOUT)
+        if info and info.get("pid") == os.getpid():
             return True
         if attempt < VERIFY_TRIES - 1:
             time.sleep(0.3)
@@ -495,8 +494,13 @@ def discover_sources():
     # AStudio（Acode / 科大讯飞星辰）：rollout JSONL 在 acode-home-overlay/sessions/
     astudio_home = os.environ.get("AGENTFIND_ASTUDIO_HOME")
     if not astudio_home:
+        # 独立版没有驾驶舱注入的环境变量：先认本机实际数据盘，再落 LOCALAPPDATA 默认位。
+        legacy = Path("D:/Artificial_Intelligence/AStudio Data/acode-home-overlay/sessions")
         local = os.environ.get("LOCALAPPDATA", "")
-        astudio_home = str(Path(local) / "Programs/AStudio Data/acode-home-overlay/sessions") if local else ""
+        if legacy.exists():
+            astudio_home = str(legacy)
+        elif local:
+            astudio_home = str(Path(local) / "Programs/AStudio Data/acode-home-overlay/sessions")
     if astudio_home:
         add("astudio", "AStudio", "astudio_rollout", [Path(astudio_home)])
 
@@ -508,7 +512,7 @@ def discover_sources():
         "qoder-cn-ide": [HOME / ".qoder-cn-ide/projects"],
         "workbuddy": [HOME / ".workbuddy/projects"],
         "workbuddy-intl": [HOME / ".workbuddy-ai/projects"],
-        "astudio": [astudio_sessions],
+        "astudio": [Path(astudio_home)] if astudio_home else [],
         "minimax": [HOME / ".minimax/sessions"],
         "traework-cn": [HOME / ".trae-cn/memory/projects"],
         "zcode": [HOME / ".zcode/cli/db/db.sqlite"],
@@ -2265,7 +2269,7 @@ def serve(port, open_browser, initial_query):
                     self._json(desktop_feed(read_con()))
                 elif u.path == "/api/agentfind":
                     self._json({"service": "AgentFind", "sessions_ui": 1,
-                                "script": SCRIPT_FINGERPRINT})
+                                "script": SCRIPT_FINGERPRINT, "pid": os.getpid()})
                 elif u.path == "/api/meta":
                     ov = overview(read_con())
                     ov.update(progress=STATE["progress"], ready=STATE["ready"], pid=os.getpid(),
@@ -2330,8 +2334,8 @@ def serve(port, open_browser, initial_query):
             srv = ThreadingHTTPServer(("127.0.0.1", cand), Handler)
         except OSError:
             continue
-        # 探活必须在后台扫描启动之前做：首轮 refresh 一边写库一边让人读 /api/meta，
-        # 慢到 3s 以上甚至回 500，探活就会把归我们的好端口误判成"没抢到"、白往后漂。
+        # 自证走不碰数据库的 /api/agentfind（带 pid），扫描写库再慢也不会把
+        # 归我们的好端口误判成"没抢到"、白往后漂。
         threading.Thread(target=srv.serve_forever,
                          kwargs={"poll_interval": 0.05}, daemon=True).start()
         if is_me_running(cand):
@@ -2644,7 +2648,7 @@ button:not(.ghost):not(.go):not(.session-name):not(.more-rows){border-color:var(
 const $=id=>document.getElementById(id);
 const searchBody=$('search-body'),searchToggle=$('search-toggle'),pinToggle=$('pin-toggle');
 const searchFolds=[...searchBody.querySelectorAll('.fold')];
-let searchScrollDistance=0,searchScrollSettling=false,searchCollapsed=false;
+let searchScrollDistance=0,searchScrollSettling=false,searchCollapsed=false,searchAutoCollapsed=false;
 let searchPinned=localStorage.getItem('agentfind.searchPinned')==='1';
 const searchScrollPositions=new WeakMap();
 function setSearchCollapsed(collapsed){
@@ -2657,13 +2661,14 @@ function setSearchCollapsed(collapsed){
  searchToggle.setAttribute('aria-expanded',String(!collapsed));
  searchToggle.textContent=collapsed?'展开搜索 ▾':'收起搜索 ▴';
  searchScrollDistance=0;
+ if(!collapsed)searchAutoCollapsed=false;
  // Folding changes document height. Ignore the resulting scroll anchoring events.
  requestAnimationFrame(()=>requestAnimationFrame(()=>{
   searchScrollPositions.set(document,window.scrollY);
   searchScrollSettling=false;
  }));
 }
-searchToggle.onclick=()=>setSearchCollapsed(!searchCollapsed);
+searchToggle.onclick=()=>{searchAutoCollapsed=false;setSearchCollapsed(!searchCollapsed);};
 function renderPin(){
  pinToggle.classList.toggle('on',searchPinned);
  pinToggle.setAttribute('aria-pressed',String(searchPinned));
@@ -2689,10 +2694,15 @@ document.addEventListener('scroll',event=>{
  const position=target===document?window.scrollY:target.scrollTop;
  const previous=searchScrollPositions.get(target)||0;
  searchScrollPositions.set(target,position);
- if(searchPinned || searchScrollSettling || searchCollapsed)return;
+ if(searchPinned || searchScrollSettling)return;
+ if(searchCollapsed){
+  // 滚回页面初始位置时，把滚动自动收起的筛选区还回来；手动收起的不强行展开。
+  if(searchAutoCollapsed && target===document && position<=0)setSearchCollapsed(false);
+  return;
+ }
  const delta=position-previous;
  searchScrollDistance=delta>0?searchScrollDistance+delta:0;
- if(searchScrollDistance>=80)setSearchCollapsed(true);
+ if(searchScrollDistance>=80){setSearchCollapsed(true);searchAutoCollapsed=true;}
 },{capture:true,passive:true});
 const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
  .replace(/"/g,'&quot;');
