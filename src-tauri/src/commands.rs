@@ -130,6 +130,26 @@ fn find_pair(site_id: &str, key_id: &str) -> Option<(Value, Value)> {
     Some((site, key))
 }
 
+/// 把一次拉到的模型并进站点的「可用模型」：已存在的不重复加，返回（新增数，合并后清单）。
+fn merge_site_models(sobj: &Value, ids: &[String]) -> (usize, Vec<String>) {
+    let mut merged: Vec<String> = sobj["models_list"]
+        .as_str()
+        .unwrap_or("")
+        .split([',', '，', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let mut added = 0;
+    for id in ids {
+        if !merged.iter().any(|x| x == id) {
+            merged.push(id.clone());
+            added += 1;
+        }
+    }
+    (added, merged)
+}
+
 #[tauri::command]
 pub fn get_meta(app: String, name: String) -> Value {
     let m = match reg::find_instance(&app, &name) {
@@ -3206,6 +3226,31 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             json!({
                 "ok": true,
                 "msg": format!("拉到 {} 个模型，站点清单里新增 {} 个", ids.len(), added),
+                "models": ids,
+                "models_list": merged.join(", "),
+            })
+        }
+
+        "site_models_all" => {
+            // 界面上「获取模型」全站只有一个按钮，所以它得把每个接入点都问一遍，
+            // 而不是像 site_models 那样由调用方指定某一个口。
+            let site_id = payload["site"].as_str().unwrap_or("");
+            let sobj = match keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site_id)) {
+                Some(p) => p,
+                None => return Some(err("站点不存在")),
+            };
+            let (ids, notes) = keys::probe_models_all(&sobj);
+            let detail = notes.join("；");
+            if ids.is_empty() {
+                return Some(err(format!("没拉到模型：{detail}")));
+            }
+            let (added, merged) = merge_site_models(&sobj, &ids);
+            let mut upd = sobj.clone();
+            upd["models_list"] = json!(merged.join(", "));
+            let _ = keys::upsert_site(&upd);
+            json!({
+                "ok": true,
+                "msg": format!("拉到 {} 个模型，新增 {} 个（{detail}）", ids.len(), added),
                 "models": ids,
                 "models_list": merged.join(", "),
             })

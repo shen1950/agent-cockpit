@@ -6149,9 +6149,7 @@ function siteInfo(p) {
         el('span', { class: 'url', title: b.url }, b.url)),
       btn('复制', 'plain sm', () => copyText(b.url), '复制这个接入点'),
       btn('连通检测', 'plain sm', () => openMatrix(p.id, { type: 'fmt', value: fmt }),
-        '按协议检测：这一列下每把密钥能不能通'),
-      btn('获取模型', 'plain sm', () => pullSiteModels(p, b),
-        `向 ${b.url}/models 发一次请求，把拉到的模型并进站点的「可用模型」`)));
+        '按协议检测：这一列下每把密钥能不能通')));
   }
 
   const chips = el('div', { class: 'sichips' });
@@ -6174,16 +6172,27 @@ function siteInfo(p) {
     }, showAll ? '把模型清单收回去' : '展开这个站点的全部模型'));
   }
 
+  // 「获取模型」全站只放这一处（她 2026-11-20 要求）：模型清单是站点级的，
+  // 不分协议、也不分密钥单独存，所以协议行里各摆一个同名按钮既重复也没意义——
+  // 「点哪一个」本身就说不清。点一次由后端把每个接入点挨个问过去。
   return el('div', { class: 'siteinfo' },
     bases.length ? rows : null,
-    models.length
-      ? el('div', { class: 'sigroup' }, el('span', { class: 'silab' }, `模型 ${models.length}`), chips)
-      : null);
+    el('div', { class: 'sigroup' },
+      el('span', { class: 'silab' }, models.length ? `模型 ${models.length}` : '模型'),
+      chips,
+      bases.length
+        ? btn('获取模型', 'plain sm', () => pullSiteModelsAll(p),
+          '把这站每个接入点都问一遍，拉到的模型并进「可用模型」')
+        : btn('获取模型', 'plain sm', () => openSiteModal(p),
+          '还没有接入点，先填 Base URL')));
 }
 
-async function pullSiteModels(site, b) {
-  toast(`正在向 ${b.url} 要模型清单…`, true);
-  const r = await invoke('action', { payload: { action: 'site_models', site: site.id, base: b.url } });
+/* 一个站点的「获取模型」：把每个接入点问一遍，合并结果。
+   协议多的时候逐个问，某个口拿不到（比如那个格式的 /models 不对外）
+   不会把整次拉取判死，另有能用的口就照常出结果，缺哪个口在提示里写明。 */
+async function pullSiteModelsAll(site) {
+  toast(`正在向 ${(site.base_urls || []).length} 个接入点要模型清单…`, true);
+  const r = await invoke('action', { payload: { action: 'site_models_all', site: site.id } });
   toast(r.msg, r.ok);
   if (r.ok) load();
 }

@@ -1508,6 +1508,91 @@ pub fn probe_models(base_url: &str, key: &str) -> (bool, String, Vec<String>) {
     }
 }
 
+/// 一个站点常有多个接入点（OpenAI 兼容 / Anthropic 兼容 / DashScope…）。
+/// 界面上「获取模型」全站只留一个入口，那它就得把这些口都问一遍——
+/// 只问第一口，登记顺序把 Responses 排在前面的站会显示「没拉到模型」，
+/// 而其实是那个口拿不到清单、另一个口本来就正常。
+///
+/// 每个口按密钥顺序试到一把能用的为止：有的站某把密钥只对某个口开放，
+/// 从头到尾只用第一把，那一整口都会判死。
+/// 返回（去重合并后的模型 id，逐口说明）。
+pub fn probe_models_all(site: &Value) -> (Vec<String>, Vec<String>) {
+    let mut ids: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+
+    let keys: Vec<String> = site["keys"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|k| k["key"].as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 同一个地址登记两遍（不同格式标签）不该发两次请求
+    let mut bases: Vec<(String, String)> = Vec::new();
+    for b in site["base_urls"].as_array().into_iter().flatten() {
+        let url = b["url"].as_str().unwrap_or("").trim().to_string();
+        if url.is_empty() || bases.iter().any(|(u, _)| *u == url) {
+            continue;
+        }
+        bases.push((url, b["format"].as_str().unwrap_or("openai").to_string()));
+    }
+    if bases.is_empty() {
+        return (ids, vec!["这个站点还没登记接入点".into()]);
+    }
+
+    for (url, fmt) in &bases {
+        let label = match fmt.as_str() {
+            "openai" => "OpenAI 兼容".to_string(),
+            "anthropic" => "Anthropic 兼容".to_string(),
+            "dashscope" => "DashScope".to_string(),
+            "openai-resp" => "OpenAI Responses".to_string(),
+            other => other.to_string(),
+        };
+        // 一把密钥都没有时用空 key 试一次：有的站 /models 不校验
+        let attempts: Vec<String> = if keys.is_empty() {
+            vec![String::new()]
+        } else {
+            keys.clone()
+        };
+        let mut got: Option<Vec<String>> = None;
+        let mut last = String::new();
+        let mut which = 0usize;
+        for (i, k) in attempts.iter().enumerate() {
+            let (good, msg, list) = probe_models(url, k);
+            if good {
+                got = Some(list);
+                which = i + 1;
+                break;
+            }
+            last = msg;
+        }
+        match got {
+            Some(list) => {
+                let n = list.len();
+                let mut added = 0;
+                for m in list {
+                    if !ids.iter().any(|x| *x == m) {
+                        ids.push(m);
+                        added += 1;
+                    }
+                }
+                let who = if attempts.len() > 1 {
+                    format!("（第 {which} 把密钥）")
+                } else {
+                    String::new()
+                };
+                notes.push(format!("{label}：{n} 个，新增 {added}{who}"));
+            }
+            None => notes.push(format!("{label}：{last}")),
+        }
+    }
+    (ids, notes)
+}
+
 /// 从文档复制来的地址常常已经带上了动作后缀
 /// （…/v1/chat/completions、…/responses、…/v1/messages 之类）。
 /// 测活和拉模型要的是 API 根：先把这些后缀剥掉再拼 /models，
