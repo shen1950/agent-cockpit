@@ -517,6 +517,57 @@ pub fn base_and_fmt(site: &Value, key: &Value) -> (String, String) {
     (String::new(), String::new())
 }
 
+/// 从地址反推它属于哪种兼容格式。密钥自带接入点时，要靠它判断这条地址
+/// 对应矩阵里的哪一列——否则会拿 Responses 的地址去打 chat 的口。
+pub fn fmt_of_url(url: &str) -> &'static str {
+    let low = url.trim().trim_end_matches('/').to_ascii_lowercase();
+    if low.ends_with("/responses") {
+        "openai-resp"
+    } else if low.ends_with("/messages") {
+        "anthropic"
+    } else if low.contains("generativelanguage") || low.contains(":generatecontent") {
+        "gemini"
+    } else {
+        "openai"
+    }
+}
+
+/// 矩阵的列：站点登记的接入点；一个都没登记时（老数据只把地址挂在 key 上），
+/// 按密钥自带地址反推出的格式补出来，别让弹窗直接空着。
+pub fn matrix_columns(site: &Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(arr) = site["base_urls"].as_array() {
+        for b in arr {
+            let u = b["url"].as_str().unwrap_or("").trim();
+            if u.is_empty() {
+                continue;
+            }
+            let f = match b["format"].as_str().unwrap_or("").trim() {
+                "" => fmt_of_url(u),
+                other => other,
+            };
+            if !out.iter().any(|(x, _)| x == f) {
+                out.push((f.to_string(), u.to_string()));
+            }
+        }
+    }
+    if out.is_empty() {
+        if let Some(ks) = site["keys"].as_array() {
+            for k in ks {
+                let u = k["base_url"].as_str().unwrap_or("").trim();
+                if u.is_empty() {
+                    continue;
+                }
+                let f = fmt_of_url(u);
+                if !out.iter().any(|(x, _)| x == f) {
+                    out.push((f.to_string(), u.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 站点的模型清单：站点上那份为主，key 自己那份是补充
 pub fn models_for(site: &Value, key: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -1095,11 +1146,90 @@ fn upstream_hint(body: &str) -> String {
 /// （她的截图就是这么来的）。格式登记了却不用，等于没登记。
 ///
 /// 认不出 fmt 时保持老行为（chat/completions），别把没登记格式的站点搞坏。
-pub fn chat_probe(base_url: &str, key: &str, model: &str, fmt: &str) -> (bool, String) {
+/// 一次（密钥 × 协议）探测的结构化结果。
+///
+/// `state` 直接给界面用，取值固定：
+///   `ok` 通 / `site_disabled` 站点停用该协议 / `key_denied` 密钥无权 /
+///   `model_mismatch` 模型名不被接受 / `error` 其他错误。
+///
+/// 为什么要单列 `site_disabled`：星驰这类站把 `/v1/chat/completions` 整条停了，
+/// 那一列里每把密钥都会失败。若一律标成「密钥无权」，三行全红会被读成
+/// 「三把 key 都坏了」，实际是站点没开这个协议——结论完全不同。
+pub struct ProbeOutcome {
+    pub state: &'static str,
+    pub code: u16,
+    pub ms: u128,
+    pub said: String,
+    pub hint: String,
+    pub extra: &'static str,
+    /// 传输层失败（连不上/超时）：此时 code 为 0，`hint` 是翻译过的人话。
+    pub net_err: bool,
+}
+
+impl ProbeOutcome {
+    fn fail(state: &'static str, code: u16, ms: u128, hint: impl Into<String>) -> Self {
+        ProbeOutcome {
+            state,
+            code,
+            ms,
+            said: String::new(),
+            hint: hint.into(),
+            extra: "",
+            net_err: false,
+        }
+    }
+}
+
+/// 按 HTTP 状态码与上游原话判失败性质。
+///
+/// 400 的三种写法要分开：「停用接口」「模型不认」「其他」。前两种的处置完全不同
+/// （换协议 / 先取模型清单），糊成一句「请求被拒」等于没说。
+fn classify_failure(code: u16, body: &str) -> &'static str {
+    let low = body.to_ascii_lowercase();
+    let disabled = low.contains("chat_completions_disabled")
+        || body.contains("已停用")
+        || low.contains("dispatch")
+        || low.contains("does not allow")
+        || low.contains("not allowed for this");
+    let model_bad = low.contains("model")
+        && (low.contains("not found")
+            || low.contains("does not exist")
+            || low.contains("unknown")
+            || low.contains("invalid"));
+    match code {
+        400 => {
+            if disabled {
+                "site_disabled"
+            } else if model_bad {
+                "model_mismatch"
+            } else {
+                "error"
+            }
+        }
+        // 401 鉴权失败、403 不允许调、429 额度用尽：都归到这把 key 身上
+        401 | 403 | 429 => "key_denied",
+        // 404 多半是这个地址根本没有该协议的接口
+        404 => "site_disabled",
+        _ => "error",
+    }
+}
+
+/// 真发一次最小对话，返回结构化结果（矩阵与单点检测共用这一份实现）。
+pub fn probe_combo(
+    base_url: &str,
+    key: &str,
+    model: &str,
+    fmt: &str,
+    timeout_secs: u64,
+) -> ProbeOutcome {
     // 地址本身带 /responses 的，就算 fmt 没登记也按 Responses 打——
     // 用户已经把「我要走这个协议」写在地址里了，不该再被改成 chat。
     let wants_responses = fmt.eq_ignore_ascii_case("openai-resp")
-        || base_url.trim().trim_end_matches('/').to_ascii_lowercase().ends_with("/responses");
+        || base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .ends_with("/responses");
     let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
     let (url, body) = if wants_responses {
         match responses_url(base) {
@@ -1112,7 +1242,7 @@ pub fn chat_probe(base_url: &str, key: &str, model: &str, fmt: &str) -> (bool, S
                     "stream": false,
                 }),
             ),
-            None => return (false, "未填 Base URL".into()),
+            None => return ProbeOutcome::fail("error", 0, 0, "未填 Base URL"),
         }
     } else {
         match chat_url(base) {
@@ -1125,16 +1255,16 @@ pub fn chat_probe(base_url: &str, key: &str, model: &str, fmt: &str) -> (bool, S
                     "stream": false,
                 }),
             ),
-            None => return (false, "未填 Base URL".into()),
+            None => return ProbeOutcome::fail("error", 0, 0, "未填 Base URL"),
         }
     };
     let t0 = std::time::Instant::now();
     let mut req = ureq::post(&url)
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .set("Content-Type", "application/json");
     // ureq 默认 UA 是 `ureq/x.y`，有些中转站按 UA 首 token 放行（星驰只认
     // WorkBuddy / Codex / Claude Code 这类编程客户端，裸脚本一律 403 client_not_allowed）。
-    // 测试按钮的意义是「验证这把 key 在这个站能不能用」，不是「验证 ureq 能不能用」，
+    // 检测的意义是「验证这把 key 在这个站能不能用」，不是「验证 ureq 能不能用」，
     // 所以这里声明成 WorkBuddy——和真正调用它的客户端一致，测出来的结论才作数。
     req = req.set("User-Agent", PROBE_UA);
     if !key.is_empty() {
@@ -1172,12 +1302,15 @@ pub fn chat_probe(base_url: &str, key: &str, model: &str, fmt: &str) -> (bool, S
             }
             .replace(['\n', '\r'], " ");
             let said: String = said.trim().chars().take(40).collect();
-            let msg = if said.is_empty() {
-                format!("真请求通过（{}ms）：上游收下了这把 key（模型 {model}）", ms)
-            } else {
-                format!("真请求通过（{}ms）：模型 {model} 回了「{said}」", ms)
-            };
-            (true, msg)
+            ProbeOutcome {
+                state: "ok",
+                code: 200,
+                ms,
+                said,
+                hint: String::new(),
+                extra: "",
+                net_err: false,
+            }
         }
         Err(ureq::Error::Status(code, resp)) => {
             let txt = resp.into_string().unwrap_or_default();
@@ -1191,10 +1324,123 @@ pub fn chat_probe(base_url: &str, key: &str, model: &str, fmt: &str) -> (bool, S
                 429 => "：限流，或这把 key 的额度用完了",
                 _ => "",
             };
-            (false, format!("真请求失败（HTTP {code}{extra}）{hint}"))
+            ProbeOutcome {
+                state: classify_failure(code, &txt),
+                code,
+                ms: t0.elapsed().as_millis(),
+                said: String::new(),
+                hint,
+                extra,
+                net_err: false,
+            }
         }
-        Err(e) => (false, friendly_net_err(&e, 20)),
+        Err(e) => ProbeOutcome {
+            state: "error",
+            code: 0,
+            ms: t0.elapsed().as_millis(),
+            said: String::new(),
+            hint: friendly_net_err(&e, timeout_secs),
+            extra: "",
+            net_err: true,
+        },
     }
+}
+
+/// 单点检测（「请求」按钮）：沿用原来的两元组与文案，内部走 `probe_combo`。
+pub fn chat_probe(base_url: &str, key: &str, model: &str, fmt: &str) -> (bool, String) {
+    let o = probe_combo(base_url, key, model, fmt, 20);
+    if o.net_err {
+        return (false, o.hint);
+    }
+    if o.state == "ok" {
+        let msg = if o.said.is_empty() {
+            format!("真请求通过（{}ms）：上游收下了这把 key（模型 {model}）", o.ms)
+        } else {
+            format!("真请求通过（{}ms）：模型 {model} 回了「{}」", o.ms, o.said)
+        };
+        (true, msg)
+    } else {
+        (
+            false,
+            format!("真请求失败（HTTP {}{}）{}", o.code, o.extra, o.hint),
+        )
+    }
+}
+
+/// 矩阵里的一格：谁 × 哪种协议 × 结果。
+pub struct MatrixCell {
+    pub key_id: String,
+    pub fmt: String,
+    pub state: &'static str,
+    pub code: u16,
+    pub ms: u128,
+    pub msg: String,
+}
+
+/// 批量探测：把任务摊到固定数量的工作线程上。
+///
+/// 为什么必须并发：一个 10 密钥 × 3 协议的站是 30 次请求，串行按 20 秒超时算
+/// 最坏要等十分钟，界面上就是「点了没反应」。并发上限压在 6，既快又不至于
+/// 把中转站的限流打爆。
+pub fn probe_matrix(
+    jobs: Vec<(String, String, String, String, String)>,
+    timeout_secs: u64,
+    workers: usize,
+) -> Vec<MatrixCell> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let total = jobs.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let jobs = std::sync::Arc::new(jobs);
+    let cursor = AtomicUsize::new(0);
+    let out: Mutex<Vec<Option<MatrixCell>>> = Mutex::new((0..total).map(|_| None).collect());
+    let n = workers.clamp(1, total).min(6);
+
+    std::thread::scope(|s| {
+        for _ in 0..n {
+            s.spawn(|| loop {
+                let i = cursor.fetch_add(1, Ordering::SeqCst);
+                if i >= total {
+                    break;
+                }
+                let (key_id, fmt, url, key, model) = &jobs[i];
+                let o = probe_combo(url, key, model, fmt, timeout_secs);
+                let msg = if o.net_err {
+                    o.hint.clone()
+                } else if o.state == "ok" {
+                    if o.said.is_empty() {
+                        "连通".to_string()
+                    } else {
+                        format!("返回「{}」", o.said)
+                    }
+                } else {
+                    let h = o.hint.trim_start_matches("；上游说：");
+                    if h.is_empty() {
+                        format!("HTTP {}", o.code)
+                    } else {
+                        format!("HTTP {}：{}", o.code, h)
+                    }
+                };
+                out.lock().unwrap()[i] = Some(MatrixCell {
+                    key_id: key_id.clone(),
+                    fmt: fmt.clone(),
+                    state: o.state,
+                    code: o.code,
+                    ms: o.ms,
+                    msg,
+                });
+            });
+        }
+    });
+
+    out.into_inner()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// 网络错误翻译成人话：超时（Windows 上表现为 os error 10060）要说清
@@ -1658,6 +1904,71 @@ mod tests {
         assert!(wants("", "https://api.xingchiapi.com/v1/responses/"), "地址写明了就照办");
         assert!(!wants("openai", "https://x/v1"), "普通 chat 站保持老行为");
         assert!(!wants("", "https://x/v1"));
+    }
+
+    /// 失败归因必须把「站点停用这个协议」和「这把密钥不行」分开。
+    /// 混成一句「请求失败」，三行全红的矩阵会被读成「三把 key 都坏了」。
+    #[test]
+    fn classify_failure_separates_protocol_from_key() {
+        assert_eq!(
+            classify_failure(
+                400,
+                r#"{"error":{"code":"chat_completions_disabled","message":"本站已停用 /v1/chat/completions"}}"#
+            ),
+            "site_disabled"
+        );
+        assert_eq!(
+            classify_failure(400, r#"{"error":{"message":"This group does not allow /v1/messages dispatch"}}"#),
+            "site_disabled"
+        );
+        assert_eq!(
+            classify_failure(400, r#"{"error":{"message":"model gpt-x not found"}}"#),
+            "model_mismatch"
+        );
+        assert_eq!(classify_failure(400, r#"{"error":{"message":"bad request"}}"#), "error");
+        assert_eq!(classify_failure(401, "unauthorized"), "key_denied");
+        assert_eq!(classify_failure(403, "forbidden"), "key_denied");
+        assert_eq!(classify_failure(429, "slow down"), "key_denied");
+        assert_eq!(classify_failure(404, ""), "site_disabled");
+        assert_eq!(classify_failure(500, ""), "error");
+    }
+
+    /// 密钥自带接入点时，要靠地址反推它属于矩阵的哪一列；
+    /// 推错就会拿 Responses 的地址去打 chat 的口。
+    #[test]
+    fn fmt_of_url_reads_the_protocol_from_the_path() {
+        assert_eq!(fmt_of_url("https://api.xingchiapi.com/v1/responses"), "openai-resp");
+        assert_eq!(fmt_of_url("https://api.xingchiapi.com/v1/responses/"), "openai-resp");
+        assert_eq!(fmt_of_url("https://x/v1/messages"), "anthropic");
+        assert_eq!(fmt_of_url("https://x/v1/chat/completions"), "openai");
+        assert_eq!(fmt_of_url("https://x/openai/v1"), "openai");
+        assert_eq!(fmt_of_url("https://generativelanguage.googleapis.com/v1beta"), "gemini");
+    }
+
+    /// 列来自站点登记的接入点；站点没登记时退回密钥自带地址，别让弹窗空着。
+    #[test]
+    fn matrix_columns_prefers_site_then_falls_back_to_keys() {
+        let site = json!({"base_urls": [
+            {"format": "openai-resp", "url": "https://a/v1/responses"},
+            {"format": "openai",      "url": "https://a/v1"},
+            {"format": "openai",      "url": "https://a/v1-duplicate"},
+            {"format": "anthropic",   "url": "  "}
+        ]});
+        let cols = matrix_columns(&site);
+        assert_eq!(cols.len(), 2, "同一格式只占一列，空地址要跳过");
+        assert_eq!(cols[0], ("openai-resp".to_string(), "https://a/v1/responses".to_string()));
+        assert_eq!(cols[1], ("openai".to_string(), "https://a/v1".to_string()));
+
+        let only_keys = json!({"keys": [
+            {"base_url": "https://b/v1/responses"},
+            {"base_url": ""},
+            {"base_url": "https://b/v1/responses"}
+        ]});
+        let c2 = matrix_columns(&only_keys);
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].0, "openai-resp");
+
+        assert!(matrix_columns(&json!({})).is_empty());
     }
 
     /// 上游报错的写法五花八门：网关一套、OpenAI 一套，抠不出 JSON 时也得截一段给看。

@@ -124,6 +124,8 @@ const ACT_ICONS = {
   eye: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/></svg>',
   plug: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.7 9.3l2.6-2.6"/><path d="M7.7 4.2l1.1-1.1a2.55 2.55 0 0 1 3.6 3.6l-1.1 1.1"/><path d="M8.3 11.8l-1.1 1.1a2.55 2.55 0 0 1-3.6-3.6l1.1-1.1"/></svg>',
   trash: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4.3h11"/><path d="M6.3 4.3V3.2a1.1 1.1 0 0 1 1.1-1.1h1.2a1.1 1.1 0 0 1 1.1 1.1v1.1"/><path d="M4.2 4.3l.6 8.3a1.2 1.2 0 0 0 1.2 1.1h4a1.2 1.2 0 0 0 1.2-1.1l.6-8.3"/></svg>',
+  // 「接入点体检」：九宫格，一眼是「一张表」而不是又一次单点请求
+  grid: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.9" y="1.9" width="4.9" height="4.9" rx="1.1"/><rect x="9.2" y="1.9" width="4.9" height="4.9" rx="1.1"/><rect x="1.9" y="9.2" width="4.9" height="4.9" rx="1.1"/><rect x="9.2" y="9.2" width="4.9" height="4.9" rx="1.1"/></svg>',
 };
 /* key 测试在途表：站点不通时一次要等 10 秒，连点几下就排一队，
    界面像卡死（B.ai 那次就是这么"不断返回失败"的）。在途期间按钮自锁，
@@ -143,6 +145,8 @@ function keyActTd(site, k) {
     // 有的站点 /models 谁问都给（小红书 Dots 就这样），真调用才 403。
     iconBtn('chat', (e) => keyChat(site.id, k.id, e.currentTarget),
       '请求：真发一条最小对话（POST /chat/completions），验证上游认不认这把 Key。\n点名一个模型、只回 1 个字，几乎不耗额度'),
+    iconBtn('grid', () => openMatrix(site.id, { type: 'key', value: k.id }),
+      '接入点体检：把这把密钥 × 每种协议逐个检测，看清是密钥的事还是协议的事'),
     iconBtn('edit', () => openKeyModal(site, k),
       '编辑：名称、来源、密钥与截止日期'),
     iconBtn('copy', () => copyKey(site.id, k.id, k.label || site.name),
@@ -211,6 +215,180 @@ async function keyChat(siteId, id, btn) {
     }
   }
 }
+/* ---------------- 接入点体检（密钥 × 协议矩阵） ----------------
+   「这把 key 能不能用」和「这个协议能不能用」是两个维度：
+   星驰那种站把 /v1/chat/completions 整条停了，那一列每把 key 都会失败。
+   只说「失败」会把站点策略误读成密钥坏了，所以摊成矩阵，坏在哪一层直接标出来。
+
+   数据只在打开弹窗期间留在内存（MX.cells），不落盘：检测结果是有时效的，
+   存下来反而会让人对着过期结论下判断。 */
+const MX = { siteId: null, focus: null, busy: false, cells: new Map() };
+const MX_LABEL = {
+  ok: '连通', key_denied: '密钥无权', site_disabled: '站点停用',
+  model_mismatch: '模型不识别', error: '其他错误', run: '检测中', unt: '未检测',
+};
+const MX_FMT_LABEL = {
+  openai: 'Chat Completions', 'openai-resp': 'Responses',
+  anthropic: 'Messages', gemini: 'Gemini', other: '其他',
+};
+
+/* 从地址反推协议：密钥自带接入点时靠它判断这条地址属于哪一列。
+   与后端 keys::fmt_of_url 保持同一套规则，否则界面列和后端实际请求会对不上。 */
+function mxFmtOf(url) {
+  const low = String(url || '').trim().replace(/\/+$/, '').toLowerCase();
+  if (low.endsWith('/responses')) return 'openai-resp';
+  if (low.endsWith('/messages')) return 'anthropic';
+  if (low.includes('generativelanguage') || low.includes(':generatecontent')) return 'gemini';
+  return 'openai';
+}
+
+/* 矩阵的列：站点登记的接入点；一个都没登记时（老数据只把地址挂在 key 上），
+   按密钥自带地址补出来，别让弹窗直接空着。 */
+function mxBases(site) {
+  const out = [];
+  for (const b of site.base_urls || []) {
+    const url = String(b.url || '').trim();
+    if (!url) continue;
+    const fmt = String(b.format || '').trim() || mxFmtOf(url);
+    if (!out.some((x) => x.fmt === fmt)) out.push({ fmt, url });
+  }
+  if (!out.length) {
+    for (const k of site.keys || []) {
+      const url = String(k.base_url || '').trim();
+      if (!url) continue;
+      const fmt = mxFmtOf(url);
+      if (!out.some((x) => x.fmt === fmt)) out.push({ fmt, url });
+    }
+  }
+  return out;
+}
+
+function mxCellKey(sid, kid, fmt) { return `${sid}|${kid}|${fmt}`; }
+function mxGet(sid, kid, fmt) { return MX.cells.get(mxCellKey(sid, kid, fmt)) || { state: 'unt' }; }
+
+function mxChip(c) {
+  const st = (c && c.state) || 'unt';
+  const box = el('span', { class: `mxst ${st}`, title: (c && c.msg) || '' });
+  box.appendChild(el('span', { class: 'dot' }));
+  const label = MX_LABEL[st] || st;
+  box.appendChild(document.createTextNode(
+    st === 'ok' && c && c.ms ? `${label} · ${(c.ms / 1000).toFixed(1)}s` : label));
+  return box;
+}
+
+async function openMatrix(siteId, focus) {
+  const site = (S.data?.keys || []).find((p) => p.id === siteId);
+  if (!site) return;
+  MX.siteId = siteId;
+  MX.focus = focus || null;
+  const bases = mxBases(site);
+  const keys = site.keys || [];
+  $('mx-title').textContent = `接入点体检 · ${site.name}`;
+  $('mx-sub').textContent = bases.length
+    ? `${keys.length} 把密钥 × ${bases.length} 个协议，共 ${keys.length * bases.length} 项`
+    : '这个站点还没有接入点——先在「修改站点」里填协议与地址';
+  renderMatrix();
+  $('mxmodal').hidden = false;
+  if (!bases.length || !keys.length) return;
+  // 从哪进来就先测哪一行/列：一上来把整张表打一遍既慢又白烧额度
+  if (focus && focus.type === 'fmt') return mxRun({ fmts: [focus.value] });
+  if (focus && focus.type === 'key') return mxRun({ keys: [focus.value] });
+  return mxRun({});
+}
+
+function renderMatrix() {
+  const site = (S.data?.keys || []).find((p) => p.id === MX.siteId);
+  if (!site) return;
+  const bases = mxBases(site);
+  const keys = site.keys || [];
+  const f = MX.focus;
+
+  const head = $('mx-head');
+  clear(head);
+  const trh = el('tr');
+  trh.appendChild(el('th', { class: 'kh' }, '密钥 / 协议'));
+  for (const b of bases) {
+    const th = el('th', { class: f && f.type === 'fmt' && f.value === b.fmt ? 'hl' : '' });
+    th.appendChild(el('div', { class: 'mxcol', title: b.url }, MX_FMT_LABEL[b.fmt] || b.fmt));
+    th.appendChild(btn('检测本列', 'plain sm', () => mxRun({ fmts: [b.fmt] }), '检测该协议下的全部密钥'));
+    trh.appendChild(th);
+  }
+  trh.appendChild(el('th', { class: 'op' }, ''));
+  head.appendChild(trh);
+
+  const body = $('mx-body');
+  clear(body);
+  for (const k of keys) {
+    const models = String(k.models_list || '').split(/[,，\s]+/).filter(Boolean);
+    const tr = el('tr');
+    tr.appendChild(el('td', { class: 'kc' + (f && f.type === 'key' && f.value === k.id ? ' hl' : '') },
+      el('div', { class: 'mxname' }, k.label || '未命名'),
+      el('div', { class: 'mxsub' }, `${models.length} 个模型`)));
+    for (const b of bases) {
+      const c = mxGet(site.id, k.id, b.fmt);
+      const td = el('td', {
+        class: 'cell' + (f && f.type === 'fmt' && f.value === b.fmt ? ' hl' : ''),
+        title: c.msg || '点击检测这一格',
+      }, mxChip(c));
+      td.addEventListener('click', () => mxRun({ keys: [k.id], fmts: [b.fmt] }));
+      tr.appendChild(td);
+    }
+    tr.appendChild(el('td', { style: 'text-align:right' },
+      btn('检测本行', 'plain sm', () => mxRun({ keys: [k.id] }), '检测该密钥的全部协议')));
+    body.appendChild(tr);
+  }
+}
+
+/* 一次检测可以只覆盖一部分组合（单格 / 整行 / 整列 / 全表）。
+   等待期间把目标格标成「检测中」，失败就退回「未检测」——
+   不能让界面留着上一次的旧结论假装这次也测过了。 */
+async function mxRun(filter) {
+  if (MX.busy) { toast('上一轮还没测完，等它回来', false); return; }
+  const site = (S.data?.keys || []).find((p) => p.id === MX.siteId);
+  if (!site) return;
+  const bases = mxBases(site).filter((b) => !filter.fmts || filter.fmts.includes(b.fmt));
+  const keys = (site.keys || []).filter((k) => !filter.keys || filter.keys.includes(k.id));
+  if (!bases.length || !keys.length) return;
+
+  const pending = [];
+  for (const k of keys) {
+    for (const b of bases) {
+      pending.push([k.id, b.fmt]);
+      MX.cells.set(mxCellKey(site.id, k.id, b.fmt), { state: 'run' });
+    }
+  }
+  const resetPending = () => {
+    for (const [kid, fmt] of pending) MX.cells.set(mxCellKey(site.id, kid, fmt), { state: 'unt' });
+  };
+  MX.busy = true;
+  renderMatrix();
+  try {
+    const payload = { action: 'key_matrix', site: site.id };
+    if (filter.keys) payload.keys = filter.keys;
+    if (filter.fmts) payload.fmts = filter.fmts;
+    const r = await invoke('action', { payload });
+    if (!r.ok) {
+      toast(r.msg, false);
+      resetPending();
+    } else {
+      let cells = [];
+      try { cells = (JSON.parse(r.msg) || {}).cells || []; } catch { /* 后端没给合法 JSON 就按未测处理 */ }
+      for (const c of cells) {
+        MX.cells.set(mxCellKey(site.id, c.key, c.fmt), {
+          state: c.state, ms: c.ms, msg: c.msg, code: c.code,
+        });
+      }
+      const missing = pending.filter(([kid, fmt]) => !cells.some((c) => c.key === kid && c.fmt === fmt));
+      for (const [kid, fmt] of missing) MX.cells.set(mxCellKey(site.id, kid, fmt), { state: 'unt' });
+    }
+  } catch (e) {
+    toast(String((e && (e.message || e)) || e).slice(0, 180), false);
+    resetPending();
+  }
+  MX.busy = false;
+  renderMatrix();
+}
+
 function iconBtn(act, handler, title) {
   const b = el('button', {
     class: `iconbtn${act === 'trash' ? ' danger' : ''}`,
@@ -5970,6 +6148,8 @@ function siteInfo(p) {
         chip(label, 'fmt'),
         el('span', { class: 'url', title: b.url }, b.url)),
       btn('复制', 'plain sm', () => copyText(b.url), '复制这个接入点'),
+      btn('连通检测', 'plain sm', () => openMatrix(p.id, { type: 'fmt', value: fmt }),
+        '按协议检测：这一列下每把密钥能不能通'),
       btn('获取模型', 'plain sm', () => pullSiteModels(p, b),
         `向 ${b.url}/models 发一次请求，把拉到的模型并进站点的「可用模型」`)));
   }
@@ -10703,6 +10883,10 @@ function bind() {
   $('sm-cancel').addEventListener('click', closeSiteModal);
   $('sm-save').addEventListener('click', saveSiteModal);
   $('smodal').addEventListener('click', (e) => { if (e.target.id === 'smodal') closeSiteModal(); });
+  // 接入点体检弹窗：关闭 + 全表检测，点遮罩也关
+  $('mx-close').addEventListener('click', () => { $('mxmodal').hidden = true; });
+  $('mxmodal').addEventListener('click', (e) => { if (e.target.id === 'mxmodal') $('mxmodal').hidden = true; });
+  $('mx-all').addEventListener('click', () => mxRun({}));
   ['s-name', 's-home'].forEach((id) => $(id).addEventListener('keydown',
     (e) => { if (e.key === 'Enter') saveSiteModal(); }));
   $('km-cancel').addEventListener('click', closeKeyModal);

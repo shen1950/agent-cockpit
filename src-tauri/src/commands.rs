@@ -3049,6 +3049,76 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             if good { ok(msg) } else { err(msg) }
         }
 
+        "key_matrix" => {
+            // 接入点体检：把（密钥 × 协议）每个组合真发一条最小对话，结果给弹窗里的矩阵用。
+            // 单个组合的解释力有限——「哪把 key 能用」和「哪种协议能用」是两个维度，
+            // 只看一个维度就会把「站点停用了这个协议」误判成「这把 key 坏了」。
+            let site = payload["site"].as_str().unwrap_or("");
+            let sobj = match keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site)) {
+                Some(p) => p,
+                None => return Some(err("站点不存在")),
+            };
+            let cols = keys::matrix_columns(&sobj);
+            if cols.is_empty() {
+                return Some(err("这个站点还没有接入点——点「修改站点」把协议与地址填上"));
+            }
+            let pick = |k: &str| -> Option<Vec<String>> {
+                payload[k].as_array().map(|a| {
+                    a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+                })
+            };
+            let only_key = pick("keys");
+            let only_fmt = pick("fmts");
+            let mut jobs: Vec<(String, String, String, String, String)> = Vec::new();
+            for k in sobj["keys"].as_array().cloned().unwrap_or_default() {
+                let kid = k["id"].as_str().unwrap_or("").to_string();
+                if kid.is_empty() {
+                    continue;
+                }
+                if let Some(list) = &only_key {
+                    if !list.iter().any(|x| x == &kid) {
+                        continue;
+                    }
+                }
+                let plain = k["key"].as_str().unwrap_or("").to_string();
+                let own = k["base_url"].as_str().unwrap_or("").trim().to_string();
+                // 模型名用这把 key 自己的第一项；没有就退回站点清单的第一项。
+                // 空着不填，上游多半回 400——那叫「没告诉它调哪个模型」，不叫「key 不能用」。
+                let model = keys::models_for(&sobj, &k)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "gpt-4o-mini".to_string());
+                for (fmt, url) in &cols {
+                    if let Some(list) = &only_fmt {
+                        if !list.iter().any(|x| x == fmt) {
+                            continue;
+                        }
+                    }
+                    // 密钥自带接入点、且格式与这一列相符时优先用它
+                    let use_url = if !own.is_empty() && keys::fmt_of_url(&own) == fmt.as_str() {
+                        own.clone()
+                    } else {
+                        url.clone()
+                    };
+                    jobs.push((kid.clone(), fmt.clone(), use_url, plain.clone(), model.clone()));
+                }
+            }
+            if jobs.is_empty() {
+                return Some(err("没有可检测的组合"));
+            }
+            let cells = keys::probe_matrix(jobs, 15, 6);
+            let list: Vec<Value> = cells
+                .iter()
+                .map(|c| {
+                    json!({
+                        "key": c.key_id, "fmt": c.fmt, "state": c.state,
+                        "code": c.code, "ms": c.ms, "msg": c.msg,
+                    })
+                })
+                .collect();
+            ok(json!({ "cells": list }).to_string())
+        }
+
         "key_models" => {
             // 拉取该接入点实际可调用的模型清单，供用户登记/校对
             let (sobj, item) = match find_pair(payload["site"].as_str().unwrap_or(""), payload["id"].as_str().unwrap_or("")) {

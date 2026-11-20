@@ -461,6 +461,38 @@
   </div>
 </div>
 
+<!-- ================= 接入点体检弹窗 =================
+     一张矩阵：行是密钥、列是协议。两种入口都进这张表——
+     从接入点行进来高亮那一列，从密钥行进来高亮那一行。
+     单说「可用 / 不可用」分不清是密钥的事还是协议的事，摊开才看得明白。 -->
+<div class="modal" id="mxmodal" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true">
+    <h3 id="mx-title">接入点体检</h3>
+    <p class="askbody" id="mx-sub"></p>
+    <div class="mxwrap">
+      <table class="mx">
+        <thead id="mx-head"></thead>
+        <tbody id="mx-body"></tbody>
+      </table>
+    </div>
+    <div class="mxlegend">
+      <span class="mxst ok"><span class="dot"></span>连通</span>
+      <span class="mxst key_denied"><span class="dot"></span>密钥无权</span>
+      <span class="mxst site_disabled"><span class="dot"></span>站点停用该协议</span>
+      <span class="mxst model_mismatch"><span class="dot"></span>模型不识别</span>
+      <span class="mxst unt"><span class="dot"></span>未检测</span>
+    </div>
+    <p class="mxhint">
+      点单元格复检单项；表头「检测本列」检测该协议下的全部密钥；行尾「检测本行」检测该密钥的全部协议。
+      「站点停用该协议」不是密钥的问题——换一列看。
+    </p>
+    <footer class="dialogfoot">
+      <button class="btn" id="mx-close">关闭</button>
+      <button class="btn primary" id="mx-all">检测全表</button>
+    </footer>
+  </div>
+</div>
+
 <!-- ================= key 编辑弹窗 =================
      这条 key 自己的东西：名称、来源、Key 原文、截止日期、备注；
      接入点默认归站点（「修改站点」里那几行），这里多一格只在
