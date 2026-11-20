@@ -980,6 +980,7 @@ fn refresh_quota(name: &str) -> Result<Value, String> {
         source: "server".into(),
         live_error: String::new(),
         auth_from: "凭据管理器".into(),
+        granted_total: None,
         trend: Value::Null,
     };
     let latest = card(name)?;

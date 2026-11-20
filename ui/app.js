@@ -305,23 +305,34 @@ const BUILTIN_ICONS = [
   // ChatGPT / OpenAI：黑底 + 白色花结，深色主题下描一圈边免得和底融了
   [/chatgpt|chat gpt|openai/i, knotTile('#111', ' stroke="rgba(128,128,128,.45)"')],
 ];
+/* ChatGPT 桌面版（id 是 codex-desktop，显示名 ChatGPT）单独走这一张。
+   它不能靠 BUILTIN_ICONS 里那条通用规则：id 里带 codex，会先被 Codex 那条绿底规则吃掉，
+   18px 缩下来就剩一个绿点（v2.1.7 就是为这个把它踢出内置 SVG 的）。
+   **透明底、只画线稿**，与 OpenAI 官方包内图标一致（`assets/Square*.png` 全是
+   透明底白/黑线稿，没有一个带色块底板）；颜色走 `currentColor`，
+   浅色主题是深墨、深色主题是浅墨，两边都成立，不用两套图。
+   画满 24 格（留 1 格呼吸边）：官方 targetsize-256 的墨迹包围盒占画布 99.2%，
+   比 Codex 那种「62% 小符号 + 品牌色底」大得多——这才是 ChatGPT 该有的样子。 */
+const CHATGPT_KNOT = `<svg viewBox="0 0 24 24"><g transform="translate(1 1) scale(.9167)" fill="currentColor"><path d="${OPENAI_KNOT}"/></g></svg>`;
 function builtinIcon(a) {
-  // ChatGPT 桌面版不吃内置 SVG：它的 id 里带 codex，会先被下面 Codex 那条绿底规则吃掉
-  // （18px 缩下来就剩一个绿点）。这张卡用后端给的图标，想换就放
-  // ~/.agent-cockpit/icons/custom/codex-desktop.png。
-  if (a.id === 'codex-desktop') return '';
+  if (a.id === 'codex-desktop') return CHATGPT_KNOT;
   const key = `${a.id} ${a.name}`;
   for (const [re, svg] of BUILTIN_ICONS) if (re.test(key)) return svg;
   return '';
 }
 
-/* 程序图标节点：内置品牌 SVG > 后端从 exe 提取的 PNG > 名字缩写占位。
-   内置的排第一是因为后端对没有图标的 exe 会拿到 Windows 那张"空白文档"默认图。
+/* 程序图标节点：用户自己指定的图 > 内置品牌 SVG > 后端从 exe 提取的 PNG > 名字缩写占位。
+   内置的排在后端 PNG 前面，是因为后端对没有图标的 exe 会拿到 Windows 那张"空白文档"默认图；
+   用户手指定的图排最前，是因为那是明确的意思——放了 ~/.agent-cockpit/icons/custom/<id>.png
+   就是要用自己那张，别被内置品牌盖掉。
    侧栏和首页卡片共用这一套，免得两边对同一个程序长成两个样子。 */
 function appIconNode(a) {
+  if (a.icon_custom && a.icon) return el('img', { class: 'fav', src: a.icon, alt: '', width: 18, height: 18 });
   const bisvg = builtinIcon(a);
   if (bisvg) {
-    const s = el('span', { class: 'fav svg', title: a.name });
+    // tint：透明底线稿（ChatGPT），墨色由 CSS 跟着主题给；其余内置图是自带底色的完整方块
+    const cls = a.id === 'codex-desktop' ? 'fav svg tint' : 'fav svg';
+    const s = el('span', { class: cls, title: a.name });
     s.innerHTML = bisvg;
     return s;
   }
@@ -1128,7 +1139,9 @@ async function refreshAllQuota() {
    现在换成白话，并且说清结果会记进日志。 */
 async function claimAllCheckin() {
   const pick = (d) => ((d && d.items) || []).filter(
-    (x) => x.claimable === true && !x.error && x.scope !== 'account');
+    // 隐藏的账号、以及"名下账号全隐藏"的产品行都不在一键范围内——她藏起来就是为了不再领
+    (x) => x.claimable === true && !x.error && x.scope !== 'account'
+      && x.hidden !== true && x.all_hidden !== true);
   let items = pick(S.checkin);
   if (!items.length) {
     // 手上这份可能是旧的，也可能刚开机还没查回来。刷新现在是**后台跑**（立刻回快照），
@@ -1216,6 +1229,8 @@ async function loadCheckin(force) {
    `pending` 是"这次还没读到"——列表已经画出来了，状态正在补，不该写成"状态未知"。 */
 function ciState(it) {
   const w = it.words || {};
+  // 藏起来的号没有状态可言：它不是"没读到"，是我们有意不问
+  if (it.hidden === true) return { cls: 'off', word: '已隐藏' };
   if (it.pending) return { cls: 'pending', word: '查询中…' };
   // 这次没读到（服务端回空列表，或者没拿到客户端设备令牌）：要写成"没读到"，
   // 不能落到最底下那句"状态未知"——那句等于把"我们没问出来"和"厂商没给"混成一件事
@@ -1233,6 +1248,8 @@ function ciState(it) {
   }
   if (it.signed_today === true) return { cls: 'done', word: w.done || '今天已签' };
   if (it.claimable === true) return { cls: 'go', word: w.go || '今天可领' };
+  // 这台机器上压根没登过那个号：直接写「未登录」，别写成"状态未知"或"没读到"
+  if (it.not_logged_in) return { cls: 'off', word: '未登录' };
   // 接口两条都正常返回、只是今天还没到账：那是"还没登录过"，不许画成红色"读不到"
   if (it.need_login) return { cls: 'wait', word: w.wait || '今天还没登录' };
   // 活动是开着的、今天也确实没有可领项：这是一个**确定**的答案，不是"未知"
@@ -1270,6 +1287,17 @@ function ciBadge(it) {
    2026-10-17 改：登录那一步不再叫"打开客户端登一次"（她原话"太难听了，一点也不书面化"），
    也不再要求她登完回来点第二次——按钮自己会等、会领。 */
 function ciAction(it, name) {
+  // 隐藏的号：这一列只留一个「恢复」。它不查、不领，摆个领取按钮等于骗她点
+  if (it.hidden === true) {
+    return btn('恢复', 'sm ci-ext', () => toggleAccountHidden(it, false),
+      '把这个号放回签到列表：下一轮刷新会读回它自己的状态，之后照常能签');
+  }
+  // 名下账号卡全被藏起来的产品行：它签的是"本机现在登着的那个号"，而那个号正是被藏的一个。
+  // 按钮不能装成还能点——先让她把要签的号恢复出来。
+  if (it.all_hidden === true) {
+    return btn('名下账号已隐藏', 'sm', () => {},
+      '这家的账号卡都隐藏了：先点下面「显示」把那几行摆出来，再逐个「恢复」，否则这一行签的是被藏起来的号');
+  }
   if (it.pending) {
     return btn('查询中…', 'sm', () => {}, '状态正在读，马上就有');
   }
@@ -1419,7 +1447,8 @@ function ciRefreshBtn(it) {
    日志里没有这一笔。点一下补一条日志、标注"非驾驶舱领取"，并把今天记成完成，
    免得自动领再发一次。旅行猫的派出/领取两步都由驾驶舱管，不在此列。 */
 function ciExternalBtn(it, name) {
-  if (it.pending || it.unreadable || it.error || it.shared) return null;
+  // 隐藏的号不补记：它今天本来就不签，补一笔只会把"今天已完成"写进账里
+  if (it.pending || it.unreadable || it.error || it.shared || it.hidden === true) return null;
   if (it.mode === 'travel') return null;
   if ((it.scope || 'product') !== 'account' && (S.checkin || {}).items) {
     // 按账号各记各的产品，产品行上补记说不清是哪个号——只在这家的账号行上给
@@ -1451,7 +1480,7 @@ function ciExternalBtn(it, name) {
 function checkinMark(i) {
   const c = i.checkin;
   if (!c || !c.state) return null;
-  const txt = { done: '已签', claimable: '可领', off: '签到未开', unreadable: '没读到', unknown: '状态未知', error: '读不到' }[c.state];
+  const txt = { done: '已签', claimable: '可领', off: '签到未开', unreadable: '没读到', unlogged: '未登录', unknown: '状态未知', error: '读不到' }[c.state];
   if (!txt) return null;
   const tip = `${c.name || '每日签到'} · ${txt}`
     + (c.streak != null ? ` · 连签 ${c.streak} 天` : '')
@@ -1498,8 +1527,34 @@ function ciNameEl(text) {
   return s;
 }
 
+/* 隐藏 / 恢复一个账号（她 2026-11-12：某个号暂时不想用了、也签不了到，先让它灰掉）。
+   只写驾驶舱自己的账号卡记录——档案目录、登录包、换号记录一概不动，所以随时能原地恢复。
+   手上这份 items 先改掉，界面立刻按新状态画；后台缓存也同步改了，4 秒轮询不会把它变回来。 */
+async function toggleAccountHidden(it, hide) {
+  const name = it.account || '';
+  if (!name) { toast('这一行没有账号名，改不了', false); return; }
+  const r = await invoke('action', {
+    payload: { action: hide ? 'hide_account' : 'unhide_account', app: it.app || '', name, store: it.product },
+  }).catch((e) => ({ ok: false, msg: String(e) }));
+  if (!r || !r.ok) { toast(`没改成：${(r && r.msg) || '未知原因'}`, false); return; }
+  toast(r.msg || (hide ? '已隐藏' : '已恢复'), true);
+  for (const x of (S.checkin && S.checkin.items) || []) {
+    if (x.scope !== 'account' || x.product !== it.product || x.account !== name) continue;
+    if (hide) {
+      x.hidden = true; x.pending = false; x.signed_today = null; x.claimable = false;
+    } else {
+      delete x.hidden; x.pending = true; x.note = '已恢复：下一轮刷新会读回这个号自己的状态';
+    }
+  }
+  S.ciRenderSig = null;
+  renderCheckin();
+  // 恢复出来要真读一次它的状态；隐藏不用——它本来就不再查
+  if (!hide) loadCheckin(true);
+}
+
 function ciCells(grid, it, autoOn, opts) {
   const o = opts || {};
+  const isHidden = it.hidden === true;
   const name = it.name || CI_NAMES[it.product] || it.product;
   // 产品行的标题格：有账号子行时左边挂一个折叠箭头（▾ 展开 / ▸ 收起）。
   // 账号行缩进一格，左边画一条竖线，一眼看出它属于上面那家。
@@ -1519,8 +1574,12 @@ function ciCells(grid, it, autoOn, opts) {
     nmRow.appendChild(f);
   }
   nmRow.appendChild(ciNameEl(name));
+  if (isHidden) nmRow.appendChild(el('span', { class: 'ci-off' }, '已隐藏'));
   if (it.note) nmRow.appendChild(ihelp(it.note));
-  if (o.kids) nmRow.appendChild(el('span', { class: 'ci-kids' }, `${o.kids} 个账号`));
+  if (o.kids) {
+    nmRow.appendChild(el('span', { class: 'ci-kids' },
+      `${o.kids} 个账号${o.hiddenCount ? ` · ${o.hiddenCount} 个已隐藏` : ''}`));
+  }
   nameCell.appendChild(nmRow);
   grid.appendChild(nameCell);
   // 有账号子行时，产品行的状态列换成**汇总**：「1/2 已签」。
@@ -1531,6 +1590,12 @@ function ciCells(grid, it, autoOn, opts) {
       class: `ci-badge ${all ? 'done' : 'go'}`,
       title: `名下 ${o.agg.total} 个账号里今天已有 ${o.agg.done} 个领到；各自的详细状态看下面那几行`,
     }, `${o.agg.done}/${o.agg.total} 已签`));
+  } else if (it.all_hidden === true && it.not_logged_in !== true) {
+    // 名下的号全藏起来了：这一格不能再写"今天可领"——那一份签的是被藏起来的号
+    grid.appendChild(el('span', {
+      class: 'ci-badge off',
+      title: '名下的账号卡都被隐藏了：这一行不查、不自动签；点下面「显示」可以逐个恢复',
+    }, '名下账号已隐藏'));
   } else {
     grid.appendChild(ciBadge(it));
   }
@@ -1549,6 +1614,14 @@ function ciCells(grid, it, autoOn, opts) {
   const actCell = el('div', { class: 'ci-act' }, ciAction(it, name));
   const extBtn = ciExternalBtn(it, name);
   if (extBtn) actCell.appendChild(extBtn);
+  // 账号行多一个「隐藏」：藏起来之后不查、不自动签、不计入统计，随时可以恢复。
+  // 产品行不给——那一家要不要停靠的是账号，产品行本身没有"哪一个号"可言。
+  // `shared` 那几行（整机一份登录态的产品）也不给：它们只是"切到该号"的入口，
+  // 藏掉等于把换号的入口一起藏了，签到本身并不会因此少领一份。
+  if (o.account && !isHidden && !it.shared) {
+    actCell.appendChild(btn('隐藏', 'sm ci-ext', () => toggleAccountHidden(it, true),
+      '这个号暂时不用了：藏起来之后不再查它的状态、不替它自动签到，也不计入统计；档案和登录态一概不动'));
+  }
   grid.appendChild(actCell);
   // 「自动领」「提醒」是**按产品**设的开关，账号行不重复摆——同一个产品摆两排同样的勾，
   // 勾哪一个生效就说不清了。这里写清楚它跟着上面那行走。
@@ -1556,7 +1629,10 @@ function ciCells(grid, it, autoOn, opts) {
     const tip = '自动领 / 提醒是**按产品**设的开关，在上面那一行（' + (CI_NAMES[it.product] || it.product) + '）上勾';
     grid.appendChild(el('span', { class: 'cick no', title: tip }, '同上'));
     grid.appendChild(el('span', { class: 'cick no', title: tip }, '同上'));
-    grid.appendChild(el('div', { class: 'ci-ref' }, ciRefreshBtn(it)));
+    grid.appendChild(el('div', { class: 'ci-ref' },
+      isHidden
+        ? el('span', { class: 'cick no', title: '隐藏的号不查询状态；恢复之后这一格才会有 ↻' }, '—')
+        : ciRefreshBtn(it)));
     return;
   }
   // 只有厂商给了独立状态接口、领取又不需要验证码的，才允许交给程序自动跑
@@ -1612,7 +1688,9 @@ function renderCheckin() {
     d && d.refreshing, st, S.ciLogRange, S.ciFold, S.ciWait,
     // 表头筛选状态必须进签名：她 2026-11-08 选了筛选值页面纹丝不动——
     // 签名没算它，renderCheckin 以为"内容没变"直接跳过重建，筛选落不到列表上
-    S.ciLogDay, S.ciLogKind, S.ciLogWho, S.checkinAuto, S.checkinMute]);
+    S.ciLogDay, S.ciLogKind, S.ciLogWho, S.checkinAuto, S.checkinMute,
+    // 「显示已隐藏」是个纯界面开关，但切换后必须重画——不进签名就会被判成"没变"直接跳过
+    S.ciShowHidden]);
   if (sig === S.ciRenderSig && host.firstChild) {
     const span = host.querySelector('.ci-status');
     if (span) span.textContent = ciStatusText(d);
@@ -1682,11 +1760,15 @@ function renderCheckin() {
   // 其余几家整机一份登录态，硬拆只会给出串号的假答案，所以只有产品行。
   const prods = items.filter((x) => x.scope !== 'account');
   const today = (items[0] && items[0].today) || '';
-  const go = prods.filter((x) => x.claimable === true && !x.error);
-  const nAcc = items.length - prods.length;
+  const go = prods.filter((x) => x.claimable === true && !x.error && x.all_hidden !== true);
+  // 隐藏的账号不计数：它们不查、不领、不催，摆进"另有 N 个账号单独看着"只会让人以为还有事要做
+  const allAcc = items.filter((x) => x.scope === 'account');
+  const hiddenAcc = allAcc.filter((x) => x.hidden === true);
+  const nAcc = allAcc.filter((x) => x.hidden !== true).length;
+  const showHidden = !!S.ciShowHidden;
   $('checkin-count').textContent = d.placeholder
     ? '正在读各家状态…'
-    : `${prods.filter((x) => x.signed_today === true).length} 家已签 · ${go.length} 家可领`
+    : `${prods.filter((x) => x.signed_today === true && x.all_hidden !== true).length} 家已签 · ${go.length} 家可领`
       + (nAcc ? ` · 另有 ${nAcc} 个账号单独看着` : '');
   if (!items.length) {
     host.appendChild(el('div', { class: 'qempty' },
@@ -1701,17 +1783,44 @@ function renderCheckin() {
   // 一行里会出现两三种不同的 y——就是"线不对齐"。改成一行一条、跨满整行。
   S.ciFold = S.ciFold || {};
   for (const it of prods) {
-    const kids = items.filter((x) => x.scope === 'account' && x.parent === it.product);
+    const kidsAll = items.filter((x) => x.scope === 'account' && x.parent === it.product);
+    // 隐藏的号：默认不摆（她已经说了暂时不用），点底部「显示」才以灰色行回来。
+    // 合计只算看得见的那些，不然藏起来的号还会把「1/2 已签」写得像差一份没领。
+    const kids = kidsAll.filter((x) => x.hidden !== true);
+    const hidKids = kidsAll.filter((x) => x.hidden === true);
     const folded = !!S.ciFold[it.product];
     const agg = kids.length
       ? { done: kids.filter((x) => x.signed_today === true).length, total: kids.length }
       : null;
-    ciCells(grid, it, !!(S.checkinAuto || {})[it.product], { kids: kids.length, folded, agg });
+    ciCells(grid, it, !!(S.checkinAuto || {})[it.product],
+      { kids: kidsAll.length, folded, agg, hiddenCount: hidKids.length });
     ciRule(grid);
     if (folded) continue;
     for (const k of kids) { ciCells(grid, k, false, { account: true }); ciRule(grid); }
+    if (showHidden) {
+      for (const k of hidKids) {
+        const from = grid.children.length;
+        ciCells(grid, k, false, { account: true });
+        // 灰色只染这一行自己的格子：grid 是扁平的，ciCells 只往后追加
+        for (let i = from; i < grid.children.length; i++) grid.children[i].classList.add('ci-ghost');
+        ciRule(grid);
+      }
+    }
   }
   host.appendChild(grid);
+  // 「已隐藏 N 个账号」这一条常驻在表下面：藏了哪些、怎么拿回来，全在这
+  if (hiddenAcc.length) {
+    const who = [...new Set(hiddenAcc.map((x) => CI_NAMES[x.product] || x.product))].join('、');
+    host.appendChild(el('div', { class: 'cihid' },
+      el('span', {}, `已隐藏 ${hiddenAcc.length} 个账号（${who}）`,
+        ihelp('隐藏的号不查状态、不自动签到、也不计入统计；它们仍在账号列表里，登录态和档案一概没动。'
+          + '点右边「显示」把它们按灰色行摆出来，每行最右边就是「恢复」。')),
+      btn(showHidden ? '收起' : '显示', 'sm ci-ext', () => {
+        S.ciShowHidden = !showHidden;
+        S.ciRenderSig = null;
+        renderCheckin();
+      }, showHidden ? '把灰色行收起来' : '把隐藏的账号按灰色行摆出来，好逐个恢复')));
+  }
   // 还在等它到账的那几家：写明白"在等什么、等了多久"，别让她以为忘了
   // 等得最久的排最前
   const pend = Object.values((d.state && d.state.pending) || {})
@@ -2302,6 +2411,8 @@ function quotaRows(i) {
 /* 一档都没有：一句话说清，原因留在 title 里，不摆 0、也不摆一整段 */
 function quotaMiss(q) {
   const reason = String(q.stale_hint || q.live_error || '').trim();
+  // 只给累计口径的产品（豆包）：有数就报数，别一句"额度读不到"把有数说成没数
+  if (q.granted_total) return `累计获得 ${nfmt(q.granted_total)} ${utxt(q.unit || '额度')} · 厂商不给剩余`;
   if (!q.fetched_at && !q.stale && !reason) return '还没读到额度 · 点「↻ 刷新额度」';
   if (q.account_only && !q.stale) return '只读到登录账号，额度没读到';
   return q.stale ? '额度读不到，缓存里也没有' : '额度读不到';
@@ -2338,9 +2449,14 @@ function quotaGroups(i) {
       return { ...it, left, total, used: used != null ? used : diff(total, left) };
     });
     const left = num(g.left), total = num(g.total), used = num(g.used);
+    // 厂商没给「已用」时（used_known=false）不许拿 total−left 反推：
+    // 那是两个不同口径相减，算出来的数只会让人算不平。
+    // 小浣熊就是这种：官网那一栏显示的是**当前余额**，不是发放总额。
+    const known = g.used_known !== false && used != null;
     return {
       ...g, items, left, total, unit: g.unit || 'credits', scope: String(g.scope || '').trim(),
-      used: used != null ? used : diff(total, left),
+      used: known ? used : null,
+      used_known: known,
     };
   };
   if (Array.isArray(q.groups) && q.groups.length) return q.groups.map(norm);
@@ -2409,13 +2525,13 @@ function usedPct(total, used) {
   return Math.max(0, Math.min(100, (used / total) * 100));
 }
 
-/* 百分比上界面：29,971 / 30,000 四舍五入是 100%，可它明明用掉了 29——
-   夹到 1~99，只有真的一分没动 / 一点不剩才写 0% / 100% */
+/* 百分比保留两位，只有完全没动或完全耗尽才显示 100% / 0%。
+   妙手 2170.5 / 2200 为 98.66%，不能取整成 99%。 */
 function pctTxt(gp) {
   if (gp == null) return '';
   if (gp >= 100) return '100%';
   if (gp <= 0) return '0%';
-  return `${Math.min(99, Math.max(1, Math.round(gp)))}%`;
+  return `${Math.min(99.99, Math.max(0.01, gp)).toFixed(2).replace(/\.00$/, '')}%`;
 }
 
 /* 汇总口径：单位不一致时大字只加第一档那种单位的档——把 6.24 元和 1,500 积分加成
@@ -2525,6 +2641,17 @@ function quotaBox(i) {
       if (q.fetched_at) box.appendChild(el('div', { class: 'stamp' }, `上次读取 ${stampTime(q.fetched_at)}`));
       return box;
     }
+    if (q.granted_total) {
+      // 厂商只给"累计获得"、没有剩余接口的产品（豆包签到活动）：
+      // 有数就要摆出来，但口径必须说死——这是"一共发过多少"，不是"还剩多少"。
+      box.appendChild(el('div', { class: 'row' },
+        el('span', { class: 'cap' }, '累计获得'),
+        el('span', { class: 'val' }, nfmt(q.granted_total)),
+        el('span', { class: 'unit' }, utxt(q.unit || '额度'))));
+      box.appendChild(el('div', { class: 'stamp' }, '厂商没有剩余额度接口，这里只能看到累计发放'));
+      if (q.fetched_at) box.appendChild(el('div', { class: 'stamp' }, `上次读取 ${stampTime(q.fetched_at)}`));
+      return box;
+    }
     // 一档都没有（MiMo 那种只有登录账号的）：说"读不到"，不许摆一个 0 出来
     box.appendChild(el('div', { class: 'none', title: String(q.live_error || '').trim() }, quotaMiss(q)));
     return box;
@@ -2540,7 +2667,12 @@ function quotaBox(i) {
   // 中间隔几个小时就会算出对不上的"已用"，那是假账
   const aTotal = a.pctMode ? 100
     : (q.detail_stale && numv(q.total) != null ? numv(q.total) : a.total);
-  const used = left != null && aTotal != null ? Math.max(0, aTotal - left) : null;
+  // 「已用」只有在**总额与剩余同源**时才算得出来。
+  // 小浣熊这类：厂商给的总额就是当前余额（官网那一栏显示的也是它），
+  // 拿它减剩余必然得 0 ——「已用 0 / 15,878」是凭空来的数。
+  // 有档位明确说「厂商没给已用」时，这一行就不摆已用与共多少。
+  const usedKnown = groups.length > 0 && groups.every((g) => g.used_known !== false);
+  const used = usedKnown && left != null && aTotal != null ? Math.max(0, aTotal - left) : null;
   const pct = quotaPct(aTotal, left);
   const uPct = usedPct(aTotal, used);
   const dl = groups.map((g) => g.days_left).find((x) => x != null);
@@ -2553,11 +2685,11 @@ function quotaBox(i) {
         expText(q.days_left != null ? q.days_left : dl)) : null));
   const srow = [
     // 百分比额度不摆"共 100 %/已用 0"：分母是 100% 这件事没信息量，各档自己那行已经写清楚了
-    !a.pctMode && pct != null && used != null
-      ? el('span', {}, `共 ${nfmt(aTotal)} ${up.main}`) : null,
-    !a.pctMode && pct != null && used != null
+    !a.pctMode && pct != null && used != null && usedKnown
       ? el('span', { class: 'used' },
-        `已用 ${nfmt(used)}（${pctTxt((used / aTotal) * 100)}）`) : null,
+        `已用 ${nfmt(used)} / ${nfmt(aTotal)} ${up.main}`) : null,
+    !a.pctMode && pct != null && used != null && usedKnown
+      ? el('span', {}, `剩 ${pctTxt(pct)}`) : null,
     // 缺数说明（谁没给总额 / 谁没给剩余 / 单位是不是好几种）由 quotaCaveat 一处说完，不重复
     el('span', { class: 'unitnote' }, quotaCaveat(a, groups)),
   ].filter((x) => x && String(x.textContent || '').trim());
@@ -2577,9 +2709,17 @@ function quotaBox(i) {
     const gu = utxt(g.unit);
     // 百分比额度（Antigravity）：没有"到期"这回事，重置时刻已经写在档名里
     const pctG = String(g.unit) === '%';
+    // 厂商没给「已用」时（used_known=false），g.total 是**当前余额**不是发放总额，
+    // 拿它当分母算「已用 X / Y」会算出 0/余额 —— 看着像一分没动，实际是厂商没这个数。
+    // 这时改说厂商给的「累计发放」（granted_total），并在标题里说清是哪个口径。
+    const granted = g.granted_total != null ? numv(g.granted_total) : null;
     const sub = [
       gp != null && g.used != null && !pctG
         ? el('span', { class: 'cval' }, `已用 ${nfmt(g.used)} / ${nfmt(g.total)} ${gu}`) : null,
+      // 厂商不给已用但给了累计发放：把「发过多少」摆出来，别让人以为余额就是总量
+      gp != null && g.used == null && !pctG && granted != null && granted > 0
+        ? el('span', { class: 'cval faint', title: '厂商只给当前余额与累计发放，没给「已用」' },
+          `累计发放 ${nfmt(granted)} ${gu}`) : null,
       g.live_count > 1 ? el('span', { class: 'cval' }, `${g.live_count} 笔在效期`) : null,
       (g.items || []).length && g.items.some((it) => it.left == null)
         ? el('span', { class: 'cval faint' }, '逐笔只给了获得数') : null,
@@ -2589,11 +2729,13 @@ function quotaBox(i) {
       el('div', { class: 'row' },
         el('span', { class: 'clab', title: g.name }, g.name),
         scopeTag(g),
-        el('span', { class: 'cleft' }, g.left == null
-          ? '剩余未给出'
-          : (String(g.unit) === '%'
-            ? `剩 ${nfmt(g.left)}%`
-            : `剩 ${nfmt(g.left)}${up.mixed ? ` ${gu}` : ''}${gp != null ? `（${pctTxt(gp)}）` : ''}`)),
+        el('span', { class: 'cleft' }, g.all_expired
+          ? `已全部过期${g.expired_count ? ` · ${g.expired_count} 笔` : ''}`
+          : g.left == null
+            ? '剩余未给出'
+            : (String(g.unit) === '%'
+              ? `剩 ${nfmt(g.left)}%`
+              : `剩 ${nfmt(g.left)}${up.mixed ? ` ${gu}` : ''}${gp != null ? `（${pctTxt(gp)}）` : ''}`)),
         !pctG && (g.days_left != null || g.expires)
           ? el('span', {
             class: expCls(g.days_left, q.stale),
@@ -2991,7 +3133,10 @@ function openItemModal(inst, group, it) {
   };
   $('qp-title').textContent = `编辑积分包 · ${it.label || ''}`;
   $('qp-name').value = it.label || '';
-  $('qp-date').value = expiryHas(it.expires_on) ? String(it.expires_on).slice(0, 16) : '';
+  // 推算出来的到期日（厂商没给）不回填进输入框：一回填，改个名字保存就把它固化成
+  // 「自填」，日期从此不再跟到账时刻走。留空即保持推算值（后端三项全空就不写覆盖）。
+  const estDate = !it.expires_manual && it.expires_est;
+  $('qp-date').value = estDate ? '' : (expiryHas(it.expires_on) ? String(it.expires_on).slice(0, 16) : '');
   $('qp-note').value = it.detail || '';
   $('qp-total').value = '';
   $('qp-left').value = '';
@@ -3005,7 +3150,9 @@ function openItemModal(inst, group, it) {
   $('qp-date-row').hidden = false;
   $('qp-del').hidden = true;
   const vendor = expiryHas(it.expires_vendor) ? String(it.expires_vendor).slice(0, 16) : '';
-  $('qp-hint').textContent = vendor ? `厂商原给的到期日 ${vendor}，留空即回到它。` : '';
+  $('qp-hint').textContent = estDate
+    ? `这个到期日是推算的（厂商没给日期，按公告「活动奖励自到账起 1 年」用到账时刻 +1 年），留空即保持推算。`
+    : (vendor ? `厂商原给的到期日 ${vendor}，留空即回到它。` : '');
   $('qpmodal').hidden = false;
   $('qp-name').focus();
 }
@@ -3113,7 +3260,9 @@ function quotaPanel(i) {
   // 同 quotaBox：明细那份读数比汇总数旧时，分母跟最新的汇总数走，别拿旧分组求和配新剩余
   const aTotal = a.pctMode ? 100
     : (q.detail_stale && numv(q.total) != null ? numv(q.total) : a.total);
-  const used = left != null && aTotal != null ? Math.max(0, aTotal - left) : null;
+  // 同 quotaBox：厂商没给「已用」时不算已用（总额与剩余不同源，相减是假账）
+  const usedKnown = groups.length > 0 && groups.every((g) => g.used_known !== false);
+  const used = usedKnown && left != null && aTotal != null ? Math.max(0, aTotal - left) : null;
   const pct = quotaPct(aTotal, left);
   const uPct = usedPct(aTotal, used);
   const notes = quotaCaveat(a, groups);
@@ -3131,7 +3280,8 @@ function quotaPanel(i) {
           : (String(g.unit) === '%' ? `${nfmt(g.left)}%` : `${nfmt(g.left)} ${utxt(g.unit)}`))))),
     // 有档没给总额时不摆比例：`已用 0 / 0　剩 0%` 和一条 0% 的条子都是凭空的数
     // 百分比额度也不摆：分母就是 100%，"已用 0 / 100 %"没信息量
-    !a.pctMode && pct != null && used != null
+    // 厂商没给「已用」时也不摆：总额与剩余不同源，相减出来的是假账
+    !a.pctMode && pct != null && used != null && usedKnown
       ? el('div', { class: 'qused' },
         `已用 ${nfmt(used)} / ${nfmt(aTotal)} ${up.main}　剩 ${pctTxt(pct)}`) : null,
     uPct != null ? el('div', { class: 'bar' }, el('i', { style: `width:${uPct}%` })) : null,
@@ -3162,7 +3312,11 @@ function quotaPanel(i) {
       : el('span', { class: 'qgwhen' }, `到期时间 ${g.expires || EXP_NONE}`));
     const foot = el('div', { class: 'qgfoot' },
       el('span', { class: 'qgcount' },
-        `有效期内 ${g.live_count || 0} 笔` + (g.expired_count ? ` · 已过期 ${g.expired_count} 笔` : '')
+        `有效期内 ${g.live_count || 0} 笔`
+        // 「已过期 0 笔」也写出来：不写的话卡片上只有"有效期内 N 笔"，
+        // 看着像根本没在留档。这一句是"到期不会被平台删掉"的凭据。
+        + (g.expired_count ? ` · 已过期 ${g.expired_count} 笔`
+          : ' · 已过期 0 笔 · 到期后自动留档')
         + (noLeft ? ` · ${noLeft} 笔官方只给了获得数` : '')),
       (g.items || []).length
         ? btn('查看明细 ›', 'sm', () => openQuotaDetail(i, g),
@@ -3180,10 +3334,14 @@ function quotaPanel(i) {
         // 编辑入口：照密钥列表那样一枚铅笔，别在行内再铺一排字
         pctG ? null : iconBtn('edit', () => openPackModal(i, g),
           '编辑：名称、截止日期与备注（自己加的包还能改总额与剩余）'),
-        el('span', { class: 'qgstat' }, gp != null
-          ? (pctG ? `剩余 ${pctTxt(gp)}`
-            : `已用 ${nfmt(g.used)} / ${nfmt(g.total)} ${gu}　剩余 ${pctTxt(gp)}`)
-          : g.left != null ? `剩 ${nfmt(g.left)} ${gu}（没给总额）` : '没给出数值')),
+        el('span', { class: 'qgstat' }, g.all_expired
+          // 整档都过期的（ZCode 套餐结束、Qoder 那几档被平台收走）：
+          // 摆「剩 0（没给总额）」会被读成"额度读错了"，直接说"已全部过期"
+          ? `已全部过期${g.expired_count ? ` · ${g.expired_count} 笔` : ''}`
+          : gp != null
+            ? (pctG ? `剩余 ${pctTxt(gp)}`
+              : `已用 ${nfmt(g.used)} / ${nfmt(g.total)} ${gu}　剩余 ${pctTxt(gp)}`)
+            : g.left != null ? `剩 ${nfmt(g.left)} ${gu}（没给总额）` : '没给出数值')),
       uPct != null ? el('div', { class: 'cbar', title: `已用 ${nfmt(g.used)} / 共 ${nfmt(g.total)} ${gu}（剩 ${nfmt(g.left)}）` },
         el('b', { style: `width:${uPct}%` })) : null,
       g.scope ? el('div', { class: 'qgscope' }, `这一档只用于：${g.scope}`) : null,
@@ -3202,7 +3360,10 @@ function quotaPanel(i) {
 let qdetail = null;
 function openQuotaDetail(inst, group) {
   qdetail = {
-    app: inst.app, name: inst.name, group: group.name, tab: 'live',
+    app: inst.app, name: inst.name, group: group.name,
+    // 整档都已过期的（ZCode 套餐结束、Qoder 被平台收走的档）默认落在「已过期」，
+    // 否则点进去先看到一句"这一档已经没有在效期内的积分了"，还得再点一下
+    tab: (group.live_count || 0) > 0 ? 'live' : 'dead',
     at: (inst.quota || {}).fetched_at,
   };
   S.qdetail = qdetail;
@@ -3228,8 +3389,12 @@ function renderQuotaDetail() {
   $('qm-title').textContent = `${g.name}明细`;
   // 按到期时间升序：最早要作废的那一笔排最上面（没给日期 / 无限期的沉底）
   const byExp = (a, b) => expKey(a.expires_on).localeCompare(expKey(b.expires_on));
+  // 有效期内：最近到期的在最上（先看会先作废的）。
+  // 已过期：**最新过期的最上**（今天作废的排第一，往下翻越来越旧）——
+  // 2026-11-17 用户明确要求：「最新的在最上面，往下翻是时间越来越旧的」。
+  // 早先两栏都正序，过期那栏就把 7 月的老账顶在最前面，今天的沉在底部。
   const live = (g.items || []).filter((it) => !it.expired).sort(byExp);
-  const dead = (g.items || []).filter((it) => it.expired).sort(byExp);
+  const dead = (g.items || []).filter((it) => it.expired).sort((a, b) => byExp(b, a));
   const tabs = $('qm-tabs');
   clear(tabs);
   for (const [k, label, n] of [['live', '有效期内', live.length], ['dead', '已过期', dead.length]]) {
@@ -3238,11 +3403,20 @@ function renderQuotaDetail() {
     tabs.appendChild(b);
   }
   const shown = qdetail.tab === 'live' ? live : dead;
-  // 合计只加给了数的笔：厂商「获得明细」那种表没有逐笔剩余列，缺的笔不能当 0 加进来
-  const lefts = shown.map((it) => it.left).filter((v) => v != null);
-  const totals = shown.map((it) => it.total).filter((v) => v != null);
-  const sumLeft = lefts.length ? lefts.reduce((s, v) => s + v, 0) : null;
-  const sumTotal = totals.length ? totals.reduce((s, v) => s + v, 0) : null;
+  // 合计只加给了数的笔：厂商「获得明细」那种表没有逐笔剩余列，缺的笔不能当 0 加进来。
+  // spec 的笔（妙手「每期 200 Credits」那种规格）不是已到账，也不进合计。
+  const summable = shown.filter((it) => !it.spec);
+  const lefts = summable.map((it) => it.left).filter((v) => v != null);
+  const totals = summable.map((it) => it.total).filter((v) => v != null);
+  const useds = summable.map((it) => it.used).filter((v) => v != null);
+  const sumOf = (a) => (a.length ? a.reduce((s, v) => s + v, 0) : null);
+  const sumLeft = sumOf(lefts);
+  const sumTotal = sumOf(totals);
+  const sumUsed = sumOf(useds);
+  const settlements = summable.map((it) => it.voided ?? (it.from_ledger ? null : it.left)).filter((v) => v != null);
+  const sumVoided = sumOf(settlements);
+  const snapshots = summable.filter((it) => it.from_ledger && it.voided == null);
+  const deadTab = qdetail.tab === 'dead';
   const sum = $('qm-sum');
   clear(sum);
   if (shown.length) {
@@ -3253,15 +3427,25 @@ function renderQuotaDetail() {
     const nearest = qdetail.tab === 'live'
       ? (g.expires && g.expires !== EXP_NONE && g.expires !== '—' && g.expires !== '无限期' ? g.expires : '')
       : exps[exps.length - 1];
+    // 已过期那一堆：剩余已经没有意义（官方作废了），要说的是"用掉多少、剩多少作废"
     sum.append([
       `${shown.length} 笔`,
-      sumLeft != null ? `合计剩 ${nfmt(sumLeft)} ${gu}` : '这一堆没有一笔给出剩余',
-      sumLeft != null && sumTotal != null ? `共获得 ${nfmt(sumTotal)} ${gu}` : '',
-      lefts.length < shown.length ? `其中 ${shown.length - lefts.length} 笔官方只给了获得数` : '',
+      sumTotal != null ? `共获得 ${nfmt(sumTotal)} ${gu}` : '',
+      sumUsed != null ? `${deadTab && snapshots.length ? '已记录用量' : '用掉'} ${nfmt(sumUsed)} ${gu}` : '',
+      sumVoided != null && deadTab ? `${settlements.length < summable.length ? '已知作废' : '过期作废'} ${nfmt(sumVoided)} ${gu}` : '',
+      deadTab && snapshots.length ? `${snapshots.length} 笔仅有过期前记录` : '',
+      sumLeft != null && !deadTab ? `合计剩 ${nfmt(sumLeft)} ${gu}` : '',
+      sumLeft == null && !deadTab ? '这一堆没有一笔给出剩余' : '',
+      lefts.length < shown.length && !deadTab
+        ? `其中 ${shown.length - lefts.length} 笔官方只给了获得数` : '',
       nearest ? `${qdetail.tab === 'live' ? '最近到期' : '最后到期'} ${dtxt(nearest)}` : '',
     ].filter(Boolean).join(' · '));
   } else {
-    sum.textContent = qdetail.tab === 'live' ? '这一档已经没有在效期内的积分了' : '还没有过期的笔';
+    sum.textContent = qdetail.tab === 'live'
+      ? '这一档已经没有在效期内的积分了'
+      // 空态要把"以后会留"说清楚：Qoder 的包过期即从官网消失，用户看到
+      // "还没有过期的笔"会以为驾驶舱也不留，其实台账从装上起每笔都记着。
+      : '还没有过期的笔。台账已经在记这一档的每一笔，到期后不会随厂商删除而消失';
   }
   // scope 完整句子在明细层直接写出来：这一档到底只能花在什么上，别让人猜
   if (g.scope) sum.appendChild(el('span', { class: 'qscope' }, `这一档只用于：${g.scope}`));
@@ -3277,13 +3461,42 @@ function renderQuotaDetail() {
     const t = it.total, l = it.left, u = it.used;
     const iu = utxt(it.unit || g.unit);
     const p = usedPct(t, u);
+    // 到账时刻：厂商给到秒就显示到秒，只给日期就只显示日期。
+    // 统一放**右上角**（固定位置，扫一眼就能沿着同一列往下比先后），
+    // 不跟名字挤在一行——名字长短不一，标签位置会左右乱跳。
+    const gtag = String(it.granted_on || '').trim().replace('T', ' ');
+    const gdate = gtag ? gtag.slice(0, 19) : '';
+    // 到账时间分三种来源，说法不能混：厂商给的才是「到账」；规则推算的标「约」；
+    // 台账首次见到的时刻只是「首次记录」——把早已有的包写成刚到账就是撒谎。
+    const gsrc = it.granted_src || '';
+    const gtxt = gsrc === 'first_seen' ? `${gdate} 首次记录`
+      : gsrc === 'effective' ? `${gdate} 生效`
+      : gsrc === 'snapshot' ? `${gdate} 记录`
+      : (gsrc === 'estimate' || (!gsrc && it.granted_est)) ? `约 ${gdate} 到账`
+      : `${gdate} 到账`;
+    const gtitle = gsrc === 'first_seen'
+      ? `${gdate} 首次记录（厂商没给发放时间，这是驾驶舱第一次读到它的时刻，不是到账时刻）`
+      : (gsrc === 'estimate' || (!gsrc && it.granted_est))
+        ? `约 ${gdate} 到账（厂商没给发放时间，按有效期规则推算，不是厂商给的时刻）`
+        : gtxt;
     list.appendChild(el('div', { class: 'qitem' },
       el('div', { class: 'qitop' },
         el('b', {}, it.label || g.name),
         // 改过名的笔标出来：这一笔厂商原名叫什么，悬停就能看到
         it.renamed ? el('em', { class: 'qtag', title: `厂商原名「${it.orig || ''}」，显示名是你改的` }, '改名') : null,
         it.detail ? el('span', { class: 'qtag' }, it.detail) : null,
+        it.from_ledger ? el('em', {
+          class: 'qtag',
+          title: `厂商接口已经不再返回这一笔（Qoder 过期即消失、ZCode 套餐结束连桶都不给）。`
+            + `这条是台账留下的${it.last_seen ? `，最后一次见到 ${it.last_seen}` : ''}。`
+            + `「已用」是**最后一次读到**的数——包过期后厂商不再给，`
+            + `最终用量以厂商结算为准。`,
+        }, '台账') : null,
         it.pool && it.pool !== it.label ? el('span', { class: 'qtag', title: it.pool }, it.pool.replace(/^资源包\s*/, '')) : null,
+        // 右上角那一列：到账时刻 + 铅笔。`margin-left:auto` 把它们一起推到右侧，
+        // 每一条都对齐同一列，纵向扫下来就是时间顺序
+        el('span', { class: 'qgrant' },
+          el('span', { class: 'qtag qtag-grant', title: gdate ? gtitle : '' }, gdate ? gtxt : '到账时间未给出')),
         // 这一笔自己的铅笔：内层每一笔的名字与截止日期都在这儿改
         iconBtn('edit', () => openItemModal(inst, g, it),
           '编辑这一笔：名称、截止日期与备注')),
@@ -3293,12 +3506,20 @@ function renderQuotaDetail() {
         it.expires_manual ? el('em', {
           class: 'qmanual-tag',
           title: it.expires_vendor ? `你自己改的（厂商原给 ${it.expires_vendor}）` : '这个截止日期是你自己填的',
-        }, '自填') : null,
+        }, '自填') : (it.expires_est ? el('em', {
+          class: 'qmanual-tag',
+          // 小浣熊的活动奖励：流水只给到账时刻、不给 expire_at，公告写「自到账起 1 年」
+          title: '厂商没给这一笔的到期日，按公告「活动奖励自到账起 1 年内有效」用到账时刻 +1 年推算',
+        }, '推算') : null),
         el('span', { class: 'qistat' }, l == null && t == null ? '官方没给出数值'
-          : l == null ? `获得 ${nfmt(t)} ${iu}`
-            : t == null ? `剩 ${nfmt(l)} ${iu}（没给总额）`
-              : u != null ? `已用 ${nfmt(u)} / ${nfmt(t)} ${iu}` : `剩 ${nfmt(l)} / ${nfmt(t)} ${iu}`)),
-      p != null ? el('div', { class: 'cbar', title: `已用 ${nfmt(u)} / 共 ${nfmt(t)} ${iu}${l != null ? `（剩 ${nfmt(l)}）` : ''}` },
+          // 规格（妙手「每期 200 Credits」）：不是已到账，别写成「获得 200」
+          : it.spec ? `规格 ${nfmt(t)} ${iu} / 期`
+            : l == null ? `获得 ${nfmt(t)} ${iu}`
+              : t == null ? `剩 ${nfmt(l)} ${iu}（没给总额）`
+                : u != null ? `已用 ${nfmt(u)} / ${nfmt(t)} ${iu}${it.used_est ? '（推算）' : ''}` : `剩 ${nfmt(l)} / ${nfmt(t)} ${iu}`),
+        // 过期包里"没用完的那部分"被官方作废了：写出来，别让进度条满格冒充用完
+        it.voided ? el('span', { class: 'qistat faint' }, `过期作废 ${nfmt(it.voided)} ${iu}`) : null),
+      p != null ? el('div', { class: 'cbar', title: `已用 ${nfmt(u)} / 共 ${nfmt(t)} ${iu}${l != null ? `（剩 ${nfmt(l)}）` : ''}${it.voided ? `，过期作废 ${nfmt(it.voided)}` : ''}${it.used_est ? '。官方不给逐包消耗，这里是按消费流水与各包有效期推算的' : ''}` },
         el('b', { style: `width:${p}%` })) : null));
   }
   if (!shown.length) list.appendChild(el('p', { class: 'qempty' }, '这一堆没有笔。'));
@@ -5423,6 +5644,10 @@ function keySelBar(sites) {
   bar.appendChild(el('span', { class: 'ksel-n' }, `已选 ${ids.length} 条`));
   bar.appendChild(el('span', { class: 'sp' }));
 
+  // 表格里勾好的这批直接带进「批量编辑」弹窗：勾选动作不该因为换了入口就白做
+  bar.appendChild(btn('批量编辑', 'sm', () => openKeyEdit([...keySel()]),
+    '把勾选的这几条一起带进批量编辑（一屏改多项，不用一项点一次）'));
+
   bar.appendChild(btn('修改名称', 'sm', async () => {
     const v = await askText('给勾选的这些密钥统一设一个名称（列表里就按这个名字认人）。留空则清掉名称。',
       '', { title: `批量修改名称 · ${ids.length} 条`, okText: '应用' });
@@ -5824,6 +6049,130 @@ function renderKeyNav(d) {
   }
 }
 
+/* ---------------- 找密钥：手上这把 key 是谁的、还在不在台账里 ----------------
+   起因是「有些 key 不知道是哪的，也不知道保存没有」——这不是查重（查重找重复），
+   而是拿一把 key 反查归属。所以匹配分三档展示，档次越靠前越可信：
+     ① 原文全等：就是这一把，确定；
+     ② 打码全等：用户只见过 `sk-abc••••wxyz` 这种形式；
+     ③ 片段命中：只记得头尾，给候选。
+   命中的每条都要说清「在哪个站点、哪个站点里的第几条」，不然还是等于没查到。
+   key 原文只在本机比对，不发到任何地方。 */
+const keyFind = { busy: false, res: null, q: '' };
+
+/** 把一条命中渲染成一行：站点名 + 名称 + 掩码 + 位置说明 */
+function keyFindRow(e, tier) {
+  const row = el('div', { class: `kfrow ${tier}` });
+  const tierTxt = { exact: '完全一致', masked: '打码一致', partial: '片段匹配' }[tier] || tier;
+  row.appendChild(el('div', { class: 'kfrow-h' },
+    el('span', { class: 'kftier' }, tierTxt),
+    el('strong', {}, e.site_name || '（未命名站点）'),
+    kindChip(e.site_kind),
+    e.label ? el('span', { class: 'kflabel' }, e.label) : el('span', { class: 'muted' }, '未命名密钥'),
+    el('span', { class: 'sp' }),
+    el('span', { class: 'mono kfmask' }, e.masked || '—')));
+  const where = [];
+  if (e.base_url) where.push(e.base_url);
+  else if (e.homepage) where.push(e.homepage);
+  if (e.source) where.push(`来源：${e.source}`);
+  if (e.note) where.push(e.note);
+  if (e.expires_on) where.push(`截止：${e.expires_on}`);
+  row.appendChild(el('div', { class: 'kfrow-m' },
+    el('span', { class: 'muted' }, '位置：'),
+    el('span', {}, `${e.site_name || '站点'} → ${e.label || '未命名密钥'}`),
+    where.length ? el('span', { class: 'muted' }, `　${where.join('　·　')}`) : null));
+  // 跳过去：展开那个站点、把它滚到眼前、并把那条密钥高亮出来
+  row.appendChild(el('div', { class: 'kfrow-a' },
+    btn('在台账里定位', 'sm', () => {
+      S.keysOpen[e.site] = true;
+      S.keyNavSite = e.site;
+      renderKeys(S.data);
+      setTimeout(() => {
+        const t = $(`site-${e.site}`);
+        if (t) t.scrollIntoView({ block: 'start' });
+        const kid = String(e.id || '');
+        document.querySelectorAll('.kfrow.hit').forEach((x) => x.classList.remove('hit'));
+        const tr = document.querySelector(`tr[data-kid="${CSS.escape(kid)}"]`);
+        if (tr) tr.classList.add('hit');
+      }, 60);
+    }, '展开这个站点并滚到那条密钥'),
+    e.use_in_proxy ? chip('进反代', 'swap') : null));
+  return row;
+}
+
+function renderKeyFind() {
+  const out = $('k-find-out');
+  if (!out) return;
+  clear(out);
+  const info = $('k-find-info');
+  const r = keyFind.res;
+  if (!keyFind.q) {
+    if (info) info.textContent = '不会把 key 发到任何地方，只在本机台账里比对';
+    return;
+  }
+  if (keyFind.busy) {
+    if (info) info.textContent = '正在比对…';
+    return;
+  }
+  if (!r) {
+    if (info) info.textContent = '不会把 key 发到任何地方，只在本机台账里比对';
+    return;
+  }
+  const groups = [
+    ['exact', r.exact || []],
+    ['masked', r.masked || []],
+    ['partial', r.partial || []],
+  ];
+  const total = groups.reduce((s, [, a]) => s + a.length, 0);
+  if (total === 0) {
+    if (info) {
+      info.textContent = r.locked
+        ? '台账里没有这把 key。注意：保管箱锁着，只能按打码串与片段比对，完整原文比对没生效。'
+        : '台账里没有这把 key —— 它没被登记过（也可能早就删了）。';
+    }
+    out.appendChild(el('div', { class: 'empty' },
+      r.locked
+        ? '没找到。保管箱锁着时只能按打码串和片段比对，先到「设置 → 凭据安全」解锁再找一次。'
+        : '没找到。台账里确实没有这把 key。'));
+    return;
+  }
+  if (info) {
+    info.textContent = r.locked
+      ? `找到 ${total} 条（保管箱锁着，只能按打码串与片段比对）`
+      : `找到 ${total} 条`;
+  }
+  for (const [tier, arr] of groups) {
+    if (!arr.length) continue;
+    out.appendChild(el('div', { class: 'kfgroup' },
+      el('h3', {}, { exact: '完全一致', masked: '打码一致', partial: '片段匹配（不确定）' }[tier],
+        el('span', { class: 'muted' }, `　${arr.length} 条`)),
+      ...arr.map((e) => keyFindRow(e, tier))));
+  }
+}
+
+async function doKeyFind() {
+  const box = $('k-find-q');
+  if (!box) return;
+  const q = box.value.trim();
+  keyFind.q = q;
+  if (!q) {
+    keyFind.res = null;
+    renderKeyFind();
+    return;
+  }
+  keyFind.busy = true;
+  renderKeyFind();
+  try {
+    const r = await invoke('action', { payload: { action: 'key_search', query: q } });
+    keyFind.res = r;
+  } catch (e) {
+    keyFind.res = null;
+    toast('查找失败：' + (e && e.message ? e.message : e), false);
+  } finally {
+    keyFind.busy = false;
+    renderKeyFind();
+  }
+}
+
 /* key 行只留五列：接入点和模型清单挂在站点上，额度也挂在站点上（见 siteQuotaTxt）。
    操作列照 LongCat 的 API Keys 那样用图标，悬停 tooltip 说明；顺序按她点名的：
    测试 / 编辑 / 复制 / 接入 / 删除 */
@@ -6099,6 +6448,207 @@ function renderBd() {
       bd.mode === 'dedup' ? '台账里没有重复的 key。' : '台账里还没有 key。'));
   }
   syncBd();
+}
+
+/* ---------------- key 批量编辑（2026-11-11） ----------------
+   她原话："得选中几个才能出现，你就不能在批量删除那加上一个批量编辑吗"。
+   批量删除是「勾一批 → 一次删掉」；批量编辑是同一个勾选手感，只是最后不是删，
+   而是**挑几项统一改**：勾了哪项改哪项，没勾的一项都不动。
+   为什么要单独开一个弹窗而不是复用站点表格顶那条操作条：
+   那条操作条一次只能改一个属性（改名称 → 弹一次框 → 再点改来源 → 再弹一次），
+   勾了 20 条要改三样就得点三遍、填三遍。这里一屏填完一次提交。
+   key 原文（key 字段）**不在可改之列**：把一批原文改成同一个不是功能，是事故；
+   后端 update_keys_batch 的白名单里也没有它。 */
+const bem = { sel: new Set(), groups: [] };
+
+/* 可统一改的项：勾上才算「要改」，值取自同行的输入控件。
+   kind: text 普通文本 / date 截止日期（存前归一化）/ bool 三态下拉 */
+const BE_FIELDS = [
+  {
+    f: 'label', label: '名称', kind: 'text', ph: '统一改「名称」这一列，如 Pot',
+    hint: '列表里就按这个名字认人；留空 = 把这批的名称清掉',
+  },
+  {
+    f: 'source', label: '来源', kind: 'text', ph: '如 官方申请 / 群里分享',
+    hint: '留空 = 把这批的来源清掉',
+  },
+  {
+    f: 'expires_on', label: '截止日期', kind: 'date', ph: '如 2026-12-31',
+    hint: '临期提醒按它算；留空 = 把这批的截止日期清成未填',
+  },
+  {
+    f: 'note', label: '备注', kind: 'text', ph: '如 备用号，月底再测',
+    hint: '悬停在名称上能看到；留空 = 清掉备注',
+  },
+  {
+    f: 'base_url', label: '接入点', kind: 'text', ph: '留空 = 跟随站点',
+    hint: '填了就覆盖成同一个地址；留空 = 清掉自带接入点、改回跟随站点',
+  },
+  {
+    f: 'use_in_proxy', label: '进反代', kind: 'bool',
+    hint: '这批密钥要不要被本机反代拿来分发',
+  },
+];
+
+function openKeyEdit(preselect) {
+  bem.sel = new Set(preselect || []);
+  bem.groups = (S.data.keys || [])
+    .map((p) => ({
+      site: p.id,
+      site_name: p.name,
+      entries: (p.keys || []).map((k) => ({
+        site: p.id, site_name: p.name, id: k.id, label: k.label, masked: k.masked,
+        source: k.source, expires_on: k.expires_on, note: k.note,
+        base_url: k.base_url, use_in_proxy: k.use_in_proxy,
+        last_status: k.last_status, days_left: k.days_left,
+      })),
+    }))
+    .filter((g) => g.entries.length);
+  // 表单每次打开都重新画：上一次填过的值留在这里，下次一开就"看起来像要改"，
+  // 而她可能只是来改名称的——留着就是埋一个误改别的字段的坑
+  clear($('be-form'));
+  $('bemodal').hidden = false;
+  renderBe();
+}
+
+function renderBe() {
+  const box = $('be-list');
+  clear(box);
+  const all = [];
+  for (const g of bem.groups) for (const k of g.entries) all.push(`${k.site}|${k.id}`);
+  box.appendChild(el('div', { class: 'bdtools' },
+    btn(`全选（${all.length}）`, 'sm', () => {
+      bem.sel = new Set(all);
+      renderBe();
+    }, '把台账里全部密钥勾上'),
+    btn('清空', 'sm', () => { bem.sel = new Set(); renderBe(); }, '一条都不勾'),
+    el('span', { class: 'kv' }, bem.sel.size ? `已勾 ${bem.sel.size} 条` : '还没勾密钥')));
+  for (const g of bem.groups) {
+    const sigs = g.entries.map((k) => `${k.site}|${k.id}`);
+    const allOn = sigs.every((x) => bem.sel.has(x));
+    box.appendChild(el('div', { class: 'bdgroup' },
+      el('div', { class: 'bdghead' },
+        el('b', {}, g.site_name || '未命名站点'),
+        el('span', { class: 'kv' }, `${g.entries.length} 个密钥`),
+        el('span', { class: 'sp' }),
+        btn(allOn ? '取消本站' : `全选本站（${sigs.length}）`, 'sm', () => {
+          if (allOn) sigs.forEach((x) => bem.sel.delete(x));
+          else sigs.forEach((x) => bem.sel.add(x));
+          renderBe();
+        }, '只勾这个站点里的密钥'))));
+    for (const k of g.entries) {
+      const sig = `${k.site}|${k.id}`;
+      const cb = el('input', { type: 'checkbox' });
+      cb.checked = bem.sel.has(sig);
+      cb.addEventListener('change', () => {
+        if (cb.checked) bem.sel.add(sig); else bem.sel.delete(sig);
+        syncBe();
+      });
+      box.appendChild(el('label', { class: 'bdrow' }, cb,
+        el('b', {}, k.label || '未命名'),
+        k.masked ? el('span', { class: 'mono' }, k.masked) : null,
+        k.expires_on ? el('span', { class: 'kv' }, dtxt(k.expires_on)) : null,
+        k.last_status === 'ok' ? chip('可用', 'ok')
+          : k.last_status === 'fail' ? chip('失败', 'fail') : null,
+        k.use_in_proxy ? chip('进反代', 'swap') : null));
+    }
+  }
+  if (!bem.groups.length) {
+    box.appendChild(el('div', { class: 'empty' }, '台账里还没有密钥。'));
+  }
+  renderBeForm();
+  syncBe();
+}
+
+/* 表单只画一次：重画会把已经填好的值清掉（勾/取消一条不该丢输入） */
+function renderBeForm() {
+  const host = $('be-form');
+  if (host.childElementCount) return;
+  host.appendChild(el('div', { class: 'behint' },
+    '勾左边一列表示要改这项，右边填统一的值。没勾的项一律不动。'));
+  for (const spec of BE_FIELDS) {
+    const on = el('input', { type: 'checkbox', class: 'be-on' });
+    on.addEventListener('change', () => syncBe());
+    let ctl;
+    if (spec.kind === 'bool') {
+      ctl = el('select', { class: 'be-val' },
+        el('option', { value: '1' }, '进反代'),
+        el('option', { value: '0' }, '不进反代'));
+      ctl.disabled = true;
+      on.addEventListener('change', () => { ctl.disabled = !on.checked; });
+    } else if (spec.kind === 'date') {
+      const inp = el('input', { class: 'be-val', placeholder: spec.ph, autocomplete: 'off' });
+      const pick = btn('选日期', 'sm', () => {
+        const hit = String(inp.value || '').match(/\d{4}-\d{2}-\d{2}/);
+        if (hit) native.value = hit[0];
+        try { native.showPicker(); } catch { native.focus(); }
+      }, '从日历里选一个日期');
+      const native = el('input', { type: 'date', class: 'be-date-native', tabIndex: -1, aria: { hidden: 'true' } });
+      native.addEventListener('change', () => { if (native.value) inp.value = native.value; });
+      inp.disabled = true;
+      pick.disabled = true;
+      on.addEventListener('change', () => { inp.disabled = !on.checked; pick.disabled = !on.checked; });
+      ctl = el('span', { class: 'fieldexp' }, inp, pick, native);
+    } else {
+      ctl = el('input', { class: 'be-val', placeholder: spec.ph, autocomplete: 'off', spellcheck: 'false' });
+      ctl.disabled = true;
+      on.addEventListener('change', () => { ctl.disabled = !on.checked; });
+    }
+    host.appendChild(el('div', { class: 'berow' },
+      el('label', { class: 'behead', title: spec.hint },
+        on, el('b', {}, spec.label), el('span', { class: 'kv' }, spec.hint)),
+      el('div', { class: 'bectl' }, ctl)));
+  }
+}
+
+/* 勾选数 → 底部计数与「应用」按钮一起同步（和查重那边同一个道理：
+   以前写在 change 里，一加全选就出现「计数对了按钮还灰着」） */
+function syncBe() {
+  const n = bem.sel.size;
+  const onN = [...document.querySelectorAll('#be-form .be-on')].filter((x) => x.checked).length;
+  $('be-go').disabled = !n || !onN;
+  $('be-count').textContent = !n
+    ? '先在上面勾要改的密钥'
+    : (onN ? `将改 ${n} 条密钥的 ${onN} 项` : '再勾要改哪几项（右边那列）');
+}
+
+async function beApply() {
+  if (!bem.sel.size) return;
+  const ids = [...bem.sel].map((s) => {
+    const i = s.indexOf('|');
+    return { site: s.slice(0, i), id: s.slice(i + 1) };
+  });
+  const patch = {};
+  const rows = [...document.querySelectorAll('#be-form .berow')];
+  for (let i = 0; i < BE_FIELDS.length; i++) {
+    const spec = BE_FIELDS[i];
+    const row = rows[i];
+    if (!row || !row.querySelector('.be-on').checked) continue;
+    const ctl = row.querySelector('.be-val');
+    if (spec.kind === 'bool') {
+      patch[spec.f] = ctl.value === '1';
+    } else if (spec.kind === 'date') {
+      const raw = String(ctl.value || '').trim();
+      if (!raw) { patch[spec.f] = ''; continue; }
+      const v = normExpDate(raw);
+      if (!/^\d{4}-\d{2}-\d{2}/.test(v)) {
+        toast(`截止日期没认出来：留空，或按 ${spec.ph} 填`, false);
+        return;
+      }
+      patch[spec.f] = v;
+    } else {
+      patch[spec.f] = String(ctl.value || '').trim();
+    }
+  }
+  if (!Object.keys(patch).length) { toast('没勾要改哪一项', false); return; }
+  const r = await invoke('action', { payload: { action: 'key_batch_update', ids, patch } });
+  toast(r.msg, r.ok);
+  if (!r.ok) return;
+  $('bemodal').hidden = true;
+  bem.sel = new Set();
+  keySel().clear();      // 改完了，表格里那批勾选也一并收掉
+  await load();
+  renderKeys(S.data);
 }
 
 async function bdDelete() {
@@ -6512,9 +7062,9 @@ let siteEditing = null;
    openai-resp 是 OpenAI 的 Responses API（/v1/responses），和 chat completions 分开记。 */
 const BASE_FMT = [
   ['openai', 'OpenAI Chat Completions'],
-  ['openai-resp', 'OpenAI Responses API'],
-  ['anthropic', 'Anthropic'],
-  ['gemini', 'Gemini / Google'],
+  ['openai-resp', 'OpenAI Responses'],
+  ['anthropic', 'Anthropic Messages'],
+  ['gemini', 'Google Gemini'],
   ['other', '其他'],
 ];
 const BASE_DEFAULTS = ['openai', 'openai-resp', 'anthropic', 'gemini'];
@@ -10114,6 +10664,18 @@ function bind() {
     renderKeys(S.data);
   });
   $('btn-keys-dedup').addEventListener('click', () => openKeyBatch('dedup'));
+  // 找密钥：回车直接查；清空按钮把框和结果一起清掉
+  $('k-find-go').addEventListener('click', () => doKeyFind());
+  $('k-find-q').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doKeyFind(); }
+  });
+  $('k-find-clear').addEventListener('click', () => {
+    $('k-find-q').value = '';
+    keyFind.q = '';
+    keyFind.res = null;
+    renderKeyFind();
+  });
+  $('btn-keys-edit').addEventListener('click', () => openKeyEdit());
   $('btn-keys-batch').addEventListener('click', () => openKeyBatch('all'));
   $('btn-checkin-refresh').addEventListener('click', () => loadCheckin(true));
   $('c-checkin').addEventListener('click', () => { S.view = 'checkin'; render(); });
@@ -10135,6 +10697,9 @@ function bind() {
   $('bd-cancel').addEventListener('click', () => { $('bdmodal').hidden = true; });
   $('bdmodal').addEventListener('click', (e) => { if (e.target.id === 'bdmodal') $('bdmodal').hidden = true; });
   $('bd-go').addEventListener('click', bdDelete);
+  $('be-cancel').addEventListener('click', () => { $('bemodal').hidden = true; });
+  $('bemodal').addEventListener('click', (e) => { if (e.target.id === 'bemodal') $('bemodal').hidden = true; });
+  $('be-go').addEventListener('click', beApply);
   $('sm-cancel').addEventListener('click', closeSiteModal);
   $('sm-save').addEventListener('click', saveSiteModal);
   $('smodal').addEventListener('click', (e) => { if (e.target.id === 'smodal') closeSiteModal(); });

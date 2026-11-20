@@ -63,7 +63,12 @@ pub fn current_identity() -> Result<Value, String> {
     if let Ok(mut held) = cache.lock() { *held = Some((signature, value.clone())); }
     Ok(value)
 }
-fn snapshot_current() -> Result<Value, String> { helper(json!({"mode":"snapshot","record":read_record()?})) }
+/// `root` tells the reader which data root the record came from: `enc:v2`
+/// ciphertext is bound to the credential-store entry named after
+/// `credentials.json`'s real path, so the reader must know where to look.
+fn snapshot_current() -> Result<Value, String> {
+    helper(json!({"mode":"snapshot","record":read_record()?,"root":native_root()}))
+}
 pub fn identity_at(root: &Path) -> Result<Value, String> {
     plain(root)?;
     let who = if root == native_root() { current_identity()? } else { helper(json!({"mode":"identity","root":root}))? };
@@ -110,7 +115,7 @@ pub fn proxy_credential(name: &str) -> Result<Value, String> {
     let snapshot = if current_identity().is_ok_and(|who| who["user_id"] == uid) {
         snapshot_current()?
     } else { snapshot_for_uid(uid)? };
-    helper(json!({"mode":"proxy","record":snapshot["record"],"expected_user_id":uid}))
+    helper(json!({"mode":"proxy","record":snapshot["record"],"expected_user_id":uid,"root":native_root()}))
 }
 pub fn proxy_available(name: &str) -> bool {
     card(name).ok().and_then(|m| snapshot_for_uid(m["quota_user_id"].as_str().unwrap_or("")).ok())
@@ -161,7 +166,7 @@ fn legacy_snapshot(meta: &Value) -> Option<Value> {
     let old: Value = serde_json::from_str(&raw).ok()?;
     let bytes = secrets::b64_decode(old["files"]["v2/credentials.json"].as_str()?).ok()?;
     let record: Value = serde_json::from_slice(&bytes).ok()?;
-    let snapshot = helper(json!({"mode":"snapshot","record":record})).ok()?;
+    let snapshot = helper(json!({"mode":"snapshot","record":record,"root":native_root()})).ok()?;
     let who = &snapshot["identity"];
     let old_id = old["user_id"].as_str().unwrap_or("");
     let matches = [who["account"].as_str(), who["email"].as_str(), who["provider_user_id"].as_str()].into_iter().flatten().any(|s| s.eq_ignore_ascii_case(name));
@@ -323,7 +328,7 @@ fn replace_login(name:&str,logout:bool,force:bool)->Result<Value,Value>{
     let target=if logout{None}else{Some(snapshot_for_uid(uid).map_err(failure)?)};
     // Check the target before stopping a running client.
     if let Some(snapshot)=target.as_ref(){
-        let decoded=helper(json!({"mode":"snapshot","record":snapshot["record"]})).map_err(failure)?;
+        let decoded=helper(json!({"mode":"snapshot","record":snapshot["record"],"root":native_root()})).map_err(failure)?;
         if decoded["identity"]["user_id"]!=uid{return Err(failure("目标登录与账号身份不符，未切换"));}
     }
     if !logout&&who["user_id"]==uid{return launch_native().map_err(failure);}
@@ -339,7 +344,7 @@ fn replace_login(name:&str,logout:bool,force:bool)->Result<Value,Value>{
     if let Ok(snapshot)=snapshot_current(){save_snapshot(&snapshot).map_err(failure)?;}
     let directory=backup(if logout{"logout"}else{"switch"}).map_err(failure)?;
     let original=fs::read(credentials()).ok();
-    let merged=helper(json!({"mode":"merge","record":read_record().map_err(failure)?,"target":target.as_ref().map(|s|s["record"].clone()),"provider":who["provider"]})).map_err(failure)?;
+    let merged=helper(json!({"mode":"merge","record":read_record().map_err(failure)?,"target":target.as_ref().map(|s|s["record"].clone()),"provider":who["provider"],"root":native_root()})).map_err(failure)?;
     atomic(&credentials(),&serde_json::to_vec_pretty(&merged["record"]).map_err(|_|failure("登录信息序列化失败"))?).map_err(failure)?;
     invalidate();
     // Read back the written identity before launching it.

@@ -1785,6 +1785,28 @@ pub fn find_instance(app_id: &str, name: &str) -> Option<Value> {
         .find(|m| m["name"].as_str() == Some(name))
 }
 
+/// 账号卡「隐藏」标记（她 2026-11-12：某个号暂时不用了，先灰掉、别再查也别再自动签）。
+/// 只改驾驶舱自己这张卡的记录，**不动档案目录、不碰登录包**——恢复时一切照旧。
+/// 存成 `hidden: true` 字段（false 直接删字段，老版本读到的仍是"没这个键"）。
+pub fn set_instance_hidden(app_id: &str, name: &str, hide: bool) -> Result<(), String> {
+    let mut m = find_instance(app_id, name)
+        .ok_or_else(|| format!("找不到「{name}」这张账号卡（可能已被改名或删除）"))?;
+    if m["hidden"].as_bool() == Some(hide) {
+        return Ok(());
+    }
+    match m.as_object_mut() {
+        Some(o) => {
+            if hide {
+                o.insert("hidden".into(), json!(true));
+            } else {
+                o.remove("hidden");
+            }
+        }
+        None => return Err("账号记录格式不对".to_string()),
+    }
+    save_instance_checked(app_id, &m)
+}
+
 /// 账号名直接当文件名用（`instances/<产品>/<名字>.json`），Windows 文件名禁用的
 /// 字符必须一票否决：`< > : " | ? *` 加控制字符，尾部的点和空格也不行。
 /// 以前只挡了 `/ \ : ..`——向导拿打码账号名（`demo***@example.test` 这种带 `*` 的）

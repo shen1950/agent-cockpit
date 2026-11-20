@@ -211,6 +211,7 @@
         <button class="btn primary" id="btn-key-new">＋ 添加站点</button>
         <button class="btn" id="btn-keys-expiring" title="只看 30 天内过期的">只看临期</button>
         <button class="btn" id="btn-keys-dedup" title="按密钥原文找出重复登记的条目，保留一条删其余">查重</button>
+        <button class="btn" id="btn-keys-edit" title="勾选任意多条密钥，一次统一改名称、来源、截止日期、备注、接入点与是否进反代">批量编辑</button>
         <button class="btn" id="btn-keys-batch" title="勾选任意多条密钥一次删除">批量删除</button>
       </div>
       <div class="pagebody">
@@ -230,6 +231,20 @@
                   <span class="kv" id="k-intake-info">先按本机规则读，认不出才交给多模态模型（设置 → AI 识别）</span>
                 </div>
               </div>
+            </div>
+            <div class="panel keyfind" id="key-find">
+              <h2>找密钥<span class="ihelp" data-tip="手上有一把 key，不知道属于哪家、也没记下来保存过没有？把它贴进来，这里会告诉你在台账的哪个站点、哪一条里。">?</span></h2>
+              <div class="pasteline">
+                <label for="k-find-q">粘贴要找的 key（完整原文、看到的打码形式，或只记得头尾片段都行）</label>
+                <div class="ctlrow" style="margin-top:8px">
+                  <input id="k-find-q" class="grow mono" spellcheck="false" autocomplete="off"
+                    placeholder="例：sk-abc123••••wxyz　或只记得尾巴 4 位">
+                  <button class="btn primary sm" id="k-find-go">查找</button>
+                  <button class="btn sm" id="k-find-clear">清空</button>
+                </div>
+                <div class="kv" id="k-find-info">不会把 key 发到任何地方，只在本机台账里比对</div>
+              </div>
+              <div id="k-find-out"></div>
             </div>
             <div id="keysites" class="keysites"></div>
           </div>
@@ -547,6 +562,24 @@
     <footer class="dialogfoot">
       <button class="btn" id="inj-cancel">关闭</button>
       <button class="btn primary" id="inj-go">写入所选</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= API 台账：key 批量编辑 =================
+     和「批量删除」同一套勾选方式，区别只在最后一步：不是整条清掉，
+     而是把勾上的那几项统一改掉。没勾的项一律不动。 -->
+<div class="modal blur" id="bemodal" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="be-title">
+    <h3 id="be-title">批量编辑密钥</h3>
+    <div class="hintline" id="be-sub">上面勾要改哪些密钥，下面勾要统一改哪几项；没勾的项一律不动，密钥原文不会被改。</div>
+    <div class="bdlist" id="be-list"></div>
+    <div class="beform" id="be-form"></div>
+    <footer class="dialogfoot">
+      <span class="kv" id="be-count"></span>
+      <span class="sp"></span>
+      <button class="btn" id="be-cancel">取消</button>
+      <button class="btn primary" id="be-go">应用</button>
     </footer>
   </div>
 </div>

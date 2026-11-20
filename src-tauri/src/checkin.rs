@@ -46,6 +46,11 @@ pub const CATALOG: &[(&str, &str)] = &[
 /// 所以宁可只给产品级一行，也不摆一排串号的假账号行。
 pub const PER_ACCOUNT: &[&str] = &["qoder", "qoder-cn", "workbuddy", "workbuddy-intl"];
 
+/// 隐藏账号那一行写着什么。隐藏（她 2026-11-12 要的"暂时不想用了，先灰掉"）＝
+/// 不查状态、不自动签到、不计入统计；档案目录和登录包一概不动，恢复即回来。
+const HIDDEN_NOTE: &str = "已隐藏：不查状态、不自动签到、不计入统计；点「恢复」就回来";
+const RESTORE_NOTE: &str = "已恢复：下一轮刷新会读回这个号自己的状态";
+
 /// 最近一次查到的状态（整份数组）。界面每 4 秒刷新，绝不能每次都去发六条网络请求，
 /// 所以只在这里存一份，靠 stale() 决定什么时候重新查。
 static CACHE: Mutex<Option<Value>> = Mutex::new(None);
@@ -375,6 +380,9 @@ pub fn refresh() -> Value {
                 expanded.as_array().cloned().unwrap_or_default(),
                 &store_visible,
             ));
+            // 「没找到登录态 <路径>」先改写成「未登录」再往下走：后面那几步（国际版活跃判定、
+            // 外部签到认领）都不该把"没登过"当错误看
+            soften_missing_login(&mut items);
             let _guard = LEDGER_WRITE.lock().unwrap();
             let mut st = load_state();
             apply_workbuddy_statuses(&mut items, &st);
@@ -401,6 +409,11 @@ pub fn refresh() -> Value {
 /// 到账归属仍只按次日结算惯例推测；不能拿今早的到账堵住今天的活跃。
 fn apply_workbuddy_status(item: &mut Value, st: &Value) {
     if item["product"].as_str() != Some("workbuddy-intl") || item.get("error").is_some() {
+        return;
+    }
+    // 隐藏的号不套"今天已活跃"：它的状态列写的是「已隐藏」，不该在背后被改成已签；
+    // 名下账号全藏起来的产品行同理（它代表的就是那个被藏起来的号）
+    if item["hidden"].as_bool() == Some(true) || item["all_hidden"].as_bool() == Some(true) {
         return;
     }
     let today = item["today"].as_str().unwrap_or("").to_string();
@@ -513,6 +526,8 @@ fn record_external_signins(items: &Value, st: &mut Value) {
     for it in arr {
         if it["signed_today"].as_bool() != Some(true) { continue; }
         if !it["error"].is_null() || it["mode"].as_str() == Some("travel") { continue; }
+        // 隐藏的号不认领外部签到：它今天本来就没打算签，替它记一笔等于凭空多一条"已签"
+        if it["hidden"].as_bool() == Some(true) { continue; }
         let today = match it["today"].as_str() {
             Some(t) if !t.is_empty() => t.to_string(),
             _ => continue,
@@ -564,15 +579,74 @@ fn expand_accounts(items: Value) -> Value {
                 o.insert("app".into(), json!(app_id));
             }
         }
+        // 名下账号卡全被隐藏了：这一行也就没有可签的号了（它签的正是"本机现在登着的那个号"，
+        // 而那也是被隐藏的其中一个）。标记出来，界面上把它按灰色画、自动签到跳过它。
+        let kids: Vec<Value> = if store.is_empty() {
+            Vec::new()
+        } else {
+            crate::local_quota::app_for_store(&store)
+                .map(|app_id| account_items(app_id, &store))
+                .unwrap_or_default()
+        };
+        if all_accounts_hidden(&kids) {
+            prod["all_hidden"] = json!(true);
+        }
         out.push(prod);
-        if store.is_empty() {
-            continue;
-        }
-        if let Some(app_id) = crate::local_quota::app_for_store(&store) {
-            out.extend(account_items(app_id, &store));
-        }
+        out.extend(kids);
     }
     json!(out)
+}
+
+/// 这一组账号行是不是"全都被隐藏了"。没有账号行不算——那家只有产品级一行。
+/// `shared` 那几行（整机一份登录态的产品，如 Trae CN / MiniMax）不参与判定：它们本来
+/// 就只是"切到该号"的入口，藏不藏都不影响产品级的领取。
+fn all_accounts_hidden(rows: &[Value]) -> bool {
+    let own: Vec<&Value> = rows.iter().filter(|r| r["shared"].as_bool() != Some(true)).collect();
+    !own.is_empty() && own.iter().all(|r| r["hidden"].as_bool() == Some(true))
+}
+
+/// agenthub 那句"没找到登录态 <长路径>"算不算"没登录"。
+/// 各家原话不一样（没找到…登录态/登录令牌/登录档案/登录凭据/登录数据、没在这台机器登录过），
+/// 但都落在"这台机器还没登过"这一件事上——它不是故障，是缺一步登录。
+fn is_missing_login(e: &str) -> bool {
+    if e.contains("没找到") && e.contains("登录") {
+        return true;
+    }
+    e.contains("还没在这台机器登录过")
+        || e.contains("没在这台机器登录过")
+        || e.contains("从没登录过")
+        || e.contains("还没登录")
+}
+
+/// 把"没找到登录态 <路径>"改写成「未登录」，而不是一行红字。
+/// 她 2026-11-12：账号都还没登进去，签到页却横着一条红字带绝对路径——那是"缺一步登录"，
+/// 不是出错。改完：状态列写「今天还没登录」、动作给「登录并领取」，原始路径收进问号里。
+fn soften_missing_login(items: &mut Value) {
+    if let Some(arr) = items.as_array_mut() {
+        for it in arr.iter_mut() {
+            soften_item(it);
+        }
+    }
+}
+
+/// 单条的那一份（refresh_one / 单行重查也走同一条判断）
+fn soften_item(it: &mut Value) {
+    let raw = it["error"].as_str().unwrap_or("").to_string();
+    if !is_missing_login(&raw) {
+        return;
+    }
+    if let Some(o) = it.as_object_mut() {
+        o.remove("error");
+        o.insert("need_login".into(), json!(true));
+        // 跟 need_login 分开记：need_login 也用在"今天还没在客户端用过"，
+        // 这一条才是"这台机器上压根没登过"——状态列直接写「未登录」
+        o.insert("not_logged_in".into(), json!(true));
+        o.insert("signed_today".into(), Value::Null);
+        o.insert("claimable".into(), json!(false));
+        o.insert("note".into(), json!(format!(
+            "这台机器上还没有这个号的登录态。登进去之后就能查状态、领今天这份。\n（它找的是：{raw}）"
+        )));
+    }
 }
 
 /// 点「刷新状态」的那一下：**立刻回快照，后台去问各家**。
@@ -732,18 +806,36 @@ fn account_row_unreadable(app_id: &str, store: &str, name: &str, why: &str) -> V
 
 pub fn account_items(app_id: &str, store: &str) -> Vec<Value> {
     let insts = crate::registry::load_instances(app_id);
-    let names: Vec<String> = insts
+    // 每张卡带一个「隐藏」标记：隐藏的号这次不查（一次 agenthub 启动两三秒），
+    // 但仍然摆一行出来——界面上它默认淡出，点「显示已隐藏」就能看见并恢复。
+    let cards: Vec<(String, bool)> = insts
         .iter()
-        .filter_map(|m| m["name"].as_str().map(String::from))
-        .filter(|n| !n.is_empty())
+        .filter_map(|m| {
+            let n = m["name"].as_str()?.to_string();
+            if n.is_empty() {
+                return None;
+            }
+            Some((n, m["hidden"].as_bool() == Some(true)))
+        })
         .collect();
     // 一个号的产品不展开：产品级那一行就是它，再挂一条同名子行只是重复
-    if names.len() < 2 {
+    if cards.len() < 2 {
         return Vec::new();
     }
     let readable = per_account(store);
     let mut out = Vec::new();
-    for name in names {
+    for (name, hidden) in cards {
+        if hidden {
+            out.push(json!({
+                "scope": "account", "account": name, "name": name,
+                "product": store, "parent": store, "app": app_id,
+                "hidden": true, "pending": false,
+                "supported": true, "auto": false, "activity_on": true,
+                "signed_today": Value::Null, "claimable": false,
+                "note": HIDDEN_NOTE,
+            }));
+            continue;
+        }
         // 读不到独立登录态 / 这个号还没存过登录包：摆一行占位，不再逐个起 agenthub
         if !readable || crate::authpack::stored(app_id, &name).is_none() {
             out.push(json!({
@@ -801,6 +893,137 @@ pub fn account_items(app_id: &str, store: &str) -> Vec<Value> {
     out
 }
 
+/// 把「隐藏」标记写到 items 里属于某个账号的那一行上（缓存与落盘快照共用）。
+/// 隐藏时顺手把这一行的状态清成"没查到"：留着旧的「今天可领」会让一键领取/合计把它们算进去。
+/// 返回有没有找到这一行——找不到说明缓存里本来就没展开它。
+fn mark_hidden(items: &mut Value, store: &str, name: &str, hide: bool) -> bool {
+    let arr = match items.as_array_mut() {
+        Some(a) => a,
+        None => return false,
+    };
+    let mut found = false;
+    for it in arr.iter_mut() {
+        if it["scope"].as_str() != Some("account")
+            || it["product"].as_str() != Some(store)
+            || it["account"].as_str() != Some(name)
+        {
+            continue;
+        }
+        found = true;
+        if let Some(o) = it.as_object_mut() {
+            if hide {
+                o.insert("hidden".into(), json!(true));
+                o.insert("pending".into(), json!(false));
+                o.insert("signed_today".into(), Value::Null);
+                o.insert("claimable".into(), json!(false));
+                o.insert("note".into(), json!(HIDDEN_NOTE));
+            } else {
+                o.remove("hidden");
+                // 恢复后状态要重新问一次，先写"查询中"而不是沿用隐藏前的旧数
+                o.insert("pending".into(), json!(true));
+                o.insert("note".into(), json!(RESTORE_NOTE));
+            }
+        }
+    }
+    found
+}
+
+/// 名下账号卡全被隐藏时给产品行补 `all_hidden`，有可见账号行时把它摘掉。
+/// 界面按它决定这一行还画不画"1/2 已签"，自动签到按它决定跳不跳。
+fn sync_all_hidden(items: &mut Value) {
+    let arr = match items.as_array_mut() {
+        Some(a) => a,
+        None => return,
+    };
+    // (产品, 它的账号行是否全隐藏)。先算完再改，避免一边遍历一边借可变引用
+    let mut verdict: Vec<(String, bool)> = Vec::new();
+    let stores: Vec<String> = arr
+        .iter()
+        .filter(|it| it["scope"].as_str() != Some("account"))
+        .filter_map(|it| it["product"].as_str().map(String::from))
+        .collect();
+    for s in stores {
+        let rows: Vec<&Value> = arr
+            .iter()
+            .filter(|it| it["scope"].as_str() == Some("account") && it["product"].as_str() == Some(s.as_str()))
+            .collect();
+        // 只按"自己有登录态的账号行"判（shared 那几行只是切号入口，不参与）
+        let own: Vec<&&Value> = rows.iter().filter(|r| r["shared"].as_bool() != Some(true)).collect();
+        let all_hidden = !own.is_empty()
+            && own.iter().all(|r| r["hidden"].as_bool() == Some(true));
+        verdict.push((s, all_hidden));
+    }
+    for it in arr.iter_mut() {
+        if it["scope"].as_str() == Some("account") {
+            continue;
+        }
+        let store = it["product"].as_str().unwrap_or("").to_string();
+        let hidden = verdict
+            .iter()
+            .find(|(s, _)| *s == store)
+            .map(|(_, h)| *h)
+            .unwrap_or(false);
+        if let Some(o) = it.as_object_mut() {
+            if hidden {
+                o.insert("all_hidden".into(), json!(true));
+            } else {
+                o.remove("all_hidden");
+            }
+        }
+    }
+}
+
+/// 隐藏 / 恢复一个账号（她 2026-11-12）。只写驾驶舱自己的账号卡记录：
+/// 隐藏的号不查状态、不自动签到、不计入统计，签到页里默认淡出成灰色；
+/// 档案目录、登录包、换号记录一概不动，所以随时能原地恢复。
+/// 缓存与落盘快照一起改，界面下一次轮询就是新样子，不必等一轮网络。
+pub fn set_account_hidden(app_id: &str, store: &str, name: &str, hide: bool) -> Value {
+    if app_id.is_empty() || name.is_empty() || store.is_empty() {
+        return json!({ "ok": false, "msg": "没说要隐藏哪个账号" });
+    }
+    // 整机一份登录态的产品（Trae CN / MiniMax / AStudio…）没有"这个号自己的签到"可言，
+    // 藏掉账号行只会把换号入口一起藏了。真要让那家不签，关它的「自动领」就行。
+    if !per_account(store) {
+        return json!({ "ok": false,
+            "msg": "这个产品的登录态是整机一份，藏账号没意义：要停就取消它那一行的「自动领」" });
+    }
+    if let Err(e) = crate::registry::set_instance_hidden(app_id, name, hide) {
+        return json!({ "ok": false, "msg": e });
+    }
+    {
+        let mut g = CACHE.lock().unwrap();
+        if let Some(v) = g.as_mut() {
+            // 缓存里没有 items（刚开机还没查过）就等下一轮重查，别在空值上取下标
+            if v.get("items").map(|x| x.is_array()).unwrap_or(false)
+                && mark_hidden(&mut v["items"], store, name, hide)
+            {
+                sync_all_hidden(&mut v["items"]);
+            }
+        }
+    }
+    {
+        let _guard = LEDGER_WRITE.lock().unwrap();
+        let mut st = load_state();
+        // 落盘快照同样只在真有 items 时才改（首装机器上 last 是空的）
+        if st["last"].get("items").map(|x| x.is_array()).unwrap_or(false) {
+            let mut last = st["last"].clone();
+            if mark_hidden(&mut last["items"], store, name, hide) {
+                sync_all_hidden(&mut last["items"]);
+                st["last"] = last;
+                save_state(&st);
+            }
+        }
+    }
+    json!({
+        "ok": true, "hidden": hide,
+        "msg": if hide {
+            format!("「{name}」已隐藏：这个号不再查状态、不自动签到，也不计入统计；随时可以恢复")
+        } else {
+            format!("「{name}」已恢复：下一轮刷新会读回它自己的状态")
+        },
+    })
+}
+
 /// 只重查一家（或一个账号），把结果并进缓存，**不动其它行**。
 /// 她 2026-10-17 要的：只签到了一个的时候自己点一次刷新，不要为了一行去问六家、等半天。
 pub fn refresh_one(store: &str, acct: Option<(&str, &str)>) -> Value {
@@ -855,6 +1078,7 @@ pub fn refresh_one(store: &str, acct: Option<(&str, &str)>) -> Value {
             }
         }
     }
+    soften_item(&mut item);
     apply_workbuddy_status(&mut item, &load_state());
     // 并进缓存：只换掉同一条，别的行原样留着。**不动 fetched_at**——
     // 那是"整张表最后一次查于"，动它会让别的行看起来也刚查过。
@@ -897,6 +1121,17 @@ pub fn claim(store: &str, acct: Option<(&str, &str)>) -> Value {
             None => return json!({"ok": false, "result": {"error": "当前登录身份没有对应的账号卡片，未签到"}}),
         }
     } else { acct.filter(|_| per_account(store)) };
+    // 被隐藏的号不签（她 2026-11-12）。账号行本来就不会给出领取按钮，这条防的是"从产品行
+    // 绕过去"——产品行签的是本机现在登着的那个号，而它可能正是被藏起来的那一个。
+    if let Some((app, name)) = acct {
+        if crate::registry::find_instance(app, name)
+            .map(|m| m["hidden"].as_bool() == Some(true))
+            .unwrap_or(false)
+        {
+            return json!({"ok": false, "result": {
+                "error": "这个号已隐藏：先在签到页把它「恢复」出来再签"}});
+        }
+    }
     if store == "workbuddy-intl" {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let key = format!("{store}@{}", acct.map(|(_, n)| n).unwrap_or(""));
@@ -1555,6 +1790,8 @@ pub fn for_instance(app_id: &str, name: &str) -> Value {
             // 这次没读到（空列表 / 没拿到设备令牌）：卡片角标要写"没读到"，
             // 不能落到下面的 unknown——那是"厂商没给"，跟"我们没问出来"是两件事
             else if it["unreadable"].as_bool() == Some(true) { "unreadable" }
+            // 这台机器还没登录那个号：卡片角标写「未登录」，不是「状态未知」（后者像读失败了）
+            else if it["need_login"].as_bool() == Some(true) { "unlogged" }
             else if it["activity_on"].as_bool() == Some(false) { "off" }
             else { "unknown" },
         "reward": it["reward"], "streak": it["streak"],
@@ -1614,6 +1851,8 @@ pub fn tick(app: &tauri::AppHandle) {
             .iter()
             .filter(|it| {
                 it["scope"].as_str() == Some("account")
+                    // 隐藏的号不算"这家有账号行"：它不参与领取，产品行也别为它让位
+                    && it["hidden"].as_bool() != Some(true)
                     && it["product"]
                         .as_str()
                         .map(|s| per_account(s))
@@ -1621,6 +1860,20 @@ pub fn tick(app: &tauri::AppHandle) {
                     && !it["account"].as_str().unwrap_or("").is_empty()
             })
             .filter_map(|it| it["product"].as_str())
+            .collect();
+        // 被隐藏的账号卡清单：产品行领的是"本机现在登着的那个号"，那个号被隐藏了，
+        // 这一行也不该再替它签（否则藏起来的号照样天天被领一份）。
+        let hidden_accts: Vec<(String, String)> = items
+            .iter()
+            .filter(|it| {
+                it["scope"].as_str() == Some("account") && it["hidden"].as_bool() == Some(true)
+            })
+            .filter_map(|it| {
+                Some((
+                    it["product"].as_str()?.to_string(),
+                    it["account"].as_str()?.to_string(),
+                ))
+            })
             .collect();
         // (键, 产品, 账号, 最后一次败因)：失败计数与「停止重试」在循环后一次落盘
         let mut failures: Vec<(String, String, String, String)> = Vec::new();
@@ -1631,6 +1884,22 @@ pub fn tick(app: &tauri::AppHandle) {
                 None => continue,
             };
             let scope = it["scope"].as_str().unwrap_or("product");
+            // 隐藏的行：不查、不领；名下账号卡全藏的产品行同理
+            if it["hidden"].as_bool() == Some(true) || it["all_hidden"].as_bool() == Some(true) {
+                continue;
+            }
+            if scope != "account" {
+                let cur = it["ledger_account"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| it["account"].as_str().filter(|s| !s.is_empty()))
+                    .unwrap_or("");
+                if !cur.is_empty()
+                    && hidden_accts.iter().any(|(s, n)| s == store && n == cur)
+                {
+                    continue;
+                }
+            }
             let per_acct_row = acct_stores.contains(&store);
             if scope != "account" && per_acct_row {
                 // 名下有账号行时让位——但仅当当前登录号自己就有账号行（有它自己的登录包）。
@@ -1757,7 +2026,10 @@ pub fn tick(app: &tauri::AppHandle) {
     let pending: Vec<String> = items
         .iter()
         .filter(|it| {
-            it["claimable"].as_bool().unwrap_or(false)
+            // 隐藏的号不催：她 2026-11-12 把它们藏起来，正是为了不再被"今天还没领"点一次
+            it["hidden"].as_bool() != Some(true)
+                && it["all_hidden"].as_bool() != Some(true)
+                && it["claimable"].as_bool().unwrap_or(false)
                 && !mute.get(it["product"].as_str().unwrap_or("")).and_then(|v| v.as_bool()).unwrap_or(false)
         })
         .map(|it| {
@@ -1814,6 +2086,66 @@ mod tests {
         let out = filter_items(items, &|s| s == "workbuddy");
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|x| x["product"] == "workbuddy"));
+    }
+
+    /// 隐藏一个账号：标记落在它自己那一行、状态清空；两个号都藏了，产品行标 all_hidden；
+    /// 恢复要把标记摘掉并写回"查询中"，别让人看见隐藏前的旧状态。
+    #[test]
+    fn hiding_an_account_marks_the_row_and_the_product() {
+        use super::*;
+        let mut items = json!([
+            {"product": "workbuddy-intl", "scope": "product", "account": "A"},
+            {"product": "workbuddy-intl", "scope": "account", "account": "A", "claimable": true},
+            {"product": "workbuddy-intl", "scope": "account", "account": "B"}
+        ]);
+        let kids = |v: &Value| v.as_array().unwrap()[1..].to_vec();
+        assert!(!all_accounts_hidden(&kids(&items)));
+
+        assert!(mark_hidden(&mut items, "workbuddy-intl", "A", true));
+        sync_all_hidden(&mut items);
+        assert_eq!(items[1]["hidden"], json!(true));
+        assert_eq!(items[1]["claimable"], json!(false), "藏起来的号不该还挂着可领");
+        assert!(items[0].get("all_hidden").is_none(), "还剩一个号没藏，产品行照旧");
+
+        assert!(mark_hidden(&mut items, "workbuddy-intl", "B", true));
+        sync_all_hidden(&mut items);
+        assert_eq!(items[0]["all_hidden"], json!(true), "两个号都藏了就得把整家标出来");
+        assert!(all_accounts_hidden(&kids(&items)));
+
+        assert!(mark_hidden(&mut items, "workbuddy-intl", "A", false));
+        sync_all_hidden(&mut items);
+        assert!(items[1].get("hidden").is_none(), "恢复要真的摘掉标记");
+        assert!(items[0].get("all_hidden").is_none());
+        assert_eq!(items[1]["pending"], json!(true), "恢复后先写查询中，不沿用旧状态");
+
+        assert!(!mark_hidden(&mut items, "qoder-cn", "nope", true), "找不到的号不能算改成功");
+
+        // 整机一份登录态的产品（shared 占位行）不参与"全隐藏"判定：藏了它也不该让产品行停下
+        let shared = vec![json!({"scope": "account", "shared": true, "hidden": true})];
+        assert!(!all_accounts_hidden(&shared));
+    }
+
+    /// 「没找到登录态 <路径>」是"还没登录"，不该画成红字报错；真错误不能被这条吞掉。
+    #[test]
+    fn missing_login_becomes_a_state_not_an_error() {
+        use super::*;
+        let mut items = json!([
+            {"product": "workbuddy-intl", "scope": "product",
+             "error": "没找到登录态 C:\\Users\\x\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop-ai.info（该版本可能没在这台机器登录过）"},
+            {"product": "qoder-cn", "scope": "product", "error": "接口 500"},
+            {"product": "minimax", "scope": "product", "error": "没找到可领的活动"}
+        ]);
+        soften_missing_login(&mut items);
+        assert!(items[0].get("error").is_none(), "没登录不该继续按错误报");
+        assert_eq!(items[0]["need_login"], json!(true));
+        assert_eq!(items[0]["claimable"], json!(false));
+        assert!(
+            items[0]["note"].as_str().unwrap_or("").contains("登录态"),
+            "原来找的路径要留在说明里，别彻底丢掉"
+        );
+        assert_eq!(items[1]["error"], json!("接口 500"), "真错误不能被吞");
+        assert_eq!(items[2]["error"], json!("没找到可领的活动"), "「没找到活动」跟登录无关");
+        assert!(!is_missing_login("登录态读坏了：解不开"));
     }
 
     /// 占位行也不能把本机没装的产品全铺出来。

@@ -47,6 +47,7 @@ mod proxy_ledger;
 mod qproxy;
 mod qwbridge;
 mod quota;
+mod quota_ledger;
 mod registry;
 mod remote;
 mod remote_tunnel;
@@ -161,6 +162,9 @@ fn main() {
             // 保管箱先解锁到内存（没设主密码就是 DPAPI 直接解），再把散落的明文收进去
             secrets::load();
             commands::sweep_plaintext();
+            // 官网取数入口删掉的产品（WorkBuddy），档案里残留的「去官网登录」提示
+            // 会指着一颗不存在的按钮，启动时清掉
+            webquota::sweep_stale_web_errors();
             if let Err(error) = zcode::migrate_registered() { lifecycle::note(&format!("ZCode 账号登记：{error}")); }
             // 开机先把「换号记录 vs 磁盘上的 junction」对一遍：两者脱节的后果不是显示错，
             // 是目标程序直接起不来（默认入口指着已删除的账号目录）。放在建托盘之前，
@@ -522,6 +526,29 @@ fn checkin_loop(app: tauri::AppHandle) {
     }
 }
 
+fn auto_quota_bound(app_id: &str, meta: &serde_json::Value) -> String {
+    let bound = meta["quota_user_id"].as_str().unwrap_or("").trim();
+    if !bound.is_empty() { return bound.to_string(); }
+    // 旧版妙手解析漏了 data，覆盖掉绑定；已保存的数字会话格仍是原账号 ID。
+    // 只恢复这类旧官网档案，取回身份必须与这个 ID 相等后才允许写入。
+    let slot = meta["quota_web_slot"].as_str().unwrap_or("");
+    if app_id == "catpaw" && meta["quota_detail_source"] == "web"
+        && !slot.is_empty() && slot.bytes().all(|b| b.is_ascii_digit()) {
+        return slot.to_string();
+    }
+    String::new()
+}
+
+#[test]
+fn legacy_catpaw_binding_is_scoped_to_saved_numeric_web_slot() {
+    let old = serde_json::json!({"quota_detail_source":"web", "quota_web_slot":"12345"});
+    assert_eq!(auto_quota_bound("catpaw", &old), "12345");
+    assert_eq!(auto_quota_bound("qoder", &old), "");
+    assert_eq!(auto_quota_bound("catpaw", &serde_json::json!({"quota_web_slot":"12345"})), "");
+    assert_eq!(auto_quota_bound("catpaw", &serde_json::json!({"quota_detail_source":"web", "quota_web_slot":"account-name"})), "");
+    assert_eq!(auto_quota_bound("catpaw", &serde_json::json!({"quota_user_id":"67890", "quota_detail_source":"web", "quota_web_slot":"12345"})), "67890");
+}
+
 fn autofetch_once() {
     for app_def in registry::all_apps() {
         // 能本机直读的产品优先走本机：不联网、拿到的就是客户端里那个真数
@@ -530,7 +557,7 @@ fn autofetch_once() {
                 // 只有"累计已用"的产品不进后台自动刷：它是全机共享的，自动写会把
                 // 同一个累计数灌进每个账号档案，多账号用户会被误导。要点就点。
                 let data_dir = meta["data_dir"].as_str().unwrap_or("");
-                let bound = meta["quota_user_id"].as_str().unwrap_or("").trim().to_string();
+                let bound = auto_quota_bound(&app_def.id, &meta);
                 // 没绑定过的档案不自动写：否则本机当前登录的那个号会被灌进所有空档案，
                 // 看起来像"每个账号余额都一样"。首次绑定必须由用户手动点「从本机读取」。
                 if bound.is_empty() {

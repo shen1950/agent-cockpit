@@ -5017,6 +5017,99 @@ def _wb_pack_accounts(base, token, uid):
     return rows
 
 
+def _wb_fetch_expired(base, token, uid, path):
+    """官网「已过期」页的同一条接口，客户端凭据直读（2026-11-17 实测 225 条全量）。
+
+    关键在参数：只改 Status 不够，必须带 OnlyValidPeriod=False、OnlyExpiredPeriod=True、
+    NeedActualCycleCapacityUsed=True（官网枚举 0=valid 1=refund 2=expired 3=usedUp）。
+    完整翻页：PageSize 上限 200，按 TotalCount 收口。失败返回 []，不阻断余额读取。
+    """
+    rows = []
+    for page in range(1, 21):
+        body = json.dumps({
+            "PageNumber": page, "PageSize": 200, "PackageCodes": WORKBUDDY_PACK_CODES,
+            "Status": [2, 3], "OnlyValidPeriod": False, "IsDisplayTotalInfo": True,
+            "OnlyExpiredPeriod": True, "NeedActualCycleCapacityUsed": True,
+        }).encode()
+        got = None
+        for _attempt in (1, 2):
+            req = UrlRequest(base + path, data=body, headers={
+                "Content-Type": "application/json", "Accept": "application/json",
+                "Authorization": f"Bearer {token}", "X-User-Id": uid,
+                "User-Agent": "WorkBuddy/1.0",
+            })
+            try:
+                with direct_open(req, timeout=20) as r:
+                    if r.status != 200:
+                        continue
+                    got = json.loads(r.read().decode("utf-8", "replace"))
+                break
+            except Exception:      # noqa: BLE001  历史读不到不影响当前余额
+                continue
+        if got is None:
+            break
+        d = got.get("data") or {}
+        accs = d.get("Accounts") or []
+        rows.extend(accs)
+        try:
+            total_count = int(d.get("TotalCount") or 0)
+        except (TypeError, ValueError):
+            total_count = 0
+        if not accs or (total_count and len(rows) >= total_count):
+            break
+    return rows
+
+
+def _wb_expired_accounts(base, token, uid):
+    rows = []
+    for path, paid in (("/billing/meter/get-user-resource-free-packages", False),
+                       ("/billing/meter/get-user-resource-paid-packages", True)):
+        for a in _wb_fetch_expired(base, token, uid, path):
+            a["_paid"] = paid
+            rows.append(a)
+    return rows
+
+
+def _wb_expired_items(accounts):
+    """历史包 → 逐笔「已过期」明细。字段口径与活笔不同（2026-11-17 实测）：
+
+    历史包的当前周期字段（CycleCapacity*）大多已清零，总额要读 CapacitySizePrecise，
+    真实历史已用要读 ActualCycleCapacityUsed——套活笔的解析器会把总额/用量全读成 0。
+    身份用 ResourceId（225 条各不相同），台账据此认人，不与活笔混淆。
+    """
+    out = {}
+    for a in accounts:
+        code = a.get("PackageCode") or ""
+        total = _wb_num(a.get("CapacitySizePrecise") or a.get("CapacitySize"))
+        if total <= 0:
+            continue
+        used = _wb_num(a.get("ActualCycleCapacityUsed"))
+        if used <= 0:
+            used = _wb_num(a.get("CapacityUsedPrecise") or a.get("CapacityUsed"))
+        left = max(total - used, 0.0)
+        grant = ""
+        for at in a.get("AccountAttributes") or []:
+            if at.get("Key") == "grantReason":
+                grant = str(at.get("Value") or "")
+                break
+        out.setdefault(code, []).append({
+            "label": a.get("PackageName") or code or "积分",
+            "detail": grant or "已过期（官方历史）",
+            "total": total,
+            "used": used,
+            "left": left,
+            "voided": left,
+            # 历史笔的到期日用 ExpiredTime（真实过期时刻）优先：CycleEndTime 是
+            # 周期结束日，已用完的周期包它可能晚于真实过期日，拿去判过期会虚增 live
+            "expires_on": dt_text(_wb_ms(a.get("ExpiredTime")) or _wb_cycle_end(a)),
+            "unit": a.get("CapacityUnit") or "credits",
+            "granted_on": dt_text_full(int(a.get("CreateTime") or 0)),
+            "resource_id": str(a.get("ResourceId") or ""),
+            "expired": True,
+        })
+    return out
+
+
 def _wb_cycle_end(a):
     """这一笔哪天作废。CycleEndTime = 本轮周期结束（循环包到这里未用的额度就没了）；
     DeductionEndTime = 权益扣减窗口结束（循环包给的是 2034 那种哨兵值）。
@@ -5071,6 +5164,12 @@ def _wb_pack_items(accounts):
             "left": remain,
             "expires_on": dt_text(_wb_cycle_end(a)),
             "unit": a.get("CapacityUnit") or "credits",
+            # 这一笔什么时候到账：CreateTime 是毫秒时间戳（实测 1792281959000 →
+            # 2026-10-18 08:05）。以前完全没带出去，界面上那枚「到账」标签就一直空着。
+            # CycleStartTime 有时是字符串、有时是 0，所以优先用 CreateTime。
+            "granted_on": dt_text_full(int(a.get("CreateTime") or 0)),
+            # 厂商资源 ID：台账的稳定身份（活笔过期后转进历史接口，靠它认回同一笔）
+            "resource_id": str(a.get("ResourceId") or ""),
         })
     return out
 
@@ -5111,26 +5210,54 @@ def workbuddy_full(intl=False, profile=None, live=True):
     accs = _wb_pack_accounts(_wb_base(login["domain"]), login["token"], login["uid"])
     pack_exp = _wb_pack_expiry(accs)
     pack_items = _wb_pack_items(accs)
+    # 过期历史：同一条接口加官网「已过期」页的参数，客户端凭据直读、完整翻页
+    # （2026-11-17 实测 225 条，ResourceId 各不相同）。读不到只影响历史栏，余额不受牵连。
+    hist_accs = _wb_expired_accounts(_wb_base(login["domain"]), login["token"], login["uid"])
+    hist_items = _wb_expired_items(hist_accs)
+    hist_cat = {}
+    for a in hist_accs:
+        code = a.get("PackageCode") or ""
+        if code:
+            hist_cat.setdefault(code, _wb_category(a))
     cat_by_code = {}
     for a in accs:
         code = a.get("PackageCode") or ""
         if code:
             cat_by_code.setdefault(code, _wb_category(a))
     dedicated = []
+    seen_codes = set()
+    # 活笔与历史笔按 ResourceId 去重：万一活接口也回了同一资源，不许出重影
+    live_rids = {i.get("resource_id") for its in pack_items.values() for i in its
+                 if i.get("resource_id")}
     for p in packs:
         t = float(p.get("CycleTotalCapacity") or 0)
         r = float(p.get("CycleRemainCapacity") or 0)
         u = float(p.get("CycleUsedCapacity") or 0)
-        if t <= 0 and u <= 0:
-            continue
         code = p.get("PackageCode") or ""
+        seen_codes.add(code)
+        items = pack_items.get(code, []) + [
+            i for i in hist_items.get(code, []) if i.get("resource_id") not in live_rids]
+        if t <= 0 and u <= 0 and not items:
+            continue
         dedicated.append({
             "name": code[:24] or "套餐",
             "total": t, "used": u, "remaining": r, "unit": "credits",
             # 该包「最近会作废的一笔」的到期日（毫秒）；取不到 = 0 → 界面显示「未给出」
             "expiresAt": pack_exp.get(code, 0),
             "category": cat_by_code.get(code, "平台奖励积分"),
-            "items": pack_items.get(code, []),
+            "items": items,
+        })
+    # 历史里有、当前 summary 已不再返回的包码：单独立一条只有过期明细的档，
+    # 总额/剩余记 0（额度早已作废），历史笔照常进「已过期」页签
+    for code, items in hist_items.items():
+        if code in seen_codes:
+            continue
+        dedicated.append({
+            "name": code[:24] or "积分",
+            "total": 0, "used": 0, "remaining": 0, "unit": "credits",
+            "expiresAt": 0,
+            "category": hist_cat.get(code, "平台奖励积分"),
+            "items": items,
         })
     shaped = {
         "userId": login["uid"],
@@ -5836,11 +5963,14 @@ def _astudio_allocate(grants, debits, now_ms):
       按 FIFO（先到账先扣）推出来的是 2026-11-03T00:01:08，差 6 天。
       也就是说厂商确实是先扣快到期的那个包。
 
-    扣款时**不看包是否已过期**：厂商扣的是「当前还剩着余额的最早到期那个包」，
-    过期是另一件事。实测 2026-10-31 那批 757 分消耗，扣掉的是 10-02 到账、
-    11-02 到期的那几个包——它们在消耗发生时都还没过期，随后才到期作废。
-    若按「消耗当时已过期就跳过」来摊，757 会扣到更晚到账的包上，
-    未过期余额就凑不出官方的 8343。
+    扣款按「消耗发生那一刻」判断包的生死，而不是按「现在」：
+      - 消耗时包还活着（到期时间晚于消耗时间）：照扣，哪怕它随后才到期作废。
+        实测 2026-10-31 那批 757 分扣的是 10-02 到账、11-02 到期的包——
+        消耗发生时它们都还没过期，随后才作废，这样摊才对得上官方 8343。
+      - 消耗时包已过期（到期时间不晚于消耗时间）：跳过。过期那一刻没用完的
+        余额已被官方作废、且不记进消耗流水，这笔钱再也扣不到；若仍把它当成
+        「还能扣的钱」，会把本该扣在活包上的消耗错扣到死包上，活包剩余虚高。
+        真机 2026-11-13 通用档差 +18 正是这个：11 个过期包共作废 18 分。
 
     过期作废：官方余额只算**没过期**的包（实测星火档流水净额 61162，
     官方余额 35000，差额 26162 正是已过期那几包被作废掉的）。
@@ -5875,6 +6005,9 @@ def _astudio_allocate(grants, debits, now_ms):
                 continue
             if (g.get("_grant_ms") or 0) > t_ms:
                 continue          # 这一笔消耗发生时这个包还没到账
+            exp = g.get("_exp_ms") or 0
+            if exp and exp <= t_ms:
+                continue          # 消耗发生时这个包已过期作废，扣不到它头上
             take = min(need, left[i])
             left[i] -= take
             used[i] += take
@@ -6085,18 +6218,27 @@ def astudio_credit(profile=None, live=True):
                     continue
                 left_v = alloc["left"].get(i, 0.0)
                 used_v = alloc["used"].get(i, 0.0)
-                # 过期的包剩余已被官方作废（流水里没有 EXPIRE 记录，作废不记流水），
-                # 显示成「过期但还剩 N」是在画一笔不存在的钱——归零，used 补上。
+                # 过期那一刻还没花掉的部分被官方作废（流水里不记 EXPIRE，作废不记流水）。
+                # 以前把这部分并进 used，进度条就画成满格——等于宣称这一包全用完了，
+                # 而她明明记得"没用完就过期了"。现在分开记：used 只放真实消耗，
+                # 作废的剩余单独标 voided，明细里写「过期作废 N」。
+                voided_v = 0.0
                 if g["ms"] and g["ms"] <= now_ms:
-                    used_v += left_v
-                    left_v = 0.0
+                    voided_v = left_v
                 g["left"] = round(left_v, 3)
                 g["used"] = round(used_v, 3)
+                if voided_v:
+                    g["voided"] = round(voided_v, 3)
         groups.append({"name": gname, "scope": scope, "unit": "积分",
                        "total": gt, "used": max(gt - gr, 0.0), "remaining": gr,
                        "expiresAt": min((g["ms"] for g in live_usable), default=0),
-                       "items": [{k: v for k, v in g.items()
-                                  if k not in ("asset", "ms", "_exp_ms", "_grant_ms")}
+                       "items": [{**{k: v for k, v in g.items()
+                                     if k not in ("asset", "ms", "_exp_ms", "_grant_ms")},
+                                  # 每一笔什么时候到账（流水 createTime）：界面上那枚小标签。
+                                  # 给**完整时刻**（厂商给到秒就保留到秒），不要截成 [:10] ——
+                                  # 同一天签到的几笔光看日期分不出先后。
+                                  "granted_on": (dt_text_full(g.get("_grant_ms"))
+                                                 if g.get("_grant_ms") else "")}
                                  for g in items]})
 
     total = sum(g["total"] for g in groups)
@@ -6199,14 +6341,17 @@ def _minimax_refresh(auth_path, state_path, key, rec, gen):
 
 
 
-@contextlib.contextmanager
 def _minimax_refresh_lock(auth_path):
     """Serialize AgentHub processes while refreshing the rotating token.
 
     The lock is released by the OS even if the process terminates. The official
     client does not use this lock, so avoid refreshing concurrently with it.
     """
-    lock_path = auth_path.with_name("agenthub-refresh.lock")
+    return _file_transaction_lock(auth_path.with_name("agenthub-refresh.lock"))
+
+
+@contextlib.contextmanager
+def _file_transaction_lock(lock_path):
     with open(lock_path, "a+b") as lock:
         lock.seek(0)
         if os.name == "nt":
@@ -6218,7 +6363,7 @@ def _minimax_refresh_lock(auth_path):
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
-                        raise RuntimeError("等待 MiniMax 令牌刷新锁超时")
+                        raise RuntimeError(f"等待文件锁超时：{lock_path.name}")
                     time.sleep(0.1)
             try:
                 yield
@@ -6366,8 +6511,12 @@ def minimax_credit(profile=None, live=True):
         g["items"].append({"label": p["name"], "total": p["total"], "used": p["used"],
                            "left": p["remaining"], "unit": "credits",
                            "expires_on": dt_text(p["expiresAt"]),
-                           "detail": (dt_text(p["grantedAtMs"])[:10] + " 到账")
-                                     if p["grantedAtMs"] else ""})
+                           # 到账时刻单独给一个字段（界面上是一枚小标签），别再塞进 detail：
+                           # detail 那一栏留给"这笔是什么"这类说明。
+                           # 给完整时刻（到秒），别截成 [:10]：MiniMax 一天可能签两次，
+                           # 只有日期就分不出哪笔先到
+                           "granted_on": dt_text_full(p["grantedAtMs"]) if p["grantedAtMs"] else "",
+                           "detail": ""})
         if p["expiresAt"] > now_ms and p["remaining"] > 0:
             g["ms"].append(p["expiresAt"])
     groups = []
@@ -6521,6 +6670,106 @@ def _trae_ent_date(ent_id):
     return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
 
 
+def _trae_exp_minus30(exp_ms):
+    """从到期时间往回推 30 天，当作到账时间（Trae 的签到/邀请积分有效期固定 30 天）。
+
+    实测依据：有效笔那批的 `entitlement_base_info.start_time` 与 `expire_time`
+    正好差 30×86400 秒（2026-11-11 18:26 到账 → 2026-12-11 18:26 到期）。
+    expired_ents 只给 expire_time_ms，没有 start_time，所以只能这么推。
+    ⚠ 这是推算值，调用方必须标 `granted_est`，界面上要写"约"。
+    """
+    if not exp_ms:
+        return ""
+    return dt_text(int(exp_ms) - 30 * 86400 * 1000)
+
+
+def _trae_granted(p):
+    """这一笔什么时候到账。
+
+    优先 `entitlement_base_info.start_time`（秒级，实测 1794385596 →
+    2026-11-11 18:26，比 id 里抠出来的日期精确得多）；
+    老数据没给 start_time 才退回到 entitlement_id 里的日期（只有日，没有时分）。
+    """
+    st = int(((p.get("entitlement_base_info") or {}).get("start_time")) or 0)
+    if st > 0:
+        return dt_text_full(st * 1000)
+    return _trae_ent_date((p.get("entitlement_base_info") or {}).get("entitlement_id"))
+
+
+TRAE_EXPIRED_ENTS = "/trae/api/v2/pay/expired_ents"
+
+# expired_ents 只给「奖励名」，有效笔那批给的是「档名」——两套叫法得对上，
+# 外层档名一律照**官网「奖励积分」那一栏**的四个名字，不许多出一档
+# （2026-11-17 用户：「外层积分包完全按照 TraeCN 显示的这四种记录」）。
+# 外层档名照官网「奖励积分」那栏显示的分类。2026-11-18 用户拍板：**动态分类**，
+# 不固定死四档——真实出现「原速通次数兑换」就加第五档，以后出现「学生认证」等
+# 就再加。内层保留官方原名；只有来源名称缺失时才暂放「其他积分」。
+TRAE_CANON_ORDER = ["每日签到", "每月登录赠送", "TraeCode 邀请好友奖励", "积分返还", "原速通次数兑换"]
+
+# 两套接口的叫法都不一样，逐个对上：
+#   有效笔那批用 group_name：每日签到 / 每月登录积分 / 邀请好友奖励 / 平台活动
+#   过期那批用 name      ：签到奖励 / TraeCode 邀请好友奖励 / 原速通次数兑换
+# 实测（2026-11-18 探针）：有效笔 group_name「邀请好友奖励」的 display_desc 就是
+# 「TraeCode 邀请好友奖励」——同一档，合并有据。
+TRAE_GROUP_ALIAS = {
+    "签到奖励": "每日签到",
+    "每日签到奖励": "每日签到",
+    "每日签到": "每日签到",
+    "每月登录积分": "每月登录赠送",
+    "每月登录赠送": "每月登录赠送",
+    "邀请好友奖励": "TraeCode 邀请好友奖励",
+    "TraeCode 邀请好友奖励": "TraeCode 邀请好友奖励",
+    "TraeCode邀请好友奖励": "TraeCode 邀请好友奖励",
+    "平台活动": "积分返还",
+    "积分返还": "积分返还",
+    # 速通次数换回来的积分是独立来源，自成一档（用户 2026-11-18 明确要求，
+    # 不再硬塞进「积分返还」）
+    "原速通次数兑换": "原速通次数兑换",
+}
+
+
+def _trae_group_of(name, merged=None):
+    """把来源名归一化到外层档名。
+
+    认得出的按别名表归并；认不出的**保留原名自成一档**（动态分类，
+    以后出现学生认证等真实来源就按数据增加）；只有名称缺失才放「其他积分」。
+    不再把未知类型默认塞进「积分返还」——那会丢掉真实来源。
+    """
+    name = str(name or "").strip()
+    if not name:
+        return "其他积分"
+    return TRAE_GROUP_ALIAS.get(name, name)
+
+
+def _trae_expired(host, token, uid):
+    """Trae 的**已过期**资源包（2026-11-17 挖到，官网用量页 JS 里的 GetExpiredEnts）。
+
+    `POST /trae/api/v2/pay/expired_ents`，body `{"Request": {}}` —— 不要分页参数，
+    带了也不变（实测 page_num / page / page_size 四种写法返回完全一致）。
+    返回 `expired_ent_list[]`：`credits_limit` / `used_credits_amount` / `expire_time_ms` / `name`。
+    实测 56 笔，最早到 2026-07，每笔带真实已用量（39.078 / 77.5016 / 100 …）。
+
+    ⚠ 这个接口只在**官网用量页**用到，客户端 `ide_user_ent_usage` 不返回过期包——
+      以前只翻客户端包，所以得出"平台没有历史接口"的错误结论。
+    ⚠ `used_credits_amount` 可能是 **None**（那笔一分没用就过期了），
+      不能当 0，要保留 None 让界面说"官方没给"。
+    """
+    body = json.dumps({"Request": {}}).encode()
+    req = UrlRequest(host.rstrip("/") + TRAE_EXPIRED_ENTS, data=body, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Cloud-IDE-JWT {token}",
+        "x-device-id": uid, "User-Agent": "Trae/1.0"})
+    try:
+        with direct_open(req, timeout=25) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:      # noqa: BLE001  拿不到过期明细不影响当前额度
+        return None, f"{type(e).__name__}: {e}"
+    lst = d.get("expired_ent_list")
+    if not isinstance(lst, list):
+        return None, "接口没返回 expired_ent_list"
+    return lst, None
+
+
 def _trae_shape(d, who, expires_at, host, auth_from):
     """把 Trae 额度响应整形成 Qoder 用量形状。
 
@@ -6542,7 +6791,9 @@ def _trae_shape(d, who, expires_at, host, auth_from):
         if limit <= 0:
             continue        # 「免费」那笔只有功能开关、没有额度，摊进来就是一行 0
         used = float((p.get("usage") or {}).get("credits_amount") or 0)
-        gname = p.get("group_name") or p.get("display_desc") or "其他积分"
+        # 档名一律归一化到官网那四个（group_name 给的是「每月登录积分」「邀请好友奖励」
+        # 「平台活动」，官网显示的是「每月登录赠送」「TraeCode 邀请好友奖励」「积分返还」）
+        gname = _trae_group_of(p.get("group_name") or p.get("display_desc") or "")
         g = merged.setdefault(gname, {"name": gname, "unit": "credits", "total": 0.0,
                                       "used": 0.0, "remaining": 0.0, "items": [], "ms": []})
         order.append(gname)
@@ -6552,17 +6803,108 @@ def _trae_shape(d, who, expires_at, host, auth_from):
         exp_ms = int(p.get("expire_time") or 0) * 1000
         ent = ebi.get("entitlement_id") or ""
         g["items"].append({
-            "label": p.get("display_desc") or gname,
+            # 内层保留**官方原名**（display_desc 优先，没有才用 group_name）：
+            # 外层档名是归类用的，内层要能看出这一笔真实叫什么（2026-11-18 用户要求）。
+            "label": str(p.get("display_desc") or p.get("group_name") or gname).strip() or gname,
             "total": limit, "used": used, "left": max(limit - used, 0.0),
             "expires_on": dt_text(exp_ms), "unit": "credits",
-            "detail": (_trae_ent_date(ent) + " 到账") if _trae_ent_date(ent) else "",
+            "granted_on": _trae_granted(p),
+            "granted_src": "effective" if (p.get("entitlement_base_info") or {}).get("start_time") else "estimate",
+            # 厂商权益 ID：台账的稳定身份（过期后 expired_ents 不给 ID，
+            # 靠 到期+总额 签名认回这条记录）
+            "resource_id": str(ent),
+            "detail": "",
         })
         if exp_ms > now_ms and max(limit - used, 0.0) > 0:
             g["ms"].append(exp_ms)
+
+    # 已过期的笔：从官网那条 expired_ents 接口补回来。
+    #
+    # 两条规矩（2026-11-17 用户报"为什么有一个每日签到还有一个签到奖励、里面还重叠"）：
+    # ① **并进同名档，不许另开一档**：expired_ents 只给 `name`（「签到奖励」），而有效笔那批
+    #    用的是 `group_name`（「每日签到」）——同一个东西两个名字，照 name 建组就会长出
+    #    两档。这里把 name 映射回已有的组名（见 TRAE_GROUP_ALIAS），找不到才新开。
+    # ② **去重**：同一笔可能既在台账里（上一轮读到的）、又在 expired_ents 里。
+    #    按「总额 + 已用 + 到期」三元组认人，重复的跳过——否则 17 号那笔会出现两次。
+    exp_list, exp_err = _trae_expired(host, (d.get("_token") or ""), (d.get("_uid") or ""))
+    if exp_list:
+        def _key(total, used, exp):
+            return (round(total, 4), None if used is None else round(used, 4), exp)
+
+        overlaps = {}
+        for g in merged.values():
+            for i in g["items"]:
+                signature = (g["name"], _key(i.get("total") or 0, i.get("used"), i.get("expires_on") or ""))
+                overlaps.setdefault(signature, []).append(i)
+        for it in exp_list:
+            try:
+                limit = float(it.get("credits_limit") or 0)
+            except (TypeError, ValueError):
+                continue
+            if limit <= 0:
+                continue
+            raw_used = it.get("used_credits_amount")
+            # None 不等于 0：那笔一分没用就作废了，界面要说"官方没给"，不能写"已用 0"
+            used = None if raw_used is None else float(raw_used)
+            exp_ms = int(it.get("expire_time_ms") or 0)
+            exp_txt = dt_text(exp_ms)
+            gname = _trae_group_of(str(it.get("name") or "").strip(), merged)
+            matches = overlaps.get((gname, _key(limit, used, exp_txt)))
+            if matches:
+                matches.pop()["expired"] = True
+                continue
+            g = merged.setdefault(gname, {"name": gname, "unit": "credits", "total": 0.0,
+                                          "used": 0.0, "remaining": 0.0, "items": [], "ms": []})
+            order.append(gname)
+            item = {
+                # 内层保留官方原名（expired_ents 的 name），不改成组名——
+                # 「原速通次数兑换」「签到奖励」这些真实来源要看得见
+                "label": str(it.get("name") or "").strip() or gname,
+                "total": limit,
+                "used": used,
+                "left": None if used is None else max(limit - used, 0.0),
+                "expires_on": exp_txt, "unit": "credits",
+                # expired_ents 不给发放时间，只能从到期时间往回推：
+                # Trae 的签到/邀请积分有效期固定 30 天（有效笔那批实测 start_time 与
+                # expire_time 正好差 30×86400 秒），所以到账 ≈ 到期 − 30 天。
+                # 标 granted_src=estimate，界面写"约"，不冒充厂商给的时刻。
+                # ⚠ 兑换类积分有效期未必是 30 天，这个推算对它们只是粗估。
+                "detail": "已过期（官网 expired_ents）",
+                "expired": True,
+            }
+            if gname in ("每日签到", "TraeCode 邀请好友奖励"):
+                item.update(granted_on=_trae_exp_minus30(exp_ms), granted_est=True, granted_src="estimate")
+            # 已用为 None 时不能反推"剩余"，但可以确定"整笔都作废了"
+            if used is None:
+                item["voided"] = limit
+            else:
+                item["voided"] = max(limit - used, 0.0)
+            g["items"].append(item)
+
+    # 常见档按官网顺序排在前面（每日签到 / 每月登录赠送 / TraeCode 邀请好友奖励 /
+    # 积分返还 / 原速通次数兑换），动态新增的档跟在后面；没有记录的分类不占位置。
     groups = []
-    for gname in dict.fromkeys(order):
+    ordered = [n for n in TRAE_CANON_ORDER if n in merged]
+    ordered += [n for n in dict.fromkeys(order) if n not in ordered]
+    for gname in ordered:
         g = merged[gname]
         g["expiresAt"] = min(g.pop("ms"), default=0)
+        # 组层汇总只算效期内的笔：过期的额度已经作废，不能继续算在余额里
+        live = [i for i in g["items"] if not i.get("expired")]
+        if live:
+            g["total"] = sum(i["total"] for i in live)
+            g["used"] = sum(i["used"] for i in live if i.get("used") is not None)
+            g["remaining"] = sum(i["left"] for i in live if i.get("left") is not None)
+        else:
+            g.update(total=0, used=0, remaining=0)
+        g["live_count"] = len(live)
+        g["expired_count"] = len(g["items"]) - len(live)
+        if g["expired_count"] and exp_err:
+            g["expired_error"] = exp_err
+        # 过期那一栏按到期时间**倒序**（最新过期在最上），有效那一栏正序（最近到期在最上）。
+        # 界面两个页签共用一份 items，顺序在这里定好，UI 不再重排。
+        g["items"].sort(key=lambda i: str(i.get("expires_on") or ""),
+                        reverse=bool(g["expired_count"] and not g["live_count"]))
         groups.append(g)
     user_id = (who.get("userId") or who.get("id") or
                (d["user_entitlement_pack_list"][0].get("user_id") or "")
@@ -6609,6 +6951,10 @@ def trae_credit(profile=None, live=True):
             "error": f"服务端读不到（{live_err}）",
             "auth_from": login["from"], "auth_kind": "byteCrypto",
         }
+    # 过期明细要单独一条接口（expired_ents），凭证跟着主读数一起带进去
+    if isinstance(got, dict):
+        got["_token"] = login["token"]
+        got["_uid"] = login["user_id"]
     shaped = _trae_shape(got, login["who"], login["expires_at"], login["host"], login["from"])
     return {
         "data": shaped, "who": login["who"], "source": "server",
@@ -6723,10 +7069,19 @@ def cmd_trae(con, args):
 
 # ---------------------------------------------------------------------------
 # ZCode（智谱 GLM 编程助手，Electron）：凭据在 <数据根>/v2/credentials.json，
-#   值形如 enc:v1:<b64url(iv12)>.<b64url(tag16)>.<b64url(ct)>，AES-256-GCM。
-#   密钥纯本地派生：key = SHA256(env.ZCODE_CREDENTIAL_SECRET
-#     ?? "zcode-credential-fallback:{platform}:{homedir}:{username}")，
-#   不依赖 DPAPI、不需要抓包（逆向自 app.asar 的 createCredentialCipherProvider）。
+#   两种信封并存（均 AES-256-GCM，iv 12B + tag 16B + ct，逆向自 app.asar
+#   createSystemCredentialCipher）：
+#     enc:v1:<iv>.<tag>.<ct>
+#       密钥纯本地派生 = SHA256(env.ZCODE_CREDENTIAL_SECRET
+#       ?? "zcode-credential-fallback:{platform}:{homedir}:{username}")。
+#     enc:v2:<源>:<24位密钥指纹>:<iv>.<tag>.<ct>      ← 2026-11-12 版客户端起默认
+#       源 os  = 32 字节随机密钥寄存在系统凭据库；Windows 上条目名是
+#                "{sha256(realpath(credentials.json))}.ZCode Credential Encryption"，
+#                条目内容就是那 32 字节的 base64url 文本。
+#       源 env = SHA256(ZCODE_CREDENTIAL_SECRET 或同级 credential-secret 文件内容)。
+#       指纹 = SHA256(key).hexdigest()[:24]，先验指纹再解密，绝不瞎猜密钥。
+#   ⚠ enc:v2 的密钥不跟凭据文件走：把密文快照搬进临时/实例目录时，密钥仍在
+#     原路径那条系统凭据下，所以取密钥要允许「按指纹枚举」兜底。
 #   解出 zcodejwttoken 后调 GET {origin}/api/v1/zcode-plan/billing/balance?app_version=<ver>。
 #   ⚠ 服务端认来源头，其中 X-Device-Mid 是硬性必需：缺即 400 code:3001 parameter error，
 #   实测「只带 Authorization + X-Device-Mid」就能 200；deviceMid 在
@@ -6749,6 +7104,9 @@ def _zcode_root(profile=None):
     return Path(os.environ.get("ZCODE_HOME") or (Path.home() / ".zcode"))
 
 
+ZCODE_KEYRING_SUFFIX = ".ZCode Credential Encryption"
+
+
 def _zcode_key():
     """复刻 defaultCredentialSecret：环境变量优先，否则用「平台:主目录:用户名」拼串。"""
     secret = os.environ.get("ZCODE_CREDENTIAL_SECRET") or (
@@ -6758,12 +7116,154 @@ def _zcode_key():
     return hashlib.sha256(secret.encode("utf-8")).digest()
 
 
-def _zcode_decrypt(blob, key):
-    """解 enc:v1 信封（AES-256-GCM，iv 12B + tag 16B + ct）。非 enc:v1 原样返回。"""
-    prefix = "enc:v1:"
-    if not isinstance(blob, str) or not blob.startswith(prefix):
+def _zcode_credential_structs():
+    """Windows 凭据管理器的 CREDENTIAL 布局；非 Windows 返回 None。"""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    import ctypes.wintypes as wt
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wt.DWORD), ("dwHighDateTime", wt.DWORD)]
+
+    class CREDENTIAL(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wt.DWORD), ("Type", wt.DWORD), ("TargetName", wt.LPWSTR),
+            ("Comment", wt.LPWSTR), ("LastWritten", FILETIME),
+            ("CredentialBlobSize", wt.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_char)),
+            ("Persist", wt.DWORD), ("AttributeCount", wt.DWORD),
+            ("Attributes", ctypes.c_void_p), ("TargetAlias", wt.LPWSTR),
+            ("UserName", wt.LPWSTR)]
+    return ctypes, wt, CREDENTIAL
+
+
+def _zcode_cred_read(target):
+    """读一条通用凭据的密码文本；不存在/读不了都返回 None。"""
+    built = _zcode_credential_structs()
+    if built is None:
+        return None
+    ctypes, wt, CREDENTIAL = built
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.CredReadW.argtypes = [wt.LPWSTR, wt.DWORD, wt.DWORD,
+                                 ctypes.POINTER(ctypes.POINTER(CREDENTIAL))]
+    advapi.CredReadW.restype = wt.BOOL
+    advapi.CredFree.argtypes = [ctypes.c_void_p]
+    pointer = ctypes.POINTER(CREDENTIAL)()
+    if not advapi.CredReadW(target, 1, 0, ctypes.byref(pointer)):
+        return None
+    try:
+        held = pointer.contents
+        raw = ctypes.string_at(held.CredentialBlob, held.CredentialBlobSize)
+        return raw.decode("utf-16-le")
+    except Exception:           # noqa: BLE001 - 绝不回显密码内容
+        return None
+    finally:
+        advapi.CredFree(pointer)
+
+
+def _zcode_cred_targets():
+    """系统凭据库里所有属于 ZCode 的条目名。"""
+    built = _zcode_credential_structs()
+    if built is None:
+        return []
+    ctypes, wt, CREDENTIAL = built
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    count = wt.DWORD(0)
+    array = ctypes.POINTER(ctypes.POINTER(CREDENTIAL))()
+    advapi.CredEnumerateW.argtypes = [
+        wt.LPWSTR, wt.DWORD, ctypes.POINTER(wt.DWORD),
+        ctypes.POINTER(ctypes.POINTER(ctypes.POINTER(CREDENTIAL)))]
+    advapi.CredEnumerateW.restype = wt.BOOL
+    advapi.CredFree.argtypes = [ctypes.c_void_p]
+    if not advapi.CredEnumerateW(None, 0, ctypes.byref(count), ctypes.byref(array)):
+        return []
+    try:
+        names = [(array[i].contents.TargetName or "") for i in range(count.value)]
+    finally:
+        advapi.CredFree(array)
+    return [name for name in names if name.endswith(ZCODE_KEYRING_SUFFIX)]
+
+
+def _zcode_key_text(secret):
+    """凭据库里存的是 32 字节密钥的 base64url 文本。"""
+    if not secret:
+        return None
+    try:
+        key = base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))
+    except Exception:           # noqa: BLE001
+        return None
+    return key if len(key) == 32 else None
+
+
+def _zcode_v2_key(source, want, root):
+    """按指纹找出 enc:v2 的密钥；找不到就返回 None（绝不瞎猜）。
+
+    快路径按 credentials.json 真实路径拼条目名；慢路径枚举，因为密文快照被搬进
+    临时/实例目录后，密钥还在原路径那条系统凭据下。
+    """
+    def proven(key):
+        return key is not None and hashlib.sha256(key).hexdigest()[:24] == want
+
+    if source == "os":
+        forms = set()
+        if root is not None:
+            path = str(Path(root) / "v2" / "credentials.json")
+            forms = {os.path.realpath(path), os.path.abspath(path)}
+        for form in forms:
+            target = hashlib.sha256(form.encode("utf-8")).hexdigest() + ZCODE_KEYRING_SUFFIX
+            key = _zcode_key_text(_zcode_cred_read(target))
+            if proven(key):
+                return key
+        for target in _zcode_cred_targets():
+            key = _zcode_key_text(_zcode_cred_read(target))
+            if proven(key):
+                return key
+        return None
+
+    texts = [os.environ.get("ZCODE_CREDENTIAL_SECRET")]
+    declared = os.environ.get("ZCODE_CREDENTIAL_SECRET_FILE")
+    if declared:
+        try:
+            texts.append(Path(declared).read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    if root is not None:
+        try:
+            texts.append((Path(root) / "v2" / "credential-secret")
+                         .read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    for text in texts:
+        if not text or not 32 <= len(text.encode("utf-8")) <= 4096:
+            continue
+        key = hashlib.sha256(text.encode("utf-8")).digest()
+        if proven(key):
+            return key
+    return None
+
+
+def _zcode_decrypt(blob, key, root=None):
+    """解 ZCode 凭据信封（AES-256-GCM，iv 12B + tag 16B + ct）。
+
+    enc:v1 用调用方给的派生密钥；enc:v2 按信封里的源与指纹现取密钥。
+    非 enc: 前缀原样返回，但**认不出的信封要报错**——原样放行会把
+    「官方换了格式」伪装成「没登录」，那是最难查的一类故障。
+    """
+    if not isinstance(blob, str) or not blob.startswith("enc:"):
         return blob
-    parts = blob[len(prefix):].split(".")
+    if blob.startswith("enc:v1:"):
+        body = blob[len("enc:v1:"):]
+    elif blob.startswith("enc:v2:"):
+        source, want, body = blob[len("enc:v2:"):].split(":", 2)
+        if source not in ("os", "env") or len(want) != 24:
+            raise ValueError("凭据信封格式非法")
+        key = _zcode_v2_key(source, want, root)
+        if key is None:
+            raise ValueError("取不到系统密钥（{0}/{1}），请先解锁系统凭据库".format(source, want))
+    else:
+        raise ValueError("认不出的凭据信封（{0}…），请更新 agenthub".format(blob[:12]))
+    parts = body.split(".")
     if len(parts) != 3:
         raise ValueError("密文格式非法")
     iv, tag, ct = (base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)) for p in parts)
@@ -6785,13 +7285,15 @@ def zcode_credit(profile=None, live=True):
     if not cred_file.is_file():
         return {"error": f"没找到 ZCode 登录数据（{cred_file} 不存在）"}
     auth_from = str(cred_file)
-    kind = "enc:v1(AES-256-GCM)"
     try:
         raw = json.loads(cred_file.read_text(encoding="utf-8"))
     except Exception as e:      # noqa: BLE001
-        return {"error": f"{cred_file} 解不开：{e}", "auth_from": auth_from, "auth_kind": kind}
+        return {"error": f"{cred_file} 解不开：{e}", "auth_from": auth_from, "auth_kind": "未知"}
+    kind = ("enc:v2(系统凭据库)" if any(
+        isinstance(v, str) and v.startswith("enc:v2:") for v in raw.values())
+        else "enc:v1(AES-256-GCM)")
     try:
-        store = {k: _zcode_decrypt(v, _zcode_key()) for k, v in raw.items()}
+        store = {k: _zcode_decrypt(v, _zcode_key(), root) for k, v in raw.items()}
     except Exception as e:      # noqa: BLE001
         return {"error": f"凭据解密失败：{e}", "auth_from": auth_from, "auth_kind": kind}
     jwt = (store.get("zcodejwttoken") or "").strip()
@@ -6894,6 +7396,13 @@ QWENWORK_API = "https://gateway.qwenwork.cn"
 QWENWORK_CONTEXT = ("/api/v1/adapter/user/account-context"
                     "?include=user,plan,quota,page,data_sharing")
 QWENWORK_WALLETS = "/api/v1/adapter/user/wallets?page_size=100"
+
+# 套餐每期的积分额度（pid → 额度）。服务端只给余额，这是唯一的分母来源。
+# 依据：官方套餐页「个人免费版：每月 100 积分」（本机实测余额 97.4742 = 用掉 2.53）。
+# 套餐档位变了就在这里加一行；查不到的套餐不给分母，界面照实说"官方没给总额"。
+QWENWORK_PLAN_CREDITS = {
+    "subscription-cn-free": 100.0,
+}
 
 
 def _qwenwork_dirs(profile=None):
@@ -7008,6 +7517,12 @@ def qwenwork_credit(profile=None, live=True):
     def tier(k):
         return _f((wal.get(k) or {}).get("total_balance"))
 
+    # 套餐每期额度：千问办公的服务端只给「当前余额」（quota.total / used 实测是 null），
+    # 钱包接口也只回当期的 balance，回不到"这一期发过多少"。官方套餐页写死的每期额度
+    # 就是唯一的分母——「个人免费版 每月 100 积分」，余额 97.47 就是已用 2.53。
+    # 没在表里的套餐一律不给分母（宁可说"没给总额"，也不编一个数）。
+    plan_credits = QWENWORK_PLAN_CREDITS.get(str(plan.get("pid") or ""), 0.0)
+
     daily, monthly, longterm = tier("daily_credits"), tier("monthly_credits"), tier("longterm_credits")
     now_ms = int(time.time() * 1000)
     dated = sorted(w["ms"] for w in
@@ -7016,12 +7531,27 @@ def qwenwork_credit(profile=None, live=True):
 
     def pack(name, amount, scope):
         """一档钱包。到期时间优先取"金额正好等于这一档"的那笔钱包，取不到就按
-        最早到期算（宁早不晚，临期提醒才不会漏）。"""
+        最早到期算（宁早不晚，临期提醒才不会漏）。
+
+        套餐积分这一档有已知的每期额度（plan_credits）时，用「每期额度」当分母、
+        余额当剩余：界面才会写「已用 2.53 / 100」而不是「已用 0 / 97.47」。
+
+        每一档都带一条逐笔明细：只有带了 items，台账才记得住"这一档哪天到期、
+        到期时还剩多少"。千问办公的每日赠送次日就作废，没这一条的话过期之后
+        连"曾经发过"都查不到（服务端只回当期钱包，没有历史接口）。
+        """
         hit = next((w for w in ws
                     if abs(_f(w.get("balance")) - amount) < 1e-6 and _iso_ms(w.get("valid_to"))), None)
-        return {"name": name, "total": amount, "used": 0, "remaining": amount, "unit": "积分",
-                "scope": scope,
-                "expiresAt": _iso_ms(hit.get("valid_to")) if hit else (dated[0] if dated else 0)}
+        total, used = amount, 0
+        if name == "套餐积分" and plan_credits > 0:
+            total = max(plan_credits, amount)
+            used = round(max(0.0, total - amount), 4)
+        exp_ms = _iso_ms(hit.get("valid_to")) if hit else (dated[0] if dated else 0)
+        return {"name": name, "total": total, "used": used, "remaining": amount, "unit": "积分",
+                "scope": scope, "expiresAt": exp_ms,
+                "items": [{"label": name, "total": total, "used": used, "left": amount,
+                           "unit": "积分", "expires_on": exp_text(exp_ms) if exp_ms else EXPIRY_UNKNOWN,
+                           "detail": ""}]}
 
     groups = [pack(n, v, s) for n, v, s in (
         ("每日赠送积分", daily, "每天登录赠送，通常次日作废"),
@@ -7211,26 +7741,27 @@ def catpaw_credit(profile=None, live=True):
                 cycle_credit = int(mm.group(1))
                 break
         break
+    # 加量包只当"可购规格"报，不进逐笔列表：它还没到账，列成一条会被读成
+    # 「我已经有 1,000 积分」，而余额 2,170.5 是历史累积，两者一加就对不上账。
+    addon_note = ""
+    for ad in (addons or []):
+        fee = (ad.get("priceFen") or 0) / 100.0
+        addon_note += ("；加量包 %s Credits / %g 元 / 有效期 %s 个月（%s）" % (
+            ad.get("creditAmount") or "?", fee, ad.get("validMonths") or "?",
+            "可购买" if ad.get("purchasable")
+            else (ad.get("notPurchasableReason") or "当前不可购买")))
     pack_items = [{
         "label": f"{plan_name or '套餐'}（套餐包）",
+        # total 是「每期规格」，不是本期已到账的额度（余额 2,170.5 是历史累积，
+        # 两者一加就对不上）。spec=True 让界面把它当规格展示、不进"共获得"合计。
         "total": cycle_credit, "used": None, "left": None, "unit": "积分",
-        "expires_on": ref_txt,
+        "expires_on": ref_txt, "spec": True,
         "detail": ("每期发放 %s Credits" % cycle_credit if cycle_credit else "官方未给出每期额度")
                   + (" · " + cycle_desc if cycle_desc else "")
                   + (" · " + ref_txt + " 刷新" if ref_txt else "")
-                  + " · 当前余额含历史累积，服务端不拆每包剩余",
+                  + " · 当前余额含历史累积，服务端不拆每包剩余"
+                  + addon_note,
     }]
-    for ad in (addons or []):
-        fee = (ad.get("priceFen") or 0) / 100.0
-        pack_items.append({
-            "label": ad.get("name") or "加量包",
-            "total": ad.get("creditAmount"), "used": None, "left": None, "unit": "积分",
-            "expires_on": "",
-            "detail": "%s Credits / %g 元 / 有效期 %s 个月 · %s" % (
-                ad.get("creditAmount") or "?", fee, ad.get("validMonths") or "?",
-                "可购买" if ad.get("purchasable")
-                else (ad.get("notPurchasableReason") or "当前不可购买")),
-        })
     today_tok, _conv = None, None
     try:
         _now = int(time.time() * 1000)
@@ -7873,6 +8404,29 @@ RACCOON_POOLS = [("daily_points", "每日积分", "daily_grant"),
                  ("reward_points", "活动奖励", "reward_grant"),
                  ("topup_points", "充值积分", "topup_grant"),
                  ("monthly_points", "月度积分", "monthly_grant")]
+# 活动奖励（新人礼包 / 邀请奖励 / 桌面端·移动端登录礼包 / 补偿积分）的有效期口径：
+# 官网《任务及奖励》和 2026-11-18 的「服务异常补偿说明」都写「自到账起 1 年内有效」，
+# 但流水里这几笔**不给 expire_at**（2026-11-18 实测 9 笔 reward_grant 全是 None）。
+# 所以按到账时刻 +1 年推一个到期日摆进明细——不然只能一笔一笔手填，而手填的键是
+# 「档名:笔名」，同名的那几笔（4 笔「邀请奖励」）会互相覆盖，改一笔全改。
+RACCOON_REWARD_VALID_YEARS = 1
+
+
+def _raccoon_reward_exp_ms(it):
+    """活动奖励的推算到期时刻（毫秒）：到账时刻 +1 年；解析不了返回 0。
+
+    闰日（2/29）没有次年同日，退到 3/1：宁可早一天作废，也别把 3/1 写成 2/29。
+    """
+    s = str(it.get("created_at") or "")[:19].replace("T", " ")
+    try:
+        t = dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return 0
+    try:
+        t = t.replace(year=t.year + RACCOON_REWARD_VALID_YEARS)
+    except ValueError:
+        t = t.replace(year=t.year + RACCOON_REWARD_VALID_YEARS, month=3, day=1)
+    return int(t.timestamp() * 1000)
 
 
 def _raccoon_dirs(profile=None):
@@ -7969,10 +8523,14 @@ def raccoon_identity(profile=None):
 def raccoon_credit(profile=None, live=True):
     """积分余额 + 逐笔未过期发放。接口照 Magpie 的 raccoon 插件实测：
       GET  /api/web/points/v1/balance                     available_points 与分档余额
-      GET  /api/web/points/v1/bills?paging.limit=N       逐笔流水（发放为正、消耗为负，带 expire_at）
+      GET  /api/web/points/v2/bills?cursor=…              全量流水（发放/消耗/到期清零）
       GET  /api/web/auth/v1/user_info                    昵称 / 手机号 / 数字 id
       GET  /api/web/auth/v1/entitlement_info             office.pro_enable 与套餐类型（Free/Pro）
-    bills 的 paging.offset 无效、total 恒为 0（插件 #223 实测），所以只能一次要一大把。
+
+    ⚠ 档位的 total/remaining 一律照厂商口径（balance 里那个分档余额）：
+    官网「积分构成」那一栏的「每日额度 1878」就是 balance.daily_points（**当前剩余**），
+    不是这一档历次发放的累加。两套口径混用会让「已用」变成假数、合计对不上官网
+    （2026-11-12 全面审查：`14000 + 2100 − 41 ≠ 15878` 就是这么来的）。
     """
     try:
         token, f, raw, claims, uid = raccoon_identity(profile)
@@ -8002,7 +8560,7 @@ def raccoon_credit(profile=None, live=True):
 
     user, _e2 = _raccoon_req("/api/web/auth/v1/user_info", token)
     if isinstance(user, dict):
-        who = {"name": _raccoon_label(user, uid), "userId": uid}
+        who = {"name": _raccoon_label(user, uid)}
         uid = str(user.get("id") or uid)
 
     ent, _e3 = _raccoon_req("/api/web/auth/v1/entitlement_info", token)
@@ -8013,55 +8571,91 @@ def raccoon_credit(profile=None, live=True):
     pro_exp_ms = _iso_ms(office.get("pro_expired_time")) if pro else 0
 
     avail = int(bal.get("available_points") or 0)
-    bills, _e4 = _raccoon_bills(token, 1000)
+    bills, _e4 = _raccoon_bills(token)
     now_ms = int(time.time() * 1000)
     groups = []
+    rebuilt = {}
     if isinstance(bills, list):
+        # 逐笔重建：厂商的扣减规则是「先到期先扣」（FEFO）——
+        # 2026-11-12 实测反推：当天消耗 177 分，同一时刻到期的 300 分那笔清零 123
+        # = 300 − 177，两头都对得上；换成「先发放先扣」就凑不出这个数。
+        # 所以逐笔剩余能精确重建，不必再靠分档余额倒推。
+        rebuilt = _raccoon_rebuild(bills, now_ms)
         by_biz = {}
-        for it in bills:
-            try:
-                pts = int(it.get("points") or 0)
-            except (TypeError, ValueError):
-                continue
-            if pts <= 0:
-                continue
-            exp_ms = _iso_ms(it.get("expire_at"))
-            if exp_ms and exp_ms <= now_ms:
-                continue        # 已过期的发放不是"还剩下的额度"，不往明细里摆
-            by_biz.setdefault(str(it.get("biz_type") or "other"), []).append((pts, exp_ms, it))
+        seen_biz = set()
+        for pts, exp_ms, it, left in rebuilt["grants"]:
+            by_biz.setdefault(str(it.get("biz_type") or "other"), []).append(
+                (pts, exp_ms, it, left))
+        # 历史上发过、但现在全过期/用完的档也要留着：余额 0 不等于"没这一档"，
+        # 藏起来的话用户看不到"这档已经用光了"，反而会去别处找原因。
+        for pts, exp_ms, it, left in rebuilt["expired_grants"]:
+            seen_biz.add(str(it.get("biz_type") or "other"))
         for key, label, biz in RACCOON_POOLS:
             pool_left = int(bal.get(key) or 0)
             items_raw = by_biz.pop(biz, [])
-            if not pool_left and not items_raw:
+            # 余额 0、从没发过、厂商也没报这一档 → 不显示（官网也不显示这一栏）
+            if not pool_left and not items_raw and biz not in seen_biz:
                 continue
-            total = sum(x[0] for x in items_raw) or pool_left
+            # 但余额 0 且厂商确实报了这一档 → 留着（"这档已经用光了"也是信息）
+            granted_total = sum(x[0] for x in items_raw)
             # 到期时间必须**到分钟**：官网「积分明细」写的是「有效期至 11-12 24:00」，
             # 接口给的 expire_at 就是 23:59:59。只格式化到日会把这一刻抹掉，
             # 界面上就只剩一个日期，"当天几点作废"看不出来（她 11-06 问的就是这个）。
             items = [{"label": str(it.get("event_name") or label),
-                      "total": pts, "used": 0, "left": pts,
+                      "total": pts,
+                      # 已用优先用 rebuild 的结论（有清零记录时就是"发放 − 清零"），
+                      # 不到万不得已不许拿 pts-left 反推——那会把整笔作废算成已用完
+                      "used": it.get("_used", pts - left), "left": left,
                       "expires_on": (dt.datetime.fromtimestamp(exp_ms / 1000).strftime("%Y-%m-%d %H:%M")
                                      if exp_ms else EXPIRY_UNKNOWN),
+                      # 每次发放的到账时刻（流水里的 created_at）：保留到秒，
+                      # 界面上就是一笔后面挂的小标签
+                      "granted_on": str(it.get("created_at") or "")[:19].replace("T", " "),
+                      # 这个到期日是推算的（厂商没给 expire_at）：界面标「推算」，
+                      # 别让它跟厂商口径的日期看起来一样
+                      "expires_est": bool(exp_ms and not str(it.get("expire_at") or "").strip()),
+                      # 逐笔身份：同一档里多笔可能全叫「邀请奖励」，拿名字当键会让
+                      # 改一笔全改（她 2026-11-18 报的就是这个）。bill_id 是厂商给的稳定唯一号。
+                      "pid": (str(it.get("bill_id") or "").strip()
+                              or f"{it.get('event_name') or label}@{str(it.get('created_at') or '')[:19]}"),
                       "unit": "积分", "detail": ""}
-                     for pts, exp_ms, it in items_raw]
+                     for pts, exp_ms, it, left in items_raw]
+            # 作废/推算标记逐笔补上（界面据此写「过期作废 N」和「推算值」）
+            for it_out, (_p, _e, it_src, _l) in zip(items, items_raw):
+                if it_src.get("_voided"):
+                    it_out["voided"] = it_src["_voided"]
+                if it_src.get("_derived"):
+                    it_out["used_derived"] = True
             groups.append({"name": label, "category": label, "unit": "积分",
-                           "total": max(total, pool_left), "remaining": pool_left,
-                           "used": max(0, total - pool_left),
-                           "expiresAt": min((x[1] for x in items_raw if x[1]), default=0),
+                           # 档位口径 = 厂商给的当前余额（官网那一栏显示的就是它）
+                           "total": pool_left, "remaining": pool_left,
+                           # 「已用」是厂商不给的数：拿发放累减余额能反推，但那不是厂商口径，
+                           # 混着显示只会让人算不平。诚实记 0 并标 used_known=False。
+                           "used": 0, "used_known": False,
+                           "granted_total": granted_total,
+                           # 「最近到期」只认**还没用完**的笔：已过期那笔（left=0，
+                           # 留在明细里只是为了别让守卫误判）不能把到期日拉到昨天。
+                           "expiresAt": min((x[1] for x in items_raw if x[1] and x[3] > 0),
+                                            default=0),
                            **({"items": items} if items else {})})
         # 余额里有、流水里没归到任何一档的（厂商新开的分档）：照样算进去，别让合计对不上
         rest = sum(int(bal.get(k) or 0) for k, _l, _b in RACCOON_POOLS)
         leftover = int(bal.get("available_points") or 0) - rest
         if leftover > 0:
             groups.append({"name": "其他积分", "category": "其他", "unit": "积分",
-                           "total": leftover, "remaining": leftover, "used": 0})
+                           "total": leftover, "remaining": leftover, "used": 0,
+                           "used_known": False, "granted_total": leftover})
     if not groups:
         groups = [{"name": "可用积分", "category": "积分", "unit": "积分",
-                   "total": avail, "remaining": avail, "used": 0}]
+                   "total": avail, "remaining": avail, "used": 0, "used_known": False}]
 
     soonest = min((g.get("expiresAt") or 0 for g in groups if g.get("expiresAt")), default=0)
     shaped = {"userId": uid, "userType": plan, "expiresAt": pro_exp_ms or soonest,
               "isQuotaExceeded": avail <= 0,
+              # 累计已用：厂商 balance 只给"当前余额"，已用要从流水里把消耗加回来。
+              # 官网「已用 38 / 16,100」就是这个口径（16,100 = 余额 16,062 + 已用 38）。
+              # 分档的 used 仍然留空（拆不到具体哪一包），只在总账上用它。
+              "consumedTotal": (rebuilt.get("consumed") if isinstance(bills, list) else None),
               "totalUsagePercentage": 0, "vendorGroups": groups,
               "raw": {"userId": uid, "identity": ident, "org": org, "plan": plan}}
     live_error = ""
@@ -8072,12 +8666,175 @@ def raccoon_credit(profile=None, live=True):
             "live_error": live_error}
 
 
-def _raccoon_bills(token, limit=20):
-    d, e = _raccoon_req(f"/api/web/points/v1/bills?paging.limit={limit}&paging.offset=0", token)
+def _raccoon_rebuild(bills, now_ms):
+    """按厂商的扣减规则重建每一笔发放的剩余。
+
+    规则（2026-11-12 实测反推）：
+      - 消耗优先扣**当时还没到期、且最早到期**的那笔（FEFO）；
+      - 到期那一刻该笔没用完的部分被清零（流水里是一条 daily_expire 负分记录）。
+
+    判据：当天消耗 177 分、同一时刻到期的 300 分那笔清零 123 = 300 − 177，
+    两头都对得上；换成「先发放先扣」（FIFO）就凑不出这个数。
+
+    ⚠ 两处必须注意：
+      1. 重放消耗时**要把已过期的发放也算进去**：过期那笔的消耗记在它自己头上，
+         漏掉它会把消耗错记到后面那笔头上，逐笔剩余全乱。
+      2. 厂商给的清零记录是权威：它说的是「到期那一刻还剩多少」。据此能推出
+         「那笔在到期前被用掉多少」= 发放 − 清零额，比拿窗口内的消耗流水倒推可靠
+         （消耗流水可能早就被挤出 v1 的 100 条窗口）。
+
+    返回 {"grants": [(发放额, 到期毫秒, 原记录, 剩余), …], "cleared": {到期时刻: 清零额}}
+    """
+    grants, consumes, expires = [], [], {}
+    for it in bills:
+        try:
+            pts = int(it.get("points") or 0)
+        except (TypeError, ValueError):
+            continue
+        biz = str(it.get("biz_type") or "")
+        if pts > 0:
+            exp_ms = _iso_ms(it.get("expire_at"))
+            # 厂商给了就照它的；没给且这一笔是活动奖励 → 按公告「自到账起 1 年」推
+            if not exp_ms and biz == "reward_grant":
+                exp_ms = _raccoon_reward_exp_ms(it)
+            grants.append({"pts": pts, "exp_ms": exp_ms,
+                           "created": str(it.get("created_at") or ""),
+                           "it": it, "left": pts, "used": 0})
+        elif biz == "daily_expire":
+            # 到期清零：记下「这一刻还剩多少、也就是这一刻清了多少」。
+            # 同一到期日可能有多条清零（同日发了几笔各自作废），要累加而不是覆盖。
+            k = str(it.get("expire_at") or "")
+            expires[k] = expires.get(k, 0) + abs(pts)
+        else:
+            consumes.append(it)
+
+    # 每个到期日底下有几笔发放：清零额只有"这一日恰好一笔"时才认得出该归谁
+    per_exp = {}
+    for g in grants:
+        k = str(g["it"].get("expire_at") or "")
+        per_exp[k] = per_exp.get(k, 0) + 1
+
+    # 重放消耗：按时间顺序，每次扣「当时还没到期、且最早到期」的那笔
+    for c in sorted(consumes, key=lambda x: str(x.get("created_at") or "")):
+        need = abs(int(c.get("points") or 0))
+        at = str(c.get("created_at") or "")
+        for g in sorted(grants, key=lambda x: (x["exp_ms"] or 2 ** 62)):
+            if need <= 0:
+                break
+            # 这笔在消耗发生时还没发出来
+            if g["created"] and g["created"] > at:
+                continue
+            exp_at = str(g["it"].get("expire_at") or "")
+            # 消耗发生时这笔已经到期清零了 → 不该再扣它
+            if exp_at and exp_at <= at:
+                continue
+            take = min(need, g["left"])
+            g["left"] -= take
+            g["used"] += take
+            need -= take
+
+    # 到期清零：厂商给的记录是权威（它记的是「到期那一刻还剩多少」）
+    cleared = {}
+    for g in grants:
+        exp_at = str(g["it"].get("expire_at") or "")
+        if not exp_at:
+            continue
+        amt = expires.get(exp_at)
+        one = per_exp.get(exp_at, 0) == 1
+        if amt is not None and one:
+            # 到期那一刻只剩 amt 分 → 这一笔真正用掉的是「发放 − 清零」，剩下的作废。
+            #
+            # ⚠ 这里**不许**再和重放出来的消耗取 max（2026-11-16 实锤的错）：
+            # 11-14 那笔清零 300（一分没用、整笔作废），重放却把当天的消耗全扣在它头上，
+            # 取 max 之后界面写成「已用 300 / 300」——正好和事实相反。
+            # 厂商的清零额是精确值，重放只是估值，两者冲突时只能信前者。
+            g["used"] = max(0, g["pts"] - amt)
+            g["voided"] = amt
+            g["left"] = 0
+            g["exact"] = True
+            cleared[exp_at] = cleared.get(exp_at, 0) + amt
+        elif g["exp_ms"] and g["exp_ms"] <= now_ms:
+            # 没有（或分不清）清零记录：剩余按作废处理，但"用了多少"只能算推算值。
+            # 仍保留重放结果，另标 derived，界面据此不说死是厂商给的数。
+            if g["left"] > 0:
+                g["voided"] = g["left"]
+                cleared[exp_at] = cleared.get(exp_at, 0) + g["left"]
+                g["left"] = 0
+            g["derived"] = True
+
+    # 把逐笔结果写回原流水记录：raccoon_credit 组 items 时用的是这份，
+    # 早先它拿 `pts - left` 自己算已用，正好把"作废"也算成了"用掉"。
+    for g in grants:
+        g["it"]["_used"] = round(g["used"], 4)
+        if g.get("voided"):
+            g["it"]["_voided"] = round(g["voided"], 4)
+        if g.get("derived"):
+            g["it"]["_derived"] = True
+
+    # 已经过期的发放不再算"还剩下的额度"，但**全部留在明细里**（界面落在「已过期」页签）。
+    #
+    # 早先只留最近一笔，理由是"明细条数变少会被守卫判成粗读数"。现在两件事都变了：
+    #   ① 组层汇总只按效期内的笔算，过期笔不再影响余额；
+    #   ② 过期笔会被写进台账，流水分页把旧笔挤出去时台账还能补回来。
+    # 所以她 11-16 问的"已过期的应该是过去每次签到都保留、用了多少也写清楚"能兑现。
+    alive = [g for g in grants if not (g["exp_ms"] and g["exp_ms"] <= now_ms)]
+    expired = [g for g in grants if (g["exp_ms"] and g["exp_ms"] <= now_ms)]
+    expired.sort(key=lambda g: g["exp_ms"], reverse=True)
+    rows = [(g["pts"], g["exp_ms"], g["it"], g["left"]) for g in alive]
+    rows += [(g["pts"], g["exp_ms"], g["it"], g["left"]) for g in expired]
+    return {"grants": rows,
+            "expired_grants": [(g["pts"], g["exp_ms"], g["it"], g["left"]) for g in expired],
+            # 累计消耗：流水里所有负分的加总（不含 daily_expire 那种到期清零）。
+            # 官网「已用 X / 总量」就是它，总量 = 当前余额 + 它。
+            "consumed": round(sum(abs(_f(c.get("points"))) for c in consumes), 4),
+            "cleared": cleared}
+
+
+def _raccoon_bills(token, limit=50, max_pages=40):
+    """小浣熊积分流水。
+
+    v1 的 `/points/v1/bills` 取不全：`paging.limit` 硬上限 100 条（传 1000 也只回 100）、
+    `paging.offset` 完全无效（offset=100 直接返回空）、`paging.total` 恒为 0。
+    桌面端消耗流水（biz_type=desktop）每天几十到上百条，发放记录很快被挤出这个窗口——
+    2026-11-12 实测当天窗口里只剩 1 条 daily_grant，真实有 8 条。
+
+    v2 的 `/points/v2/bills` 提供游标分页（has_more + next_cursor）。
+    ⚠ **参数名是 `cursor`，不是 `paging.cursor`**：传 `paging.cursor` 会被服务端忽略，
+    永远返回同一批数据（本机实测踩过）。正确传法 3 页取全 118 条。
+
+    v2 读不到时退回 v1：至少还能拿到最近 100 条，界面照常显示只是明细不全。
+    """
+    items, seen = [], set()
+    cursor = None
+    for _page in range(max_pages):
+        path = f"/api/web/points/v2/bills?paging.limit={limit}"
+        if cursor:
+            path += "&cursor=" + quote(cursor)
+        d, e = _raccoon_req(path, token)
+        if d is None:
+            break
+        batch = d.get("items") if isinstance(d, dict) else None
+        for it in (batch or []):
+            bid = str(it.get("bill_id") or "")
+            key = bid or f"_{len(seen)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(it)
+        if not d.get("has_more"):
+            return items, None
+        nxt = d.get("next_cursor")
+        if not nxt or nxt == cursor:
+            break
+        cursor = nxt
+    if items:
+        return items, None
+    # v2 不可用 → 退回 v1（明细会少，但不至于读不到额度）
+    d, e = _raccoon_req(f"/api/web/points/v1/bills?paging.limit={limit}", token)
     if d is None:
         return None, e
-    items = d.get("items") if isinstance(d, dict) else None
-    return (items or []), None
+    v1_items = d.get("items") if isinstance(d, dict) else None
+    return (v1_items or []), None
 
 
 def _raccoon_is_daily(it, today):
@@ -8107,6 +8864,9 @@ def _raccoon_is_daily(it, today):
 DOUBAO_SCENE = "pc_incentive_task_mvp_v3"
 DOUBAO_AID = "497858"
 DOUBAO_MAIN = "https://www.doubao.com"
+# 凭据缓存（DPAPI 加密）。豆包常驻时 Cookies 库是"拒绝共享"打开，进程内读不到，
+# 只能靠这份兜底；放驾驶舱数据目录，与其它产品的登录包同处一处。
+DOUBAO_CACHE = Path.home() / ".agent-cockpit" / "doubao_auth.dpapi"
 DOUBAO_DAILY = 200          # 常规每天 200 额度；周一翻倍由服务端决定，这里只写常规值
 DOUBAO_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Doubao/2.32.6")
@@ -8139,6 +8899,71 @@ def _doubao_secret(blob, aes, host):
     return pt.decode("utf-8", "replace")
 
 
+def _win_shared_copy(src, dst):
+    """以「允许共享」的方式复制一个可能被占用的文件。
+
+    Chromium 把 Cookies 库常开着，shutil.copy2 会直接 WinError 32
+    「另一个程序正在使用此文件」。这里自己 CreateFileW 带
+    FILE_SHARE_READ|WRITE|DELETE 读原始字节，绕开共享冲突；
+    非 Windows 或拿不到句柄时退回 shutil.copy2（让原始异常带着路径抛出来）。
+    """
+    if os.name != "nt":
+        shutil.copy2(src, dst)
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                wintypes.HANDLE]
+    k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                             ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k32.ReadFile.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    GENERIC_READ, FILE_SHARE_ALL, OPEN_EXISTING = 0x80000000, 0x7, 3
+    invalid = ctypes.c_void_p(-1).value
+    handle = k32.CreateFileW(str(src), GENERIC_READ, FILE_SHARE_ALL, None,
+                             OPEN_EXISTING, 0x80, None)   # 0x80 = FILE_ATTRIBUTE_NORMAL
+    if handle in (invalid, None):
+        shutil.copy2(src, dst)      # 拿不到句柄就让 copy2 报出带路径的真错误
+        return
+    try:
+        buf = ctypes.create_string_buffer(1 << 16)
+        read = wintypes.DWORD()
+        chunks = []
+        while True:
+            if not k32.ReadFile(handle, buf, len(buf), ctypes.byref(read), None):
+                raise OSError(ctypes.get_last_error(), f"读 {src} 失败")
+            if read.value == 0:
+                break
+            chunks.append(buf.raw[:read.value])
+    finally:
+        k32.CloseHandle(handle)
+    Path(dst).write_bytes(b"".join(chunks))
+
+
+def _dpapi_protect(data):
+    """CryptProtectData：只有当前 Windows 用户能解开。凭据缓存走这个，不落明文。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    src = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    out = BLOB()
+    if not ctypes.windll.crypt32.CryptProtectData(
+            ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)):
+        raise RuntimeError("CryptProtectData 失败")
+    res = ctypes.create_string_buffer(out.cbData)
+    ctypes.memmove(res, out.pbData, out.cbData)
+    ctypes.windll.kernel32.LocalFree(out.pbData)
+    return res.raw
+
+
 def doubao_cookie_header(profile=None):
     """返回 (cookie 串, 来源说明)。读不到就抛 RuntimeError，文案里说清是锁着还是没登录。"""
     home = doubao_home(profile)
@@ -8149,9 +8974,20 @@ def doubao_cookie_header(profile=None):
     aes = _aes_key(ls_path)
     tmp = Path(tempfile.gettempdir()) / f"doubao_ck_{os.getpid()}_{int(time.time())}.db"
     try:
-        shutil.copy2(db, tmp)
+        _win_shared_copy(db, tmp)
     except (PermissionError, OSError):
-        raise RuntimeError("豆包正在运行，Cookies 库被独占锁住。请退出豆包后刷新登录态。")
+        # 豆包常驻时会以"拒绝共享"打开 Cookies 库（连 FILE_SHARE_READ 都过不去），
+        # 这时只能退回上次读到的缓存。缓存是 DPAPI 加密的，只有当前 Windows 用户能解；
+        # 会话 cookie 能撑很久（实测 38 小时前的照样能读签到状态），窗口给 30 天。
+        # 真过期了接口层会自己报错，不会把老 cookie 当新会话用。
+        with contextlib.suppress(Exception):
+            ck = json.loads(_dpapi(DOUBAO_CACHE.read_bytes()).decode("utf-8"))
+            if ck.get("cookie"):
+                age = time.time() - float(ck.get("at") or 0)
+                if age < 30 * 86400:
+                    return ck["cookie"], str(DOUBAO_CACHE) + f"（豆包在运行，{int(age // 3600)} 小时前读到）"
+        raise RuntimeError("豆包正在运行且 Cookies 库被独占（豆包新版是拒绝共享打开），"
+                           "这台机器还没有可用缓存——关掉豆包读一次即可，之后开着也能用")
     try:
         con = sqlite3.connect(str(tmp))
         rows = con.execute("select host_key, name, encrypted_value, value from cookies").fetchall()
@@ -8174,6 +9010,12 @@ def doubao_cookie_header(profile=None):
     if not parts:
         raise RuntimeError("豆包 Cookies 里没有 doubao.com 的会话——先在豆包里登录一次")
     cookie = "; ".join(parts)
+    # 加密落盘一次：豆包一开着就读不到它的 Cookies 库，没有这份兜底，
+    # 反代和签到就只能等它完全退出才有凭据。DPAPI 加密，不是明文。
+    with contextlib.suppress(Exception):
+        DOUBAO_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        DOUBAO_CACHE.write_bytes(_dpapi_protect(
+            json.dumps({"cookie": cookie, "at": time.time()}).encode("utf-8")))
     return cookie, str(db)
 
 
@@ -8234,11 +9076,123 @@ def doubao_checkin_state(cookie):
     return d, task, ((task or {}).get("daily_checkin") or {})
 
 
+DOUBAO_QUOTA_SUMMARY = "/alice/commerce/sale/subscription/quota/summary/"
+DOUBAO_QUOTA_OVERVIEW = "/alice/commerce/sale/subscription/overview/"
+
+
+def _doubao_num(v):
+    """接口里的额度是带千分位的字符串（"3,750"），统一转成 float。"""
+    try:
+        return float(str(v if v is not None else "0").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def doubao_quota_overview(cookie):
+    """豆包「可用额度」页的**逐包**明细（2026-11-16 21:52 挖到的）。
+
+    接口：`POST /alice/commerce/sale/subscription/overview/`，body `{"product_line": "membership"}`。
+
+    报文里逐包的是 `incentive_quota_entitlements[]`：
+      end_time(ms) / total_amount / used_amount / status / total_used_percent
+    —— 每包各自的到期日都在（12-06 19:59、12-09 13:28、12-13 09:30 …），与客户端
+    「订阅与额度管理 → 可用额度」那页逐条显示的完全一致。
+
+    ⚠ 别再用 `quota/summary` 的 window_limits 当明细：那个接口服务端**已经合并**
+      （12 个包合成一条总额 3750），不是原始包列表。
+    ⚠ `quota_balance_overview.top_items` 只有 3 条且 has_more=true，翻页参数试了十来个
+      （offset/cursor/page/page_size/item_limit…）都不变——它就是"最紧的几条"，
+      逐包全量要从 `incentive_quota_entitlements` 取。
+    """
+    d, e = _doubao_req(DOUBAO_QUOTA_OVERVIEW, cookie, {"product_line": "membership"},
+                       tag="doubao overview")
+    if d is None:
+        return None, e
+    if not isinstance(d, dict):
+        return None, "额度接口返回了非对象"
+    ents = d.get("incentive_quota_entitlements")
+    if not isinstance(ents, list):
+        return None, "逐包接口未返回额度包列表"
+    packs = []
+    for x in ents:
+        if not isinstance(x, dict):
+            continue
+        t = _doubao_num(x.get("total_amount"))
+        u = _doubao_num(x.get("used_amount"))
+        if t <= 0:
+            continue
+        exp_ms = int(x.get("end_time") or 0)
+        packs.append({
+            "total": t, "used": u, "left": max(0.0, t - u),
+            "expires_on": dt_text(exp_ms) if exp_ms else EXPIRY_UNKNOWN,
+            "exp_ms": exp_ms, "status": x.get("status"),
+            "resource_id": str(x.get("entitlement_id") or x.get("id") or ""),
+            "granted_on": dt_text_full(int(x["start_time"])) if str(x.get("start_time") or "").isdigit() and len(str(x["start_time"])) == 13 else "",
+            "used_percent": x.get("total_used_percent"),
+        })
+    packs.sort(key=lambda p: p["exp_ms"] or 2 ** 62)
+    return {"packs": packs, "raw": d}, None
+
+
+def doubao_quota_wallet(cookie):
+    """读豆包「额度与订阅」汇总——PC 端唯一给**余额**的口子（2026-11-16 实测）。
+
+    incentive_quota_section 才是真账：
+      · entitlement_count          手里有几个额度包（当前 12 个）
+      · window_limit_groups[].window_limits[]
+                                   total_amount / used_amount / used_percent / end_time(ms)
+    但服务端**只下发聚合后的窗口**：12 个包合成一条（总额 3750 / 已用 0 / 最早到期
+    12-06 11:59）。逐笔明细另有 `overview` 接口（见 doubao_quota_overview），
+    这个接口只用来对总额。
+    """
+    d, e = _doubao_req(DOUBAO_QUOTA_SUMMARY, cookie, {"product_line": "membership"},
+                       tag="doubao wallet")
+    if d is None:
+        return None, e
+    if not isinstance(d, dict):
+        return None, "额度接口返回了非对象"
+    sec = d.get("incentive_quota_section") or {}
+    count = int(sec.get("entitlement_count") or 0)
+    groups, exp_min = [], 0
+    for g in (sec.get("window_limit_groups") or []):
+        name = str(g.get("feature_group_name") or "").strip() or "活动赠送额度"
+        items, tot, used, left = [], 0.0, 0.0, 0.0
+        for w in (g.get("window_limits") or []):
+            t = _doubao_num(w.get("total_amount"))
+            u = _doubao_num(w.get("used_amount"))
+            exp = int(w.get("end_time") or 0)
+            if not t and not u:
+                continue
+            items.append({"label": name, "total": t, "used": u,
+                          "left": max(0.0, t - u), "expires_on": dt_text(exp),
+                          "unit": "额度", "aggregate": True,
+                          "detail": (f"{count} 个额度包合并计 · PC 接口只给合并窗口，"
+                                     "逐包明细只在手机 App「可用额度」里" if count > 1 else "")})
+            tot += t
+            used += u
+            left += max(0.0, t - u)
+            if exp and (not exp_min or exp < exp_min):
+                exp_min = exp
+        if not items:
+            continue
+        groups.append({"name": name, "category": "平台奖励积分", "unit": "额度",
+                       "total": tot, "used": used, "remaining": left,
+                       "used_known": True, "expiresAt": exp_min,
+                       "pack_count": count, "items": items})
+    disp = ((d.get("current_subscription") or {}).get("display") or {})
+    return {"groups": groups, "expires_at": exp_min, "pack_count": count,
+            "plan": str(disp.get("short_name") or "")}, None
+
+
 def doubao_credit(profile=None, live=True):
-    """豆包额度。**厂商没有"剩余额度"接口**——签到活动只给 progress.total_amount（累计获得），
-    对话消耗扣在哪一桶、还剩多少，服务端不对外。所以这里只认账号，额度按规矩报 None，
-    绝不把"累计获得 1000"当成"还剩 1000"摆出去（那是撒谎）。
-    累计值放在 note 里，驾驶舱签到页会显示。"""
+    """豆包额度：账号 + 真余额。
+
+    2026-11-16 更正：以前这里写着「厂商没有剩余额度接口」——那是因为只看了签到活动
+    （/alice/ug/campaign/v3/detail 的 progress.total_amount），那个数确实是「累计获得」。
+    真账在 /alice/commerce/sale/subscription/quota/summary/：total/used/end_time 三件套，
+    和手机 App「可用额度」页对得上（当前 3,750）。所以现在按余额口径出 vendorGroups，
+    界面就能画「可用 / 共多少 / 最近到期」，而不是只摆一个累计值。
+    """
     try:
         cookie, src = doubao_cookie_header(profile)
     except RuntimeError as e:
@@ -8256,22 +9210,69 @@ def doubao_credit(profile=None, live=True):
            "auth_kind": "doubao.com 会话 cookie（Chromium os_crypt v10）"}
     if not live:
         out["source"] = "local-cache"
-        out["live_error"] = "按 --local 读：只解了 cookie 认人，没去读签到额度"
+        out["live_error"] = "按 --local 读：只解了 cookie 认人，没去读额度"
         return out
+
+    # ① 真余额（聚合窗口）：有它就按余额口径走，界面不再说"厂商不给剩余"
+    wallet, we = doubao_quota_wallet(cookie)
+    if wallet and wallet.get("groups"):
+        base["vendorGroups"] = wallet["groups"]
+        if wallet.get("expires_at"):
+            base["expiresAt"] = wallet["expires_at"]
+        if wallet.get("plan"):
+            base["subscriptionPackageName"] = wallet["plan"]
+        tot = sum(_f(g.get("total")) for g in wallet["groups"])
+        used = sum(_f(g.get("used")) for g in wallet["groups"])
+        out["doubao"] = {"available": max(0.0, tot - used), "total": tot, "used": used,
+                         "total_unit": "额度", "pack_count": wallet.get("pack_count") or 0,
+                         "nearest_expiry": dt_text(wallet.get("expires_at") or 0)}
+    else:
+        out["doubao"] = {"wallet_error": we or "额度接口没返回额度窗口", "total_unit": "额度"}
+
+    # ② 逐包明细（overview 接口）：每包各自的到期日与已用。
+    # 聚合窗口只有一个最早到期日，写不出"12 笔各什么时候作废"——这才是用户要的明细。
+    ov, oe = doubao_quota_overview(cookie)
+    if ov is None and not base["vendorGroups"]:
+        return {"error": oe or we or "额度接口未返回数据"}
+    if ov is not None and (ov["packs"] or not base["vendorGroups"]):
+        packs = ov["packs"]
+        items = [{"label": "活动赠送额度", "total": p["total"], "used": p["used"],
+                  "left": p["left"], "unit": "额度", "expires_on": p["expires_on"],
+                  "resource_id": p["resource_id"], "granted_on": p["granted_on"],
+                  "granted_src": "effective" if p["granted_on"] else "",
+                  "detail": ""} for p in packs]
+        ptot = sum(p["total"] for p in packs)
+        pused = sum(p["used"] for p in packs)
+        exp_min = min((p["exp_ms"] for p in packs if p["exp_ms"]), default=0)
+        base["vendorGroups"] = [{
+            "name": "活动赠送额度", "category": "平台奖励积分", "unit": "额度",
+            "total": ptot, "used": pused, "remaining": max(0.0, ptot - pused),
+            "used_known": True, "expiresAt": exp_min,
+            "pack_count": len(packs), "items": items,
+        }] if packs else []
+        base["expiresAt"] = exp_min or base.get("expiresAt") or 0
+        out["doubao"].update({"available": max(0.0, ptot - pused), "total": ptot,
+                               "used": pused, "pack_count": len(packs),
+                               "nearest_expiry": dt_text(exp_min)})
+
+    # ② 签到进度（连签 / 今天领没领 / 累计获得）：签到页要用
     try:
         d, _task, chk = doubao_checkin_state(cookie)
     except RuntimeError as e:
+        if base["vendorGroups"]:
+            out["doubao"]["checkin_error"] = str(e)
+            return out
         out["source"] = "local-cache"
         out["live_error"] = str(e)
         return out
     total = (d.get("progress") or {}).get("total_amount")
-    out["doubao"] = {"total_granted": total,
-                     "continuous_days": chk.get("continuous_days"),
-                     "checked_in_today": bool(chk.get("checked_in_today")),
-                     "last_checkin_date": chk.get("last_checkin_date") or ""}
-    out["live_error"] = (f"签到活动累计获得 {total} 额度；厂商没有剩余额度接口，"
-                         "读不到还剩多少") if total is not None else ""
+    # total_granted 留着是给老界面/老档案兜底用的：**不进 buckets**，它不是余额。
+    out["doubao"].update({"total_granted": total,
+                          "continuous_days": chk.get("continuous_days"),
+                          "checked_in_today": bool(chk.get("checked_in_today")),
+                          "last_checkin_date": chk.get("last_checkin_date") or ""})
     return out
+
 
 
 def ci_doubao(claim=False, profile=None, **_kw):
@@ -8296,7 +9297,7 @@ def ci_doubao(claim=False, profile=None, **_kw):
     total = (d.get("progress") or {}).get("total_amount")
     reward = int((chk.get("reward") or {}).get("reward_amount") or DOUBAO_DAILY)
     note = (f"每日 {DOUBAO_DAILY} 额度，周一翻倍；累计获得 {total if total is not None else '?'}。"
-            "厂商只有累计口径，没有剩余额度接口。")
+            "余额看「额度与用量」那页——那走的是额度汇总接口。")
     base = {
         "supported": True, "auto": True, "account": account, "streak": days,
         "activity_on": True, "signed_today": signed, "claimable": not signed,
@@ -8328,7 +9329,7 @@ def ci_doubao(claim=False, profile=None, **_kw):
             "claimed": not idem, "already": idem, "reward": amount,
             "verified": signed2,
             "note": f"每日 {DOUBAO_DAILY} 额度，周一翻倍；累计获得 {total2 if total2 is not None else '?'}。"
-                    "厂商只有累计口径，没有剩余额度接口。"}
+                    "余额看「额度与用量」那页——那走的是额度汇总接口。"}
 
 
 def ci_raccoon(claim=False, profile=None, **_kw):
@@ -8477,6 +9478,13 @@ def credit_buckets(d):
         b = {"pool": label, "total": q.get("total"), "used": q.get("used"),
              "remaining": q.get("remaining"), "unit": q.get("unit") or "credits",
              "expires": exp_text(eff), "category": category}
+        # 「已用」厂商没给时（used_known=False）不许拿 total−remaining 反推：
+        # 那是两个不同口径相减，算出来的数只会让人算不平（2026-11-12 审查）。
+        if "used_known" in q:
+            b["used_known"] = q.get("used_known")
+        # 厂商给的"历次发放累加"：与"当前余额"分开存，界面能区分哪个是厂商口径
+        if q.get("granted_total") is not None:
+            b["granted_total"] = q.get("granted_total")
         if q.get("note"):
             b["note"] = q["note"]
         # scope = 这一档能花在什么上（厂商原话），界面拿它做"仅星火模型"这类标注
@@ -8523,6 +9531,18 @@ def dt_text(ms):
     return dt.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
 
 
+def dt_text_full(ms):
+    """毫秒 → 'YYYY-MM-DD 时:分:秒'。只用于**到账时间**：厂商给到秒就保留到秒
+    （用户 2026-11-17 要求"能读取到时间的尽量把时分秒也加上"）。
+    到期日不用它：到期判定那几处解析器认的是分钟精度，换成秒会把当天到期的笔
+    误判成还没过期。三态与 dt_text 相同。"""
+    if not ms:
+        return EXPIRY_UNKNOWN
+    if ms >= FOREVER_MS:
+        return "无限期"
+    return dt.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _f(v):
     try:
         return float(v)
@@ -8545,7 +9565,18 @@ def credit_groups(buckets, now=None):
         if b.get("scope") and not g.get("scope"):
             g["scope"] = b["scope"]
         t, r = _f(b.get("total")), _f(b.get("remaining"))
-        u = _f(b.get("used")) or max(0.0, t - r)
+        # 「已用」厂商没给时（used_known=false）不许拿 total−remaining 反推：
+        # 那是两个不同口径相减，算出来的数只会让人算不平（小浣熊就是这种）。
+        used_known = b.get("used_known")
+        if used_known is False:
+            u = 0.0
+            g["used_known"] = False
+        else:
+            u = _f(b.get("used")) or max(0.0, t - r)
+        # 厂商给的「历次发放累加」：与「当前余额」分开存，界面能区分口径
+        gt = b.get("granted_total")
+        if gt is not None:
+            g["granted_total"] = _f(g.get("granted_total")) + _f(gt)
         g["total"] += t
         g["left"] += r
         g["used"] += u
@@ -8560,13 +9591,7 @@ def credit_groups(buckets, now=None):
             g["items"].append(it)
 
     def expired(item):
-        s = str(item.get("expires_on") or "")
-        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
-            try:
-                return dt.datetime.strptime(s, fmt) < now
-            except ValueError:
-                continue
-        return False        # "未给出"/"无限期" 不算过期
+        return item.get("expired") is True or _exp_is_past(item.get("expires_on"), now)
 
     def finalize(g):
         live = [i for i in g["items"] if not expired(i)]
@@ -8584,15 +9609,56 @@ def credit_groups(buckets, now=None):
         exp_dates = sorted(str(i.get("expires_on")) for i in usable
                            if i.get("expires_on") not in (EXPIRY_UNKNOWN, "无限期", ""))
         known_left = [_f(i.get("left")) for i in live if i.get("left") is not None]
+        # 组层汇总只算**效期内**的笔：过期包的额度已经作废，把它加进"总剩余"就是
+        # 把一笔花不出去的钱算成余额（MiniMax 的 20,920.99 应当只有 19,824）。
+        # 逐笔完整（total 与 left 都给了）时才用逐笔汇总，否则保留厂商给的档级汇总数——
+        # 妙手那种只给"当前余额"、逐笔没有剩余的产品，拿 200+1000 当分母会算出倒挂。
+        full = bool(live) and all(i.get("total") is not None and i.get("left") is not None
+                                  for i in live)
+        g_total, g_left, g_used = g["total"], g["left"], g["used"]
+        if not live:
+            # 整档全部过期：可用余额必须是 0。厂商档级汇总里的 remaining 是
+            # 过期那一刻的剩余（已经作废），继续摆着就是"剩 80 却一分用不了"
+            # （2026-11-17 隔离复现的第三项）。总额/已用保留历史口径不变。
+            g_left = 0.0
+        if full:
+            g_total = round(sum(_f(i.get("total")) for i in live), 4)
+            g_left = round(sum(_f(i.get("left")) for i in live), 4)
+            vals = [i.get("used") for i in live if i.get("used") is not None]
+            if len(vals) == len(live):
+                g_used = round(sum(_f(v) for v in vals), 4)
+            else:
+                # 逐笔发放额与逐笔剩余都是真的，相减就是这段时间用掉的量。
+                # 与"拿余额当总量再减剩余"不是一回事：分母已经换成真发放额了。
+                g_used = round(max(0.0, g_total - g_left), 4)
+                g["used_derived"] = True
+            if g.get("used_known") is False:
+                # used_known 是"厂商有没有直接给已用"的标记；full 分支下已用是
+                # 用真发放额与真剩余算出来的，可以上界面，别再整行藏起来
+                g["used_known"] = True
+        elif live and any(i.get("left") is None or i.get("total") is None for i in live):
+            # 逐笔缺发放额或剩余（妙手的「套餐包」只给规格、不给本期发放）：
+            # 这时候任何分母都不可信，宁可报"没给总额"，也别画出倒挂的比例
+            g_total = None
+        dead = [i for i in g["items"] if i.get("expired")]
+        r4 = lambda v: None if v is None else round(v, 4)      # noqa: E731
         g.update({
             "live_count": len(live),
-            "expired_count": len(g["items"]) - len(live),
+            "expired_count": len(dead),
             "usable_count": len(usable),
-            "live_left": round(sum(known_left), 4) if known_left else round(g["left"], 4),
+            "live_left": r4(sum(known_left) if known_left else g_left),
             "expires": exp_dates[0] if exp_dates else EXPIRY_UNKNOWN,
-            "left": round(g["left"], 4), "total": round(g["total"], 4),
-            "used": round(g["used"], 4),
+            "left": r4(g_left), "total": r4(g_total),
+            "used": r4(g_used),
         })
+        # 已过期那一堆自己的合计：明细弹窗要能说清"这些作废的里头用掉了多少、剩多少作废"
+        if dead:
+            dt_ = [i.get("total") for i in dead if i.get("total") is not None]
+            dl_ = [i.get("left") for i in dead if i.get("left") is not None]
+            du_ = [i.get("used") for i in dead if i.get("used") is not None]
+            g["expired_total"] = round(sum(_f(v) for v in dt_), 4) if dt_ else None
+            g["expired_left"] = round(sum(_f(v) for v in dl_), 4) if dl_ else None
+            g["expired_used"] = round(sum(_f(v) for v in du_), 4) if du_ else None
         return g
 
     groups = [finalize(merged.pop(n)) for n in GROUP_ORDER if merged.get(n)]
@@ -8600,6 +9666,380 @@ def credit_groups(buckets, now=None):
     # 跟在四档老口径后面。早先这里只补一个 expires=未给出，等于把逐笔到期直接丢掉，
     # 界面上这些产品就永远只有总量、没有"哪一笔哪天作废"。
     return groups + [finalize(g) for g in merged.values()]
+
+
+# ---------------------------------------------------------------------------
+# 积分包台账（quota-ledger）
+#
+# 厂商接口只报「现在还挂着的那几笔」：Qoder 的包一过期就从列表里消失，WorkBuddy
+# 官网按"当前资源包"下发，MiniMax/ZCode 套餐结束连 balance 桶都没了。结果「已过期」
+# 永远是 0 笔——用户看不到"那一天作废了多少、那笔用掉了多少"。
+#
+# 台账把每次读到的逐笔记下来（按 产品 + 账号 + 档名 + 包身份），下一轮读数里没有的笔，
+# 只要已经过期就补回「已过期」那一堆；厂商给过的 used/left 都留着。过期包里
+# "用掉多少、剩多少作废"正是要看的那个数。
+#
+# 只记录、不改判定：补回的笔一律带 from_ledger=True，界面据此标"台账记的"；
+# 组层汇总只按效期内的笔算，台账里的旧包不会把余额撑大。
+# ---------------------------------------------------------------------------
+QUOTA_LEDGER_VERSION = 2
+# 2026-11-18 起不再设每组 400 笔 / 两年清理的上限：用户要求过期包永久留档，
+# 厂商不给历史的产品（豆包等）台账是唯一副本，清掉就再也找不回来。
+_QUOTA_LEDGER_SEP = "\x1f"
+
+
+def _quota_ledger_path():
+    root = Path(os.environ.get("AGENT_COCKPIT_HOME") or (HOME / ".agent-cockpit"))
+    return root / "quota-ledger.json"
+
+
+def _pack_sig(it):
+    """保守匹配用的签名：到期 + 发放额（都是不可变字段）。
+
+    到期统一截到分钟再比：旧档案存的是分钟精度，新读数可能带秒，
+    不归一化会让同一笔在新旧格式之间匹配不上。"""
+    exp = str(it.get("expires_on") or "")[:16]
+    return (exp, None if it.get("total") is None else round(_f(it.get("total")), 6))
+
+
+def _pack_ident(it):
+    """一笔包的稳定身份。厂商资源 ID（resource_id）优先；没有才退到 到期+发放额。
+
+    **已用（used）绝不进身份**：它随消费变化，2026-11-17 的隔离复现里
+    同一笔已用 0→20 就被存成两条过期记录。**组名也不进身份**：改分类
+    只改记录上的 group 属性，不造新条目。两个不同资源 ID 的同额同到期包
+    各自一条，不再被合并。"""
+    rid = str(it.get("resource_id") or "").strip()
+    if rid:
+        return "r" + _QUOTA_LEDGER_SEP + rid
+    exp, total = _pack_sig(it)
+    return "s" + _QUOTA_LEDGER_SEP + exp + _QUOTA_LEDGER_SEP + ("" if total is None else "%.6f" % total)
+
+
+def _quota_ledger_migrate(packs):
+    """旧键（产品␟账号␟组名␟到期␟总额␟已用）→ 新键（产品␟账号␟身份）。
+
+    同一笔的多个旧快照（已用不同 / 组名改过）合并成一条：取 last_seen 最新
+    的那份读数，first_seen 取最早。旧键里本来就没有资源 ID，同额同到期
+    在旧方案下也分不清，合并不会丢掉旧方案分得清的东西。返回是否有改动。"""
+    changed = False
+    merged = {}
+    for key in list(packs.keys()):
+        parts = key.split(_QUOTA_LEDGER_SEP)
+        if len(parts) >= 3 and parts[2] in ("r", "s"):
+            continue                      # 已是新键
+        rec = packs.pop(key)
+        changed = True
+        if len(parts) < 6:
+            continue                      # 认不出的残键，丢弃（旧格式至少 6 段）
+        product, acct, _group, exp, total, _used = parts[:6]
+        try:
+            total_v = None if not total else round(float(total), 6)
+        except ValueError:
+            total_v = None
+        sig = (exp[:16], total_v)
+        nk = _QUOTA_LEDGER_SEP.join([product, acct,
+                                     "s", sig[0], "" if sig[1] is None else "%.6f" % sig[1]])
+        old = merged.get(nk)
+        if old is None:
+            merged[nk] = rec
+            continue
+        # 最新读数优先；最早的 first_seen 与缺失的补充字段保留
+        keep, drop = (rec, old) if str(rec.get("last_seen") or "") >= str(old.get("last_seen") or "") else (old, rec)
+        for fld in ("first_seen",):
+            vals = [str(x.get(fld) or "") for x in (keep, drop) if x.get(fld)]
+            if vals:
+                keep[fld] = min(vals)
+        for fld in ("granted_on", "granted_est", "granted_src", "resource_id", "unit"):
+            if keep.get(fld) in (None, "") and drop.get(fld) not in (None, ""):
+                keep[fld] = drop[fld]
+        merged[nk] = keep
+    packs.update(merged)
+    return changed
+
+
+def _quota_ledger_load():
+    p = _quota_ledger_path()
+    try:
+        raw = p.read_text(encoding="utf-8")
+        d = json.loads(raw)
+    except FileNotFoundError:
+        return {"version": QUOTA_LEDGER_VERSION, "packs": {}}
+    except Exception:            # noqa: BLE001
+        # 台账坏了不许把额度页带崩：当成空的，下一轮重建
+        return {"version": QUOTA_LEDGER_VERSION, "packs": {}}
+    if not isinstance(d, dict) or not isinstance(d.get("packs"), dict):
+        return {"version": QUOTA_LEDGER_VERSION, "packs": {}}
+    if _quota_ledger_migrate(d["packs"]):
+        # 迁移前备份一份旧账（只备一次），改坏了还能找回来
+        bak = p.with_name(p.name + ".bak-identity")
+        if not bak.exists():
+            try:
+                bak.write_text(raw, encoding="utf-8")
+            except Exception:    # noqa: BLE001
+                pass
+    d["version"] = QUOTA_LEDGER_VERSION
+    return d
+
+
+def _quota_ledger_save(led):
+    p = _quota_ledger_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(led, ensure_ascii=False, separators=(",", ":")),
+                       encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:            # noqa: BLE001
+        pass
+
+
+def _exp_is_past(s, now):
+    """到期日是不是已经过去。和 credit_groups 的 expired() 同一套三态判定。"""
+    s = str(s or "")
+    if len(s) == 10:
+        s += " 23:59:59"
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return dt.datetime.strptime(s, fmt) < now
+        except ValueError:
+            continue
+    return False
+
+
+def quota_ledger_merge(product, account, groups, now=None, led=None):
+    """把这次读数并进台账，并把台账里这次没返回、且已过期的笔补回「已过期」。
+
+    led 由调用方传入时只改内存，由调用方统一 save（一轮读多个产品只写一次盘）。
+
+    身份认人（2026-11-18 重写）：资源 ID 优先，没有才按 到期+发放额 保守匹配。
+    已用随消费变化、组名随分类变化，都不进身份——同一笔不会被拆成两条，
+    两个不同 ID 的同额包也不会被合成一条。匹配不上的旧记录（比如活笔过期后
+    从带 ID 的接口转到不带 ID 的过期接口）按签名收养，不另立一条。
+
+    两种情况都要补：
+      · 这一档还在、只是某一笔不 returned 了（Qoder 的包过期即从列表消失）；
+      · **整档都没了**（ZCode 的 start plan 领完、MiniMax 套餐结束连桶都不返回）——
+        这时按台账新建一档「剩 0 + 已过期 N 笔」，否则那段历史就彻底看不见了。
+    """
+    now = now or dt.datetime.now()
+    led = led if led is not None else _quota_ledger_load()
+    packs = led["packs"]
+    stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    acct = str(account or "")
+    mine = _QUOTA_LEDGER_SEP.join([product, acct]) + _QUOTA_LEDGER_SEP
+    # Trae 的台账里有旧组名（「签到奖励」已并入「每日签到」）。键不再含组名，
+    # 这里只改记录上的 group 属性，等于把旧账迁到新档下，不会造出新条目。
+    if product in ("traework-cn", "trae-cn"):
+        for rec in packs.values():
+            if rec.get("product") != product or rec.get("account") != acct:
+                continue
+            new = TRAE_GROUP_ALIAS.get(str(rec.get("group") or ""))
+            if new:
+                rec["group"] = new
+    # 本产品的记录按签名建索引，供收养匹配用
+    by_sig = {}
+    by_grant = {}
+    for k, r in packs.items():
+        if k.startswith(mine):
+            by_sig.setdefault(_pack_sig(r), []).append(k)
+            g = str(r.get("granted_on") or "")[:16]
+            if g:
+                by_grant.setdefault((g, _pack_sig(r)[1]), []).append(k)
+
+    def _adopt(it, gname, matched):
+        """给这次读到的一笔找到台账里对应的那条记录；找不到返回 None。"""
+        key = mine + _pack_ident(it)
+        rid = str(it.get("resource_id") or "").strip()
+        def compatible(k):
+            old_id = packs[k].get("resource_id")
+            return not old_id or (old_id == rid if rid else old_id not in incoming_ids)
+        if key in packs and key not in matched:
+            return key
+        cands = [k for k in by_sig.get(_pack_sig(it), [])
+                 if k in packs and k not in matched and k != key and compatible(k)]
+        if not cands:
+            # 二级收养：到期日口径变过（活笔周期末 → 历史真实过期日、有→无）时
+            # 签名对不上，按 到账时刻+总额 再认一次（发放时刻是不可变字段）
+            g = str(it.get("granted_on") or "")[:16]
+            if g:
+                cands = [k for k in by_grant.get((g, _pack_sig(it)[1]), [])
+                         if k in packs and k not in matched and k != key and compatible(k)]
+        if not cands:
+            return None
+        # 没有资源 ID 的旧记录优先（带 ID 的留给它自己那条 ID 读数），
+        # 同组的优先，再按最近见到排（稳定排序：先按时间倒序，再按优先级）
+        cands.sort(key=lambda k: str(packs[k].get("last_seen") or ""), reverse=True)
+        cands.sort(key=lambda k: (bool(packs[k].get("resource_id")),
+                                  str(packs[k].get("group") or "") != gname))
+        old = cands[0]
+        if str(it.get("resource_id") or "").strip():
+            # 这笔带 ID：把旧记录搬到 ID 键下（first_seen 等历史跟着搬）
+            packs[key] = packs.pop(old)
+            return key
+        return old                    # 这笔没 ID：沿用旧记录的键（可能带 ID）
+
+    out, seen_groups = [], set()
+    matched = set()          # 全局：这次返回了的台账记录键
+    incoming_ids = {str(i["resource_id"]) for g in groups or [] for i in g.get("items", []) if i.get("resource_id")}
+    prepared = []            # [(组, 组名, 逐笔)]
+    # 第一阶段：**所有组**的返回笔先全量并进台账。
+    # 不能按组"边匹配边补回"：旧分类（如积分返还）的记录会在先处理的组里被补回，
+    # 随后新分类（原速通次数兑换）的返回笔又把它收养走——同一笔在两档各出现一次
+    # （2026-11-18 真机 92/90 就是这条）。
+    for g in groups or []:
+        g = dict(g)
+        gname = str(g.get("name") or "")
+        seen_groups.add(gname)
+        items = [dict(i) for i in (g.get("items") or [])]
+        for it in items:
+            if it.get("aggregate") or it.get("spec"):
+                continue
+            key = _adopt(it, gname, matched)
+            rec = dict(packs.get(key) or {}) if key else {}
+            if key is None:
+                key = mine + _pack_ident(it)
+                if key in matched and not it.get("resource_id"):
+                    base = key
+                    ordinal = 2
+                    while key in packs:
+                        key = base + _QUOTA_LEDGER_SEP + str(ordinal)
+                        ordinal += 1
+            # 「已用」取**最近一次读数**，不是历史最大值（max(旧,新) 会把
+            # 任何一轮的小读数永久冻住，2026-11-17 用户报的"64 变 25"）。
+            u = it.get("used")
+            if u is not None:
+                rec["used"] = u
+            elif rec.get("used") is not None:
+                it["used"] = rec["used"]
+            if it.get("left") is not None:
+                rec["left"] = it["left"]
+            elif rec.get("left") is not None:
+                it["left"] = rec["left"]
+            if it.get("total") is None and rec.get("total") is not None:
+                it["total"] = rec["total"]
+            rid = str(it.get("resource_id") or "").strip()
+            if rid:
+                rec["resource_id"] = rid
+            elif rec.get("resource_id"):
+                it["resource_id"] = rec["resource_id"]
+            rec.update({"product": product, "account": acct, "group": gname,
+                        "label": it.get("label"), "unit": it.get("unit"),
+                        "expires_on": it.get("expires_on"),
+                        "total": it.get("total") if it.get("total") is not None else rec.get("total"),
+                        "last_seen": stamp})
+            rec.setdefault("first_seen", stamp)
+            if product in ("trae-cn", "traework-cn") and gname not in ("每日签到", "TraeCode 邀请好友奖励") and rec.get("granted_est"):
+                for field in ("granted_on", "granted_est", "granted_src"):
+                    rec.pop(field, None)
+            rec["expired"] = it.get("expired") is True
+            if it.get("voided") is not None:
+                rec["voided"] = it["voided"]
+            source = it.get("granted_src") or ("estimate" if it.get("granted_est") else "vendor")
+            stored_source = rec.get("granted_src") or ("estimate" if rec.get("granted_est") else "vendor")
+            rank = {"first_seen": 0, "estimate": 1, "effective": 2, "vendor": 3}
+            if it.get("granted_on") and (not rec.get("granted_on") or rank.get(source, 3) >= rank.get(stored_source, 3)):
+                rec["granted_on"] = it["granted_on"]
+                it["granted_src"] = rec["granted_src"] = source
+                it["granted_est"] = rec["granted_est"] = source == "estimate"
+            elif rec.get("granted_on"):
+                it["granted_on"] = rec["granted_on"]
+                if rec.get("granted_src"):
+                    it["granted_src"] = rec["granted_src"]
+                it["granted_src"] = stored_source
+                it["granted_est"] = stored_source == "estimate"
+            else:
+                # 厂商不给到账时间：用台账第一次见到它的时刻兜底。
+                # 这是**我们第一次读到它**的时间，不是发放时间——标 first_seen，
+                # 界面写「首次记录」，不能标成「约某日到账」冒充发放时刻。
+                fs = str(rec.get("first_seen") or "")
+                if fs:
+                    it["granted_on"] = fs
+                    it["granted_src"] = "first_seen"
+                    rec["granted_on"] = fs
+                    rec["granted_src"] = "first_seen"
+            packs[key] = rec
+            matched.add(key)
+        prepared.append((g, gname, items))
+
+    # 第二阶段：逐组补回——只补全局都没匹配上的记录，且按记录**当前**的 group
+    # 属性归组（第一阶段已把收养到的记录改成新分类）。
+    for g, gname, items in prepared:
+        # 补回：台账里这一档、这次没给、且确实已经过期的笔。
+        # 身份匹配已经把"这次返回了的"都认走了，剩下的未匹配记录就是真正
+        # 消失的笔——两个同额同到期但 ID 不同的包各是一条记录，各补各的。
+        for key, rec in list(packs.items()):
+            if not key.startswith(mine) or key in matched:
+                continue
+            if str(rec.get("group") or "") != gname:
+                continue
+            exp = str(rec.get("expires_on") or "")
+            if not rec.get("expired") and not _exp_is_past(exp, now):
+                continue
+            # 全 0 的占位条目（官网偶尔给一条 total/left/used 都是 0 的「周期刷新」）
+            if (_f(rec.get("total")) <= 0 and _f(rec.get("left")) <= 0
+                    and _f(rec.get("used")) <= 0 and _f(rec.get("voided")) <= 0):
+                continue
+            items.append(_ledger_item(rec, gname, g.get("unit")))
+        for it in items:
+            it["expired"] = it.get("expired") is True or _exp_is_past(it.get("expires_on"), now)
+        live = [i for i in items if not i.get("expired")]
+        g["items"] = items
+        if items and not live:
+            g.update(left=0, live_left=0, total=0, used=0, usable_count=0, all_expired=True)
+        g["live_count"] = len(live)
+        g["expired_count"] = len(items) - len(live)
+        out.append(g)
+
+    # 整档都没了的（套餐结束 / 产品把空桶收起来）：按台账把过期记录单独立一档
+    gone = {}
+    for key, rec in list(packs.items()):
+        if not key.startswith(mine):
+            continue
+        gname = str(rec.get("group") or "")
+        if not gname or gname in seen_groups:
+            continue
+        exp = str(rec.get("expires_on") or "")
+        if not rec.get("expired") and not _exp_is_past(exp, now):
+            continue        # 没有确切到期日的不补：分不清是真第二笔还是旧记录
+        if (_f(rec.get("total")) <= 0 and _f(rec.get("left")) <= 0
+                and _f(rec.get("used")) <= 0 and _f(rec.get("voided")) <= 0):
+            continue
+        gone.setdefault(gname, []).append(_ledger_item(rec, gname, rec.get("unit")))
+    for gname, items in gone.items():
+        items.sort(key=lambda i: str(i.get("expires_on") or ""), reverse=True)
+        out.append({
+            "name": gname, "unit": (items[0].get("unit") or "credits"),
+            "total": 0, "left": 0, "used": 0, "scope": "",
+            "expires": EXPIRY_UNKNOWN, "days_left": None,
+            "live_count": 0, "expired_count": len(items), "usable_count": 0,
+            "live_left": 0, "items": items, "all_expired": True,
+            "note": "这一档的额度已经全部过期；厂商接口不再返回它，记录来自台账",
+        })
+    return out
+
+
+def _ledger_item(rec, gname, unit=None):
+    """台账里的一条记录 → 一笔「已过期」明细。"""
+    it = {
+        "label": rec.get("label") or gname,
+        "total": rec.get("total"), "used": rec.get("used"),
+        "left": rec.get("left"), "unit": rec.get("unit") or unit,
+        "expires_on": str(rec.get("expires_on") or ""),
+        "detail": "台账记录 · 厂商已不再返回这一笔",
+        "granted_on": rec.get("granted_on") or rec.get("first_seen") or "",
+        "granted_src": rec.get("granted_src") if rec.get("granted_on") else "first_seen",
+        "voided": rec.get("voided"),
+        "expired": True, "from_ledger": True,
+        "last_seen": rec.get("last_seen") or "",
+    }
+    if rec.get("resource_id"):
+        it["resource_id"] = rec["resource_id"]
+    if rec.get("granted_src"):
+        it["granted_src"] = rec["granted_src"]
+    if rec.get("granted_est"):
+        it["granted_est"] = True
+    return it
 
 
 def exp_text(ms):
@@ -8716,14 +10156,69 @@ def _ci_pick(dct, *names):
 # 官方 CLI（@genie/agent-cli）跟着桌面端一起装，它认 CODEBUDDY_AUTH_TOKEN 这个环境变量，
 # 把桌面端已登录的令牌喂进去就能无人值守跑一句——实测（2026-10-13）不需要再走一次浏览器登录。
 # bin/codebuddy 是无扩展名的 node 脚本，Windows 不能直接 exec，必须 node 拉起。
-WB_CLI_BY_INTL = {
-    False: Path("{LOCALAPPDATA}/LenovoSoftstore/Install/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy"),
-    True: Path("{LOCALAPPDATA}/Programs/WorkBuddyAI/resources/app.asar.unpacked/cli/bin/codebuddy"),
+#
+# 2026-11-19 修：原来这里写的是 Path("{LOCALAPPDATA}/LenovoSoftstore/...")，两个错叠在一起——
+# ① Path() 不认 {LOCALAPPDATA} 这种占位符（本文件只有 _expand() 会展开），拼出来的路径永远不存在，
+#    活跃签到的自动重试就全军覆没，界面上只剩「没找到国内版自带的命令行」；
+# ② 就算展开了也没用：安装盘是用户选的，不该由代码预设。
+# 所以改成「先问记录、再试默认落点」：驾驶舱的 exe-overrides.json 与 catalog.json 都记着本机
+# 实际 exe，用户换盘后那两处会跟着改，CLI 路径顺着 exe 的父目录推出来即可。
+# 2026-11-20：默认落点只保留厂商/系统的标准位置，不再写任何本机自定义安装盘——
+# 写死盘符既帮不到别人，也会把开发机的目录结构带进公开源码。
+_WB_CLI_REL = ("resources", "app.asar.unpacked", "cli", "bin", "codebuddy")
+_WB_INSTALL_GUESS = {
+    False: ("{LOCALAPPDATA}/LenovoSoftstore/Install/WorkBuddy",
+            "{PROGRAMFILES}/LenovoSoftstore/Install/WorkBuddy"),
+    True: ("{LOCALAPPDATA}/Programs/WorkBuddyAI",
+           "{PROGRAMFILES}/WorkBuddyAI"),
 }
+_WB_CLI_TRIED = []          # 只给报错文案用：这一次到底找过哪几个地方
+
+
+def _wb_recorded_exe(intl=False):
+    """本机已经认过的 exe：驾驶舱 exe-overrides.json（用户手改过盘的，最可信）+ 跨工具索引
+    catalog.json。两处都是纯 JSON，读不到或写坏了就跳过，绝不影响后面按默认落点兜底。"""
+    want = "workbuddy-intl" if intl else "workbuddy"
+    out = []
+    cockpit = Path(os.environ.get("AGENT_COCKPIT_HOME") or (HOME / ".agent-cockpit"))
+    try:
+        doc = json.loads((cockpit / "exe-overrides.json").read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and isinstance(doc.get(want), str):
+            out.append(doc[want])
+    except (OSError, ValueError):
+        pass
+    try:
+        doc = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+        for a in (doc.get("agents") or []) if isinstance(doc, dict) else []:
+            if isinstance(a, dict) and a.get("id") == want:
+                out.extend([x for x in (a.get("exe") or []) if isinstance(x, str)])
+    except (OSError, ValueError, AttributeError):
+        pass
+    return [x for x in out if x and x != "-"]
 
 
 def _wb_cli_path(intl=False):
-    return WB_CLI_BY_INTL.get(bool(intl))
+    """返回真正存在的那个 codebuddy；一处都没有就返回 None（试过的路径留在 _WB_CLI_TRIED）。
+
+    每条线索可能是 exe 路径，也可能是安装目录：带 .exe/.cmd 的取父目录再拼 CLI 的相对路径。
+    找不到不缓存（失败可能只是客户端正在更新），找到就直接返回，代价只有几次 is_file()。
+    """
+    rel = Path(*_WB_CLI_REL)
+    tried, seen = [], set()
+    for raw in _wb_recorded_exe(intl) + list(_WB_INSTALL_GUESS[bool(intl)]):
+        p = Path(_expand(raw).strip())
+        root = p.parent if p.suffix.lower() in (".exe", ".cmd", ".bat") else p
+        cand = root / rel
+        key = str(cand).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tried.append(str(cand))
+        if cand.is_file():
+            _WB_CLI_TRIED[:] = [str(cand)]
+            return cand
+    _WB_CLI_TRIED[:] = tried
+    return None
 
 
 def _wb_activity_dir(intl=False):
@@ -8957,7 +10452,9 @@ def _wb_send_activity(intl=False, auth_file=None):
       但绝不该拿她的仓库当这个定时任务的 cwd。）"""
     cli = _wb_cli_path(intl)
     if cli is None or not cli.is_file():
-        return {"error": f"没找到 {'国际版' if intl else '国内版'}自带的命令行（{cli}）"}
+        return {"error": f"没找到 {'国际版' if intl else '国内版'}自带的命令行。找过 "
+                         + "；".join(_WB_CLI_TRIED[:3])
+                         + "。客户端换过安装盘的话，到「程序」页把它的 exe 重新指一下"}
     login, err = _wb_read_login(intl, auth_file)
     if login is None:
         return {"error": err or "读不到 WorkBuddy 的登录令牌"}
@@ -10017,10 +11514,25 @@ def cmd_quota(con, args):
         if who.get("email") and who.get("name"):
             acct += f"〈{who['email']}〉"
         buckets = credit_buckets(d)
+        groups = credit_groups(buckets)
+        # 台账：把这次没返回、但确实已经过期的笔补回来（过期记录不许凭空消失）。
+        # Qoder 系例外：它的权威逐笔明细是驾驶舱用官网会话单独读回来的（Rust 侧
+        # webquota::apply），账号名也以官网那份为准；这边再记一遍会变成两套 key、
+        # 过期后补出重复的两条。Qoder 的台账在 Rust 侧做，见 quota_ledger.rs。
+        if p not in QODER_STORES:
+            ledger_path = _quota_ledger_path()
+            ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            with _file_transaction_lock(ledger_path.with_suffix(".lock")):
+                ledger = _quota_ledger_load()
+                groups = quota_ledger_merge(p, acct, groups, led=ledger)
+                _quota_ledger_save(ledger)
         # 一笔额度都没有时输出 null 而不是 0：把"这产品读不到额度"显示成"剩 0 积分"是撒谎
         # （Xiaomi MiMo 只有登录态可读，见 xiaomi_mimo_credit 那段）
-        left = round(sum(b["remaining"] or 0 for b in buckets), 8) if buckets else None
-        total = round(sum(b["total"] or 0 for b in buckets), 8) if buckets else None
+        # 汇总只按**效期内**的笔算：过期的额度已经作废，不能算进"总剩余"。
+        gl = [g.get("left") for g in groups if g.get("left") is not None]
+        gt = [g.get("total") for g in groups if g.get("total") is not None]
+        left = round(sum(_f(v) for v in gl), 8) if gl else None
+        total = round(sum(_f(v) for v in gt), 8) if gt else None
         live_err = r.get("live_error", "")
         # 登录态实际是从哪个档案读到的：换了档案位置（0.4.x 新壳）时，这是唯一的线索
         auth_from = r.get("auth_from", "")
@@ -10031,7 +11543,13 @@ def cmd_quota(con, args):
                  "source": r.get("source", "local-cache"), "liveError": live_err,
                  "authFrom": auth_from, "authKind": r.get("auth_kind", ""),
                  "plan": d.get("subscriptionPackageName") or "",
-                 "buckets": buckets, "groups": credit_groups(buckets)}
+                 "buckets": buckets, "groups": groups}
+        # 厂商只给「当前余额」、已用要从流水累加的产品（小浣熊）：
+        # 把累计消耗带出来，界面才能写「已用 38 / 16,100」而不是「已用 0 / 16,062」
+        if d.get("consumedTotal") is not None:
+            entry["consumedTotal"] = d["consumedTotal"]
+        if r.get("doubao"):
+            entry["doubao"] = r["doubao"]
         # 按天消耗序列（驾驶舱的波形图/热力图用）。读不出来只记一句原因，
         # 不许把余额本身打挂——她那张卡还得显示剩多少积分。
         t0 = daily_trend(p, profile=getattr(args, "profile", None))

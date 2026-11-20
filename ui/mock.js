@@ -155,10 +155,10 @@ const DATA = {
     { id: 'auto-ollama', name: 'Ollama', kind: 'plain', installed: true, swapped: '', swap_ok: false, discovered: true, isolatable: false, short: 'OL' },
     // 启动工具：没有账号也没有额度，界面上摆的是程序本身的信息和运行状态
     { id: 'auto-magpie', name: 'Magpie', kind: 'plain', installed: true, swapped: '', swap_ok: false,
-      discovered: true, isolatable: false, exe: 'D:\\Artificial_Intelligence\\magpie-windows-amd64.exe',
+      discovered: true, isolatable: false, exe: 'C:\\Program Files\\Magpie\\magpie.exe',
       exe_size: 49434880, exe_modified: 1756000000, first_seen: 1755000000 },
     { id: 'auto-cockpittools', name: 'Cockpit Tools', kind: 'plain', installed: true, swapped: '', swap_ok: false,
-      discovered: true, isolatable: false, exe: 'D:\\Artificial_Intelligence\\Cockpit Tools\\cockpit-tools.exe',
+      discovered: true, isolatable: false, exe: 'C:\\Program Files\\Cockpit Tools\\cockpit-tools.exe',
       exe_size: 129761280, exe_modified: 1757000000, first_seen: 1750000000 },
   ],
   instances: [

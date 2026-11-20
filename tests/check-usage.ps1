@@ -9,6 +9,10 @@ foreach ($script in @('ui/app.js', 'ui/usage-dashboard.js', 'ui/chatgpt.js', 'ui
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & python tests/usage-local.test.py
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& python tests/zcode-proxy-auth.test.py
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& python tests/zcode-credential-v2.test.py
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Push-Location -LiteralPath (Join-Path $projectRoot 'src-tauri')
 try {
     $env:CARGO_NET_OFFLINE = 'true'

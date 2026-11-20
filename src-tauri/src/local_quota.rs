@@ -12,8 +12,9 @@ pub const LOCAL_STORES: &[(&str, &str)] = &[
     ("astudio", "astudio"),
     ("minimax", "minimax"),
     ("traework-cn", "trae-cn"),
-    // ZCode（智谱）：凭据 enc:v1 是 AES-256-GCM，密钥纯本地派生；登录态就在实例目录自己的
-    // v2/credentials.json 里（~/.zcode 整体被换号），所以按账号目录读即可、无需回落。
+    // ZCode（智谱）：凭据是 AES-256-GCM（enc:v1 本地派生密钥 / enc:v2 系统凭据库密钥）；
+    // 登录态就在实例目录自己的 v2/credentials.json 里（~/.zcode 整体被换号），
+    // 所以按账号目录读即可、无需回落。enc:v2 的密钥不跟目录走，见 agenthub._zcode_v2_key。
     ("zcode", "zcode"),
     // 2026-10-11 新登记四家（接口与落点都已实测；agenthub 侧产品名与 id 同名）：
     // 千问办公：{APPDATA}\QwenWorkCN\auth-v2.dat（os_crypt v10 信封）
@@ -108,6 +109,10 @@ pub struct Quota {
     pub live_error: String,
     /// 登录态实际是从哪个文件读到的（Qoder 0.4.x 换壳后这是唯一能看出"读错档案"的线索）
     pub auth_from: String,
+    /// 厂商**只给"累计获得"、不给余额**时的那个数（豆包：签到活动一共发过多少额度）。
+    /// 有它就不能再在界面上写"额度读不到"——不是没数，是厂商没有"剩余"这个口径。
+    /// 与 `left/total` 严格分开：把它当余额画比例就是假账。
+    pub granted_total: Option<f64>,
     /// 按天消耗序列（波形图与热力图的数据源）：`{unit,days[],total,peak,peak_date,from,to}`，
     /// 读不出来时是 `{error:"…"}`，agenthub 那个产品压根没有逐笔时刻可聚时为 `Null`。
     /// 只有 WorkBuddy 系有这份数——它的本地库逐会话记了各资源包扣掉多少 credits。
@@ -369,6 +374,11 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
                 "left": num(&b["remaining"]),
                 "total": num(&b["total"]),
                 "used": num(&b["used"]),
+                // 厂商没给「已用」时（used_known=false）不许拿 total−remaining 反推：
+                // 小浣熊的 total 就是当前余额（官网那一栏显示的也是它），相减是假账。
+                "used_known": b.get("used_known").and_then(|v| v.as_bool()),
+                // 厂商给的「历次发放累加」：与「当前余额」分开存，界面能区分口径
+                "granted_total": b.get("granted_total").and_then(num),
                 "expires_on": if b_exp.is_empty() { expires.clone() } else { b_exp },
                 "category": b["category"].as_str().unwrap_or(""),
                 "unit": b["unit"].as_str().unwrap_or(unit),
@@ -392,10 +402,12 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
         portions,
         groups,
         plan_name: d["plan"].as_str().unwrap_or("").to_string(),
-        // 单位取第一笔实际给的：逐桶单位不一致的产品目前没见到，取第一笔即够用
+        // 单位取第一笔实际给的：逐桶单位不一致的产品目前没见到，取第一笔即够用。
+        // 一桶都没有但厂商给了累计值时（豆包），单位跟着累计值那一段走，别退回 credits。
         unit: buckets
             .first()
             .and_then(|b| b["unit"].as_str())
+            .or_else(|| d["doubao"]["total_unit"].as_str())
             .unwrap_or("credits")
             .to_string(),
         kind: d["kind"].as_str().unwrap_or("full").to_string(),
@@ -405,6 +417,8 @@ pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
         source: d["source"].as_str().unwrap_or("server").to_string(),
         live_error: d["liveError"].as_str().unwrap_or("").to_string(),
         auth_from: d["authFrom"].as_str().unwrap_or("").to_string(),
+        // 只给累计口径的产品（豆包签到活动）：数字在这儿，余额在 left/total 里仍然是 None
+        granted_total: num(&d["doubao"]["total_granted"]),
         // 按天序列与它的"为什么没有"合并成一个值：界面只认一种形状，
         // 有 days 就画图、只有 error 就把那句话原样显示出来，不许自己编一组数。
         trend: match d.get("trend") {
@@ -485,6 +499,42 @@ pub fn stored_rank(m: &Value) -> (usize, usize) {
     detail_rank(&arr(m, "quota_groups"), &arr(m, "credits"))
 }
 
+/// 这次读到的比档案里存的**更粗**吗？更粗就不覆盖（"明细只许越读越细"）。
+///
+/// 判据不能只认逐笔条数：资源包过期后会从列表里消失，正常一轮刷新条数就会变少。
+/// 两条"细读数"的正向判据：
+///   1. 每一笔都带真到期日（对 WorkBuddy / Qoder 官网读数成立）；
+///   2. **这次读到了逐笔明细本身**——厂商不给日期的产品（小浣熊「活动奖励」8 笔
+///      `expire_at` 全空）永远凑不齐第 1 条，只靠它就会把每次刷新都当成粗读数，
+///      明细永久冻在第一次跨天的时刻（2026-11-13 用户报的"刷了好多次时间还停在昨天"）。
+///
+/// 但仍留一道闸：条数骤减到不足原来一半时按粗读数处理，防止"2 笔汇总"
+/// 把"21 笔逐包"盖掉——那正是这道守卫当初要防的场景。
+fn is_coarser_reading(stored: (usize, usize), groups: &[Value], portions: &[Value]) -> bool {
+    let incoming = detail_rank(groups, portions);
+    if stored <= incoming {
+        return false;               // 不比档案粗，直接放行
+    }
+    let (in_n, in_dated) = dated_item_rank(groups);
+    if in_n == 0 {
+        return true;                // 连逐笔都没有：确实是粗读数（如 Qoder 本机的两个汇总数）
+    }
+    // 闸门先判：条数骤减到不足原来一半时一律按粗读数处理，
+    // 哪怕这次每一笔都带日期（2 笔都带日期同样会把 21 笔逐包盖掉）。
+    let shrunk_a_lot = stored.0 >= 4 && in_n * 2 < stored.0;
+    if shrunk_a_lot {
+        return true;
+    }
+    let all_dated = in_dated == in_n;
+    let has_items = groups.iter().any(|g| {
+        g.get("items")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    });
+    !(all_dated || has_items)
+}
+
 /// 更细的那份留在档案里，同时把"汇总数比明细新"这件事标出来，交给界面如实说。
 fn mark_detail_fresh(obj: &mut serde_json::Map<String, Value>, source: &str) {
     obj.insert("quota_detail_source".into(), json!(source));
@@ -500,6 +550,14 @@ fn mark_detail_fresh(obj: &mut serde_json::Map<String, Value>, source: &str) {
 
 /// 把读到的数写进实例档案；第一次读时把 userId 绑到这个账号上，之后每次校验。
 pub fn apply(meta: &Value, q: &Quota) -> Value {
+    // 先把档案里已有的逐笔明细回填进台账：厂商一收起某一笔（ZCode 套餐结束、
+    // Qoder 到期下架）就再也读不回来，档案里那份是唯一还能抢救的历史。
+    // 幂等，所以每轮都调也不会重复记。
+    crate::quota_ledger::backfill(
+        meta.get("app").and_then(|v| v.as_str()).unwrap_or(""),
+        meta.get("quota_account").and_then(|v| v.as_str()).unwrap_or(""),
+        &meta.get("quota_groups").cloned().unwrap_or(Value::Null),
+    );
     let mut m = meta.clone();
     let obj = match m.as_object_mut() {
         Some(o) => o,
@@ -534,10 +592,15 @@ pub fn apply(meta: &Value, q: &Quota) -> Value {
     // "粗"的判据只认逐笔条数**不够**：资源包过期后会从列表里消失，正常一轮刷新条数就会变少。
     // 新读数自己把每一笔的到期日都给全了，就说明它也是逐笔读数，条数少只代表包少了
     // （WorkBuddy 实测 10-18 的 69 笔把之后每轮 65~66 笔全挡在门外，临期提醒一直冻着）。
-    let (in_n, in_dated) = dated_item_rank(&q.groups);
-    let incoming_is_dated_detail = in_n > 0 && in_dated == in_n;
+    //
+    // 但"每笔都有到期日"这个判据对**厂商不给日期**的产品永远不成立：小浣熊的「活动奖励」
+    // 8 笔 `expire_at` 全是空的，于是每次刷新都被当成粗读数、明细永久冻在第一次跨天的时刻
+    // （2026-11-13 用户报的"刷了好多次，积分时间还停在昨天、也没写今天到期多少"）。
+    // 补一条：**这次读到了逐笔明细本身就说明是细读数**——条数少是过期导致的，不是读数变粗。
+    // 但要留一道闸：条数骤减到不足原来一半时仍按粗读数处理，
+    // 防止"2 笔汇总"把"21 笔逐包"盖掉（那正是这道守卫当初要防的场景）。
     let keep_detail =
-        stored_rank(meta) > detail_rank(&q.groups, &q.portions) && !incoming_is_dated_detail;
+        is_coarser_reading(stored_rank(meta), &q.groups, &q.portions);
     if keep_detail {
         obj.insert("quota_detail_stale".into(), json!(true));
     } else {
@@ -558,6 +621,9 @@ pub fn apply(meta: &Value, q: &Quota) -> Value {
     // 令牌过期时 agenthub 读不到服务端，只剩旧缓存——不记下来，界面就会把 8 月的数当今天的。
     obj.insert("quota_source".into(), json!(q.source));
     obj.insert("quota_live_error".into(), json!(q.live_error));
+    // "只给累计获得"的产品（豆包签到活动）：这个数要跟着档案存下来，
+    // 否则卡片上永远是"额度读不到"——明明读到了，只是厂商不给剩余口径
+    obj.insert("quota_granted_total".into(), json!(q.granted_total));
     if !q.auth_from.is_empty() {
         obj.insert("quota_auth_from".into(), json!(q.auth_from));
     }
@@ -604,7 +670,7 @@ mod tests {
             portions: vec![], groups: vec![], plan_name: String::new(), unit: String::new(),
             kind: "full".into(), used: 0.0, sessions: 0, last_active: String::new(),
             source: "local-cache".into(),
-            live_error: "没有余额接口".into(), auth_from: String::new(),
+            live_error: "没有余额接口".into(), auth_from: String::new(), granted_total: None,
             trend: Value::Null,
         };
         assert!(q.is_account_only());
@@ -633,6 +699,7 @@ mod tests {
             plan_name: "体验版".into(), unit: "credits".into(),
             kind: "full".into(), used: 100.0, sessions: 3, last_active: "2026-10-07 18:00".into(),
             source: "server".into(), live_error: String::new(), auth_from: String::new(),
+            granted_total: None,
             trend: Value::Null,
         };
         let m = apply(&meta, &q);
@@ -735,7 +802,7 @@ mod tests {
         assert_eq!(store_for("astudio"), Some("astudio"));
         assert_eq!(store_for("minimax"), Some("minimax"));
         assert_eq!(store_for("traework-cn"), Some("trae-cn"));
-        // ZCode：凭据 enc:v1 是本地可派的 AES-256-GCM，登录态在实例目录里，已确证能直读
+        // ZCode：凭据是 AES-256-GCM（v1 本地派生 / v2 系统凭据库），登录态在实例目录里，已确证能直读
         assert_eq!(store_for("zcode"), Some("zcode"));
         // 2026-10-11 新登记四家（接口与落点都已实测）：都有直读通道
         assert_eq!(store_for("qwenwork"), Some("qwenwork"));
@@ -803,6 +870,7 @@ mod tests {
             kind: "usage_only".into(), used: 9395.07, sessions: 126,
             last_active: "2026-10-07 19:12".into(),
             source: String::new(), live_error: String::new(), auth_from: String::new(),
+            granted_total: None,
             trend: Value::Null,
         };
         assert!(q.is_usage_only());
@@ -899,6 +967,7 @@ mod tests {
             portions: vec![], groups: vec![], plan_name: String::new(), unit: "credits".into(), kind: "full".into(), used: 0.0, sessions: 0,
             last_active: String::new(),
             source: source.into(), live_error: live_error.into(), auth_from: String::new(),
+            granted_total: None,
             trend: Value::Null,
         }
     }
@@ -931,6 +1000,55 @@ mod tests {
         let m = apply(&json!({ "name": "Qoder" }), &q);
         assert_eq!(m["quota_source"], "local-cache");
         assert!(m["quota_live_error"].as_str().unwrap().contains("TOKEN_EXPIRE"));
+    }
+
+    /// 明细保鲜守卫：厂商不给到期日时不许把新读数当粗读数（小浣熊 2026-11-13）。
+    ///
+    /// 现场：小浣熊「每日积分」每天到期一笔，逐笔条数 7 → 6 → 5；而「活动奖励」8 笔
+    /// `expire_at` 全空。旧判据要求"每一笔都带真到期日"才算细读数，于是每次刷新都被
+    /// 判成变粗、保留档案里那份 → 明细永久冻在第一次跨天的时刻，界面上就是
+    /// "刷了好多次，积分时间还停在昨天、也没写今天到期多少"。
+    #[test]
+    fn incoming_detail_without_dates_is_not_treated_as_coarse() {
+        // 档案里：每日积分 7 笔（都带日期）+ 活动奖励 8 笔（都没日期）→ (15, 7)
+        let stored = (15usize, 7usize);
+
+        // 新读数：每日积分 6 笔带日期（今天那笔过期消失了）+ 活动奖励 8 笔无日期 → (14, 6)
+        let incoming: Vec<Value> = vec![
+            json!({"name": "每日积分", "items": (0..6).map(|i| json!({
+                "expires_on": format!("2026-11-{:02} 23:59", 13 + i), "left": 300
+            })).collect::<Vec<_>>()}),
+            json!({"name": "活动奖励", "items": (0..8).map(|_| json!({
+                "expires_on": "未给出", "left": 500
+            })).collect::<Vec<_>>()}),
+        ];
+        assert!(
+            !is_coarser_reading(stored, &incoming, &[]),
+            "带逐笔明细的新读数不该被判成粗读数，否则明细永远停在旧的那份"
+        );
+
+        // 对照：Qoder 本机接口只回两个汇总数（没有 groups）→ 必须仍然判成粗读数，
+        // 否则官网读回来的 21 笔逐包会被它盖掉
+        let portions: Vec<Value> = (0..2)
+            .map(|i| json!({"label": format!("包{i}"), "left": 100.0, "expires_on": "2026-12-01"}))
+            .collect();
+        assert!(
+            is_coarser_reading((21, 21), &[], &portions),
+            "只有汇总数时必须挡住，别把官网那份逐包盖掉"
+        );
+
+        // 闸门：条数骤减到不足一半时仍按粗读数处理（防 2 笔汇总盖掉 21 笔逐包）
+        let tiny: Vec<Value> = vec![json!({"name": "积分", "items": [
+            {"expires_on": "2026-12-01 23:59", "left": 10},
+            {"expires_on": "2026-12-02 23:59", "left": 10},
+        ]})];
+        assert!(
+            is_coarser_reading((21, 21), &tiny, &[]),
+            "条数骤减到不足一半时要挡住"
+        );
+
+        // 不比档案粗就直接放行（条数变多、或同等细）
+        assert!(!is_coarser_reading((15, 7), &incoming, &[]));
     }
 
     /// 服务端读成功（source=server）绝不能被误判成旧缓存

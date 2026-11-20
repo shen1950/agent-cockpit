@@ -494,13 +494,18 @@ def discover_sources():
     # AStudio（Acode / 科大讯飞星辰）：rollout JSONL 在 acode-home-overlay/sessions/
     astudio_home = os.environ.get("AGENTFIND_ASTUDIO_HOME")
     if not astudio_home:
-        # 独立版没有驾驶舱注入的环境变量：先认本机实际数据盘，再落 LOCALAPPDATA 默认位。
-        legacy = Path("D:/Artificial_Intelligence/AStudio Data/acode-home-overlay/sessions")
-        local = os.environ.get("LOCALAPPDATA", "")
-        if legacy.exists():
-            astudio_home = str(legacy)
-        elif local:
-            astudio_home = str(Path(local) / "Programs/AStudio Data/acode-home-overlay/sessions")
+        # 独立版没有驾驶舱注入的环境变量：先在各个盘下找这个已知布局（安装盘由用户选，
+        # 不能写死盘符），再落 LOCALAPPDATA 默认位。
+        rel = Path("Artificial_Intelligence/AStudio Data/acode-home-overlay/sessions")
+        for drive in ("D", "E", "F", "G", "C"):
+            cand = Path(drive + ":/") / rel
+            if cand.exists():
+                astudio_home = str(cand)
+                break
+        if not astudio_home:
+            local = os.environ.get("LOCALAPPDATA", "")
+            if local:
+                astudio_home = str(Path(local) / "Programs/AStudio Data/acode-home-overlay/sessions")
     if astudio_home:
         add("astudio", "AStudio", "astudio_rollout", [Path(astudio_home)])
 

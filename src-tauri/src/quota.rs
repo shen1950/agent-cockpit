@@ -9,7 +9,7 @@ pub fn days_left(expires_on: &str) -> Option<i64> {
     }
     // 到期时间从 agenthub 过来是精确到分的（"2026-10-11 15:31"），倒计时只看日期部分；
     // "未给出""无限期"这类文字截不出日期，自然返回 None（不冒充承诺）。
-    let head = &s[..s.len().min(10)];
+    let head = s.get(..10)?;
     let d = NaiveDate::parse_from_str(head, "%Y-%m-%d").ok()?;
     let today = Local::now().date_naive();
     Some(d.signed_duration_since(today).num_days())
@@ -25,17 +25,18 @@ pub fn expiry(expires_on: &str) -> (bool, Option<i64>) {
     if s.is_empty() {
         return (false, None);
     }
-    let end = match NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
-        Ok(t) => Some(t),
-        Err(_) => NaiveDate::parse_from_str(&s[..s.len().min(10)], "%Y-%m-%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(23, 59, 59)),
-    };
+    let end = expiry_time(s);
     // "未给出" / "无限期" 截不出时间 → 不判过期，天数照 days_left 给 None
     match end {
         Some(t) => (t < Local::now().naive_local(), dl),
         None => (false, dl),
     }
+}
+
+pub(crate) fn expiry_time(s: &str) -> Option<NaiveDateTime> {
+    ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"].iter()
+        .find_map(|fmt| NaiveDateTime::parse_from_str(s, fmt).ok())
+        .or_else(|| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?.and_hms_opt(23, 59, 59))
 }
 
 /// 返回 (剩余, 总额, 错误)

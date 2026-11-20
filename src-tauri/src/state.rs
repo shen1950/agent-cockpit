@@ -101,6 +101,7 @@ pub fn reset_caps() {
 }
 
 pub fn build_state(proxy: &Proxy) -> Value {
+    let ledger = std::cell::OnceCell::new();
     crate::gateway::migrate_legacy_names();
     let snap = snapshot();
     let vis = windowed_pids();
@@ -200,6 +201,8 @@ pub fn build_state(proxy: &Proxy) -> Value {
             "swap_ok": app.id != "codex-desktop" && app.kind != "plain" && profile_dir(&app.id).is_some(),
             "local_quota": crate::local_quota::store_for(&app.id).is_some(),
             "icon": crate::icons::get(&app.id),
+            // 用户自己在 ~/.agent-cockpit/icons/custom/<id>.png 放了图：前端要让它压过内置品牌 SVG
+            "icon_custom": crate::icons::is_custom(&app.id),
             "exe": exe_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
             // 可执行文件本身的信息：启动工具这类程序没有账号和额度，
             // 界面上能读到的就剩这些（文件多大、什么时候换过版、什么时候被收录的）
@@ -340,6 +343,8 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 && !m["quota_account"].as_str().unwrap_or("").trim().is_empty()
                 && m["credits_left"].is_null()
                 && m["credits_total"].is_null()
+                // 有"累计获得"就不算 account_only：那是有数可摆的，只是没有剩余口径
+                && m["quota_granted_total"].is_null()
                 && !has_portions
                 && m["quota_used_local"].is_null()
                 && m["quota_groups"]
@@ -374,10 +379,17 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     "left": l,
                     "total": t,
                     "used": c["used"].as_f64(),
+                    "used_est": c["used_est"].as_bool().unwrap_or(false),
                     "category": c["category"].as_str().unwrap_or("").to_string(),
                     "unit": c["unit"].as_str().unwrap_or("credits").to_string(),
                     "expires_on": e,
                     "days_left": d,
+                    // 到账时间：和 groups 那条路径一样必须带出来，否则明细里那一栏又没了
+                    "granted_on": c["granted_on"].as_str().unwrap_or("").to_string(),
+                    "granted_est": c["granted_est"].as_bool().unwrap_or(false),
+                    "granted_src": c["granted_src"].as_str().unwrap_or("").to_string(),
+                    "resource_id": c["resource_id"].as_str().unwrap_or("").to_string(),
+                    "voided": c["voided"].as_f64(),
                     // 这个日期是她自己填的，不是厂商给的：界面必须标出来
                     "expires_manual": manual_portions.get(ci).copied().unwrap_or(false),
                     "note": c["note"].as_str().unwrap_or("").to_string(),
@@ -411,9 +423,27 @@ pub fn build_state(proxy: &Proxy) -> Value {
                 // 可能只有那 62.36 积分的一笔。同一时刻到期的几笔要合起来算。
                 let mut nearest_left: Option<f64> = None;
                 let mut nearest_unknown = false;
-                for it in g["items"].as_array().cloned().unwrap_or_default() {
+                for mut it in g["items"].as_array().cloned().unwrap_or_default() {
+                    let grant = it["granted_on"].as_str().unwrap_or("");
+                    let allow_estimate = !matches!(app.id.as_str(), "trae-cn" | "traework-cn")
+                        || matches!(g["name"].as_str(), Some("每日签到" | "TraeCode 邀请好友奖励"));
+                    if !grant.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                        || (!allow_estimate && (it["granted_est"] == true || it["granted_src"] == "estimate")) {
+                        it["granted_on"] = Value::Null;
+                        if !custom && it["spec"] != true {
+                            if let Some((date, src)) = crate::quota_ledger::saved_grant(ledger.get_or_init(crate::quota_ledger::saved_records),
+                                crate::local_quota::store_for(&app.id).unwrap_or(&app.id), m["quota_account"].as_str().unwrap_or(""), &it, allow_estimate) {
+                                it["granted_on"] = date;
+                                it["granted_src"] = src;
+                            } else if let Some(ts) = m["quota_detail_at"].as_f64().filter(|ts| *ts > 0.0 && it["from_ledger"] != true) {
+                                it["granted_on"] = json!(fmt_min(ts));
+                                it["granted_src"] = json!("snapshot");
+                            }
+                        }
+                    }
                     let e = it["expires_on"].as_str().unwrap_or("").trim().to_string();
                     let (dead, d) = crate::quota::expiry(&e);
+                    let dead = dead || it["expired"].as_bool() == Some(true);
                     let l = it["left"].as_f64();
                     if dead {
                         dead_n += 1;
@@ -451,10 +481,31 @@ pub fn build_state(proxy: &Proxy) -> Value {
                         "left": l,
                         "total": it["total"].as_f64(),
                         "used": it["used"].as_f64(),
+                        "used_est": it["used_est"].as_bool().unwrap_or(false),
                         "unit": it["unit"].as_str().unwrap_or("credits").to_string(),
                         "expires_on": e,
+                        // 这个到期日是推算的（厂商没给 expire_at，按公告「活动奖励自到账起
+                        // 1 年内有效」用到账时刻 +1 年推出来）。界面要标「推算」，
+                        // 不能和厂商给的日期长得一样
+                        "expires_est": it["expires_est"].as_bool().unwrap_or(false),
                         "days_left": d,
                         "expired": dead,
+                        // 这一笔什么时候到账（MiniMax 那张表的口径，推广到所有产品）。
+                        // ⚠ 这里是逐笔的**白名单重建**：上面漏掉哪个字段，界面上就少哪一列，
+                        //   而 agenthub 那边明明已经取到了。2026-11-17 用户报"MiniMax 原本
+                        //   显示的到账时间没了"就是这个原因——数据在、渲染也在，中间这一层丢了。
+                        "granted_on": it["granted_on"].as_str().unwrap_or("").to_string(),
+                        // 这个到账时间是推算的（厂商没给发放时刻，用台账首次见到它的时间兜底）
+                        "granted_est": it["granted_est"].as_bool().unwrap_or(false),
+                        // 到账时间的来源：vendor=厂商给的 / estimate=规则推算 / first_seen=首次记录
+                        "granted_src": it["granted_src"].as_str().unwrap_or("").to_string(),
+                        // 厂商资源 ID：台账的稳定身份，界面编辑/对账按它认人
+                        "resource_id": it["resource_id"].as_str().unwrap_or("").to_string(),
+                        // 过期时没用完、被官方作废掉的那部分（不能并进 used，否则进度条满格＝谎称用完）
+                        "voided": it["voided"].as_f64(),
+                        // 这一笔是台账留下的（厂商已经不再返回它）
+                        "from_ledger": it["from_ledger"].as_bool().unwrap_or(false),
+                        "last_seen": it["last_seen"].as_str().unwrap_or("").to_string(),
                         // 这一笔的日期是她自己填的（厂商那份是空，或被她改过）
                         "expires_manual": it["expires_manual"].as_bool().unwrap_or(false),
                         // 厂商原来给的那个日期：她改过之后仍然留着，好让她能"改回厂商口径"
@@ -464,6 +515,10 @@ pub fn build_state(proxy: &Proxy) -> Value {
                         "iid": it["iid"].as_str().unwrap_or("").to_string(),
                         "orig": it["orig"].as_str().unwrap_or("").to_string(),
                         "renamed": it["renamed"].as_bool().unwrap_or(false),
+                        // 厂商给的"规格"（妙手「每期 200 Credits」）：不是已到账，别算进合计
+                        "spec": it["spec"].as_bool().unwrap_or(false),
+                        // 已用是推算值（厂商没给逐笔用量），界面要标出来别当权威数
+                        "used_derived": it["used_derived"].as_bool().unwrap_or(false),
                     }));
                 }
                 // 这一档的到期日：她自己填的那一个优先（编辑里填了就照她填的显示），
@@ -481,7 +536,10 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     "name": g["name"].as_str().unwrap_or("其他").to_string(),
                     "unit": g["unit"].as_str().unwrap_or("credits").to_string(),
                     "scope": g["scope"].as_str().unwrap_or("").to_string(),
-                    "left": g["left"].as_f64(),
+                    "left": if dead_n > 0 && items.iter().filter(|it| it["expired"] != true).all(|it| it["left"].is_number()) {
+                        Some(live_left)
+                    } else { g["left"].as_f64() },
+                    "all_expired": dead_n > 0 && live_n == 0,
                     "total": g["total"].as_f64(),
                     "used": g["used"].as_f64(),
                     "live_count": live_n,
@@ -627,9 +685,11 @@ pub fn build_state(proxy: &Proxy) -> Value {
             // 明细与汇总数可能来自两次不同的读数：本机那条接口只有汇总数、逐笔到期只有官网有。
             // 这种时候大字跟最新的汇总数走，明细单独标"截至几点"——拿旧明细逐笔求和冒充
             // 现在的余额，就是把几小时前的数当今天报出去。
-            let use_top = detail_stale && top_left.is_some();
+            let use_top = (detail_stale || app.id == "catpaw") && top_left.is_some();
             let (left, total, expires_on, dl) = if use_top {
                 (top_left, m["credits_total"].as_f64(), earliest_exp, earliest_dl)
+            } else if !groups_out.is_empty() && groups_out.iter().all(|g| g["all_expired"] == true) {
+                (Some(0.0), Some(0.0), earliest_exp, earliest_dl)
             } else if has_portions {
                 (
                     if has_left { Some(sum_left) } else { None },
@@ -740,6 +800,9 @@ pub fn build_state(proxy: &Proxy) -> Value {
                     // 绑的是哪个 userId：向导第 2 步靠它判断"刚登进来的号是不是已经有卡了"
                     "user_id": m["quota_user_id"].as_str().unwrap_or(""),
                     "local_used": m["quota_used_local"].as_f64().unwrap_or(0.0),
+                    // 厂商只给"累计获得"、不给余额时的数（豆包签到活动）：界面上单独一行写
+                    // 「累计获得 N」，绝不并进 left/total 当余额
+                    "granted_total": m["quota_granted_total"].as_f64(),
                     // 数据来源：server = 服务端实时；local-cache = 客户端旧缓存（stale=true 时不可信）
                     "source": m["quota_source"].as_str().unwrap_or(""),
                     "stale": quota_stale,
@@ -985,5 +1048,39 @@ mod tests {
     fn exp_sort_key_puts_unknown_last() {
         assert!(exp_sort_key("2026-12-31") < exp_sort_key("未给出"));
         assert!(exp_sort_key("2026-12-31") < exp_sort_key(""));
+    }
+
+    /// 逐笔明细是**白名单重建**的：agenthub 取到的每个字段都得在这一层显式搬过来，
+    /// 漏一个界面上就少一列，而数据明明在。2026-11-17 用户报「MiniMax 原本显示的
+    /// 到账时间没了」就是这个——`granted_on` 在档案里、UI 里也画，中间这一层丢了。
+    ///
+    /// 这条测试钉住"取数层的字段清单 ⊆ 重建层的字段清单"，以后再加字段能当场发现。
+    #[test]
+    fn every_item_field_survives_the_whitelist_rebuild() {
+        // 取数层（agenthub）会给逐笔带上的字段
+        let upstream = [
+            "label", "pool", "detail", "left", "total", "used", "used_est", "unit", "expires_on",
+            "granted_on", "granted_est", "granted_src", "resource_id",
+            "voided", "from_ledger", "last_seen", "expires_manual", "expires_est",
+            "expires_vendor", "pid", "iid", "orig", "renamed", "spec", "used_derived",
+        ];
+        let src = include_str!("state.rs");
+        // 只取 items.push(json!({...})) 那一段（重建白名单）
+        let start = src
+            .find("items.push(json!({")
+            .expect("找不到逐笔重建那一处");
+        // 切到这一段自己的结尾 `}));`，别按固定字节数切 4000：这段里全是中文注释，
+        // 加几行就可能把边界落进某个汉字中间，测试会以 "not a char boundary" 自己 panic
+        let end = src[start..]
+            .find("}));")
+            .map(|i| start + i + 4)
+            .unwrap_or(src.len());
+        let seg = &src[start..end];
+        for k in upstream {
+            assert!(
+                seg.contains(&format!("\"{k}\"")),
+                "逐笔重建漏了字段 {k}：取数层给了、这一层没搬，界面上就少这一列"
+            );
+        }
     }
 }

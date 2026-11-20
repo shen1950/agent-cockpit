@@ -847,6 +847,16 @@ html[data-theme="light"] .card.running { border-color: rgba(20, 125, 90, .30) }
 .qitop .iconbtn { margin-left: auto; width: 24px; height: 24px; flex: none }
 .qitop .iconbtn svg { width: 13px; height: 13px }
 .qitop b { font-size: 12.5px; font-weight: 650; color: var(--text); overflow-wrap: anywhere }
+/* 到账时刻固定在右上角：`.qgrant` 用 margin-left:auto 吃掉名字后面的空隙，
+   和铅笔一起贴右。每条明细都对齐同一列，纵向扫下来就是时间先后。
+   早先它跟在名字后面，名字长短不一时标签左右乱跳，压根没法比。 */
+.qitop .qgrant { margin-left: auto; display: inline-flex; align-items: center; flex: none }
+/* 铅笔自己不再抢 auto，否则会把 .qgrant 顶到中间去 */
+.qitop .qgrant + .iconbtn { margin-left: 0 }
+.qtag-grant {
+  font-family: var(--font-data); font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
 .qtag {
   font-size: 10.5px; color: var(--text-faint); padding: 1px 7px; max-width: 100%;
   border: 1px solid var(--line); border-radius: var(--r-pill); overflow: hidden;
@@ -1146,6 +1156,10 @@ html[data-theme="light"] .modal.blur { background: rgba(80, 72, 60, .30) }
 }
 .applist .fav.svg { display: inline-flex }
 .applist .fav.svg svg { width: 100%; height: 100%; border-radius: 6px; display: block }
+/* 透明底品牌线稿（ChatGPT 桌面版）：只画符号、不铺色块，墨色跟着主题走。
+   浅色主题用正文墨色（#1B2029）、深色主题用浅墨（#E9E7E2）——
+   与 OpenAI 官方包内图标一致：它们本来就是透明底的单色线稿，没有底板。 */
+.applist .fav.svg.tint { color: var(--text) }
 .applist .cap {
   flex: none; font-size: 10px; padding: 1px 6px; border-radius: var(--r-pill);
   border: 1px solid var(--line-strong); color: var(--text-faint); white-space: nowrap;
@@ -1816,6 +1830,8 @@ svg.wave { display: block; width: 100%; height: 150px }
 .cimark.done { color: var(--ok); background: var(--ok-soft) }
 .cimark.error { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line) }
 .cimark.unreadable { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line) }
+/* 「未登录」不是故障：跟"活动未开"一样用中性灰，别跟"读不到"抢红色 */
+.cimark.unlogged { color: var(--text-muted); background: var(--bg-sunken) }
 .cinum.wide { width: 70px }
 .ciwarn { accent-color: var(--accent) }
 
@@ -2023,6 +2039,7 @@ svg.wave { display: block; width: 100%; height: 150px }
 .hacard .fav { width: 20px; height: 20px; flex: none; border-radius: 5px }
 .hacard .fav.svg { display: inline-flex }
 .hacard .fav.svg svg { width: 100%; height: 100%; border-radius: 5px; display: block }
+.hacard .fav.svg.tint { color: var(--text) }
 .hacard .fav.none { display: grid; place-items: center; background: var(--bg);
   border: 1px solid var(--line); font: 600 8.5px/1 var(--font-data); color: var(--text-muted) }
 
@@ -2093,6 +2110,23 @@ svg.wave { display: block; width: 100%; height: 150px }
 /* 共用登录态那一行：整行淡一点，别跟读到了数的行一样显眼 */
 .ci-badge.off { color: var(--text-muted); background: var(--bg-sunken) }
 
+/* 隐藏的账号（2026-11-12）：名字后面一枚灰签、整行淡出、表下一条常驻说明。
+   隐藏只改驾驶舱自己的账号卡记录——不查状态、不自动签，档案和登录态一概没动 */
+.ci-off {
+  flex: 0 0 auto; font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  color: var(--text-faint); background: var(--bg-sunken); border: 1px dashed var(--line);
+}
+.ci-ghost { opacity: .5 }
+.ci-ghost:hover { opacity: .78 }
+.cihid {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 12px; padding: 8px var(--sp-3);
+  font-size: 11.5px; color: var(--text-muted); line-height: 1.55;
+  background: var(--bg-sunken); border: 1px dashed var(--line); border-radius: var(--r-md);
+}
+.cihid b { color: var(--text); font-weight: 650 }
+.cihid .sp { flex: 1 1 auto }
+
 /* ------------------------------------------------------------
    API 站点内批量管理（2026-10-17）
    勾选列 + 顶部操作条。操作条 sticky 在内容区顶部，滚动时不会跑丢。
@@ -2121,6 +2155,45 @@ svg.wave { display: block; width: 100%; height: 150px }
   padding-bottom: 8px; border-bottom: 1px dashed var(--line) }
 .bdgroup .bdghead { display: flex; align-items: center; gap: 8px }
 .bdgroup .bdghead .sp { flex: 1 1 auto }
+
+/* ---------- key 批量编辑弹窗（2026-11-11） ----------
+   和查重/批量删共用 .bdlist 那套勾选列表；下面接一段「勾哪项改哪项」的表单。
+   表单每行左侧是复选框 + 字段名 + 一句说明，右侧是值控件：
+   没勾的项控件是灰的（disabled），一眼能看出"这项这次不动"。
+   高度分配：**列表限高自己滚**（密钥可能几十条），**表单按内容完整显示**
+   （六项一屏看全，否则会被当成"只能改四项"）。两者都不吃对方的滚动条：
+   表单不再设 max-height，极端矮窗口交给 .dialog 自身的 max-height 兜。
+   列表右缘常驻一条滚动槽，底边截断时也看得出"下面还有"。 */
+#bemodal .dialog.wide {
+  width: min(760px, 100%); max-height: 90vh;
+  display: flex; flex-direction: column;
+}
+#bemodal .dialog.wide > h3 { flex: none }
+#bemodal .hintline { flex: none }
+#bemodal .bdlist {
+  flex: 0 1 auto; max-height: 30vh; min-height: 140px;
+  margin-top: 10px; scrollbar-gutter: stable;
+}
+.beform {
+  flex: none; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line);
+}
+.behint { font-size: 12px; color: var(--text-faint); margin-bottom: 8px }
+.berow {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--sp-3); align-items: center; padding: 7px 0;
+}
+.berow + .berow { border-top: 1px dashed var(--line) }
+/* 左边：复选框 + 字段名 + 一句说明（说明跟在名字后面，不用再占一行高度） */
+.behead { display: flex; align-items: baseline; gap: 7px; cursor: pointer; min-width: 0; flex-wrap: wrap }
+.behead input[type="checkbox"] { flex: none; align-self: center; width: 14px; height: 14px; accent-color: var(--accent) }
+.behead b { font-size: 12.5px; font-weight: 600; color: var(--text) }
+.behead .kv { font-size: 11.5px; color: var(--text-faint) }
+.bectl { display: flex; align-items: center; gap: var(--sp-2); min-width: 0 }
+.bectl .be-val { width: 240px; min-width: 0 }
+.bectl .fieldexp { width: 300px }
+.bectl select.be-val { width: 150px }
+.bectl .be-val:disabled { opacity: .5 }
+.be-date-native { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none }
 
 /* ------------------------------------------------------------
    拖拽排序（2026-10-28）：站点卡 & key 行都从 ⠿ 手柄拖
@@ -2723,6 +2796,42 @@ table.tbl td.acts > *:last-child { margin-right: 0 }
 .legalack { display: flex; align-items: flex-start; gap: var(--sp-2); margin: var(--sp-4) 0 var(--sp-2); font: 400 13px/1.6 var(--font-sans); color: var(--text); cursor: pointer }
 .legalack input { flex-shrink: 0; margin-top: 3px }
 .legal-fine { margin-top: var(--sp-2); font: 400 12px/1.7 var(--font-sans); color: var(--text-muted) }
+
+/* ---------------- 找密钥（密钥管理页）----------------
+   拿一把 key 反查归属：三档命中（原文全等 / 打码全等 / 片段匹配）各有各的视觉分量，
+   片段命中必须一眼看出「这是候选，不是确定」，免得把不确定当确定去用。 */
+.panel.keyfind { margin-top: var(--sp-4) }
+.panel.keyfind h2 { display: flex; align-items: center; gap: var(--sp-2) }
+.keyfind input.grow { min-width: 220px; font-family: var(--font-mono) }
+#k-find-out:empty { display: none }
+.kfgroup { margin-top: var(--sp-3) }
+.kfgroup h3 { font-size: 13px; font-weight: 650; margin: 0 0 var(--sp-2); color: var(--text) }
+.kfrow {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: var(--sp-3);
+  margin-bottom: var(--sp-2);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.kfrow.exact { border-left: 3px solid #4CAF7D }
+.kfrow.masked { border-left: 3px solid #C8956C }
+.kfrow.partial { border-left: 3px solid var(--text-muted); opacity: .88 }
+.kfrow-h { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap }
+.kfrow-h .sp { flex: 1 }
+.kfrow-h strong { font-size: 13.5px; font-weight: 650 }
+.kftier {
+  font-size: 11px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--line-strong); color: var(--text-muted); white-space: nowrap;
+}
+.kfrow.exact .kftier { color: #4CAF7D; border-color: rgba(76, 175, 125, .4) }
+.kfrow.masked .kftier { color: #C8956C; border-color: rgba(200, 149, 108, .4) }
+.kflabel { font-size: 13px }
+.kfmask { font-size: 12.5px; color: var(--text-muted) }
+.kfrow-m { font-size: 12px; color: var(--text-muted); word-break: break-all }
+.kfrow-a { display: flex; align-items: center; gap: var(--sp-2); margin-top: 2px }
+/* 「在台账里定位」跳过去以后，把目标那一行点亮一下 */
+.tbl.keys tbody tr.hit > td { background: rgba(200, 149, 108, .14) }
+.tbl.keys tbody tr.hit > td:first-child { box-shadow: inset 3px 0 0 var(--accent) }
 
 /* Account details keep the field label legible when values contain long paths. */
 #im-body { container-type: inline-size }

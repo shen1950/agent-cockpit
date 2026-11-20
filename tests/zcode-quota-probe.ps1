@@ -21,10 +21,46 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 payload=json.loads(sys.stdin.buffer.read().decode('utf-8-sig'))
 secret=os.environ.get('ZCODE_CREDENTIAL_SECRET') or 'zcode-credential-fallback:%s:%s:%s'%(sys.platform,pathlib.Path.home(),os.environ.get('USERNAME') or os.environ.get('USER') or 'unknown')
 key=hashlib.sha256(secret.encode()).digest()
+ROOT=pathlib.Path(payload['native_root'])
+def os_key(want):
+ import ctypes,ctypes.wintypes as wt
+ class FT(ctypes.Structure):_fields_=[('a',wt.DWORD),('b',wt.DWORD)]
+ class CR(ctypes.Structure):_fields_=[('Flags',wt.DWORD),('Type',wt.DWORD),('TargetName',wt.LPWSTR),('Comment',wt.LPWSTR),('LastWritten',FT),('CredentialBlobSize',wt.DWORD),('CredentialBlob',ctypes.POINTER(ctypes.c_char)),('Persist',wt.DWORD),('AttributeCount',wt.DWORD),('Attributes',ctypes.c_void_p),('TargetAlias',wt.LPWSTR),('UserName',wt.LPWSTR)]
+ api=ctypes.WinDLL('advapi32',use_last_error=True);api.CredFree.argtypes=[ctypes.c_void_p]
+ def read(t):
+  p=ctypes.POINTER(CR)()
+  api.CredReadW.argtypes=[wt.LPWSTR,wt.DWORD,wt.DWORD,ctypes.POINTER(ctypes.POINTER(CR))]
+  if not api.CredReadW(t,1,0,ctypes.byref(p)):return None
+  try:
+   c=p.contents;return ctypes.string_at(c.CredentialBlob,c.CredentialBlobSize).decode('utf-16-le')
+  finally:api.CredFree(p)
+ def fit(text):
+  try:k=base64.urlsafe_b64decode((text or '')+'='*(-len(text or '')%4))
+  except Exception:return None
+  return k if len(k)==32 and hashlib.sha256(k).hexdigest()[:24]==want else None
+ f=os.path.realpath(str(ROOT/'v2'/'credentials.json'))
+ k=fit(read(hashlib.sha256(f.encode()).hexdigest()+'.ZCode Credential Encryption'))
+ if k:return k
+ n=wt.DWORD(0);a=ctypes.POINTER(ctypes.POINTER(CR))()
+ api.CredEnumerateW.argtypes=[wt.LPWSTR,wt.DWORD,ctypes.POINTER(wt.DWORD),ctypes.POINTER(ctypes.POINTER(ctypes.POINTER(CR)))]
+ if not api.CredEnumerateW(None,0,ctypes.byref(n),ctypes.byref(a)):return None
+ try:
+  for i in range(n.value):
+   name=a[i].contents.TargetName or ''
+   if name.endswith('.ZCode Credential Encryption'):
+    k=fit(read(name))
+    if k:return k
+ finally:api.CredFree(a)
+ return None
 def dec(s):
- if not s.startswith('enc:v1:'):return s
- iv,tag,ct=[base64.urlsafe_b64decode(p+'='*(-len(p)%4)) for p in s[7:].split('.')]
- return AESGCM(key).decrypt(iv,ct+tag,None).decode('utf-8')
+ if not s.startswith('enc:'):return s
+ if s.startswith('enc:v1:'):
+  iv,tag,ct=[base64.urlsafe_b64decode(p+'='*(-len(p)%4)) for p in s[7:].split('.')]
+  return AESGCM(key).decrypt(iv,ct+tag,None).decode('utf-8')
+ source,want,body=s[7:].split(':',2)
+ if source!='os':raise SystemExit('probe only handles the os key source, got %r'%source)
+ iv,tag,ct=[base64.urlsafe_b64decode(p+'='*(-len(p)%4)) for p in body.split('.')]
+ return AESGCM(os_key(want)).decrypt(iv,ct+tag,None).decode('utf-8')
 class NoRedirect(urllib.request.HTTPRedirectHandler):
  def redirect_request(self,*args,**kwargs):return None
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())

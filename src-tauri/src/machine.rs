@@ -91,6 +91,9 @@ pub fn read(app_id: &str) -> Value {
                 "left": q.left, "total": q.total, "expires_on": q.expires_on,
                 "source": q.source, "stale": q.is_stale(), "live_error": q.live_error,
                 "auth_from": q.auth_from,
+                // 厂商只给"累计获得"、不给余额时（豆包签到活动）：向导要能把这个数摆出来，
+                // 否则卡片只能写"额度读不到"，看着像整条链路断了
+                "granted_total": q.granted_total,
                 // 只有登录身份、没有余额接口的店（MiMo/Antigravity/Coze）：
                 // 向导据此说"只认到了登录身份"，而不是"剩 0 / 共 0"
                 "account_only": q.is_account_only(),
