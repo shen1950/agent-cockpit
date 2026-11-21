@@ -84,9 +84,17 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::home_dir()
 }
 
-/// 要注入哪些模型：站点的清单为主，key 自己那份是补充（都空时兜 key["model"]）
+/// 已发现目录只用于它对应的接入点，不能把其他端点的模型注入当前地址。
 fn models_of(key: &Value, site: &Value) -> Vec<String> {
+    let (base, fmt) = crate::keys::base_and_fmt(site, key);
+    if key["model_catalogs"].as_array().is_some_and(|catalogs| !catalogs.is_empty()) {
+        return crate::keys::models_for_endpoint(site, key, &crate::keys::endpoint_id(&fmt, &base));
+    }
     let mut out = crate::keys::models_for(site, key);
+    // 仅保留老数据的接入行为；这不是检测权限，也不会被矩阵自动采用。
+    if out.is_empty() && key["models_list"].as_str().unwrap_or("").trim().is_empty() {
+        out = crate::keys::models_for(site, &Value::Null);
+    }
     if out.is_empty() {
         let d = key["model"].as_str().unwrap_or("").trim();
         if !d.is_empty() {
@@ -523,14 +531,11 @@ mod tests {
     }
 
     #[test]
-    fn model_list_comes_from_the_site_with_the_key_as_extra() {
-        // 站点那份在前，key 自己补的在后，逗号/中文逗号/换行/空格都算分隔，重复的并掉
+    fn model_list_prioritizes_key_and_only_falls_back_for_legacy_data() {
         let site = json!({ "models_list": "glm-5.3-flash, qwen3.8-flash，u2-flash\nhy3  hy3" });
         let key = json!({ "models_list": "LongCat-2.0 glm-5.3-flash" });
-        assert_eq!(
-            models_of(&key, &site),
-            vec!["glm-5.3-flash", "qwen3.8-flash", "u2-flash", "hy3", "LongCat-2.0"]
-        );
+        assert_eq!(models_of(&key, &site), vec!["LongCat-2.0", "glm-5.3-flash"]);
+        assert_eq!(models_of(&json!({"models_list":""}), &site), vec!["glm-5.3-flash", "qwen3.8-flash", "u2-flash", "hy3"]);
         assert_eq!(
             models_of(&json!({ "model": "only-one" }), &json!({})),
             vec!["only-one"],

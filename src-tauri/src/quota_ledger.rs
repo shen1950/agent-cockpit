@@ -195,6 +195,8 @@ fn item_of(rec: &Value, gname: &str, unit: Option<&str>) -> Value {
         "voided": rec.get("voided"),
         "unit": rec.get("unit").and_then(|v| v.as_str()).or(unit),
         "expires_on": rec.get("expires_on").cloned().unwrap_or(Value::Null),
+        // 这一笔哪天被扣光（WorkBuddy 的 ExpiredTime）；没有就 null，界面写 ——
+        "ended_on": rec.get("ended_on").cloned().unwrap_or(Value::Null),
         "detail": "台账记录 · 厂商已不再返回这一笔",
         "granted_on": rec.get("granted_on").cloned().unwrap_or(Value::Null),
         // 到账时间的来源：vendor=厂商给的 / estimate=规则推算 / first_seen=我们首次读到
@@ -259,6 +261,9 @@ pub fn backfill(app: &str, account: &str, groups: &Value) {
                     "label": it.get("label").cloned().unwrap_or(Value::Null),
                     "unit": it.get("unit").cloned().unwrap_or(Value::Null),
                     "expires_on": it.get("expires_on").cloned().unwrap_or(Value::Null),
+                    // 记下「哪天被扣光」：厂商把这一笔收起来之后，明细里还得能看出
+                    // 它是用光的还是放久的（这两件事以前混在「到期时间」一列里）
+                    "ended_on": it.get("ended_on").cloned().unwrap_or(Value::Null),
                     "total": it.get("total").cloned().unwrap_or(Value::Null),
                     "used": it.get("used").cloned().unwrap_or(Value::Null),
                     "left": it.get("left").cloned().unwrap_or(Value::Null),
@@ -480,6 +485,16 @@ fn merge_at(app: &str, account: &str, groups: &Value, now: &NaiveDateTime, stamp
                 "expires_on".into(),
                 it.get("expires_on").cloned().unwrap_or(Value::Null),
             );
+            // 耗尽时间跟着本轮读数走：厂商这轮没给就清掉，别留上一轮的旧值冒充
+            // （自然到期的笔本轮一定回空串，清掉之后界面才显示 —— ）
+            match it.get("ended_on").filter(|v| v.as_str().is_some_and(|s| !s.is_empty())) {
+                Some(v) => {
+                    rec.insert("ended_on".into(), v.clone());
+                }
+                None => {
+                    rec.remove("ended_on");
+                }
+            }
             rec.insert(
                 "total".into(),
                 it.get("total").cloned().unwrap_or(Value::Null),

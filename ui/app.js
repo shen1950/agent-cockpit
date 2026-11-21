@@ -141,12 +141,10 @@ function keyActTd(site, k) {
       ? el('span', { class: 'muted', title: '正在向站点发请求，等它回来' }, '测试中…')
       : iconBtn('test', () => keyTest(site.id, k.id),
         '测试：向站点的接入点发一次 GET /models，验证这把 Key 还能不能用'),
-    // 「请求」= 真发一条最小对话。模型清单打得通 ≠ key 真能用：
-    // 有的站点 /models 谁问都给（小红书 Dots 就这样），真调用才 403。
-    iconBtn('chat', (e) => keyChat(site.id, k.id, e.currentTarget),
-      '请求：真发一条最小对话（POST /chat/completions），验证上游认不认这把 Key。\n点名一个模型、只回 1 个字，几乎不耗额度'),
+    iconBtn('chat', () => keyChat(site.id, k.id),
+      '请求：打开检测矩阵，确认该密钥、接入点与模型后再发送请求，可能产生少量费用'),
     iconBtn('grid', () => openMatrix(site.id, { type: 'key', value: k.id }),
-      '接入点体检：把这把密钥 × 每种协议逐个检测，看清是密钥的事还是协议的事'),
+      '接入点体检：按具体地址与模型检测该密钥，区分密钥权限和端点问题'),
     iconBtn('edit', () => openKeyModal(site, k),
       '编辑：名称、来源、密钥与截止日期'),
     iconBtn('copy', () => copyKey(site.id, k.id, k.label || site.name),
@@ -186,207 +184,307 @@ async function keyTest(site, id) {
     if (!patchKeyAct(site, id)) renderKeys(S.data);
   }
 }
-/* 「请求」：真发一条最小对话，看上游到底认不认这把 key。
-   和「测试」分开是因为两件事结论不一样——测试只问「模型清单给不给看」，
-   有的站点谁问都给，于是坏 key 也显示可用（2026-11-05 小红书 Dots 实测）。
-   不落账、不整表重绘：只换这一个按钮的姿态，失败原因原样吐在 toast 里。
-   给 9 秒而不是默认 5.2 秒——上游那句原话常有一整行，5 秒来不及看完。 */
-async function keyChat(siteId, id, btn) {
-  if (btn && btn.dataset.busy === '1') return;
-  const prevTitle = btn ? btn.title : '';
-  if (btn) {
-    btn.dataset.busy = '1';
-    btn.disabled = true;
-    btn.style.opacity = '.45';
-    btn.title = '正在发请求，等上游回话（最多 20 秒）…';
-  }
-  try {
-    const r = await invoke('action', { payload: { action: 'key_chat', site: siteId, id } });
-    toast(r.msg, r.ok, r.ok ? 6000 : 9000);
-  } catch (e) {
-    const msg = String((e && (e.message || e)) || e).slice(0, 200);
-    toast(`这一步没跑通：${msg}`, false, 9000);
-  } finally {
-    if (btn) {
-      btn.dataset.busy = '';
-      btn.disabled = false;
-      btn.style.opacity = '';
-      btn.title = prevTitle;
-    }
-  }
+/* 旧「请求」入口先展示具体端点与模型，由用户确认后再检测。 */
+function keyChat(siteId, id) {
+  return openMatrix(siteId, { type: 'key', value: id });
 }
-/* ---------------- 接入点体检（密钥 × 协议矩阵） ----------------
-   「这把 key 能不能用」和「这个协议能不能用」是两个维度：
-   星驰那种站把 /v1/chat/completions 整条停了，那一列每把 key 都会失败。
-   只说「失败」会把站点策略误读成密钥坏了，所以摊成矩阵，坏在哪一层直接标出来。
 
-   数据只在打开弹窗期间留在内存（MX.cells），不落盘：检测结果是有时效的，
-   存下来反而会让人对着过期结论下判断。 */
-const MX = { siteId: null, focus: null, busy: false, cells: new Map() };
+/* ---------------- 接入点体检（密钥 × 接入点 × 模型） ---------------- */
+const MX = {
+  siteId: null, focus: null, busy: false, session: 0, sequence: 0, request: null,
+  cells: new Map(), choices: new Map(), revisions: new Map(), views: new Map(), buttons: [], layout: '', source: '',
+};
 const MX_LABEL = {
   ok: '连通', key_denied: '密钥无权', site_disabled: '站点停用',
-  model_mismatch: '模型不识别', error: '其他错误', run: '检测中', unt: '未检测',
+  model_mismatch: '模型不识别', error: '检测失败', run: '检测中', unt: '未检测',
+  unconfigured: '待选模型', rate_limited: '请求限流', cancelled: '已取消', invalid_response: '响应无效',
+  stale: '结果过期', incomplete: '响应未完', not_applicable: '不适用',
 };
 const MX_FMT_LABEL = {
   openai: 'Chat Completions', 'openai-resp': 'Responses',
   anthropic: 'Messages', gemini: 'Gemini', other: '其他',
 };
+const MX_CATALOG_LABEL = { ok: '已获取', empty: '目录为空', error: '获取失败', cancelled: '已取消', stale: '目录过期' };
 
-/* 从地址反推协议：密钥自带接入点时靠它判断这条地址属于哪一列。
-   与后端 keys::fmt_of_url 保持同一套规则，否则界面列和后端实际请求会对不上。 */
 function mxFmtOf(url) {
   const low = String(url || '').trim().replace(/\/+$/, '').toLowerCase();
   if (low.endsWith('/responses')) return 'openai-resp';
-  if (low.endsWith('/messages')) return 'anthropic';
-  if (low.includes('generativelanguage') || low.includes(':generatecontent')) return 'gemini';
+  if (low.endsWith('/messages') || low.split('/').includes('anthropic')) return 'anthropic';
+  if (low.includes('generativelanguage') || low.includes(':generatecontent') || low.endsWith('/v1beta') || low.endsWith('/v1beta/models')) return 'gemini';
   return 'openai';
 }
-
-/* 矩阵的列：站点登记的接入点；一个都没登记时（老数据只把地址挂在 key 上），
-   按密钥自带地址补出来，别让弹窗直接空着。 */
+function mxEndpointId(fmt, url) {
+  return `${String(fmt || '').trim()}|${String(url || '').trim().replace(/\/+$/, '')}`;
+}
 function mxBases(site) {
   const out = [];
-  for (const b of site.base_urls || []) {
-    const url = String(b.url || '').trim();
-    if (!url) continue;
-    const fmt = String(b.format || '').trim() || mxFmtOf(url);
-    if (!out.some((x) => x.fmt === fmt)) out.push({ fmt, url });
-  }
-  if (!out.length) {
-    for (const k of site.keys || []) {
-      const url = String(k.base_url || '').trim();
-      if (!url) continue;
-      const fmt = mxFmtOf(url);
-      if (!out.some((x) => x.fmt === fmt)) out.push({ fmt, url });
-    }
-  }
+  const add = (format, raw) => {
+    const url = String(raw || '').trim().replace(/\/+$/, '');
+    if (!url) return;
+    const fmt = String(format || '').trim() || mxFmtOf(url);
+    const id = mxEndpointId(fmt, url);
+    if (!out.some((b) => b.id === id)) out.push({ id, fmt, url });
+  };
+  for (const b of site.base_urls || []) add(String(b.base_format || '').trim() || b.format, b.url);
+  for (const k of site.keys || []) add(k.base_format, k.base_url);
   return out;
 }
-
-function mxCellKey(sid, kid, fmt) { return `${sid}|${kid}|${fmt}`; }
-function mxGet(sid, kid, fmt) { return MX.cells.get(mxCellKey(sid, kid, fmt)) || { state: 'unt' }; }
-
+function mxEndpointApplies(site, key, endpoint) {
+  const idFor = (fmt, url) => mxEndpointId(String(fmt || '').trim() || mxFmtOf(url), url);
+  return (site.base_urls || []).some((b) => String(b.url || '').trim() && idFor(String(b.base_format || '').trim() || b.format, b.url) === endpoint.id)
+    || (String(key.base_url || '').trim() !== '' && idFor(key.base_format, key.base_url) === endpoint.id);
+}
+function mxModels(value) {
+  return [...new Set((Array.isArray(value) ? value : String(value || '').split(/[,，\s]+/))
+    .filter((m) => typeof m === 'string').map((m) => m.trim()).filter(Boolean))];
+}
+function mxKeyModels(k) {
+  return mxModels([...mxModels(k.models_list), ...(k.model_catalogs || []).flatMap((c) => mxModels(c.models))]);
+}
+function mxModelSource(site, k, b) {
+  const catalog = (k.model_catalogs || []).find((c) => c.endpoint_id === b.id);
+  const exact = catalog ? mxModels(catalog.models) : [];
+  const manual = catalog ? [] : mxModels(k.models_list);
+  return {
+    model: catalog ? (catalog.state === 'ok' ? exact[0] || '' : '') : manual[0] || '',
+    suggestions: mxModels([...exact, ...manual]),
+    unverified: mxModels(site.models_list).filter((m) => !exact.includes(m) && !manual.includes(m)),
+    note: catalog ? `${MX_CATALOG_LABEL[catalog.state] || '目录未知'}${catalog.msg ? ` · ${catalog.msg}` : ''}`
+      : manual.length ? '历史建议 · 未验证' : '无密钥目录 · 请选模型',
+    catalog,
+  };
+}
+function mxChoiceKey(kid, endpoint) { return JSON.stringify([kid, endpoint]); }
+function mxChoice(site, k, b) {
+  const id = mxChoiceKey(k.id, b.id);
+  if (!MX.choices.has(id)) MX.choices.set(id, mxModelSource(site, k, b).model);
+  return MX.choices.get(id);
+}
+function mxCellKey(sid, kid, endpoint, model, session = MX.session) {
+  return JSON.stringify([session, sid, kid, endpoint, model]);
+}
+function mxGet(sid, kid, endpoint, model) {
+  return MX.cells.get(mxCellKey(sid, kid, endpoint, model)) || { state: model ? 'unt' : 'unconfigured' };
+}
 function mxChip(c) {
-  const st = (c && c.state) || 'unt';
-  const box = el('span', { class: `mxst ${st}`, title: (c && c.msg) || '' });
+  const st = c?.state || 'unt';
+  const box = el('span', { class: `mxst ${st}`, title: c?.msg || '' });
   box.appendChild(el('span', { class: 'dot' }));
-  const label = MX_LABEL[st] || st;
-  box.appendChild(document.createTextNode(
-    st === 'ok' && c && c.ms ? `${label} · ${(c.ms / 1000).toFixed(1)}s` : label));
+  const label = MX_LABEL[st] || '未知状态';
+  box.appendChild(document.createTextNode(st === 'ok' && c?.ms ? `${label} · ${(c.ms / 1000).toFixed(1)}s` : label));
   return box;
 }
+function mxTime(value) {
+  if (!value) return '尚未检测';
+  const stamp = typeof value === 'number' ? (value < 1e12 ? value * 1000 : value) : value;
+  const date = new Date(stamp);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('zh-CN');
+}
+function mxDataSignature(site) {
+  return JSON.stringify([mxBases(site), (site.keys || []).map((k) =>
+    [k.id, k.masked, k.secret_locked, k.probe_revision, k.base_url, k.base_format, k.models_list, k.model_catalogs])]);
+}
 
-async function openMatrix(siteId, focus) {
+/* 先释放前端会话，再通知后台停止后续调度；旧 HTTP 响应不得回写新会话。 */
+function mxCancel(notify = true) {
+  const request = MX.request;
+  MX.request = null;
+  MX.busy = false;
+  for (const [id, c] of MX.cells) {
+    if (c.state === 'run') MX.cells.set(id, { ...c, state: 'cancelled', msg: '已停止后续调度；在途请求仍受 15 秒超时限制' });
+  }
+  if (request) {
+    try {
+      Promise.resolve(invoke('action', { payload: { action: 'key_matrix_cancel', request_id: request.id } }))
+        .then((r) => { if (!r.ok) toast(`取消未确认：${r.msg}`, false); })
+        .catch((e) => toast(`取消通知失败：${String(e.message || e).slice(0, 180)}`, false));
+    } catch (e) { toast(`取消通知失败：${String(e.message || e).slice(0, 180)}`, false); }
+    if (notify) toast('已停止后续调度；在途请求等待返回或 15 秒超时，不会覆盖新检测', true);
+  }
+  if (!$('mxmodal').hidden) renderMatrix();
+}
+function closeMatrix() {
+  $('mxmodal').hidden = true;
+  mxCancel(false);
+  MX.session += 1;
+  MX.siteId = null;
+  MX.cells.clear(); MX.choices.clear(); MX.revisions.clear(); MX.views.clear(); MX.buttons = [];
+  MX.layout = ''; MX.source = '';
+  clear($('mx-head')); clear($('mx-body'));
+}
+function mxInvalidate(siteId) {
+  if (MX.siteId !== siteId) return;
+  mxCancel(false);
+  MX.session += 1;
+  MX.cells.clear(); MX.layout = ''; MX.source = '';
+  if (!$('mxmodal').hidden) renderMatrix();
+}
+function openMatrix(siteId, focus) {
+  closeMatrix();
   const site = (S.data?.keys || []).find((p) => p.id === siteId);
   if (!site) return;
   MX.siteId = siteId;
   MX.focus = focus || null;
-  const bases = mxBases(site);
-  const keys = site.keys || [];
-  $('mx-title').textContent = `接入点体检 · ${site.name}`;
-  $('mx-sub').textContent = bases.length
-    ? `${keys.length} 把密钥 × ${bases.length} 个协议，共 ${keys.length * bases.length} 项`
-    : '这个站点还没有接入点——先在「修改站点」里填协议与地址';
-  renderMatrix();
+  MX.source = mxDataSignature(site);
   $('mxmodal').hidden = false;
-  if (!bases.length || !keys.length) return;
-  // 从哪进来就先测哪一行/列：一上来把整张表打一遍既慢又白烧额度
-  if (focus && focus.type === 'fmt') return mxRun({ fmts: [focus.value] });
-  if (focus && focus.type === 'key') return mxRun({ keys: [focus.value] });
-  return mxRun({});
+  renderMatrix();
+  // 打开不自动发送计费请求，保留聚焦行/列并让用户确认每格模型。
 }
-
+function mxSetModel(kid, endpoint, value) {
+  const id = mxChoiceKey(kid, endpoint);
+  if (MX.choices.get(id) === value) return;
+  MX.choices.set(id, value);
+  MX.revisions.set(id, (MX.revisions.get(id) || 0) + 1);
+  for (const [key, c] of MX.cells) {
+    if (c.key === kid && c.endpoint === endpoint) MX.cells.delete(key);
+  }
+  mxPatchCells();
+}
+function mxPatchCells() {
+  for (const view of MX.views.values()) {
+    const model = MX.choices.get(mxChoiceKey(view.kid, view.b.id)) || '';
+    const c = mxGet(MX.siteId, view.kid, view.b.id, model.trim());
+    clear(view.status); view.status.appendChild(mxChip(c));
+    view.model.textContent = `模型：${c.model || model.trim() || '未选择'}`;
+    view.time.textContent = mxTime(c.checked_at);
+    view.status.title = [c.url || view.b.url, c.msg, c.checked_at ? `检测时间：${mxTime(c.checked_at)}` : ''].filter(Boolean).join('\n');
+    view.input.disabled = false;
+  }
+  for (const b of MX.buttons) b.disabled = MX.busy;
+  $('mx-all').disabled = MX.busy || !MX.views.size;
+  $('mx-cancel').disabled = !MX.busy;
+}
 function renderMatrix() {
   const site = (S.data?.keys || []).find((p) => p.id === MX.siteId);
   if (!site) return;
-  const bases = mxBases(site);
-  const keys = site.keys || [];
-  const f = MX.focus;
-
-  const head = $('mx-head');
-  clear(head);
-  const trh = el('tr');
-  trh.appendChild(el('th', { class: 'kh' }, '密钥 / 协议'));
-  for (const b of bases) {
-    const th = el('th', { class: f && f.type === 'fmt' && f.value === b.fmt ? 'hl' : '' });
-    th.appendChild(el('div', { class: 'mxcol', title: b.url }, MX_FMT_LABEL[b.fmt] || b.fmt));
-    th.appendChild(btn('检测本列', 'plain sm', () => mxRun({ fmts: [b.fmt] }), '检测该协议下的全部密钥'));
-    trh.appendChild(th);
-  }
-  trh.appendChild(el('th', { class: 'op' }, ''));
-  head.appendChild(trh);
-
-  const body = $('mx-body');
-  clear(body);
-  for (const k of keys) {
-    const models = String(k.models_list || '').split(/[,，\s]+/).filter(Boolean);
-    const tr = el('tr');
-    tr.appendChild(el('td', { class: 'kc' + (f && f.type === 'key' && f.value === k.id ? ' hl' : '') },
-      el('div', { class: 'mxname' }, k.label || '未命名'),
-      el('div', { class: 'mxsub' }, `${models.length} 个模型`)));
-    for (const b of bases) {
-      const c = mxGet(site.id, k.id, b.fmt);
-      const td = el('td', {
-        class: 'cell' + (f && f.type === 'fmt' && f.value === b.fmt ? ' hl' : ''),
-        title: c.msg || '点击检测这一格',
-      }, mxChip(c));
-      td.addEventListener('click', () => mxRun({ keys: [k.id], fmts: [b.fmt] }));
-      tr.appendChild(td);
+  const source = mxDataSignature(site);
+  if (MX.source && MX.source !== source) {
+    // 数据变更后不保留旧检测结论；手工输入仍归用户所有。
+    const request = MX.request;
+    MX.request = null; MX.busy = false; MX.session += 1; MX.cells.clear(); MX.layout = '';
+    for (const id of MX.choices.keys()) {
+      if (!MX.revisions.get(id)) MX.choices.delete(id);
     }
-    tr.appendChild(el('td', { style: 'text-align:right' },
-      btn('检测本行', 'plain sm', () => mxRun({ keys: [k.id] }), '检测该密钥的全部协议')));
+    if (request) {
+      Promise.resolve().then(() => invoke('action', { payload: { action: 'key_matrix_cancel', request_id: request.id } }))
+        .catch((e) => toast(`取消通知失败：${String(e.message || e).slice(0, 180)}`, false));
+    }
+  }
+  MX.source = source;
+  const bases = mxBases(site), keys = site.keys || [], f = MX.focus;
+  $('mx-title').textContent = `接入点体检 · ${site.name}`;
+  $('mx-sub').textContent = bases.length
+    ? `${keys.length} 把密钥 × ${bases.length} 个接入点，共 ${keys.length * bases.length} 项；每格独立选择模型`
+    : '尚无接入点，请先编辑站点或密钥地址';
+  const layout = JSON.stringify([MX.session, source, f, keys.map((k) => k.label)]);
+  if (layout === MX.layout) { mxPatchCells(); return; }
+  MX.layout = layout; MX.views.clear(); MX.buttons = [];
+  const action = (label, handler, title) => {
+    const b = btn(label, 'plain sm', handler, title);
+    MX.buttons.push(b); return b;
+  };
+  const head = $('mx-head'); clear(head);
+  const trh = el('tr', {}, el('th', { class: 'kh' }, '密钥 / 接入点'));
+  for (const b of bases) {
+    trh.appendChild(el('th', { class: f?.type === 'endpoint' && f.value === b.id ? 'hl' : '' },
+      el('div', { class: 'mxcol', title: b.url }, MX_FMT_LABEL[b.fmt] || b.fmt),
+      el('div', { class: 'mxurl', title: b.url }, b.url.replace(/^https?:\/\//, '')),
+      action('检测本列', () => mxRun({ endpoints: [b.id] }), '检测该地址下各密钥已选择的模型')));
+  }
+  trh.appendChild(el('th', { class: 'op' }, '')); head.appendChild(trh);
+  const body = $('mx-body'); clear(body);
+  for (const k of keys) {
+    const tr = el('tr', {}, el('td', { class: 'kc' + (f?.type === 'key' && f.value === k.id ? ' hl' : '') },
+      el('div', { class: 'mxname' }, k.label || '未命名'),
+      el('div', { class: 'mxsub' }, `${mxKeyModels(k).length} 个模型（按密钥汇总）`)));
+    for (const b of bases) {
+      if (!mxEndpointApplies(site, k, b)) {
+        tr.appendChild(el('td', { class: 'cell muted', title: '该地址仅登记在其他密钥下' }, '不适用'));
+        continue;
+      }
+      const source = mxModelSource(site, k, b);
+      const id = `mx-model-${MX.session}-${MX.views.size}`;
+      const input = el('input', { class: 'mxmodel', value: mxChoice(site, k, b), placeholder: '选择或输入模型',
+        spellcheck: false, autocomplete: 'off', aria: { label: `${k.label || '密钥'} · ${b.url} · 模型` } });
+      input.setAttribute('list', id);
+      const list = el('datalist', { id });
+      for (const m of source.suggestions) list.appendChild(el('option', { value: m, label: source.catalog ? '该密钥目录' : '历史建议 · 未验证' }));
+      for (const m of source.unverified) list.appendChild(el('option', { value: m, label: '站点汇总 · 未验证' }));
+      const status = el('div', { class: 'mxresult', title: b.url });
+      const model = el('div', { class: 'mxsub mxcurrent' });
+      const time = el('div', { class: 'mxsub' });
+      input.addEventListener('input', () => mxSetModel(k.id, b.id, input.value));
+      input.addEventListener('change', () => mxSetModel(k.id, b.id, input.value));
+      MX.views.set(mxChoiceKey(k.id, b.id), { kid: k.id, b, input, status, model, time });
+      tr.appendChild(el('td', { class: 'cell' + (f?.type === 'endpoint' && f.value === b.id ? ' hl' : ''), title: b.url },
+        input, list, el('div', { class: 'mxsub', title: source.note }, source.note),
+        status, model, time,
+        action('检测', () => mxRun({ keys: [k.id], endpoints: [b.id] }), '只检测本格所选模型')));
+    }
+    tr.appendChild(el('td', { class: 'op' }, action('检测本行', () => mxRun({ keys: [k.id] }), '检测该密钥已选择的各端点模型')));
     body.appendChild(tr);
   }
+  mxPatchCells();
 }
-
-/* 一次检测可以只覆盖一部分组合（单格 / 整行 / 整列 / 全表）。
-   等待期间把目标格标成「检测中」，失败就退回「未检测」——
-   不能让界面留着上一次的旧结论假装这次也测过了。 */
-async function mxRun(filter) {
-  if (MX.busy) { toast('上一轮还没测完，等它回来', false); return; }
+async function mxRun(filter = {}) {
+  if (MX.busy || $('mxmodal').hidden) return;
+  renderMatrix();
   const site = (S.data?.keys || []).find((p) => p.id === MX.siteId);
   if (!site) return;
-  const bases = mxBases(site).filter((b) => !filter.fmts || filter.fmts.includes(b.fmt));
+  const bases = mxBases(site).filter((b) => !filter.endpoints || filter.endpoints.includes(b.id));
   const keys = (site.keys || []).filter((k) => !filter.keys || filter.keys.includes(k.id));
-  if (!bases.length || !keys.length) return;
-
-  const pending = [];
-  for (const k of keys) {
-    for (const b of bases) {
-      pending.push([k.id, b.fmt]);
-      MX.cells.set(mxCellKey(site.id, k.id, b.fmt), { state: 'run' });
+  const pending = [], choices = [];
+  for (const k of keys) for (const b of bases) {
+    if (!mxEndpointApplies(site, k, b)) continue;
+    const model = mxChoice(site, k, b).trim();
+    const c = { key: k.id, endpoint: b.id, fmt: b.fmt, url: b.url, model, state: model ? 'run' : 'unconfigured' };
+    const cell = mxCellKey(site.id, k.id, b.id, model);
+    MX.cells.set(cell, c);
+    if (model) {
+      pending.push({ cell, c, revision: MX.revisions.get(mxChoiceKey(k.id, b.id)) || 0 });
+      choices.push({ key: k.id, endpoint: b.id, model });
     }
   }
-  const resetPending = () => {
-    for (const [kid, fmt] of pending) MX.cells.set(mxCellKey(site.id, kid, fmt), { state: 'unt' });
+  if (!choices.length) { mxPatchCells(); toast('请先为待测单元格选择或输入模型；空模型不会发送请求', false); return; }
+  const request = { id: `mx-${Date.now().toString(36)}-${MX.session}-${++MX.sequence}`, session: MX.session, source: MX.source };
+  const current = () => MX.request === request && MX.session === request.session && MX.siteId === site.id && !$('mxmodal').hidden;
+  const resetPending = (state, msg) => {
+    for (const { cell, c, revision } of pending) {
+      if ((MX.revisions.get(mxChoiceKey(c.key, c.endpoint)) || 0) !== revision) continue;
+      if ((MX.choices.get(mxChoiceKey(c.key, c.endpoint)) || '').trim() !== c.model) continue;
+      MX.cells.set(cell, { ...c, state, msg });
+    }
   };
-  MX.busy = true;
-  renderMatrix();
+  MX.request = request; MX.busy = true;
   try {
-    const payload = { action: 'key_matrix', site: site.id };
+    mxPatchCells();
+    const payload = { action: 'key_matrix', site: site.id, request_id: request.id, choices };
     if (filter.keys) payload.keys = filter.keys;
-    if (filter.fmts) payload.fmts = filter.fmts;
+    if (filter.endpoints) payload.endpoints = filter.endpoints;
     const r = await invoke('action', { payload });
-    if (!r.ok) {
-      toast(r.msg, false);
-      resetPending();
-    } else {
-      let cells = [];
-      try { cells = (JSON.parse(r.msg) || {}).cells || []; } catch { /* 后端没给合法 JSON 就按未测处理 */ }
-      for (const c of cells) {
-        MX.cells.set(mxCellKey(site.id, c.key, c.fmt), {
-          state: c.state, ms: c.ms, msg: c.msg, code: c.code,
-        });
-      }
-      const missing = pending.filter(([kid, fmt]) => !cells.some((c) => c.key === kid && c.fmt === fmt));
-      for (const [kid, fmt] of missing) MX.cells.set(mxCellKey(site.id, kid, fmt), { state: 'unt' });
+    if (!current()) return;
+    const latest = (S.data?.keys || []).find((p) => p.id === site.id);
+    if (!latest || mxDataSignature(latest) !== request.source) { mxInvalidate(site.id); return; }
+    if (!r.ok) { resetPending('error', r.msg); toast(r.msg, false); return; }
+    const data = JSON.parse(r.msg);
+    if (!Array.isArray(data?.cells)) throw new SyntaxError('检测结果缺少 cells 数组');
+    for (const { cell, c, revision } of pending) {
+      if ((MX.revisions.get(mxChoiceKey(c.key, c.endpoint)) || 0) !== revision) continue;
+      if ((MX.choices.get(mxChoiceKey(c.key, c.endpoint)) || '').trim() !== c.model) continue;
+      const result = data.cells.find((v) => v && v.key === c.key && v.endpoint === c.endpoint && v.model === c.model
+        && v.fmt === c.fmt && mxEndpointId(v.fmt, v.url) === c.endpoint);
+      MX.cells.set(cell, result ? { ...result, state: Object.prototype.hasOwnProperty.call(MX_LABEL, result.state) ? result.state : 'invalid_response' }
+        : { ...c, state: 'invalid_response', msg: '未收到对应密钥、端点与模型的结果' });
     }
   } catch (e) {
-    toast(String((e && (e.message || e)) || e).slice(0, 180), false);
-    resetPending();
+    if (current()) {
+      const msg = String(e.message || e).slice(0, 180);
+      resetPending(e instanceof SyntaxError ? 'invalid_response' : 'error', msg);
+      toast(`检测失败：${msg}`, false);
+    }
+  } finally {
+    if (current()) { MX.request = null; MX.busy = false; renderMatrix(); }
   }
-  MX.busy = false;
-  renderMatrix();
 }
 
 function iconBtn(act, handler, title) {
@@ -613,6 +711,29 @@ function expiryLabel(group) {
     ? '下次刷新' : '最近到期';
 }
 
+/* 一笔额度的两个时刻——全站（所有产品的逐笔明细）只认这一套写法，别各页各写一套：
+     到期时间 = 厂商给的有效期截止，一定有；
+     耗尽时间 = 这一笔被扣光的时刻，**厂商没给就不写这一列**。
+   为什么两列不能合并：WorkBuddy 的 ExpiredTime 是「这一笔结束的时刻」，期内被用光时
+   它写的就是用光那一刻。混成"到期时间"会让每一笔用光的积分都像提前作废
+   （2026-11-21 实测 233 笔历史里 204 笔如此，差 0～17 天不等）。
+   为什么不写「耗尽时间 ——」：目前只有 WorkBuddy 一家给得出，别的产品一屏全是破折号，
+   像坏了（用户 2026-11-21 明确要求去掉）。 */
+function expiryLine(it) {
+  const exp = it && it.expires_on ? dtxt(it.expires_on) : EXP_NONE;
+  const end = it && it.ended_on ? dtxt(it.ended_on) : '';
+  const title = '到期时间＝厂商给的有效期截止；耗尽时间＝这一笔被扣光的时刻';
+  if (!end) return el('span', { class: 'qexp', style: 'white-space:nowrap', title }, `到期时间 ${exp}`);
+  // 两段各自 nowrap、之间可以换行：面板窄的时候「耗尽时间 …」整段掉到第二行，
+  // 不会把日期断成两截（.qimid > span 的 nowrap 只作用在直接子级）
+  const seg = (t) => el('span', { style: 'white-space:nowrap' }, t);
+  return el('span', {
+    class: 'qexp',
+    style: 'display:inline-flex;flex-wrap:wrap;gap:2px 12px;white-space:normal',
+    title,
+  }, seg(`到期时间 ${exp}`), seg(`耗尽时间 ${end}`));
+}
+
 /* ---------------- 轻提示 ---------------- */
 /* ms 可调：默认 5.2 秒够看「已保存」这种短话，但上游报错常常一整行，
    5 秒看不完就消失了——需要久一点的调用方自己传（如「请求」验活）。 */
@@ -688,6 +809,9 @@ async function run(action, extra = {}) {
     toast(`这一步没跑通：${msg}`, false);
     return { ok: false, msg };
   }
+  if (r.ok && ['key_upsert_key', 'key_delete_key', 'key_delete'].includes(action)) {
+    mxInvalidate(extra.site);
+  }
   toast(r.msg, r.ok);
   load();
   return r;
@@ -707,6 +831,10 @@ async function load() {
     const d = await invoke('get_state');
     if (S.data?.settings && t0 <= lastSettingsWrite + 100) d.settings = S.data.settings;
     S.data = d;
+    if (MX.siteId && !$('mxmodal').hidden) {
+      if ((d.keys || []).some((p) => p.id === MX.siteId)) renderMatrix();
+      else closeMatrix();
+    }
     if (!S.cur || !S.data.apps.some((a) => a.id === S.cur)) S.cur = S.data.apps[0]?.id;
     render();
   } catch (e) {
@@ -3679,7 +3807,7 @@ function renderQuotaDetail() {
         iconBtn('edit', () => openItemModal(inst, g, it),
           '编辑这一笔：名称、截止日期与备注')),
       el('div', { class: 'qimid' },
-        el('span', {}, `到期时间 ${it.expires_on ? dtxt(it.expires_on) : EXP_NONE}`),
+        expiryLine(it),
         it.days_left != null ? el('span', { class: expCls(it.days_left, stale) }, expText(it.days_left)) : null,
         it.expires_manual ? el('em', {
           class: 'qmanual-tag',
@@ -6129,72 +6257,98 @@ function renderKeyList(d) {
   renderKeyNav(d);   // 左菜单的站点计数跟着列表一起更新
 }
 
-/* 站点的主要信息：接入点 + 可用模型。这两样挂在站点上（一个站常有
-   OpenAI / Anthropic / DashScope 三种口，模型清单是全站共用的），
-   key 表里就不再各占一列，免得六列挤成横向滚动。
-   两样都没有时整块不渲染——空提示把卡片撑成一坨灰底，比没有还碍事。 */
+/* 保留站点原卡片与模型汇总，目录权限单独按密钥、接入点展示。 */
+const SITE_MODELS_BUSY = new Set();
 function siteInfo(p) {
-  const bases = (p.base_urls || []).filter((b) => String(b.url || '').trim());
-  const models = String(p.models_list || '').split(/[,，\s]+/).filter(Boolean);
-  if (!bases.length && !models.length) return null;
-
+  const bases = mxBases(p);
+  const models = mxModels(p.models_list);
+  const hasCatalogs = (p.keys || []).some((k) => (k.model_catalogs || []).length);
+  if (!bases.length && !models.length && !hasCatalogs) return null;
   const rows = el('div', { class: 'sibases' });
   for (const b of bases) {
-    const fmt = b.format || 'openai';
-    const label = (BASE_FMT.find((x) => x[0] === fmt) || [, fmt])[1] || fmt;
+    const label = (BASE_FMT.find((x) => x[0] === b.fmt) || [, b.fmt])[1] || b.fmt;
     rows.appendChild(el('div', { class: 'sirow' },
-      // 格式 chip + 地址作为一组在剩余空间里居中（她 2026-10-28 点名往中间挪）
-      el('span', { class: 'simain' },
-        chip(label, 'fmt'),
-        el('span', { class: 'url', title: b.url }, b.url)),
+      el('span', { class: 'simain' }, chip(label, 'fmt'), el('span', { class: 'url', title: b.url }, b.url)),
       btn('复制', 'plain sm', () => copyText(b.url), '复制这个接入点'),
-      btn('连通检测', 'plain sm', () => openMatrix(p.id, { type: 'fmt', value: fmt }),
-        '按协议检测：这一列下每把密钥能不能通')));
+      btn('连通检测', 'plain sm', () => openMatrix(p.id, { type: 'endpoint', value: b.id }),
+        '打开该具体地址的检测列，确认模型后再检测')));
   }
-
   const chips = el('div', { class: 'sichips' });
-  // 模型清单默认收起只露 12 个：拉一次「获取模型」就 150+ 个 chip，撑得整卡一屏都看不下
-  // （她 2026-10-28 要个收起按钮）。展开/收起记在 S.modelsOpen，会话内记忆，不落盘。
   const MODEL_PREVIEW = 12;
   if (!S.modelsOpen) S.modelsOpen = {};
   const showAll = !!S.modelsOpen[p.id];
-  const visible = showAll ? models : models.slice(0, MODEL_PREVIEW);
-  for (const m of visible) {
-    const c = el('button', { type: 'button', class: 'chip', title: '点击复制模型名' }, m);
-    c.addEventListener('click', () => copyText(m));
-    chips.appendChild(c);
+  for (const m of (showAll ? models : models.slice(0, MODEL_PREVIEW))) {
+    const c = el('button', { type: 'button', class: 'chip', title: '站点汇总 · 未验证，点击复制模型名' }, m);
+    c.addEventListener('click', () => copyText(m)); chips.appendChild(c);
   }
   if (models.length > MODEL_PREVIEW) {
     if (!showAll) chips.appendChild(el('span', { class: 'muted' }, `+${models.length - MODEL_PREVIEW}`));
-    chips.appendChild(btn(showAll ? '收起' : `展开全部 ${models.length}`, 'plain sm', () => {
-      S.modelsOpen[p.id] = !showAll;
-      renderKeys(S.data);   // 走护栏重绘，滚动位置不丢
-    }, showAll ? '把模型清单收回去' : '展开这个站点的全部模型'));
+    chips.appendChild(btn(showAll ? '收起' : '展开全部', 'plain sm', () => {
+      S.modelsOpen[p.id] = !showAll; renderKeys(S.data);
+    }, `模型汇总共 ${models.length} 项`));
   }
-
-  // 「获取模型」全站只放这一处（她 2026-11-20 要求）：模型清单是站点级的，
-  // 不分协议、也不分密钥单独存，所以协议行里各摆一个同名按钮既重复也没意义——
-  // 「点哪一个」本身就说不清。点一次由后端把每个接入点挨个问过去。
-  return el('div', { class: 'siteinfo' },
-    bases.length ? rows : null,
-    el('div', { class: 'sigroup' },
-      el('span', { class: 'silab' }, models.length ? `模型 ${models.length}` : '模型'),
-      chips,
-      bases.length
-        ? btn('获取模型', 'plain sm', () => pullSiteModelsAll(p),
-          '把这站每个接入点都问一遍，拉到的模型并进「可用模型」')
-        : btn('获取模型', 'plain sm', () => openSiteModal(p),
-          '还没有接入点，先填 Base URL')));
+  const fetch = btn(SITE_MODELS_BUSY.has(p.id) ? '获取中…' : '获取模型', 'plain sm', (e) => {
+    if (bases.length) return pullSiteModelsAll(p, e.currentTarget);
+    openSiteModal(p);
+  }, '逐密钥、逐接入点获取目录；汇总不代表每把密钥权限');
+  fetch.disabled = SITE_MODELS_BUSY.has(p.id);
+  fetch.setAttribute('data-models-site', p.id);
+  if (!S.catalogsOpen) S.catalogsOpen = {};
+  const details = el('details', { class: 'sicatalogs', open: !!S.catalogsOpen[p.id] },
+    el('summary', {}, '按密钥查看目录'));
+  details.addEventListener('toggle', () => { S.catalogsOpen[p.id] = details.open; });
+  for (const k of p.keys || []) {
+    const group = el('div', { class: 'sikeycatalog' },
+      el('b', {}, `${k.label || '未命名密钥'} · ${mxKeyModels(k).length} 个模型`));
+    const catalogs = k.model_catalogs || [];
+    const endpointIds = new Set(bases.map((b) => b.id));
+    for (const b of bases) {
+      const c = catalogs.find((c) => c.endpoint_id === b.id);
+      group.appendChild(siteCatalogRow(b, c));
+    }
+    for (const c of catalogs) {
+      if (!endpointIds.has(c.endpoint_id)) group.appendChild(siteCatalogRow({ fmt: c.fmt, url: c.url }, c, true));
+    }
+    const manual = mxModels(k.models_list);
+    if (manual.length) group.appendChild(el('div', { class: 'mxsub' }, `历史建议 · 未验证：${manual.join('、')}`));
+    details.appendChild(group);
+  }
+  return el('div', { class: 'siteinfo' }, bases.length ? rows : null,
+    el('div', { class: 'sigroup' }, el('span', { class: 'silab' }, `模型汇总 ${models.length}`), chips, fetch),
+    el('p', { class: 'mxsub' }, '汇总不代表每把密钥权限；仅作未验证建议，请以各密钥、各接入点目录为准。'), details);
 }
-
-/* 一个站点的「获取模型」：把每个接入点问一遍，合并结果。
-   协议多的时候逐个问，某个口拿不到（比如那个格式的 /models 不对外）
-   不会把整次拉取判死，另有能用的口就照常出结果，缺哪个口在提示里写明。 */
-async function pullSiteModelsAll(site) {
-  toast(`正在向 ${(site.base_urls || []).length} 个接入点要模型清单…`, true);
-  const r = await invoke('action', { payload: { action: 'site_models_all', site: site.id } });
-  toast(r.msg, r.ok);
-  if (r.ok) load();
+function siteCatalogRow(b, c, historical = false) {
+  const models = c ? mxModels(c.models) : [];
+  const state = historical ? '历史端点 · 未验证' : c ? MX_CATALOG_LABEL[c.state] || '目录未知' : '尚未获取';
+  return el('div', { class: 'sicatalogrow', title: b.url },
+    el('div', { class: 'sicataloghead' },
+      el('span', {}, `${MX_FMT_LABEL[b.fmt] || b.fmt} · ${b.url}`),
+      el('span', { class: 'mxsub' }, state)),
+    el('div', { class: 'mxsub' }, `获取时间：${c?.checked_at ? mxTime(c.checked_at) : '尚未获取'}`),
+    c?.msg ? el('div', { class: 'sicatalogmsg' }, c.msg) : null,
+    el('div', { class: 'sicatalogmodels' }, models.length ? models.join('、') : '无模型记录'));
+}
+async function pullSiteModelsAll(site, button) {
+  if (SITE_MODELS_BUSY.has(site.id)) return;
+  SITE_MODELS_BUSY.add(site.id);
+  const patch = (busy) => {
+    const buttons = [...document.querySelectorAll('[data-models-site]')].filter((b) => b.getAttribute('data-models-site') === site.id);
+    if (button && !buttons.includes(button)) buttons.push(button);
+    for (const b of buttons) { b.disabled = busy; b.textContent = busy ? '获取中…' : '获取模型'; }
+  };
+  try {
+    patch(true);
+    toast(`正在逐密钥获取 ${mxBases(site).length} 个接入点的模型目录…`, true);
+    const r = await invoke('action', { payload: { action: 'site_models_all', site: site.id } });
+    toast(r.msg, r.ok);
+    // 部分失败也会写入各密钥目录，需要刷新并展示失败原因；不自行覆盖历史模型。
+    await load();
+    if (!$('mxmodal').hidden && MX.siteId === site.id) renderMatrix();
+  } catch (e) {
+    toast(`获取模型失败：${String(e.message || e).slice(0, 180)}`, false);
+  } finally {
+    SITE_MODELS_BUSY.delete(site.id); patch(false);
+  }
 }
 
 /* API 页左菜单：站点一多，光靠滚动找太累 */
@@ -7340,6 +7494,7 @@ async function saveSiteModal() {
   if (!item.name) { toast('站点名不能为空', false); return; }
   const r = await invoke('action', { payload: { action: 'key_upsert', item } });
   if (!r.ok) { toast(r.msg, false); return; }
+  mxInvalidate(item.id);
   await load();
   closeSiteModal();
   // 已经有 key 的站（编辑接入点）不用再催她登记一条；新建站才直接进 key 表单
@@ -7581,6 +7736,8 @@ function collectKeyItem() {
     label: $('k-label').value.trim(),
     source: $('k-source').value.trim(),
     base_url: ownBase,
+    base_format: ownBase === (old.base_url || '') ? old.base_format || '' : (ownBase ? mxFmtOf(ownBase) : ''),
+    model_catalogs: old.model_catalogs || [],
     key: $('k-key').value.trim(),
     models_list: old.models_list || '',
     total: old.total ?? null,
@@ -8003,7 +8160,7 @@ async function saveIntake(j, who) {
       label: String(k.label || '').trim(),
       base_url: own && own !== siteBase ? own : '',   // 跟站点一样就不重复存，留空表示"用站点的"
       key: String(k.key).trim(),
-      models_list: '',                                 // 模型清单归站点，key 上不再各存一份
+      models_list: mxModels(k.models_list).join(', '),    // 密钥专属的历史模型建议，不写成已验证目录
       expires_on: String(j.expires_on || '').trim(),
     };
     const r = await invoke('action', { payload: { action: 'key_upsert_key', site: s.site, item } });
@@ -8530,7 +8687,7 @@ function renderWizard() {
         el('div', { class: 'qimid' },
           c.unit === '%'
             ? el('span', {}, '按窗口剩余百分比（到点自动恢复，没有"到期"这回事）')
-            : el('span', {}, `到期时间 ${dtxt(c.expires_on)}`),
+            : expiryLine(c),
           el('span', { class: 'qistat' }, c.unit === '%'
             ? `剩 ${nfmt(c.left)}%`
             : `剩 ${nfmt(c.left)} / 共 ${nfmt(c.total)}`))))) : null,
@@ -10079,7 +10236,7 @@ function previewQuotaCredits(list, note) {
       el('div', { class: 'qitop' }, el('b', {}, c.label || '未命名'),
         c.category ? el('span', { class: 'qtag' }, c.category) : null),
       el('div', { class: 'qimid' },
-        el('span', {}, `到期时间 ${dtxt(c.expires_on)}`),
+        expiryLine(c),
         el('span', { class: 'qistat' }, `剩 ${nfmt(l)} / 共 ${nfmt(t)}`)),
       el('div', { class: 'cbar', title: `已用 ${nfmt(t - l)} / 共 ${nfmt(t)}` },
         el('b', { style: `width:${p}%` }))));
@@ -10893,9 +11050,10 @@ function bind() {
   $('sm-save').addEventListener('click', saveSiteModal);
   $('smodal').addEventListener('click', (e) => { if (e.target.id === 'smodal') closeSiteModal(); });
   // 接入点体检弹窗：关闭 + 全表检测，点遮罩也关
-  $('mx-close').addEventListener('click', () => { $('mxmodal').hidden = true; });
-  $('mxmodal').addEventListener('click', (e) => { if (e.target.id === 'mxmodal') $('mxmodal').hidden = true; });
+  $('mx-close').addEventListener('click', closeMatrix);
+  $('mxmodal').addEventListener('click', (e) => { if (e.target.id === 'mxmodal') closeMatrix(); });
   $('mx-all').addEventListener('click', () => mxRun({}));
+  $('mx-cancel').addEventListener('click', () => mxCancel());
   ['s-name', 's-home'].forEach((id) => $(id).addEventListener('keydown',
     (e) => { if (e.key === 'Enter') saveSiteModal(); }));
   $('km-cancel').addEventListener('click', closeKeyModal);
@@ -10928,6 +11086,7 @@ function bind() {
     // 测试前先落盘（新建时用刚填的 key；编辑时后端会保留原 key）
     const s = await invoke('action', { payload: { action: 'key_upsert_key', site: keyEditing.site.id, item } });
     if (!s.ok) { toast(s.msg, false); return; }
+    mxInvalidate(keyEditing.site.id);
     keyEditing.key.id = item.id;
     const btnTest = $('km-test');
     btnTest.disabled = true;
@@ -10985,6 +11144,7 @@ function bind() {
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
+      if (!$('mxmodal').hidden) { e.preventDefault(); e.stopPropagation(); closeMatrix(); return; }
       if (!$('tour').hidden) endTour();
       else if (!$('qpmodal').hidden) closePackModal();
       else if (!$('qmodal').hidden) closeQuotaDetail();

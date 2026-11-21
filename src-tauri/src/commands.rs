@@ -130,7 +130,119 @@ fn find_pair(site_id: &str, key_id: &str) -> Option<(Value, Value)> {
     Some((site, key))
 }
 
-/// 把一次拉到的模型并进站点的「可用模型」：已存在的不重复加，返回（新增数，合并后清单）。
+/// 一轮检测的生命周期。取消仅停止尚未发出的请求；在途 HTTP 仍受各自超时约束。
+/// 注册表独立于 CMD_LOCK，不能让「取消」排在网络等待后面。
+struct ProbeBatch {
+    id: String,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn probe_batches() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>> {
+    static BATCHES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> = std::sync::OnceLock::new();
+    BATCHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn early_probe_cancellations() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static EARLY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
+    EARLY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+impl ProbeBatch {
+    fn begin(id: String) -> Result<Self, String> {
+        if id.is_empty() || id.len() > 240 {
+            return Err("检测编号无效".into());
+        }
+        let mut batches = probe_batches().lock().unwrap_or_else(|p| p.into_inner());
+        if batches.contains_key(&id) {
+            return Err("该轮检测仍在进行，请勿重复提交".into());
+        }
+        if batches.len() >= 16 {
+            return Err("同时进行的检测过多，请稍后重试".into());
+        }
+        let mut early = early_probe_cancellations().lock().unwrap_or_else(|p| p.into_inner());
+        early.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(60));
+        let was_cancelled = early.remove(&id).is_some();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(was_cancelled));
+        batches.insert(id.clone(), cancelled.clone());
+        Ok(Self { id, cancelled })
+    }
+
+    fn cancel(id: &str) -> bool {
+        let batches = probe_batches().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(flag) = batches.get(id) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        } else {
+            // Tauri 工作线程可能尚未注册该轮请求；短期记下取消，避免关闭后才开始发送。
+            let mut early = early_probe_cancellations().lock().unwrap_or_else(|p| p.into_inner());
+            early.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(60));
+            if early.len() < 128 { early.insert(id.to_string(), std::time::Instant::now()); }
+            false
+        }
+    }
+}
+
+impl Drop for ProbeBatch {
+    fn drop(&mut self) {
+        let mut batches = probe_batches().lock().unwrap_or_else(|p| p.into_inner());
+        if batches.get(&self.id).map(|v| Arc::ptr_eq(v, &self.cancelled)).unwrap_or(false) {
+            batches.remove(&self.id);
+        }
+    }
+}
+
+/// 网络返回时必须重新读取账本，仅合并仍属于同一凭据/接入点的结果。
+/// 不用请求前的整份站点覆盖新内容，也不丢弃用户手工登记的模型与密钥。
+fn merge_model_discoveries(current: &Value, snapshot: &Value, results: &[Value]) -> (Value, usize, usize, usize) {
+    let mut updated = current.clone();
+    let endpoints = keys::matrix_endpoints(current);
+    let original_keys = snapshot["keys"].as_array().cloned().unwrap_or_default();
+    let mut accepted = 0usize;
+    let mut skipped = 0usize;
+    let mut applied_successes = 0usize;
+    if let Some(ks) = updated["keys"].as_array_mut() {
+        for result in results {
+            if result["state"] == "cancelled" { skipped += 1; continue; }
+            let kid = result["key_id"].as_str().unwrap_or("");
+            let eid = result["endpoint_id"].as_str().unwrap_or("");
+            let Some(before) = original_keys.iter().find(|k| k["id"].as_str() == Some(kid)) else { skipped += 1; continue; };
+            let Some(key) = ks.iter_mut().find(|k| k["id"].as_str() == Some(kid)) else { skipped += 1; continue; };
+            let unchanged = ["key", "base_url", "base_format", "probe_revision", "models_list"]
+                .iter().all(|field| key[*field] == before[*field]);
+            if !unchanged || !endpoints.iter().any(|e| e.id == eid && keys::endpoint_applies(current, key, e)) {
+                skipped += 1;
+                continue;
+            }
+            let mut catalogs = key["model_catalogs"].as_array().cloned().unwrap_or_default();
+            let prior = catalogs.iter().position(|c| c["endpoint_id"].as_str() == Some(eid));
+            let mut entry = result.clone();
+            if let Some(obj) = entry.as_object_mut() { obj.remove("key_id"); }
+            if !matches!(entry["state"].as_str(), Some("ok" | "empty")) {
+                // 保留历史数据供人工核对，但失败状态绝不被当成当前权限。
+                if let Some(old) = prior.and_then(|i| catalogs.get(i)) {
+                    let previous_was_success = matches!(old["state"].as_str(), Some("ok" | "empty"));
+                    entry["previous_models"] = if previous_was_success { old["models"].clone() } else { old["previous_models"].clone() };
+                    entry["last_success_at"] = if previous_was_success { old["checked_at"].clone() } else { old["last_success_at"].clone() };
+                }
+            }
+            if matches!(entry["state"].as_str(), Some("ok" | "empty")) { applied_successes += 1; }
+            if let Some(i) = prior { catalogs[i] = entry; } else { catalogs.push(entry); }
+            key["model_catalogs"] = json!(catalogs);
+            accepted += 1;
+        }
+    }
+    let discovered: Vec<String> = updated["keys"].as_array().into_iter().flatten()
+        .flat_map(|k| k["model_catalogs"].as_array().into_iter().flatten())
+        .filter(|c| c["state"] == "ok")
+        .flat_map(|c| c["models"].as_array().into_iter().flatten())
+        .filter_map(|m| m.as_str().map(String::from)).collect();
+    let (_, summary) = merge_site_models(&updated, &discovered);
+    // 站点汇总含历史手工登记，只供展示；检测权限只认 Key + 接入点目录。
+    updated["models_list"] = json!(summary.join(", "));
+    (updated, accepted, skipped, applied_successes)
+}
+
+/// 把一次拉到的模型并进站点汇总：不将该汇总解释为每把密钥的可调用权限。
 fn merge_site_models(sobj: &Value, ids: &[String]) -> (usize, Vec<String>) {
     let mut merged: Vec<String> = sobj["models_list"]
         .as_str()
@@ -418,6 +530,11 @@ pub async fn action(
     handle: tauri::AppHandle,
     payload: Value,
 ) -> Result<Value, String> {
+    if matches!(payload["action"].as_str(), Some("key_matrix" | "site_models_all" | "key_chat")) {
+        // 同步 HTTP 不占用异步运行时线程，否则取消命令也可能被网络等待饿死。
+        return tauri::async_runtime::spawn_blocking(move || service_action(&handle, &payload))
+            .await.map_err(|_| "后台检测任务异常结束".to_string())?;
+    }
     service_action(&handle, &payload)
 }
 
@@ -453,6 +570,7 @@ pub fn service_action(handle: &tauri::AppHandle, payload: &Value) -> Result<Valu
     if act.starts_with("chatgpt_") || act.starts_with("zcproxy_") || app_id == "zcode" || matches!(
         act.as_str(),
         "key_test" | "key_probe_models" | "key_models" | "key_chat"
+            | "key_matrix" | "key_matrix_cancel" | "site_models_all"
             | "qproxy_probe" | "qproxy_oneclick"
             | "qproxy_cn_login" | "qproxy_cn_bridge"
             | "wproxy_probe" | "wproxy_oneclick"
@@ -3030,113 +3148,103 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         }
 
         "key_chat" => {
-            // 「请求」：真发一条最小对话。测试只证明模型清单打得通，有的站点这个接口
-            // 根本不验 key（小红书 Dots 实测假 key 也返回 200），真调用才见分晓。
-            let site = payload["site"].as_str().unwrap_or("");
-            let id = payload["id"].as_str().unwrap_or("");
-            // ① 锁内快照：base / fmt / key / 模型名一次拿齐就撤，20 秒的等待不压全局锁
-            let (base, fmt, key, model) = {
-                let _g = cmd_guard();
-                match find_pair(site, id) {
-                    Some((sobj, item)) => {
-                        // 地址和格式必须同源取：登记成 openai-resp 的站要打 /responses，
-                        // 不能一律当 chat/completions（星驰API 已停用 chat，2026-11-20）
-                        let (base, fmt) = keys::base_and_fmt(&sobj, &item);
-                        (
-                            base,
-                            fmt,
-                            item["key"].as_str().unwrap_or("").to_string(),
-                            keys::models_for(&sobj, &item)
-                                .into_iter()
-                                .next()
-                                .unwrap_or_default(),
-                        )
-                    }
-                    None => return Some(err("记录不存在")),
-                }
-            };
-            if base.is_empty() {
-                return Some(err("这个站点还没有接入点——点「改站点」把 Base URL 填上"));
+            // 旧入口保留，但不再猜协议或默认模型。界面统一从矩阵明确选择组合。
+            let site_id = payload["site"].as_str().unwrap_or("");
+            let kid = payload["id"].as_str().unwrap_or("");
+            let eid = payload["endpoint"].as_str().unwrap_or("");
+            let model = payload["model"].as_str().unwrap_or("").trim();
+            if eid.is_empty() || model.is_empty() {
+                return Some(err("请先在连通检测中选择接入点与模型"));
             }
-            // 模型名优先用站点清单里的第一个：空着随便猜一个名字，上游多半回 400，
-            // 那不叫「key 不能用」，叫「我们没告诉它调哪个模型」
-            let model = if model.is_empty() {
-                "gpt-4o-mini".to_string()
-            } else {
-                model
+            let (endpoint, plain) = {
+                let _g = cmd_guard();
+                let Some((site, key)) = find_pair(site_id, kid) else { return Some(err("记录不存在")); };
+                let Some(endpoint) = keys::matrix_endpoints(&site).into_iter().find(|e| e.id == eid) else {
+                    return Some(err("接入点已变更，请重新选择"));
+                };
+                if !keys::endpoint_applies(&site, &key, &endpoint) {
+                    return Some(err("该地址只属于其他密钥，未发送请求"));
+                }
+                let plain = key["key"].as_str().unwrap_or("").to_string();
+                (endpoint, plain)
             };
-            let (good, msg) = keys::chat_probe(&base, &key, &model, &fmt);
+            if plain.trim().is_empty() { return Some(err("密钥未填写或保管箱尚未解锁")); }
+            let (good, msg) = keys::chat_probe(&endpoint.url, &plain, model, &endpoint.fmt);
             if good { ok(msg) } else { err(msg) }
         }
 
+        "key_matrix_cancel" => {
+            let id = payload["request_id"].as_str().unwrap_or("");
+            if id.is_empty() || id.len() > 240 { return Some(err("检测编号无效")); }
+            let _ = ProbeBatch::cancel(id);
+            ok("已停止后续检测；已发出的请求将在超时范围内结束")
+        }
+
         "key_matrix" => {
-            // 接入点体检：把（密钥 × 协议）每个组合真发一条最小对话，结果给弹窗里的矩阵用。
-            // 单个组合的解释力有限——「哪把 key 能用」和「哪种协议能用」是两个维度，
-            // 只看一个维度就会把「站点停用了这个协议」误判成「这把 key 坏了」。
-            let site = payload["site"].as_str().unwrap_or("");
-            let sobj = match keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site)) {
-                Some(p) => p,
-                None => return Some(err("站点不存在")),
-            };
-            let cols = keys::matrix_columns(&sobj);
-            if cols.is_empty() {
-                return Some(err("这个站点还没有接入点——点「修改站点」把协议与地址填上"));
-            }
-            let pick = |k: &str| -> Option<Vec<String>> {
-                payload[k].as_array().map(|a| {
-                    a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
-                })
-            };
-            let only_key = pick("keys");
-            let only_fmt = pick("fmts");
-            let mut jobs: Vec<(String, String, String, String, String)> = Vec::new();
-            for k in sobj["keys"].as_array().cloned().unwrap_or_default() {
-                let kid = k["id"].as_str().unwrap_or("").to_string();
-                if kid.is_empty() {
-                    continue;
+            let site_id = payload["site"].as_str().unwrap_or("");
+            let snapshot = {
+                let _g = cmd_guard();
+                match keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site_id)) {
+                    Some(p) => p,
+                    None => return Some(err("站点不存在")),
                 }
-                if let Some(list) = &only_key {
-                    if !list.iter().any(|x| x == &kid) {
+            };
+            let endpoints = keys::matrix_endpoints(&snapshot);
+            if endpoints.is_empty() { return Some(err("请先登记接入点的协议与地址")); }
+            let request_id = payload["request_id"].as_str().filter(|s| !s.is_empty())
+                .map(String::from).unwrap_or_else(|| keys::new_id("matrix"));
+            let batch = match ProbeBatch::begin(request_id.clone()) {
+                Ok(batch) => batch,
+                Err(message) => return Some(err(message)),
+            };
+            let pick = |field: &str| -> Option<Vec<String>> {
+                payload[field].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            };
+            let only_keys = pick("keys");
+            let only_endpoints = pick("endpoints");
+            let choices = payload["choices"].as_array().cloned().unwrap_or_default();
+            let mut jobs = Vec::new();
+            let mut list: Vec<Value> = Vec::new();
+            let now = chrono::Local::now().to_rfc3339();
+            for key in snapshot["keys"].as_array().into_iter().flatten() {
+                let kid = key["id"].as_str().unwrap_or("");
+                if kid.is_empty() || only_keys.as_ref().map(|ids| !ids.iter().any(|id| id == kid)).unwrap_or(false) { continue; }
+                for endpoint in &endpoints {
+                    if only_endpoints.as_ref().map(|ids| !ids.iter().any(|id| id == &endpoint.id)).unwrap_or(false) { continue; }
+                    let selected: Vec<&Value> = choices.iter().filter(|v| v["key"].as_str() == Some(kid) && v["endpoint"].as_str() == Some(endpoint.id.as_str())).collect();
+                    if selected.len() > 1 { return Some(err("同一组合包含重复的模型选择，请重新检测")); }
+                    let model = selected.first().and_then(|v| v["model"].as_str()).unwrap_or("").trim();
+                    let plain = key["key"].as_str().unwrap_or("").trim();
+                    let applicable = keys::endpoint_applies(&snapshot, key, endpoint);
+                    if !applicable || model.is_empty() || plain.is_empty() || model.len() > 512 {
+                        let message = if !applicable { "该地址只属于其他密钥，未发送请求" } else if plain.is_empty() { "密钥未填写或保管箱尚未解锁" } else if model.is_empty() { "请先选择或输入模型" } else { "模型名称过长" };
+                        list.push(json!({"key":kid,"endpoint":endpoint.id,"fmt":endpoint.fmt,"url":endpoint.url,
+                            "model":model,"state":"unconfigured","code":0,"ms":0,"msg":message,"checked_at":now}));
                         continue;
                     }
-                }
-                let plain = k["key"].as_str().unwrap_or("").to_string();
-                let own = k["base_url"].as_str().unwrap_or("").trim().to_string();
-                // 模型名用这把 key 自己的第一项；没有就退回站点清单的第一项。
-                // 空着不填，上游多半回 400——那叫「没告诉它调哪个模型」，不叫「key 不能用」。
-                let model = keys::models_for(&sobj, &k)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| "gpt-4o-mini".to_string());
-                for (fmt, url) in &cols {
-                    if let Some(list) = &only_fmt {
-                        if !list.iter().any(|x| x == fmt) {
-                            continue;
-                        }
-                    }
-                    // 密钥自带接入点、且格式与这一列相符时优先用它
-                    let use_url = if !own.is_empty() && keys::fmt_of_url(&own) == fmt.as_str() {
-                        own.clone()
-                    } else {
-                        url.clone()
-                    };
-                    jobs.push((kid.clone(), fmt.clone(), use_url, plain.clone(), model.clone()));
+                    jobs.push(keys::ProbeJob { key_id:kid.to_string(),endpoint_id:endpoint.id.clone(),fmt:endpoint.fmt.clone(),url:endpoint.url.clone(),key:plain.to_string(),model:model.to_string() });
                 }
             }
-            if jobs.is_empty() {
-                return Some(err("没有可检测的组合"));
+            if jobs.is_empty() && list.is_empty() { return Some(err("没有可检测的组合，请重新选择")); }
+            // 慢网络位于全局锁之外，取消也不需要等此轮结束。
+            let cells = keys::probe_matrix_cancellable(jobs, 15, 6, batch.cancelled.clone());
+            let current = {
+                let _g = cmd_guard();
+                keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site_id))
+            };
+            let current_endpoints = current.as_ref().map(keys::matrix_endpoints).unwrap_or_default();
+            for cell in cells {
+                let before = snapshot["keys"].as_array().into_iter().flatten().find(|k| k["id"].as_str() == Some(cell.key_id.as_str()));
+                let after = current.as_ref().and_then(|s| s["keys"].as_array()).into_iter().flatten().find(|k| k["id"].as_str() == Some(cell.key_id.as_str()));
+                let unchanged = before.zip(after).map(|(a,b)| ["key","base_url","base_format","probe_revision","models_list","model_catalogs"].iter().all(|f| a[*f] == b[*f])).unwrap_or(false)
+                    && current_endpoints.iter().any(|e| e.id == cell.endpoint_id);
+                let cancelled = batch.cancelled.load(std::sync::atomic::Ordering::SeqCst);
+                let state = if cancelled { "cancelled" } else if !unchanged { "stale" } else { cell.state };
+                let msg = if cancelled { "已取消，本次结果不再使用".to_string() } else if !unchanged { "配置已变更，请重新检测".to_string() } else { cell.msg };
+                list.push(json!({"key":cell.key_id,"endpoint":cell.endpoint_id,"fmt":cell.fmt,"url":cell.url,
+                    "model":cell.model,"state":state,"code":cell.code,"ms":cell.ms,"msg":msg,"checked_at":chrono::Local::now().to_rfc3339()}));
             }
-            let cells = keys::probe_matrix(jobs, 15, 6);
-            let list: Vec<Value> = cells
-                .iter()
-                .map(|c| {
-                    json!({
-                        "key": c.key_id, "fmt": c.fmt, "state": c.state,
-                        "code": c.code, "ms": c.ms, "msg": c.msg,
-                    })
-                })
-                .collect();
-            ok(json!({ "cells": list }).to_string())
+            ok(json!({"request_id":request_id,"cells":list,"cancelled":batch.cancelled.load(std::sync::atomic::Ordering::SeqCst)}).to_string())
         }
 
         "key_models" => {
@@ -3232,27 +3340,47 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
         }
 
         "site_models_all" => {
-            // 界面上「获取模型」全站只有一个按钮，所以它得把每个接入点都问一遍，
-            // 而不是像 site_models 那样由调用方指定某一个口。
             let site_id = payload["site"].as_str().unwrap_or("");
-            let sobj = match keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site_id)) {
-                Some(p) => p,
-                None => return Some(err("站点不存在")),
+            let snapshot = {
+                let _g = cmd_guard();
+                match keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site_id)) {
+                    Some(site) => site,
+                    None => return Some(err("站点不存在")),
+                }
             };
-            let (ids, notes) = keys::probe_models_all(&sobj);
-            let detail = notes.join("；");
-            if ids.is_empty() {
-                return Some(err(format!("没拉到模型：{detail}")));
+            let batch = match ProbeBatch::begin(format!("models:{site_id}")) {
+                Ok(batch) => batch,
+                Err(message) => return Some(err(message)),
+            };
+            // 逐密钥、逐端点获取；任何一把成功都不代表其他分组的模型相同。
+            let results = keys::discover_site_models(&snapshot, &batch.cancelled);
+            if results.is_empty() { return Some(err("没有可获取的密钥与接入点，请先完成登记")); }
+            // 和 cancel 使用同一把短锁线性化提交：取消先发生则整轮不落账；
+            // 提交先完成则取消不会追溯撤销已保存的结果。
+            let _commit_guard = probe_batches().lock().unwrap_or_else(|p| p.into_inner());
+            if batch.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                return Some(err("模型获取已取消，原有目录未更改"));
             }
-            let (added, merged) = merge_site_models(&sobj, &ids);
-            let mut upd = sobj.clone();
-            upd["models_list"] = json!(merged.join(", "));
-            let _ = keys::upsert_site(&upd);
+            let (accepted, skipped, applied_successes, models_list) = {
+                let _g = cmd_guard();
+                let Some(current) = keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site_id)) else {
+                    return Some(err("站点已删除，已忽略本次结果"));
+                };
+                let (updated, accepted, skipped, applied_successes) = merge_model_discoveries(&current, &snapshot, &results);
+                if accepted > 0 {
+                    let (saved, message, _) = keys::upsert_site(&updated);
+                    if !saved { return Some(err(format!("模型结果保存失败：{message}"))); }
+                }
+                (accepted, skipped, applied_successes, updated["models_list"].as_str().unwrap_or("").to_string())
+            };
+            let succeeded = results.iter().filter(|r| r["state"] == "ok" || r["state"] == "empty").count();
+            let failed = results.len().saturating_sub(succeeded);
             json!({
-                "ok": true,
-                "msg": format!("拉到 {} 个模型，新增 {} 个（{detail}）", ids.len(), added),
-                "models": ids,
-                "models_list": merged.join(", "),
+                "ok": applied_successes > 0,
+                "refresh": accepted > 0,
+                "msg": format!("模型获取完成：{} 项成功，{} 项失败，{} 项配置变更已跳过；按密钥保存，可展开查看", succeeded, failed, skipped),
+                "results": results,
+                "models_list": models_list,
             })
         }
 
@@ -3801,6 +3929,108 @@ fn adopt_needs_confirm(origin: &str, src: Option<&PathBuf>, confirmed: Option<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn discovery_fixture() -> (Value, String) {
+        let url = "http://127.0.0.1:1/v1";
+        (json!({"id":"review-site","name":"Review","models_list":"manual-model",
+            "base_urls":[{"format":"openai","url":url}],
+            "keys":[{"id":"a","label":"A","key":"fictional-a"},{"id":"b","label":"B","key":"fictional-b"}]}),
+            keys::endpoint_id("openai", url))
+    }
+
+    #[test]
+    fn model_discoveries_remain_scoped_to_key_and_preserve_manual_metadata() {
+        let (snapshot, eid) = discovery_fixture();
+        let results = vec![
+            json!({"key_id":"a","endpoint_id":eid,"state":"ok","models":["model-a"],"checked_at":"review-time"}),
+            json!({"key_id":"b","endpoint_id":eid,"state":"ok","models":["model-b"],"checked_at":"review-time"}),
+        ];
+        let mut current = snapshot.clone();
+        current["note"] = json!("edited while fetching");
+        current["keys"][1]["label"] = json!("new label");
+        let (updated, accepted, skipped, successes) = merge_model_discoveries(&current, &snapshot, &results);
+        assert_eq!((accepted, skipped, successes), (2, 0, 2));
+        assert_eq!(updated["note"], current["note"]);
+        assert_eq!(updated["keys"][1]["label"], "new label");
+        assert_eq!(updated["keys"][0]["model_catalogs"][0]["models"], json!(["model-a"]));
+        assert_eq!(updated["keys"][1]["model_catalogs"][0]["models"], json!(["model-b"]));
+        assert!(updated["models_list"].as_str().unwrap().contains("manual-model"));
+        assert_eq!(keys::models_for_endpoint(&updated, &updated["keys"][1], &eid), vec!["model-b"]);
+    }
+
+    #[test]
+    fn model_discoveries_ignore_changed_credentials_and_removed_endpoints() {
+        let (snapshot, eid) = discovery_fixture();
+        let result = vec![json!({"key_id":"a","endpoint_id":eid,"state":"ok","models":["old-permission"]})];
+        let mut changed = snapshot.clone();
+        changed["keys"][0]["key"] = json!("fictional-replacement");
+        let (updated, accepted, skipped, successes) = merge_model_discoveries(&changed, &snapshot, &result);
+        assert_eq!((accepted, skipped, successes), (0, 1, 0));
+        assert!(updated["keys"][0]["model_catalogs"].is_null());
+        let mut removed = snapshot.clone();
+        removed["base_urls"] = json!([]);
+        let (_, accepted, skipped, _) = merge_model_discoveries(&removed, &snapshot, &result);
+        assert_eq!((accepted, skipped), (0, 1));
+    }
+
+    #[test]
+    fn failed_model_refresh_preserves_history_but_never_grants_permissions() {
+        let (mut snapshot, eid) = discovery_fixture();
+        snapshot["keys"][0]["model_catalogs"] = json!([{"endpoint_id":eid,"state":"ok","models":["retired-model"],"checked_at":"previous"}]);
+        let result = vec![json!({"key_id":"a","endpoint_id":eid,"state":"error","models":[],"msg":"HTTP 401","checked_at":"now"})];
+        let (updated, accepted, skipped, successes) = merge_model_discoveries(&snapshot, &snapshot, &result);
+        assert_eq!((accepted, skipped, successes), (1, 0, 0));
+        let entry = &updated["keys"][0]["model_catalogs"][0];
+        assert_eq!(entry["previous_models"], json!(["retired-model"]));
+        assert_eq!(entry["last_success_at"], "previous");
+        assert!(keys::models_for_endpoint(&updated, &updated["keys"][0], &eid).is_empty());
+    }
+
+    #[test]
+    fn repeated_failed_refresh_keeps_last_success_and_cancelled_items_do_not_replace_it() {
+        let (mut snapshot, eid) = discovery_fixture();
+        snapshot["keys"][0]["model_catalogs"] = json!([{"endpoint_id":eid,"state":"ok","models":["known-model"],"checked_at":"last-success"}]);
+        let failed = vec![json!({"key_id":"a","endpoint_id":eid,"state":"error","models":[],"checked_at":"failure-one"})];
+        let (first, _, _, _) = merge_model_discoveries(&snapshot, &snapshot, &failed);
+        let (second, _, _, _) = merge_model_discoveries(&first, &first, &failed);
+        assert_eq!(second["keys"][0]["model_catalogs"][0]["previous_models"], json!(["known-model"]));
+        assert_eq!(second["keys"][0]["model_catalogs"][0]["last_success_at"], "last-success");
+        let cancelled = vec![json!({"key_id":"a","endpoint_id":eid,"state":"cancelled","models":[]})];
+        let (untouched, accepted, skipped, _) = merge_model_discoveries(&snapshot, &snapshot, &cancelled);
+        assert_eq!((accepted, skipped), (0, 1));
+        assert_eq!(untouched["keys"], snapshot["keys"]);
+    }
+
+    #[test]
+    fn model_refresh_replaces_revoked_models_in_exact_catalog() {
+        let (mut snapshot, eid) = discovery_fixture();
+        snapshot["keys"][0]["model_catalogs"] = json!([{"endpoint_id":eid,"state":"ok","models":["old-model"]}]);
+        let result = vec![json!({"key_id":"a","endpoint_id":eid,"state":"empty","models":[],"checked_at":"now"})];
+        let (updated, _, _, successes) = merge_model_discoveries(&snapshot, &snapshot, &result);
+        assert_eq!(successes, 1);
+        assert!(keys::models_for_endpoint(&updated, &updated["keys"][0], &eid).is_empty());
+        assert_eq!(updated["keys"][0]["model_catalogs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn probe_batch_cancellation_is_independent_and_cleanup_allows_reuse() {
+        let id = keys::new_id("batch-test");
+        let batch = ProbeBatch::begin(id.clone()).unwrap();
+        assert!(ProbeBatch::begin(id.clone()).is_err());
+        assert!(ProbeBatch::cancel(&id));
+        assert!(batch.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        drop(batch);
+        let next = ProbeBatch::begin(id).unwrap();
+        assert!(!next.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancellation_before_worker_registration_is_not_lost() {
+        let id = keys::new_id("early-cancel-test");
+        assert!(!ProbeBatch::cancel(&id));
+        let batch = ProbeBatch::begin(id).unwrap();
+        assert!(batch.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn claude_desktop_rejects_instance_creation_before_any_profile_operation() {

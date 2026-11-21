@@ -5092,6 +5092,7 @@ def _wb_expired_items(accounts):
             if at.get("Key") == "grantReason":
                 grant = str(at.get("Value") or "")
                 break
+        exp_ms = _wb_cycle_end(a)
         out.setdefault(code, []).append({
             "label": a.get("PackageName") or code or "积分",
             "detail": grant or "已过期（官方历史）",
@@ -5099,9 +5100,12 @@ def _wb_expired_items(accounts):
             "used": used,
             "left": left,
             "voided": left,
-            # 历史笔的到期日用 ExpiredTime（真实过期时刻）优先：CycleEndTime 是
-            # 周期结束日，已用完的周期包它可能晚于真实过期日，拿去判过期会虚增 live
-            "expires_on": dt_text(_wb_ms(a.get("ExpiredTime")) or _wb_cycle_end(a)),
+            # 到期日只认厂商的周期结束时刻。以前这里优先取 ExpiredTime，但那个字段是
+            # 「这一笔结束的时刻」——期内被用光时它就是用光那一刻，写进「到期时间」
+            # 会让每笔用光的积分看起来提前作废（2026-11-21 实测 233 笔里 204 笔如此）。
+            "expires_on": dt_text(exp_ms),
+            # 真正被扣光的时刻单独给一列，没提前耗尽留空（界面写 ——）
+            "ended_on": _wb_ended_on(a, exp_ms),
             "unit": a.get("CapacityUnit") or "credits",
             "granted_on": dt_text_full(int(a.get("CreateTime") or 0)),
             "resource_id": str(a.get("ResourceId") or ""),
@@ -5116,6 +5120,23 @@ def _wb_cycle_end(a):
     取两者较早的一个：一次性资源两值相等，循环包则取到本轮作废日。"""
     cand = [x for x in (_wb_ms(a.get("CycleEndTime")), _wb_ms(a.get("DeductionEndTime"))) if x > 0]
     return min(cand) if cand else 0
+
+
+def _wb_ended_on(a, expires_ms=0):
+    """这一笔「被扣光的那一刻」；没提前耗尽返回空串，界面写 ——。
+
+    ExpiredTime 是厂商记的「这笔资源结束的时刻」：自然到期时它等于周期结束，
+    期内被用光时它就是用光那一刻。两种都写同一个字段，所以它只能当「耗尽时间」。
+    2026-11-21 实测 233 笔历史：204 笔是用光的，提前量 0～425 小时不等（中位 66 小时），
+    拿它当到期日会让每一笔用光的积分都显示成"提前作废"。
+    与名义到期相差不到一分钟的，视为自然到期，不给耗尽时间（两列写同一时刻没意义）。
+    """
+    ex = _wb_ms(a.get("ExpiredTime"))
+    if not ex:
+        return ""
+    if expires_ms and ex >= expires_ms - 60 * 1000:
+        return ""
+    return dt_text(ex)
 
 
 def _wb_category(a):
@@ -5156,13 +5177,16 @@ def _wb_pack_items(accounts):
             if at.get("Key") == "grantReason":
                 grant = str(at.get("Value") or "")
                 break
+        exp_ms = _wb_cycle_end(a)
         out.setdefault(code, []).append({
             "label": a.get("PackageName") or code or "积分",
             "detail": grant,
             "total": size,
             "used": used,
             "left": remain,
-            "expires_on": dt_text(_wb_cycle_end(a)),
+            "expires_on": dt_text(exp_ms),
+            # 活接口也带 Status=3（已用完）的笔：这一列写「哪天被扣光」，没扣光写 ——
+            "ended_on": _wb_ended_on(a, exp_ms),
             "unit": a.get("CapacityUnit") or "credits",
             # 这一笔什么时候到账：CreateTime 是毫秒时间戳（实测 1792281959000 →
             # 2026-10-18 08:05）。以前完全没带出去，界面上那枚「到账」标签就一直空着。
@@ -9928,6 +9952,12 @@ def quota_ledger_merge(product, account, groups, now=None, led=None):
                         "expires_on": it.get("expires_on"),
                         "total": it.get("total") if it.get("total") is not None else rec.get("total"),
                         "last_seen": stamp})
+            # 「耗尽时间」跟着本轮读数走：厂商这轮没给就清掉，别留上一轮的旧值冒充。
+            # 自然到期的笔本轮一定回空串，清掉之后界面才写 ——（2026-11-21）
+            if it.get("ended_on"):
+                rec["ended_on"] = str(it["ended_on"])
+            else:
+                rec.pop("ended_on", None)
             rec.setdefault("first_seen", stamp)
             if product in ("trae-cn", "traework-cn") and gname not in ("每日签到", "TraeCode 邀请好友奖励") and rec.get("granted_est"):
                 for field in ("granted_on", "granted_est", "granted_src"):
@@ -10026,6 +10056,8 @@ def _ledger_item(rec, gname, unit=None):
         "total": rec.get("total"), "used": rec.get("used"),
         "left": rec.get("left"), "unit": rec.get("unit") or unit,
         "expires_on": str(rec.get("expires_on") or ""),
+        # 这一笔哪天被扣光；自然到期 / 厂商没给就是空串（界面写 ——）
+        "ended_on": str(rec.get("ended_on") or ""),
         "detail": "台账记录 · 厂商已不再返回这一笔",
         "granted_on": rec.get("granted_on") or rec.get("first_seen") or "",
         "granted_src": rec.get("granted_src") if rec.get("granted_on") else "first_seen",

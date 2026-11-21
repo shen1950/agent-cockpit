@@ -7,7 +7,8 @@
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build",
-    "test": "node tests/paste-test.js",
+    "test": "node tests/paste-test.js && node tests/probe-matrix.test.cjs && node tests/site-models-single-entry.test.cjs && node tests/probe-matrix-behavior.test.cjs",
+    "test:protocols": "node tests/probe-matrix.test.cjs && node tests/site-models-single-entry.test.cjs && node tests/probe-matrix-behavior.test.cjs",
     "icon": "tauri icon assets/icon-source.png"
   },
   "devDependencies": {

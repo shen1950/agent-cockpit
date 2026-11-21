@@ -205,7 +205,7 @@
     <div id="view-keys" class="view" hidden>
       <div class="toolbar">
         <button class="btn sm back-agents" title="返回账号列表">← 返回</button>
-        <h1>密钥管理<span class="ihelp" data-tip="按站点管理：接入点与模型挂在站点上，一处的设置对站内所有密钥生效。">?</span></h1>
+        <h1>密钥管理<span class="ihelp" data-tip="按站点管理接入点；每把密钥在各接入点的模型目录与权限独立，站点汇总仅作建议。">?</span></h1>
         <span class="count" id="keys-count"></span>
         <span class="sp"></span>
         <button class="btn primary" id="btn-key-new">＋ 添加站点</button>
@@ -462,11 +462,9 @@
 </div>
 
 <!-- ================= 接入点体检弹窗 =================
-     一张矩阵：行是密钥、列是协议。两种入口都进这张表——
-     从接入点行进来高亮那一列，从密钥行进来高亮那一行。
-     单说「可用 / 不可用」分不清是密钥的事还是协议的事，摊开才看得明白。 -->
+     行是密钥、列是具体协议与地址，每格独立选择模型；打开后不自动发送请求。 -->
 <div class="modal" id="mxmodal" hidden>
-  <div class="dialog wide" role="dialog" aria-modal="true">
+  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="mx-title" aria-describedby="mx-sub">
     <h3 id="mx-title">接入点体检</h3>
     <p class="askbody" id="mx-sub"></p>
     <div class="mxwrap">
@@ -480,14 +478,21 @@
       <span class="mxst key_denied"><span class="dot"></span>密钥无权</span>
       <span class="mxst site_disabled"><span class="dot"></span>站点停用该协议</span>
       <span class="mxst model_mismatch"><span class="dot"></span>模型不识别</span>
+      <span class="mxst unconfigured"><span class="dot"></span>待选模型</span>
+      <span class="mxst rate_limited"><span class="dot"></span>请求限流</span>
+      <span class="mxst cancelled"><span class="dot"></span>已取消</span>
+      <span class="mxst invalid_response"><span class="dot"></span>响应无效</span>
       <span class="mxst unt"><span class="dot"></span>未检测</span>
     </div>
     <p class="mxhint">
-      点单元格复检单项；表头「检测本列」检测该协议下的全部密钥；行尾「检测本行」检测该密钥的全部协议。
-      「站点停用该协议」不是密钥的问题——换一列看。
+      每格先选择或输入模型，再点「检测」；空模型格不发送请求，其他已选模型可继续检测。
+      站点汇总仅为未验证建议，不代表每把密钥的权限。检测可能产生少量费用。
+      「取消检测」或关闭弹窗会停止后续调度；已发出的请求等待返回或 15 秒超时，并非立即中断 HTTP。
     </p>
     <footer class="dialogfoot">
       <button class="btn" id="mx-close">关闭</button>
+      <span class="sp"></span>
+      <button class="btn" id="mx-cancel" disabled>取消检测</button>
       <button class="btn primary" id="mx-all">检测全表</button>
     </footer>
   </div>

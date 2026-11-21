@@ -2871,16 +2871,14 @@ table.tbl td.acts > *:last-child { margin-right: 0 }
 }
 .launch-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; padding-top: var(--sp-3) }
 
-/* ---------- 接入点体检（密钥 × 协议矩阵） ----------
-   一个站常有多种协议入口、多把密钥，而「能不能用」是两个维度的事：
-   只看密钥会把「站点停用了这个协议」误读成「密钥坏了」。所以这里摊成矩阵，
-   一处看全，坏在哪一层也直接标出来。 */
-#mxmodal .dialog { max-width: 920px }
+/* ---------- 接入点体检：保留原矩阵，每格独立选择模型 ---------- */
+#mxmodal .dialog { max-width: 1100px }
 .mxwrap {
   max-height: 54vh; overflow: auto; margin-top: var(--sp-3);
   border: 1px solid var(--line); border-radius: var(--r-md);
 }
-table.mx { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed }
+table.mx { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed }
+table.mx th:not(.kh):not(.op), table.mx td.cell { width: 240px; min-width: 240px; max-width: 240px }
 table.mx th, table.mx td { padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 12.5px }
 table.mx thead th {
   position: sticky; top: 0; z-index: 1; background: var(--bg-raised);
@@ -2890,7 +2888,18 @@ table.mx thead th.kh { text-align: left; width: 210px }
 table.mx thead th.op { width: 96px }
 table.mx tbody tr:last-child td { border-bottom: 0 }
 table.mx td.kc { text-align: left }
-table.mx td.cell { text-align: center; cursor: pointer }
+table.mx td.cell { text-align: center; vertical-align: top }
+.mxmodel { display: block; width: 100%; min-width: 0; margin-bottom: 5px; font-size: 12px }
+.mxurl { color: var(--text-faint); font-size: 11px; overflow-wrap: anywhere; margin-bottom: 5px; font-weight: 400 }
+.mxresult { margin: 7px 0 4px }
+.mxcurrent, table.mx td.cell .mxsub { white-space: normal; overflow-wrap: anywhere }
+.sicatalogs { color: var(--text-muted); font-size: 12px }
+.sicatalogs > summary { cursor: pointer; padding: 4px 0 }
+.sikeycatalog { margin-top: 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md) }
+.sicatalogrow { margin-top: 8px; overflow-wrap: anywhere }
+.sicataloghead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px }
+.sicatalogmsg { color: var(--warn); margin-top: 3px }
+.sicatalogmodels { white-space: normal; overflow-wrap: anywhere; margin-top: 3px }
 table.mx td.cell:hover { background: var(--bg-hover) }
 table.mx .hl { background: var(--accent-soft) }
 .mxname { color: var(--text); font-weight: 500 }
@@ -2907,10 +2916,10 @@ table.mx .hl { background: var(--accent-soft) }
 .mxst.ok .dot { background: var(--ok) }
 .mxst.key_denied { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line) }
 .mxst.key_denied .dot { background: var(--danger) }
-.mxst.model_mismatch, .mxst.error { color: var(--warn); background: var(--warn-soft); border-color: var(--warn-line) }
-.mxst.model_mismatch .dot, .mxst.error .dot { background: var(--warn) }
-.mxst.site_disabled, .mxst.unt { color: var(--text-faint); background: transparent; border-color: var(--line-strong) }
-.mxst.site_disabled .dot, .mxst.unt .dot { background: var(--text-faint) }
+.mxst.model_mismatch, .mxst.error, .mxst.rate_limited, .mxst.invalid_response { color: var(--warn); background: var(--warn-soft); border-color: var(--warn-line) }
+.mxst.model_mismatch .dot, .mxst.error .dot, .mxst.rate_limited .dot, .mxst.invalid_response .dot { background: var(--warn) }
+.mxst.site_disabled, .mxst.unt, .mxst.unconfigured, .mxst.cancelled { color: var(--text-faint); background: transparent; border-color: var(--line-strong) }
+.mxst.site_disabled .dot, .mxst.unt .dot, .mxst.unconfigured .dot, .mxst.cancelled .dot { background: var(--text-faint) }
 .mxst.run { color: var(--accent); background: var(--accent-soft); border-color: var(--accent) }
 .mxst.run .dot { background: var(--accent) }
 

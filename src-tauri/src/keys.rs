@@ -289,6 +289,7 @@ pub fn list_masked() -> Vec<Value> {
                 json!(mask(&plain))
             };
             k["secret_locked"] = json!(plain.is_empty());
+            if let Some(fields) = k.as_object_mut() { fields.remove("key"); }
             k["days_left"] = json!(days_left(k["expires_on"].as_str().unwrap_or("")));
             decorated.push(k);
         }
@@ -393,9 +394,9 @@ pub fn upsert_site(site: &Value) -> (bool, String, String) {
             for nk in new_keys {
                 let kid = nk["id"].as_str().unwrap_or("");
                 if let Some(pos) = merged.iter().position(|k| k["id"].as_str() == Some(kid)) {
-                    merged[pos] = nk;
+                    merged[pos] = merge_key_edit(Some(&merged[pos]), &nk);
                 } else {
-                    merged.push(nk);
+                    merged.push(merge_key_edit(None, &nk));
                 }
             }
             let added = merged.len() - before;
@@ -523,63 +524,149 @@ pub fn fmt_of_url(url: &str) -> &'static str {
     let low = url.trim().trim_end_matches('/').to_ascii_lowercase();
     if low.ends_with("/responses") {
         "openai-resp"
-    } else if low.ends_with("/messages") {
+    } else if low.ends_with("/messages") || low.split('/').any(|s| s == "anthropic") {
         "anthropic"
-    } else if low.contains("generativelanguage") || low.contains(":generatecontent") {
+    } else if low.contains("generativelanguage") || low.contains(":generatecontent")
+        || low.ends_with("/v1beta") || low.ends_with("/v1beta/models")
+    {
         "gemini"
     } else {
         "openai"
     }
 }
 
-/// 矩阵的列：站点登记的接入点；一个都没登记时（老数据只把地址挂在 key 上），
-/// 按密钥自带地址反推出的格式补出来，别让弹窗直接空着。
-pub fn matrix_columns(site: &Value) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(arr) = site["base_urls"].as_array() {
-        for b in arr {
-            let u = b["url"].as_str().unwrap_or("").trim();
-            if u.is_empty() {
-                continue;
-            }
-            let f = match b["format"].as_str().unwrap_or("").trim() {
-                "" => fmt_of_url(u),
-                other => other,
-            };
-            if !out.iter().any(|(x, _)| x == f) {
-                out.push((f.to_string(), u.to_string()));
-            }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeEndpoint {
+    pub id: String,
+    pub fmt: String,
+    pub url: String,
+}
+
+pub fn endpoint_id(fmt: &str, url: &str) -> String {
+    let fmt = if fmt.trim().is_empty() { fmt_of_url(url) } else { fmt.trim() };
+    format!("{}|{}", fmt, url.trim().trim_end_matches('/'))
+}
+
+/// 身份包含协议和完整接入点，不能把同协议的不同根地址折叠。
+pub fn matrix_endpoints(site: &Value) -> Vec<ProbeEndpoint> {
+    let mut out: Vec<ProbeEndpoint> = Vec::new();
+    let mut add = |fmt: &str, url: &str| {
+        let url = url.trim().trim_end_matches('/');
+        if url.is_empty() {
+            return;
         }
+        let fmt = if fmt.trim().is_empty() { fmt_of_url(url) } else { fmt.trim() };
+        let id = endpoint_id(fmt, url);
+        if !out.iter().any(|e| e.id == id) {
+            out.push(ProbeEndpoint { id, fmt: fmt.into(), url: url.into() });
+        }
+    };
+    for b in site["base_urls"].as_array().into_iter().flatten() {
+        let fmt = b["base_format"].as_str().filter(|s| !s.trim().is_empty())
+            .or_else(|| b["format"].as_str()).unwrap_or("");
+        add(fmt, b["url"].as_str().unwrap_or(""));
     }
-    if out.is_empty() {
-        if let Some(ks) = site["keys"].as_array() {
-            for k in ks {
-                let u = k["base_url"].as_str().unwrap_or("").trim();
-                if u.is_empty() {
-                    continue;
-                }
-                let f = fmt_of_url(u);
-                if !out.iter().any(|(x, _)| x == f) {
-                    out.push((f.to_string(), u.to_string()));
-                }
-            }
-        }
+    for k in site["keys"].as_array().into_iter().flatten() {
+        add(k["base_format"].as_str().unwrap_or(""), k["base_url"].as_str().unwrap_or(""));
     }
     out
 }
 
-/// 站点的模型清单：站点上那份为主，key 自己那份是补充
+/// 站点明确登记的地址是共享端点；只登记在某把密钥上的地址不向其他密钥发送请求。
+pub fn endpoint_applies(site: &Value, key: &Value, endpoint: &ProbeEndpoint) -> bool {
+    let shared = site["base_urls"].as_array().into_iter().flatten().any(|base| {
+        let url = base["url"].as_str().unwrap_or("");
+        let fmt = base["base_format"].as_str().filter(|s| !s.trim().is_empty())
+            .or_else(|| base["format"].as_str()).unwrap_or("");
+        !url.trim().is_empty() && endpoint_id(fmt, url) == endpoint.id
+    });
+    let own = key["base_url"].as_str().unwrap_or("");
+    shared || (!own.trim().is_empty() && endpoint_id(key["base_format"].as_str().unwrap_or(""), own) == endpoint.id)
+}
+
+/// 兼容旧调用方，但不再按格式去重。
+pub fn matrix_columns(site: &Value) -> Vec<(String, String)> {
+    matrix_endpoints(site).into_iter().map(|e| (e.fmt, e.url)).collect()
+}
+
+fn append_models(out: &mut Vec<String>, source: &Value) {
+    let models: Vec<&str> = if let Some(s) = source.as_str() {
+        s.split(|c: char| c == ',' || c == '，' || c.is_whitespace()).collect()
+    } else {
+        source.as_array().into_iter().flatten().filter_map(Value::as_str).collect()
+    };
+    for model in models {
+        let model = model.trim();
+        if !model.is_empty() && !out.iter().any(|m| m == model) {
+            out.push(model.to_string());
+        }
+    }
+}
+
+/// 精确目录一旦存在，就以该次结果为准；空、错误、过期目录不能借用其他权限。
+pub fn models_for_endpoint(_site: &Value, key: &Value, endpoint: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(catalog) = key["model_catalogs"].as_array()
+        .and_then(|a| a.iter().rev().find(|c| c["endpoint_id"].as_str() == Some(endpoint)))
+    {
+        if catalog["state"].as_str() == Some("ok") {
+            append_models(&mut out, &catalog["models"]);
+        }
+        return out;
+    }
+    append_models(&mut out, &key["models_list"]);
+    out
+}
+
+/// 注入优先使用本 Key 的目录与手工清单，只有完全没有 Key 记录才兼容站点旧数据。
 pub fn models_for(site: &Value, key: &Value) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for src in [site["models_list"].as_str(), key["models_list"].as_str()] {
-        for m in src.unwrap_or("").split([',', '，', '\n', ' ']) {
-            let m = m.trim();
-            if !m.is_empty() && !out.iter().any(|x| x == m) {
-                out.push(m.to_string());
+    let mut out = Vec::new();
+    if let Some(catalogs) = key["model_catalogs"].as_array() {
+        for (i, catalog) in catalogs.iter().enumerate() {
+            let Some(id) = catalog["endpoint_id"].as_str().filter(|s| !s.is_empty()) else { continue; };
+            if catalogs[i + 1..].iter().any(|c| c["endpoint_id"].as_str() == Some(id)) {
+                continue;
+            }
+            if catalog["state"].as_str() == Some("ok") {
+                append_models(&mut out, &catalog["models"]);
             }
         }
     }
+    append_models(&mut out, &key["models_list"]);
+    if key.get("model_catalogs").is_none() && key.get("models_list").is_none() {
+        append_models(&mut out, &site["models_list"]);
+    }
     out
+}
+
+/// 编辑表单可省略目录和凭据，但凭据、接入点或手工模型变更会使旧发现失效。
+fn merge_key_edit(old: Option<&Value>, incoming: &Value) -> Value {
+    let mut merged = old.cloned().unwrap_or_else(|| json!({}));
+    for (field, value) in clean_key(incoming).as_object().into_iter().flatten() {
+        if field == "key" && value.as_str().unwrap_or("").trim().is_empty() && old.is_some() {
+            continue;
+        }
+        if field == "model_catalogs" && old.is_some()
+            && (value.is_null() || value.as_array().map(|a| a.is_empty()).unwrap_or(false))
+        {
+            continue;
+        }
+        merged[field] = value.clone();
+    }
+    let changed = old.map(|old| ["key", "base_url", "base_format", "models_list"]
+        .iter().any(|field| old[*field] != merged[*field])).unwrap_or(true);
+    if changed {
+        merged["probe_revision"] = json!(new_id("probe"));
+        if let Some(catalogs) = merged["model_catalogs"].as_array_mut() {
+            for catalog in catalogs.iter_mut().filter(|c| c.is_object()) {
+                catalog["state"] = json!("stale");
+                catalog["msg"] = json!("密钥或探测设置已变更，请重新获取模型");
+            }
+        }
+    } else if let Some(revision) = old.and_then(|o| o.get("probe_revision")) {
+        merged["probe_revision"] = revision.clone();
+    }
+    merged
 }
 
 /// 新增/更新站点下的某个 key（可改 base_url / 模型 / 额度）。
@@ -613,7 +700,7 @@ pub fn upsert_key(site_id: &str, key: &Value) -> (bool, String, String) {
 
     let msg = match ks.iter().position(|k| k["id"].as_str() == Some(&kid)) {
         Some(i) => {
-            ks[i] = v;
+            ks[i] = merge_key_edit(Some(&ks[i]), &v);
             "已更新该 key".to_string()
         }
         None => {
@@ -633,7 +720,7 @@ pub fn upsert_key(site_id: &str, key: &Value) -> (bool, String, String) {
                     let oid = ks[old]["id"].as_str().unwrap_or("").to_string();
                     let shown = if old_label.is_empty() { "未命名" } else { &old_label };
                     v["id"] = json!(oid);
-                    ks[old] = v;
+                    ks[old] = merge_key_edit(Some(&ks[old]), &v);
                     let n = ks.len();
                     p["keys"] = json!(ks);
                     p["key_count"] = json!(n);
@@ -645,7 +732,7 @@ pub fn upsert_key(site_id: &str, key: &Value) -> (bool, String, String) {
                     );
                 }
             }
-            ks.push(v);
+            ks.push(merge_key_edit(None, &v));
             "已新增该 key".to_string()
         }
     };
@@ -913,7 +1000,7 @@ pub fn remove_keys_batch(pairs: &[(String, String)]) -> (usize, Vec<String>) {
 /// 是否进反代、接入点覆盖。
 pub fn update_keys_batch(pairs: &[(String, String)], patch: &Value) -> (usize, Vec<String>) {
     const ALLOW: &[&str] = &[
-        "label", "source", "expires_on", "note", "models_list", "use_in_proxy", "base_url",
+        "label", "source", "expires_on", "note", "models_list", "use_in_proxy", "base_url", "base_format",
     ];
     let mut items = sites();
     let mut n = 0usize;
@@ -923,15 +1010,15 @@ pub fn update_keys_batch(pairs: &[(String, String)], patch: &Value) -> (usize, V
         if let Some(p) = find_site_mut(&mut items, sid) {
             let mut ks = p["keys"].as_array().cloned().unwrap_or_default();
             if let Some(k) = ks.iter_mut().find(|k| k["id"].as_str() == Some(kid.as_str())) {
-                if let Some(o) = k.as_object_mut() {
-                    for f in ALLOW {
-                        if let Some(v) = patch.get(*f) {
-                            o.insert((*f).to_string(), v.clone());
-                        }
+                let mut edit = json!({});
+                for f in ALLOW {
+                    if let Some(v) = patch.get(*f) {
+                        edit[*f] = v.clone();
                     }
-                    hit = true;
-                    n += 1;
                 }
+                *k = merge_key_edit(Some(k), &edit);
+                hit = true;
+                n += 1;
             }
             let len = ks.len();
             p["keys"] = json!(ks);
@@ -1050,42 +1137,11 @@ pub fn move_keys_batch(
     (moved, dupes.len(), dupes, misses)
 }
 
-/// 用 GET {base}/v1/models 测活；返回 (可用?, 说明, 模型数)
+/// 模型清单测活也必须验证协议结构，不能把 HTML 或错误对象算作可用。
 pub fn probe(base_url: &str, key: &str) -> (bool, String, usize) {
-    let base = base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return (false, "未填 Base URL".into(), 0);
-    }
-    // base 可能已经是 /v1 或更深（如 /openai/v1）、也可能直接给到 /chat/completions；
-    // 统一走 models_url 归一（剥动作后缀 + 拼 /models），别在这里自己再拼一套
-    let url = match models_url(base) {
-        Some(u) => u,
-        None => return (false, "未填 Base URL".into(), 0),
-    };
-    // 测活是随手点的动作，超时压到 10 秒：站点不通时干等 20 秒太磨人
-    // （B.ai 连不上那次，光一次测试就把整个后端锁了 20 秒）
-    let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(10));
-    if !key.is_empty() {
-        req = req.set("Authorization", &format!("Bearer {}", key));
-        // Anthropic 系的口认 x-api-key 不认 Bearer；多带一个头对 OpenAI 系没影响
-        req = req.set("x-api-key", key);
-    }
-    match req.call() {
-        Ok(resp) => {
-            let n = resp
-                .into_json::<Value>()
-                .ok()
-                .and_then(|v| {
-                    v["data"].as_array()
-                        .or_else(|| v["models"].as_array())   // Gemini 的清单在 models 字段
-                        .map(|a| a.len())
-                })
-                .unwrap_or(0);
-            (true, format!("可用（列出 {} 个模型）", n), n)
-        }
-        Err(ureq::Error::Status(code, _)) => (false, format!("HTTP {}", code), 0),
-        Err(e) => (false, friendly_net_err(&e, 10), 0),
-    }
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let result = discover_endpoint_models(base_url, key, fmt_of_url(base_url), &cancel, 10);
+    (matches!(result.state, "ok" | "empty"), result.msg, result.models.len())
 }
 
 /// 从上游的错误体里抠一句人话出来。各家写法不一：OpenAI 是 error.message，
@@ -1145,12 +1201,13 @@ fn upstream_hint(body: &str) -> String {
 /// 「OpenAI Responses」、地址也填的 `/v1/responses/`，点「请求」照样被 400 顶回来
 /// （她的截图就是这么来的）。格式登记了却不用，等于没登记。
 ///
-/// 认不出 fmt 时保持老行为（chat/completions），别把没登记格式的站点搞坏。
+/// 未填 fmt 时按地址推断；明确登记但不支持的格式不冒充其他协议。
 /// 一次（密钥 × 协议）探测的结构化结果。
 ///
 /// `state` 直接给界面用，取值固定：
 ///   `ok` 通 / `site_disabled` 站点停用该协议 / `key_denied` 密钥无权 /
-///   `model_mismatch` 模型名不被接受 / `error` 其他错误。
+///   `model_mismatch` 模型名不被接受 / `rate_limited` 限流 /
+///   `incomplete` Responses 未完成 / `error` 其他错误。
 ///
 /// 为什么要单列 `site_disabled`：星驰这类站把 `/v1/chat/completions` 整条停了，
 /// 那一列里每把密钥都会失败。若一律标成「密钥无权」，三行全红会被读成
@@ -1186,32 +1243,234 @@ impl ProbeOutcome {
 /// （换协议 / 先取模型清单），糊成一句「请求被拒」等于没说。
 fn classify_failure(code: u16, body: &str) -> &'static str {
     let low = body.to_ascii_lowercase();
-    let disabled = low.contains("chat_completions_disabled")
-        || body.contains("已停用")
-        || low.contains("dispatch")
-        || low.contains("does not allow")
-        || low.contains("not allowed for this");
-    let model_bad = low.contains("model")
-        && (low.contains("not found")
-            || low.contains("does not exist")
-            || low.contains("unknown")
-            || low.contains("invalid"));
-    match code {
-        400 => {
-            if disabled {
-                "site_disabled"
-            } else if model_bad {
-                "model_mismatch"
-            } else {
-                "error"
+    if code == 429 || low.contains("rate_limit_exceeded") || low.contains("rate_limit_error") {
+        return "rate_limited";
+    }
+    let scoped = ["this group", "your group", "group does", "group is", "group_id", "group_disabled",
+        "group_not_allowed", "for group", "\"group\"", "this key", "your key", "api key", "api_key",
+        "key_id", "key_disabled", "key has", "key is", "\"key\"", "this token", "your token", "token_",
+        "\"token\"", "account", "分组", "密钥", "令牌", "账户", "账号"]
+        .iter().any(|s| low.contains(s));
+    let disabled = ["chat_completions_disabled", "responses_disabled", "protocol_disabled",
+        "endpoint_disabled", "disabled for all", "本站已停用", "全站停用", "站点已停用"]
+        .iter().any(|s| low.contains(s))
+        || (low.contains("disabled") && ["site-wide", "sitewide", "globally", "entire site"]
+            .iter().any(|s| low.contains(s)));
+    if disabled && !scoped && !["group", "for this", "for your", "user", "用户"]
+        .iter().any(|s| low.contains(s))
+    {
+        return "site_disabled";
+    }
+    let model_bad = low.contains("model") && ["not found", "does not exist", "unknown",
+        "invalid", "model_not_found", "unsupported model", "not supported"]
+        .iter().any(|s| low.contains(s));
+    if model_bad && !scoped {
+        return "model_mismatch";
+    }
+    if matches!(code, 401 | 403) || scoped || low.contains("permission_denied")
+        || low.contains("not allowed for this") || low.contains("does not allow")
+    {
+        return "key_denied";
+    }
+    "error"
+}
+
+fn protocol_format(fmt: &str, url: &str) -> String {
+    if fmt.trim().is_empty() { fmt_of_url(url).into() } else { fmt.trim().to_ascii_lowercase() }
+}
+
+fn protocol_auth(req: ureq::Request, key: &str, fmt: &str) -> ureq::Request {
+    let req = req.set("User-Agent", PROBE_UA).set("Accept", "application/json");
+    match fmt {
+        "anthropic" => req.set("x-api-key", key).set("anthropic-version", "2023-06-01"),
+        "gemini" => req.set("x-goog-api-key", key),
+        _ => req.set("Authorization", &format!("Bearer {}", key)),
+    }
+}
+
+fn url_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn redact_probe_text(text: &str, key: &str) -> String {
+    if key.is_empty() {
+        return text.to_string();
+    }
+    let mut text = text.replace(key, "[已隐藏凭据]");
+    if let Ok(escaped) = serde_json::to_string(key) {
+        let escaped = escaped.trim_matches('"');
+        if !escaped.is_empty() {
+            text = text.replace(escaped, "[已隐藏凭据]");
+        }
+    }
+    text.replace(&url_component(key), "[已隐藏凭据]")
+}
+
+fn safe_upstream_hint(body: &str, key: &str) -> String {
+    // 先解码再序列化，防止上游用 Unicode 转义回显凭据后绕过脱敏与截断。
+    let decoded = serde_json::from_str::<Value>(body).map(|v| v.to_string())
+        .unwrap_or_else(|_| body.to_string());
+    upstream_hint(&redact_probe_text(&decoded, key))
+}
+
+fn read_probe_body(resp: ureq::Response) -> Result<String, String> {
+    use std::io::Read;
+    if resp.header("Content-Type").unwrap_or("").to_ascii_lowercase().contains("text/html") {
+        return Err("上游返回 HTML 页面，不是 API JSON 响应".into());
+    }
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    let mut text = String::new();
+    resp.into_reader().take(LIMIT + 1).read_to_string(&mut text)
+        .map_err(|_| "读取上游响应失败".to_string())?;
+    if text.len() as u64 > LIMIT {
+        return Err("上游响应超过安全大小限制".into());
+    }
+    Ok(text)
+}
+
+fn valid_probe_base(base: &str) -> bool {
+    let base = base.trim();
+    let rest = base.strip_prefix("http://").or_else(|| base.strip_prefix("https://"));
+    rest.map(|rest| {
+        let host = rest.split('/').next().unwrap_or("");
+        !host.is_empty() && !host.contains('@') && !base.contains(['?', '#'])
+            && !base.chars().any(char::is_whitespace)
+    }).unwrap_or(false)
+}
+
+fn protocol_error(v: &Value) -> bool {
+    v.get("error").map(|e| !e.is_null()).unwrap_or(false)
+        || v["type"].as_str() == Some("error") || v["object"].as_str() == Some("error")
+        || v["success"].as_bool() == Some(false)
+        || matches!(v["status"].as_str(), Some("error" | "failed"))
+        || ["status", "code"].iter().any(|field| v[*field].as_u64().map(|n| n >= 400).unwrap_or(false))
+        || v["error_code"].as_i64().map(|n| n != 0).unwrap_or(false)
+}
+
+/// 返回的成功必须由协议对象和终止状态共同证明，而不取决于是否有文字。
+fn parse_probe_success(fmt: &str, v: &Value) -> Result<String, &'static str> {
+    if !v.is_object() || protocol_error(v) {
+        return Err("上游返回错误或非协议对象");
+    }
+    let mut text = Vec::new();
+    match fmt {
+        "openai" => {
+            if v["object"].as_str() != Some("chat.completion") {
+                return Err("响应不是 Chat Completions 对象");
+            }
+            let choices = v["choices"].as_array().filter(|a| !a.is_empty())
+                .ok_or("Chat 响应缺少 choices")?;
+            for choice in choices {
+                let message = &choice["message"];
+                let finish = choice["finish_reason"].as_str().unwrap_or("");
+                if message["role"].as_str() != Some("assistant")
+                    || !matches!(finish, "stop" | "length" | "tool_calls" | "function_call")
+                {
+                    return Err("Chat 响应结构或结束状态不合法");
+                }
+                let tools = message["tool_calls"].as_array().map(|calls| !calls.is_empty()
+                    && calls.iter().all(|call| call["type"] == "function"
+                        && call["function"]["name"].is_string() && call["function"]["arguments"].is_string()))
+                    .unwrap_or(false);
+                let function = message["function_call"]["name"].is_string()
+                    && message["function_call"]["arguments"].is_string();
+                if (finish == "tool_calls" && !tools) || (finish == "function_call" && !function) {
+                    return Err("Chat 工具调用结构错误");
+                }
+                match message.get("content") {
+                    Some(Value::String(s)) => text.push(s.as_str()),
+                    Some(Value::Null) | None if finish == "length" || tools || function => {},
+                    _ => return Err("Chat 响应缺少合法消息内容"),
+                }
             }
         }
-        // 401 鉴权失败、403 不允许调、429 额度用尽：都归到这把 key 身上
-        401 | 403 | 429 => "key_denied",
-        // 404 多半是这个地址根本没有该协议的接口
-        404 => "site_disabled",
-        _ => "error",
+        "openai-resp" => {
+            if v["object"].as_str() != Some("response") || v["id"].as_str().unwrap_or("").is_empty()
+                || v["status"].as_str() != Some("completed")
+            {
+                return Err("Responses 未完成或不是合法 response 对象");
+            }
+            let output = v["output"].as_array().ok_or("Responses 缺少 output 数组")?;
+            for item in output {
+                match item["type"].as_str().unwrap_or("") {
+                    "message" => {
+                        if item["role"].as_str() != Some("assistant")
+                            || item["status"].as_str().map(|s| s != "completed").unwrap_or(false)
+                        {
+                            return Err("Responses 消息未完成或角色不合法");
+                        }
+                        for part in item["content"].as_array().ok_or("Responses 消息缺少 content")? {
+                            match part["type"].as_str().unwrap_or("") {
+                                "output_text" => text.push(part["text"].as_str().ok_or("Responses 文本结构错误")?),
+                                "refusal" if part["refusal"].is_string() => {},
+                                _ => return Err("Responses 内容结构错误"),
+                            }
+                        }
+                    }
+                    "reasoning" if item["summary"].is_array() => {},
+                    "function_call" if item["name"].is_string() && item["arguments"].is_string() => {},
+                    _ => return Err("Responses output 不是合法协议条目"),
+                }
+            }
+        }
+        "anthropic" => {
+            if v["type"].as_str() != Some("message") || v["role"].as_str() != Some("assistant")
+                || v["id"].as_str().unwrap_or("").is_empty()
+                || !matches!(v["stop_reason"].as_str().unwrap_or(""),
+                    "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | "pause_turn")
+            {
+                return Err("响应不是已结束的 Anthropic message 对象");
+            }
+            for part in v["content"].as_array().ok_or("Anthropic 响应缺少 content")? {
+                match part["type"].as_str().unwrap_or("") {
+                    "text" => text.push(part["text"].as_str().ok_or("Anthropic 文本结构错误")?),
+                    "thinking" if part["thinking"].is_string() => {},
+                    "redacted_thinking" if part["data"].is_string() => {},
+                    "tool_use" if part["name"].is_string() && part["input"].is_object() => {},
+                    _ => return Err("Anthropic 内容结构错误"),
+                }
+            }
+        }
+        "gemini" => {
+            let candidates = v["candidates"].as_array().filter(|a| !a.is_empty())
+                .ok_or("Gemini 没有返回可用候选内容")?;
+            for candidate in candidates {
+                let finish = candidate["finishReason"].as_str().unwrap_or("");
+                if !matches!(finish, "STOP" | "MAX_TOKENS") {
+                    return Err("Gemini 候选被拦截或尚未正常结束");
+                }
+                if finish == "MAX_TOKENS" && candidate.get("content").is_none() {
+                    continue;
+                }
+                let content = &candidate["content"];
+                if content["role"].as_str().map(|r| r != "model").unwrap_or(false) {
+                    return Err("Gemini 候选角色不合法");
+                }
+                for part in content["parts"].as_array().ok_or("Gemini 候选缺少 parts")? {
+                    if let Some(s) = part["text"].as_str() {
+                        text.push(s);
+                    } else {
+                        let function = part["functionCall"]["name"].is_string()
+                            && part["functionCall"]["args"].is_object();
+                        let data = part["inlineData"]["mimeType"].is_string() && part["inlineData"]["data"].is_string();
+                        if !function && !data {
+                            return Err("Gemini part 结构错误");
+                        }
+                    }
+                }
+            }
+        }
+        _ => return Err("不支持该协议的探测"),
     }
+    Ok(text.join(" ").replace(['\n', '\r'], " "))
 }
 
 /// 真发一次最小对话，返回结构化结果（矩阵与单点检测共用这一份实现）。
@@ -1222,126 +1481,89 @@ pub fn probe_combo(
     fmt: &str,
     timeout_secs: u64,
 ) -> ProbeOutcome {
-    // 地址本身带 /responses 的，就算 fmt 没登记也按 Responses 打——
-    // 用户已经把「我要走这个协议」写在地址里了，不该再被改成 chat。
-    let wants_responses = fmt.eq_ignore_ascii_case("openai-resp")
-        || base_url
-            .trim()
-            .trim_end_matches('/')
-            .to_ascii_lowercase()
-            .ends_with("/responses");
-    let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
-    let (url, body) = if wants_responses {
-        match responses_url(base) {
-            Some(u) => (
-                u,
-                json!({
-                    "model": model,
-                    "input": "ping",
-                    "max_output_tokens": 16,
-                    "stream": false,
-                }),
-            ),
-            None => return ProbeOutcome::fail("error", 0, 0, "未填 Base URL"),
-        }
-    } else {
-        match chat_url(base) {
-            Some(u) => (
-                u,
-                json!({
-                    "model": model,
-                    "messages": [{ "role": "user", "content": "ping" }],
-                    "max_tokens": 1,
-                    "stream": false,
-                }),
-            ),
-            None => return ProbeOutcome::fail("error", 0, 0, "未填 Base URL"),
-        }
+    let fmt = protocol_format(fmt, base_url);
+    if !valid_probe_base(base_url) {
+        return ProbeOutcome::fail("error", 0, 0, "Base URL 为空或不合法（只接受无凭据、无查询参数的 HTTP(S) 接入点）");
+    }
+    if key.trim().is_empty() {
+        return ProbeOutcome::fail("key_denied", 0, 0, "密钥为空或已锁定，未发送匿名请求");
+    }
+    if model.trim().is_empty() {
+        return ProbeOutcome::fail("model_mismatch", 0, 0, "未提供该密钥在此接入点的模型");
+    }
+    let (url, body) = match fmt.as_str() {
+        "openai" => (chat_url(base_url), json!({
+            "model": model, "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1, "stream": false,
+        })),
+        "openai-resp" => (responses_url(base_url), json!({
+            "model": model, "input": "ping", "max_output_tokens": 16, "stream": false,
+        })),
+        "anthropic" => (action_url(base_url, "/messages", "/v1"), json!({
+            "model": model, "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 16, "stream": false,
+        })),
+        "gemini" => (gemini_generate_url(base_url, model), json!({
+            "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+            "generationConfig": {"maxOutputTokens": 16},
+        })),
+        _ => return ProbeOutcome::fail("error", 0, 0, "不支持该协议的探测"),
+    };
+    let Some(url) = url else {
+        return ProbeOutcome::fail("error", 0, 0, "未填 Base URL");
     };
     let t0 = std::time::Instant::now();
-    let mut req = ureq::post(&url)
-        .timeout(std::time::Duration::from_secs(timeout_secs))
+    // 禁止重定向，避免把协议鉴权头转发给另一个站点。
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let req = protocol_auth(agent.post(&url), key, &fmt)
+        .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
         .set("Content-Type", "application/json");
-    // ureq 默认 UA 是 `ureq/x.y`，有些中转站按 UA 首 token 放行（星驰只认
-    // WorkBuddy / Codex / Claude Code 这类编程客户端，裸脚本一律 403 client_not_allowed）。
-    // 检测的意义是「验证这把 key 在这个站能不能用」，不是「验证 ureq 能不能用」，
-    // 所以这里声明成 WorkBuddy——和真正调用它的客户端一致，测出来的结论才作数。
-    req = req.set("User-Agent", PROBE_UA);
-    if !key.is_empty() {
-        req = req.set("Authorization", &format!("Bearer {}", key));
-        // Anthropic 系的口认 x-api-key 不认 Bearer；多带一个头对 OpenAI 系没影响
-        req = req.set("x-api-key", key);
-    }
     match req.send_json(body) {
         Ok(resp) => {
-            let ms = t0.elapsed().as_millis();
-            let txt = resp.into_string().unwrap_or_default();
-            let v: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
-            // 两种协议的返回体长得不一样：
-            //   chat      -> choices[0].message.content
-            //   responses -> output[].content[].text（output_text 类型）
-            let said = if wants_responses {
-                v["output"]
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|it| it["content"].as_array())
-                            .flatten()
-                            .filter(|c| c["type"].as_str() == Some("output_text"))
-                            .filter_map(|c| c["text"].as_str())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .unwrap_or_default()
-            } else {
-                v["choices"][0]["message"]["content"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string()
+            let code = resp.status();
+            let txt = match read_probe_body(resp) {
+                Ok(txt) => txt,
+                Err(msg) => return ProbeOutcome::fail("error", code, t0.elapsed().as_millis(), msg),
+            };
+            let v: Value = match serde_json::from_str(&txt) {
+                Ok(v) => v,
+                Err(_) => return ProbeOutcome::fail("error", code, t0.elapsed().as_millis(), "上游不是合法 JSON 响应"),
+            };
+            if !(200..300).contains(&code) {
+                return ProbeOutcome::fail("error", code, t0.elapsed().as_millis(), "上游重定向或非成功状态");
             }
-            .replace(['\n', '\r'], " ");
-            let said: String = said.trim().chars().take(40).collect();
-            ProbeOutcome {
-                state: "ok",
-                code: 200,
-                ms,
-                said,
-                hint: String::new(),
-                extra: "",
-                net_err: false,
+            if protocol_error(&v) {
+                return ProbeOutcome::fail(classify_failure(code, &txt), code,
+                    t0.elapsed().as_millis(), safe_upstream_hint(&txt, key));
+            }
+            if fmt == "openai-resp" && v["status"] == "incomplete" {
+                return ProbeOutcome::fail("incomplete", code, t0.elapsed().as_millis(), "Responses 返回 incomplete，尚未成功完成");
+            }
+            match parse_probe_success(&fmt, &v) {
+                Ok(said) => ProbeOutcome {
+                    state: "ok", code, ms: t0.elapsed().as_millis(),
+                    said: redact_probe_text(&said, key).trim().chars().take(40).collect(),
+                    hint: String::new(), extra: "", net_err: false,
+                },
+                Err(hint) => ProbeOutcome::fail("error", code, t0.elapsed().as_millis(), hint),
             }
         }
         Err(ureq::Error::Status(code, resp)) => {
-            let txt = resp.into_string().unwrap_or_default();
-            let hint = upstream_hint(&txt);
-            let extra = match code {
-                400 => "：请求被拒，通常是模型名这个接入点不认",
-                401 => "：这把 key 上游不认（鉴权失败）",
-                403 => "：上游认得出 key，但不允许它调这个模型",
-                404 if wants_responses => "：这个地址没有 /responses，确认兼容格式选对了没",
-                404 => "：这个地址没有 /chat/completions，可能不是 OpenAI 兼容口",
-                429 => "：限流，或这把 key 的额度用完了",
+            let txt = read_probe_body(resp).unwrap_or_default();
+            let mut outcome = ProbeOutcome::fail(classify_failure(code, &txt), code,
+                t0.elapsed().as_millis(), safe_upstream_hint(&txt, key));
+            outcome.extra = match code {
+                401 => "：鉴权失败",
+                403 => "：密钥或分组权限被拒绝",
+                404 => "：模型或接入路径不存在（不能据此断定全站停用）",
+                429 => "：上游限流或额度限制",
                 _ => "",
             };
-            ProbeOutcome {
-                state: classify_failure(code, &txt),
-                code,
-                ms: t0.elapsed().as_millis(),
-                said: String::new(),
-                hint,
-                extra,
-                net_err: false,
-            }
+            outcome
         }
         Err(e) => ProbeOutcome {
-            state: "error",
-            code: 0,
-            ms: t0.elapsed().as_millis(),
-            said: String::new(),
-            hint: friendly_net_err(&e, timeout_secs),
-            extra: "",
-            net_err: true,
+            state: "error", code: 0, ms: t0.elapsed().as_millis(), said: String::new(),
+            hint: friendly_net_err(&e, timeout_secs), extra: "", net_err: true,
         },
     }
 }
@@ -1367,228 +1589,331 @@ pub fn chat_probe(base_url: &str, key: &str, model: &str, fmt: &str) -> (bool, S
     }
 }
 
-/// 矩阵里的一格：谁 × 哪种协议 × 结果。
+pub struct ProbeJob {
+    pub key_id: String,
+    pub endpoint_id: String,
+    pub fmt: String,
+    pub url: String,
+    pub key: String,
+    pub model: String,
+}
+
 pub struct MatrixCell {
     pub key_id: String,
+    pub endpoint_id: String,
     pub fmt: String,
+    pub url: String,
+    pub model: String,
     pub state: &'static str,
     pub code: u16,
     pub ms: u128,
     pub msg: String,
 }
 
-/// 批量探测：把任务摊到固定数量的工作线程上。
-///
-/// 为什么必须并发：一个 10 密钥 × 3 协议的站是 30 次请求，串行按 20 秒超时算
-/// 最坏要等十分钟，界面上就是「点了没反应」。并发上限压在 6，既快又不至于
-/// 把中转站的限流打爆。
-pub fn probe_matrix(
-    jobs: Vec<(String, String, String, String, String)>,
+pub fn probe_matrix(jobs: Vec<ProbeJob>, timeout_secs: u64, workers: usize) -> Vec<MatrixCell> {
+    probe_matrix_cancellable(jobs, timeout_secs, workers,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+/// 最多六个在途请求；取消后尚未发送的任务保留身份并返回 cancelled。
+pub fn probe_matrix_cancellable(
+    jobs: Vec<ProbeJob>,
     timeout_secs: u64,
     workers: usize,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<MatrixCell> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-
     let total = jobs.len();
     if total == 0 {
         return Vec::new();
     }
-    let jobs = std::sync::Arc::new(jobs);
     let cursor = AtomicUsize::new(0);
     let out: Mutex<Vec<Option<MatrixCell>>> = Mutex::new((0..total).map(|_| None).collect());
-    let n = workers.clamp(1, total).min(6);
-
-    std::thread::scope(|s| {
-        for _ in 0..n {
-            s.spawn(|| loop {
+    std::thread::scope(|scope| {
+        for _ in 0..workers.clamp(1, total).min(6) {
+            scope.spawn(|| loop {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
                 let i = cursor.fetch_add(1, Ordering::SeqCst);
                 if i >= total {
                     break;
                 }
-                let (key_id, fmt, url, key, model) = &jobs[i];
-                let o = probe_combo(url, key, model, fmt, timeout_secs);
-                let msg = if o.net_err {
-                    o.hint.clone()
-                } else if o.state == "ok" {
-                    if o.said.is_empty() {
-                        "连通".to_string()
-                    } else {
-                        format!("返回「{}」", o.said)
-                    }
+                let job = &jobs[i];
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                let outcome = probe_combo(&job.url, &job.key, &job.model, &job.fmt, timeout_secs);
+                let msg = if outcome.state == "ok" {
+                    if outcome.said.is_empty() { "连通".into() }
+                    else { format!("返回「{}」", outcome.said) }
                 } else {
-                    let h = o.hint.trim_start_matches("；上游说：");
-                    if h.is_empty() {
-                        format!("HTTP {}", o.code)
-                    } else {
-                        format!("HTTP {}：{}", o.code, h)
-                    }
+                    let hint = outcome.hint.trim_start_matches("；上游说：");
+                    format!("HTTP {}：{}", outcome.code, hint)
                 };
-                out.lock().unwrap()[i] = Some(MatrixCell {
-                    key_id: key_id.clone(),
-                    fmt: fmt.clone(),
-                    state: o.state,
-                    code: o.code,
-                    ms: o.ms,
-                    msg,
-                });
+                out.lock().unwrap()[i] = Some(matrix_cell(job, outcome.state,
+                    outcome.code, outcome.ms, redact_probe_text(&msg, &job.key)));
             });
         }
     });
+    out.into_inner().unwrap().into_iter().enumerate().map(|(i, cell)| {
+        cell.unwrap_or_else(|| matrix_cell(&jobs[i], "cancelled", 0, 0, "已取消，未发送请求".into()))
+    }).collect()
+}
 
-    out.into_inner()
-        .unwrap()
-        .into_iter()
-        .flatten()
-        .collect()
+fn matrix_cell(job: &ProbeJob, state: &'static str, code: u16, ms: u128, msg: String) -> MatrixCell {
+    let id = endpoint_id(&job.fmt, &job.url);
+    MatrixCell {
+        key_id: job.key_id.clone(),
+        endpoint_id: if job.endpoint_id == id { job.endpoint_id.clone() } else { id },
+        fmt: protocol_format(&job.fmt, &job.url), url: job.url.clone(), model: job.model.clone(),
+        state, code, ms, msg,
+    }
 }
 
 /// 网络错误翻译成人话：超时（Windows 上表现为 os error 10060）要说清
 /// "等久了没连上"，别把系统错误号原样怼到脸上
 pub fn friendly_net_err(e: &ureq::Error, secs: u64) -> String {
     let s = e.to_string();
-    if s.contains("timed out") || s.contains("timeout") || s.contains("10060") || s.contains("10061") {
+    if s.contains("timed out") || s.contains("timeout") || s.contains("10060") {
         format!("连接超时（{} 秒没连上）——站点可能暂时不可达，稍后再试", secs)
     } else if s.contains("Connection refused") || s.contains("10061") {
-        format!("连接被拒——站点没在监听这个端口：{}", s)
+        "连接被拒——站点没有监听该端口".into()
     } else {
-        s
+        // 传输错误可能含请求 URL，不回显以免带出查询凭据或代理认证信息。
+        "网络请求失败，请检查地址、代理、证书或网络连接".into()
     }
 }
 
-/// 拉上游的模型 ID 清单（「添加账号」的 API 方式里点「从上游获取」用）。
-/// 和 probe 走同一条 .../models，只是把 ID 带回来而不只是数个数。
 pub fn probe_models(base_url: &str, key: &str) -> (bool, String, Vec<String>) {
-    let url = match models_url(base_url) {
-        Some(u) => u,
-        None => return (false, "未填 Base URL".into(), Vec::new()),
-    };
-    let mut req = ureq::get(&url).timeout(std::time::Duration::from_secs(20));
-    if !key.is_empty() {
-        req = req.set("Authorization", &format!("Bearer {}", key));
-        // Anthropic 系的口认 x-api-key 不认 Bearer；多带一个头对 OpenAI 系没影响
-        req = req.set("x-api-key", key);
+    probe_models_for_endpoint(base_url, key, fmt_of_url(base_url))
+}
+
+pub fn probe_models_for_endpoint(base_url: &str, key: &str, fmt: &str) -> (bool, String, Vec<String>) {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let result = discover_endpoint_models(base_url, key, fmt, &cancel, 20);
+    (matches!(result.state, "ok" | "empty"), result.msg, result.models)
+}
+
+struct ModelDiscovery {
+    models: Vec<String>,
+    state: &'static str,
+    msg: String,
+}
+
+fn model_discovery_result(models: Vec<String>, state: &'static str, msg: impl Into<String>) -> ModelDiscovery {
+    ModelDiscovery { models, state, msg: msg.into() }
+}
+
+/// 只接受协议数组，合法空清单与解析失败必须区分。
+fn parse_model_page(v: &Value, fmt: &str) -> Result<Vec<String>, &'static str> {
+    if !v.is_object() || protocol_error(v) {
+        return Err("上游返回错误对象或非模型清单");
     }
-    match req.call() {
-        Ok(resp) => {
-            let ids: Vec<String> = resp
-                .into_json::<Value>()
-                .ok()
-                .and_then(|v| {
-                    // OpenAI 系清单在 data，Gemini 在 models；Gemini 的条目名在 "name"
-                    let a = v["data"].as_array().or_else(|| v["models"].as_array());
-                    a.map(|a| {
-                        a.iter()
-                            .filter_map(|m| {
-                                m["id"].as_str()
-                                    .or_else(|| m["name"].as_str())
-                                    .map(|s| s.to_string())
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .unwrap_or_default()
-                .into_iter()
-                // Gemini 的 name 是 "models/gemini-..."，去掉前缀好认
-                .map(|s| s.strip_prefix("models/").map(|x| x.to_string()).unwrap_or(s))
-                .collect();
-            let n = ids.len();
-            (
-                true,
-                if n > 0 {
-                    format!("拉到 {n} 个模型")
-                } else {
-                    "连上了，但没解析出模型清单".into()
-                },
-                ids,
-            )
+    let field = if fmt == "gemini" { "models" } else { "data" };
+    let items = v[field].as_array().ok_or("响应缺少该协议的模型数组")?;
+    let mut out = Vec::new();
+    for item in items {
+        let id = item[if fmt == "gemini" { "name" } else { "id" }]
+            .as_str().filter(|s| !s.trim().is_empty()).ok_or("模型条目缺少合法 ID")?;
+        let id = if fmt == "gemini" { id.strip_prefix("models/").unwrap_or(id) } else { id };
+        if id.is_empty() {
+            return Err("模型 ID 为空");
         }
-        Err(ureq::Error::Status(code, _)) => (false, format!("HTTP {code}"), Vec::new()),
-        Err(e) => (false, friendly_net_err(&e, 20), Vec::new()),
+        if !out.iter().any(|m| m == id) {
+            out.push(id.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn nonempty_page_token(v: &Value) -> Result<Option<String>, &'static str> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) if s.is_empty() => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        _ => Err("分页游标格式不合法"),
     }
 }
 
-/// 一个站点常有多个接入点（OpenAI 兼容 / Anthropic 兼容 / DashScope…）。
-/// 界面上「获取模型」全站只留一个入口，那它就得把这些口都问一遍——
-/// 只问第一口，登记顺序把 Responses 排在前面的站会显示「没拉到模型」，
-/// 而其实是那个口拿不到清单、另一个口本来就正常。
-///
-/// 每个口按密钥顺序试到一把能用的为止：有的站某把密钥只对某个口开放，
-/// 从头到尾只用第一把，那一整口都会判死。
-/// 返回（去重合并后的模型 id，逐口说明）。
+/// 不跟随上游提供的任意 URL，只在原模型接口上附加协议规定的游标。
+fn next_model_page(v: &Value, fmt: &str) -> Result<Option<(String, String)>, &'static str> {
+    if fmt == "gemini" {
+        return Ok(nonempty_page_token(&v["nextPageToken"])?
+            .map(|token| ("pageToken".into(), token)));
+    }
+    for field in ["next_page_token", "nextPageToken", "next_cursor"] {
+        if let Some(token) = nonempty_page_token(&v[field])? {
+            let parameter = if field == "next_cursor" { "cursor" } else { "page_token" };
+            return Ok(Some((parameter.into(), token)));
+        }
+    }
+    if let Some(page) = v.get("next_page").filter(|p| !p.is_null()) {
+        let page = match page {
+            Value::String(s) if s.is_empty() => None,
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) if n.as_u64().unwrap_or(0) > 0 => Some(n.to_string()),
+            Value::Number(n) if n.as_u64() == Some(0) => None,
+            _ => return Err("下一页页码格式不合法"),
+        };
+        if let Some(page) = page {
+            return Ok(Some(("page".into(), page)));
+        }
+    }
+    if v.get("has_more").map(|x| !x.is_boolean()).unwrap_or(false) {
+        return Err("has_more 不是布尔值");
+    }
+    if v["has_more"].as_bool() == Some(true) {
+        let last = v["last_id"].as_str().filter(|s| !s.is_empty())
+            .or_else(|| v["data"].as_array()?.last()?["id"].as_str())
+            .filter(|s| !s.is_empty()).ok_or("上游仍有下一页但未返回游标")?;
+        return Ok(Some(((if fmt == "anthropic" { "after_id" } else { "after" }).into(), last.into())));
+    }
+    for field in ["next", "next_url", "next_page_url"] {
+        if v.get(field).map(|x| !x.is_null() && x.as_str() != Some("") && x != &Value::Bool(false)).unwrap_or(false) {
+            return Err("上游仍有下一页但分页形式不受支持，结果不完整");
+        }
+    }
+    Ok(None)
+}
+
+fn discover_endpoint_models(
+    base_url: &str,
+    key: &str,
+    fmt: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    timeout_secs: u64,
+) -> ModelDiscovery {
+    use std::sync::atomic::Ordering;
+    let mut models = Vec::new();
+    if cancel.load(Ordering::Acquire) {
+        return model_discovery_result(models, "cancelled", "已取消，未发送请求");
+    }
+    if key.trim().is_empty() {
+        return model_discovery_result(models, "error", "密钥为空或已锁定，未发送匿名请求");
+    }
+    if !valid_probe_base(base_url) {
+        return model_discovery_result(models, "error", "Base URL 为空或不合法");
+    }
+    let fmt = protocol_format(fmt, base_url);
+    if !matches!(fmt.as_str(), "openai" | "openai-resp" | "anthropic" | "gemini") {
+        return model_discovery_result(models, "error", "不支持该协议的模型发现");
+    }
+    let url = if fmt == "gemini" { action_url(base_url, "/models", "/v1beta") } else { models_url(base_url) };
+    let Some(url) = url else {
+        return model_discovery_result(models, "error", "未填 Base URL");
+    };
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let mut query: Option<(String, String)> = None;
+    let mut seen = Vec::new();
+    const MAX_PAGES: usize = 64;
+    for page in 0..MAX_PAGES {
+        if cancel.load(Ordering::Acquire) {
+            return model_discovery_result(models, "cancelled", "已取消，模型清单可能不完整");
+        }
+        let mut req = protocol_auth(agent.get(&url), key, &fmt)
+            .timeout(std::time::Duration::from_secs(timeout_secs.max(1)));
+        if let Some((name, value)) = &query {
+            req = req.query(name, value);
+        }
+        let resp = match req.call() {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(code, resp)) => {
+                let detail = read_probe_body(resp).map(|s| safe_upstream_hint(&s, key))
+                    .unwrap_or_else(|s| format!("；{s}"));
+                return model_discovery_result(models, "error", format!("HTTP {code}{detail}；模型发现未完成"));
+            }
+            Err(e) => return model_discovery_result(models, "error", friendly_net_err(&e, timeout_secs)),
+        };
+        if !(200..300).contains(&resp.status()) {
+            return model_discovery_result(models, "error", "上游重定向或非成功状态，未转发凭据");
+        }
+        let header_next = resp.header("Link").map(|s| s.contains("rel=\"next\"") || s.contains("rel=next")).unwrap_or(false)
+            || resp.header("X-Next-Page").map(|s| !s.is_empty() && s != "0").unwrap_or(false);
+        let txt = match read_probe_body(resp) {
+            Ok(txt) => txt,
+            Err(msg) => return model_discovery_result(models, "error", msg),
+        };
+        let v: Value = match serde_json::from_str(&txt) {
+            Ok(v) => v,
+            Err(_) => return model_discovery_result(models, "error", "上游不是合法模型 JSON"),
+        };
+        let ids = match parse_model_page(&v, &fmt) {
+            Ok(ids) => ids,
+            Err(msg) => {
+                let detail = safe_upstream_hint(&txt, key);
+                return model_discovery_result(models, "error", format!("{msg}{detail}"));
+            }
+        };
+        for id in ids {
+            if !models.contains(&id) {
+                models.push(id);
+            }
+        }
+        let next = match next_model_page(&v, &fmt) {
+            Ok(next) => next,
+            Err(msg) => return model_discovery_result(models, "error", msg),
+        };
+        let Some(next) = next else {
+            if header_next {
+                return model_discovery_result(models, "error", "分页响应头仍指向下一页，结果不完整");
+            }
+            let state = if models.is_empty() { "empty" } else { "ok" };
+            let msg = if models.is_empty() { "上游返回合法空模型清单".to_string() }
+                else { format!("已完整获取 {} 个模型", models.len()) };
+            return model_discovery_result(models, state, msg);
+        };
+        if page + 1 == MAX_PAGES || seen.contains(&next) {
+            return model_discovery_result(models, "error", "分页达到安全上限或游标重复，结果不完整");
+        }
+        seen.push(next.clone());
+        query = Some(next);
+    }
+    model_discovery_result(models, "error", "模型分页未完成")
+}
+
+/// 返回每一把 Key × 每一个端点的独立目录；本函数不读写存储或保管箱。
+pub fn discover_site_models(site: &Value, cancel: &std::sync::atomic::AtomicBool) -> Vec<Value> {
+    let endpoints = matrix_endpoints(site);
+    let mut out = Vec::new();
+    for key in site["keys"].as_array().into_iter().flatten() {
+        for endpoint in &endpoints {
+            if !endpoint_applies(site, key, endpoint) { continue; }
+            let plain = key["key"].as_str().unwrap_or("");
+            let result = if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                model_discovery_result(Vec::new(), "cancelled", "已取消，未发送请求")
+            } else if key["secret_locked"].as_bool() == Some(true) {
+                model_discovery_result(Vec::new(), "error", "密钥已锁定，未发送匿名请求")
+            } else {
+                discover_endpoint_models(&endpoint.url, plain, &endpoint.fmt, cancel, 20)
+            };
+            out.push(json!({
+                "key_id": key["id"].as_str().unwrap_or(""), "endpoint_id": endpoint.id,
+                "fmt": endpoint.fmt, "url": endpoint.url, "models": result.models,
+                "state": result.state, "msg": redact_probe_text(&result.msg, plain),
+                "checked_at": chrono::Local::now().to_rfc3339(),
+            }));
+        }
+    }
+    out
+}
+
+/// 兼容旧调用：只汇总完整成功的逐 Key 目录，绝不首成功即停止。
 pub fn probe_models_all(site: &Value) -> (Vec<String>, Vec<String>) {
-    let mut ids: Vec<String> = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
-
-    let keys: Vec<String> = site["keys"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|k| k["key"].as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // 同一个地址登记两遍（不同格式标签）不该发两次请求
-    let mut bases: Vec<(String, String)> = Vec::new();
-    for b in site["base_urls"].as_array().into_iter().flatten() {
-        let url = b["url"].as_str().unwrap_or("").trim().to_string();
-        if url.is_empty() || bases.iter().any(|(u, _)| *u == url) {
-            continue;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let results = discover_site_models(site, &cancel);
+    let mut ids = Vec::new();
+    let mut notes = Vec::new();
+    for result in results {
+        if result["state"] == "ok" {
+            append_models(&mut ids, &result["models"]);
         }
-        bases.push((url, b["format"].as_str().unwrap_or("openai").to_string()));
+        notes.push(format!("{} × {}：{}", result["key_id"].as_str().unwrap_or(""),
+            result["endpoint_id"].as_str().unwrap_or(""), result["msg"].as_str().unwrap_or("")));
     }
-    if bases.is_empty() {
-        return (ids, vec!["这个站点还没登记接入点".into()]);
-    }
-
-    for (url, fmt) in &bases {
-        let label = match fmt.as_str() {
-            "openai" => "OpenAI 兼容".to_string(),
-            "anthropic" => "Anthropic 兼容".to_string(),
-            "dashscope" => "DashScope".to_string(),
-            "openai-resp" => "OpenAI Responses".to_string(),
-            other => other.to_string(),
-        };
-        // 一把密钥都没有时用空 key 试一次：有的站 /models 不校验
-        let attempts: Vec<String> = if keys.is_empty() {
-            vec![String::new()]
-        } else {
-            keys.clone()
-        };
-        let mut got: Option<Vec<String>> = None;
-        let mut last = String::new();
-        let mut which = 0usize;
-        for (i, k) in attempts.iter().enumerate() {
-            let (good, msg, list) = probe_models(url, k);
-            if good {
-                got = Some(list);
-                which = i + 1;
-                break;
-            }
-            last = msg;
-        }
-        match got {
-            Some(list) => {
-                let n = list.len();
-                let mut added = 0;
-                for m in list {
-                    if !ids.iter().any(|x| *x == m) {
-                        ids.push(m);
-                        added += 1;
-                    }
-                }
-                let who = if attempts.len() > 1 {
-                    format!("（第 {which} 把密钥）")
-                } else {
-                    String::new()
-                };
-                notes.push(format!("{label}：{n} 个，新增 {added}{who}"));
-            }
-            None => notes.push(format!("{label}：{last}")),
-        }
+    if notes.is_empty() {
+        notes.push("没有可发现的密钥或接入点，未发送匿名请求".into());
     }
     (ids, notes)
 }
@@ -1599,72 +1924,60 @@ pub fn probe_models_all(site: &Value) -> (Vec<String>, Vec<String>) {
 /// 否则拼出来是 .../chat/completions/v1/models，必然 HTTP 404
 /// （她 2026-10-28：带 chat/completions 或 responses 的永远测不通，就这个原因）。
 fn strip_action_suffix(mut base: &str) -> &str {
+    base = base.trim_end_matches('/');
+    let lower = base.to_ascii_lowercase();
+    if lower.contains(":generatecontent") {
+        if let Some(i) = lower.rfind("/models/") {
+            base = &base[..i];
+        }
+    }
     const ACTIONS: &[&str] = &[
-        "/chat/completions", "/responses", "/completions", "/messages", "/embeddings",
+        "/chat/completions", "/responses", "/completions", "/messages", "/embeddings", "/models",
     ];
     loop {
         let lower = base.to_ascii_lowercase();
         match ACTIONS.iter().find(|s| lower.ends_with(*s)) {
-            Some(s) => base = &base[..base.len() - s.len()],
+            Some(s) => base = base[..base.len() - s.len()].trim_end_matches('/'),
             None => return base,
         }
     }
 }
 
-/// base 可能已经是 /v1 或更深（如 /openai/v1）；统一拼到 .../models
-fn models_url(base_url: &str) -> Option<String> {
-    let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
+fn action_url(base_url: &str, action: &str, default_version: &str) -> Option<String> {
+    let explicit = base_url.trim().trim_end_matches('/');
+    if action == "/models" && explicit.to_ascii_lowercase().ends_with("/models") {
+        return Some(explicit.into());
+    }
+    let base = strip_action_suffix(base_url.trim());
     if base.is_empty() {
         return None;
     }
     let has_version_tail = ["/v1", "/v1beta", "/v1beta1", "/v4"]
-        .iter()
-        .any(|s| base.ends_with(s));
-    Some(if base.ends_with("/models") {
-        base.to_string()
-    } else if has_version_tail {
-        format!("{base}/models")
-    } else {
-        format!("{base}/v1/models")
-    })
+        .iter().any(|s| base.ends_with(s));
+    Some(if has_version_tail { format!("{base}{action}") }
+        else { format!("{base}{default_version}{action}") })
+}
+
+fn gemini_generate_url(base_url: &str, model: &str) -> Option<String> {
+    let models = action_url(base_url, "/models", "/v1beta")?;
+    Some(format!("{}/{}:generateContent", models, url_component(model.strip_prefix("models/").unwrap_or(model))))
+}
+
+/// base 可能已经是 /v1 或更深（如 /openai/v1）；统一拼到 .../models
+fn models_url(base_url: &str) -> Option<String> {
+    action_url(base_url, "/models", "/v1")
 }
 
 /// 真请求打的地址：和 models_url 一套规矩（先剥动作后缀，再按有没有版本尾巴补）
 fn chat_url(base_url: &str) -> Option<String> {
-    let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
-    if base.is_empty() {
-        return None;
-    }
-    let has_version_tail = ["/v1", "/v1beta", "/v1beta1", "/v4"]
-        .iter()
-        .any(|s| base.ends_with(s));
-    Some(if base.ends_with("/chat/completions") {
-        base.to_string()
-    } else if has_version_tail {
-        format!("{base}/chat/completions")
-    } else {
-        format!("{base}/v1/chat/completions")
-    })
+    action_url(base_url, "/chat/completions", "/v1")
 }
 
 /// Responses 协议真请求的地址（站点兼容格式登记成 `openai-resp` 时走这里）。
 /// 规矩和 chat_url 一样：先剥动作后缀，再看有没有版本尾巴。
 /// 2026-11-20 加，起因是星驰API 停用了 /v1/chat/completions。
 fn responses_url(base_url: &str) -> Option<String> {
-    let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
-    if base.is_empty() {
-        return None;
-    }
-    let has_version_tail = ["/v1", "/v1beta", "/v1beta1", "/v4"]
-        .iter()
-        .any(|s| base.ends_with(s));
-    Some(if base.ends_with("/responses") {
-        base.to_string()
-    } else if has_version_tail {
-        format!("{base}/responses")
-    } else {
-        format!("{base}/v1/responses")
-    })
+    action_url(base_url, "/responses", "/v1")
 }
 
 /// 用该 key 配置的余额来源抓剩余/总额
@@ -1720,6 +2033,477 @@ pub fn all_keys() -> Vec<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn local_server<F>(requests: usize, mut handler: F) -> (String, std::thread::JoinHandle<()>)
+    where
+        F: FnMut(usize, &mut tiny_http::Request) -> (u16, &'static str, String) + Send + 'static,
+    {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let thread = std::thread::spawn(move || {
+            for i in 0..requests {
+                let mut request = server.recv_timeout(Duration::from_secs(5)).unwrap()
+                    .expect("本地探测请求应按预期到达");
+                let (status, content_type, body) = handler(i, &mut request);
+                let response = tiny_http::Response::from_string(body).with_status_code(status)
+                    .with_header(tiny_http::Header::from_bytes("Content-Type", content_type).unwrap());
+                request.respond(response).unwrap();
+            }
+        });
+        (base, thread)
+    }
+
+    fn request_header(request: &tiny_http::Request, name: &str) -> String {
+        request.headers().iter().find(|h| h.field.to_string().eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str().to_string()).unwrap_or_default()
+    }
+
+    fn request_json(request: &mut tiny_http::Request) -> Value {
+        let mut text = String::new();
+        request.as_reader().read_to_string(&mut text).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn chat_response(text: &str) -> Value {
+        json!({"id":"chat-fake", "object":"chat.completion", "choices":[{
+            "index":0, "message":{"role":"assistant", "content":text}, "finish_reason":"stop"
+        }]})
+    }
+
+    fn test_job(base: &str, n: usize) -> ProbeJob {
+        ProbeJob {
+            key_id: format!("key-{n}"), endpoint_id: endpoint_id("openai", base),
+            fmt: "openai".into(), url: base.into(), key: format!("fake-key-{n}"), model: format!("fake-model-{n}"),
+        }
+    }
+
+    #[test]
+    fn local_http_probe_uses_four_real_protocols() {
+        for fmt in ["openai", "openai-resp", "anthropic", "gemini"] {
+            let (base, server) = local_server(1, move |_, request| {
+                assert_eq!(request.method().as_str(), "POST");
+                assert_eq!(request_header(request, "User-Agent"), PROBE_UA);
+                assert_eq!(request_header(request, "Content-Type"), "application/json");
+                let expected_path = match fmt {
+                    "openai" => "/gateway/v1/chat/completions",
+                    "openai-resp" => "/gateway/v1/responses",
+                    "anthropic" => "/gateway/v1/messages",
+                    _ => "/gateway/v1beta/models/fake-model:generateContent",
+                };
+                assert_eq!(request.url(), expected_path);
+                match fmt {
+                    "anthropic" => {
+                        assert_eq!(request_header(request, "x-api-key"), "fake-secret");
+                        assert_eq!(request_header(request, "anthropic-version"), "2023-06-01");
+                        assert_eq!(request_header(request, "Authorization"), "");
+                    }
+                    "gemini" => {
+                        assert_eq!(request_header(request, "x-goog-api-key"), "fake-secret");
+                        assert_eq!(request_header(request, "Authorization"), "");
+                        assert_eq!(request_header(request, "x-api-key"), "");
+                    }
+                    _ => {
+                        assert_eq!(request_header(request, "Authorization"), "Bearer fake-secret");
+                        assert_eq!(request_header(request, "x-api-key"), "");
+                    }
+                }
+                let body = request_json(request);
+                let response = match fmt {
+                    "openai" => {
+                        assert_eq!(body["messages"][0], json!({"role":"user","content":"ping"}));
+                        assert_eq!(body["max_tokens"], 1);
+                        assert!(body.get("input").is_none());
+                        chat_response("pong")
+                    }
+                    "openai-resp" => {
+                        assert_eq!(body["input"], "ping");
+                        assert_eq!(body["max_output_tokens"], 16);
+                        assert!(body.get("messages").is_none());
+                        json!({"id":"resp-fake","object":"response","status":"completed","output":[{
+                            "type":"message","role":"assistant","status":"completed",
+                            "content":[{"type":"output_text","text":"pong"}]
+                        }]})
+                    }
+                    "anthropic" => {
+                        assert_eq!(body["messages"][0]["content"], "ping");
+                        assert_eq!(body["max_tokens"], 16);
+                        json!({"id":"msg-fake","type":"message","role":"assistant",
+                            "stop_reason":"end_turn","content":[{"type":"text","text":"pong"}]})
+                    }
+                    _ => {
+                        assert_eq!(body["contents"], json!([{"role":"user","parts":[{"text":"ping"}]}]));
+                        assert_eq!(body["generationConfig"]["maxOutputTokens"], 16);
+                        assert!(body.get("messages").is_none());
+                        assert!(body.get("model").is_none());
+                        json!({"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"pong"}]}}]})
+                    }
+                };
+                if fmt != "gemini" {
+                    assert_eq!(body["model"], "fake-model");
+                    assert_eq!(body["stream"], false);
+                }
+                (200, "application/json", response.to_string())
+            });
+            let suffix = match fmt {
+                "openai" => "/gateway/v1/chat/completions/",
+                "openai-resp" => "/gateway/v1/responses/",
+                "anthropic" => "/gateway/v1/messages/",
+                _ => "/gateway",
+            };
+            let outcome = probe_combo(&format!("{base}{suffix}"), "fake-secret", "fake-model", fmt, 3);
+            server.join().unwrap();
+            assert_eq!(outcome.state, "ok", "{fmt}：{}", outcome.hint);
+            assert_eq!(outcome.said, "pong");
+        }
+    }
+
+    #[test]
+    fn local_http_rejects_html_errors_malformed_and_unfinished_responses() {
+        let cases = vec![
+            ("openai", "text/html", "<html>ok</html>".to_string()),
+            ("openai", "application/json", "not JSON".into()),
+            ("openai", "application/json", json!({"text":"pong"}).to_string()),
+            ("openai", "application/json", json!({"error":{"message":"fake upstream error"}}).to_string()),
+            ("openai", "application/json", json!({"choices":[{"message":{"content":"pong"}}]}).to_string()),
+            ("openai-resp", "application/json", json!({"id":"r","object":"response","status":"failed","output":[]}).to_string()),
+            ("openai-resp", "application/json", json!({"id":"r","object":"response","status":"incomplete",
+                "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"pong"}]}]}).to_string()),
+            ("anthropic", "application/json", json!({"content":[{"text":"pong"}]}).to_string()),
+            ("gemini", "application/json", json!({"candidates":[{"finishReason":"SAFETY","content":{"parts":[{"text":"pong"}]}}]}).to_string()),
+        ];
+        for (fmt, content_type, body) in cases {
+            let (base, server) = local_server(1, move |_, _| (200, content_type, body.clone()));
+            let result = probe_combo(&base, "fake-secret", "fake-model", fmt, 3);
+            server.join().unwrap();
+            assert_ne!(result.state, "ok", "{fmt} 不得假成功");
+        }
+        for fmt in ["openai-resp", "anthropic", "gemini"] {
+            let (base, server) = local_server(1, |_, _| (200, "text/html", "<html>登录</html>".into()));
+            assert_ne!(probe_combo(&base, "fake-secret", "fake-model", fmt, 3).state, "ok");
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn local_http_legal_empty_content_can_succeed_without_text() {
+        let cases = vec![
+            ("openai", json!({"object":"chat.completion","choices":[{
+                "message":{"role":"assistant","content":null},"finish_reason":"length"}]})),
+            ("openai-resp", json!({"id":"r","object":"response","status":"completed","output":[]})),
+            ("anthropic", json!({"id":"m","type":"message","role":"assistant","content":[],"stop_reason":"max_tokens"})),
+            ("gemini", json!({"candidates":[{"finishReason":"MAX_TOKENS"}]})),
+        ];
+        for (fmt, response) in cases {
+            let (base, server) = local_server(1, move |_, _| (200, "application/json", response.to_string()));
+            let result = probe_combo(&base, "fake-secret", "fake-model", fmt, 3);
+            server.join().unwrap();
+            assert_eq!(result.state, "ok", "{fmt}：{}", result.hint);
+            assert!(result.said.is_empty());
+        }
+    }
+
+    #[test]
+    fn local_http_failure_attribution_and_credential_redaction() {
+        for (code, body, state) in [
+            (404, json!({"error":{"message":"model fake-model not found"}}), "model_mismatch"),
+            (404, json!({"message":"unknown route"}), "error"),
+            (400, json!({"message":"This group does not allow messages dispatch"}), "key_denied"),
+            (403, json!({"message":"This API key is disabled: fake-secret"}), "key_denied"),
+            (429, json!({"message":"slow down"}), "rate_limited"),
+            (400, json!({"error":{"code":"chat_completions_disabled","message":"本站已停用 /v1/chat/completions"}}), "site_disabled"),
+        ] {
+            let (base, server) = local_server(1, move |_, _| (code, "application/json", body.to_string()));
+            let result = probe_combo(&base, "fake-secret", "fake-model", "openai", 3);
+            server.join().unwrap();
+            assert_eq!(result.state, state);
+            assert!(!result.hint.contains("fake-secret"));
+        }
+    }
+
+    #[test]
+    fn upstream_credential_redaction_handles_unicode_before_truncation() {
+        let hint = safe_upstream_hint(r#"{"error":{"message":"rejected \u0066ake-secret"}}"#, "fake-secret");
+        assert!(!hint.contains("fake-secret"));
+        assert!(hint.contains("已隐藏凭据"));
+        let long_key = "fake-secret-".repeat(30);
+        let body = json!({"error":{"message":format!("rejected {long_key}")}}).to_string();
+        let hint = safe_upstream_hint(&body, &long_key);
+        assert!(!hint.contains("fake-secret"));
+        assert!(hint.contains("已隐藏凭据"));
+    }
+
+    #[test]
+    fn local_http_discovers_every_key_even_after_success_or_empty() {
+        for empty_first in [false, true] {
+            let (base, server) = local_server(4, move |i, request| {
+                assert_eq!(request.method().as_str(), "GET");
+                assert_eq!(request.url(), "/v1/models");
+                let first = i % 2 == 0;
+                assert_eq!(request_header(request, "Authorization"),
+                    if first { "Bearer fake-A" } else { "Bearer fake-B" });
+                let data = if first && empty_first { json!([]) }
+                    else if first { json!([{"id":"model-A"}]) } else { json!([{"id":"model-B"}]) };
+                (200, "application/json", json!({"object":"list","data":data}).to_string())
+            });
+            let site = json!({"base_urls":[{"format":"openai","url":base}],
+                "keys":[{"id":"A","key":"fake-A"},{"id":"B","key":"fake-B"}]});
+            let results = discover_site_models(&site, &AtomicBool::new(false));
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0]["state"], if empty_first { "empty" } else { "ok" });
+            assert_eq!(results[1]["models"], json!(["model-B"]));
+            for result in &results {
+                assert!(chrono::DateTime::parse_from_rfc3339(result["checked_at"].as_str().unwrap()).is_ok());
+                assert_eq!(result["endpoint_id"], endpoint_id("openai", &base));
+                assert!(!result.to_string().contains("fake-A"));
+                assert!(!result.to_string().contains("fake-B"));
+            }
+            let (models, notes) = probe_models_all(&site);
+            server.join().unwrap();
+            assert_eq!(notes.len(), 2);
+            assert_eq!(models, if empty_first { vec!["model-B"] } else { vec!["model-A", "model-B"] });
+        }
+    }
+
+    #[test]
+    fn local_http_model_lists_use_protocol_paths_headers_and_pagination() {
+        for fmt in ["openai", "openai-resp", "anthropic", "gemini"] {
+            let (base, server) = local_server(2, move |page, request| {
+                let prefix = if fmt == "gemini" { "/v1beta/models" } else { "/v1/models" };
+                if page == 0 {
+                    assert_eq!(request.url(), prefix);
+                } else {
+                    let query = match fmt {
+                        "anthropic" => "?after_id=model-A",
+                        "gemini" => "?pageToken=next-fake",
+                        _ => "?after=model-A",
+                    };
+                    assert_eq!(request.url(), format!("{prefix}{query}"));
+                }
+                match fmt {
+                    "anthropic" => {
+                        assert_eq!(request_header(request, "x-api-key"), "fake-secret");
+                        assert_eq!(request_header(request, "anthropic-version"), "2023-06-01");
+                        assert_eq!(request_header(request, "Authorization"), "");
+                    }
+                    "gemini" => {
+                        assert_eq!(request_header(request, "x-goog-api-key"), "fake-secret");
+                        assert_eq!(request_header(request, "Authorization"), "");
+                    }
+                    _ => assert_eq!(request_header(request, "Authorization"), "Bearer fake-secret"),
+                }
+                let id = if page == 0 { "model-A" } else { "model-B" };
+                let response = if fmt == "gemini" {
+                    let mut v = json!({"models":[{"name":format!("models/{id}")}]});
+                    if page == 0 { v["nextPageToken"] = json!("next-fake"); }
+                    v
+                } else {
+                    json!({"data":[{"id":id}],"has_more":page == 0,"last_id":id})
+                };
+                (200, "application/json", response.to_string())
+            });
+            let suffix = if fmt == "openai-resp" { "/v1/responses/" }
+                else if fmt == "anthropic" { "/v1/messages/" }
+                else if fmt == "gemini" { "/v1beta/models/fake-model:generateContent/" } else { "" };
+            let (ok, msg, models) = probe_models_for_endpoint(&format!("{base}{suffix}"), "fake-secret", fmt);
+            server.join().unwrap();
+            assert!(ok, "{fmt}：{msg}");
+            assert_eq!(models, vec!["model-A", "model-B"]);
+        }
+    }
+
+    #[test]
+    fn local_http_model_discovery_distinguishes_empty_html_and_partial() {
+        for (content_type, response, expected_state) in [
+            ("text/html", "<html>模型页</html>".to_string(), "error"),
+            ("application/json", json!({"error":{"message":"fake-secret rejected"}}).to_string(), "error"),
+            ("application/json", json!({"data":[]}).to_string(), "empty"),
+            ("application/json", "not JSON".into(), "error"),
+            ("application/json", json!({"models":[]}).to_string(), "error"),
+            ("application/json", json!({"data":[],"success":false}).to_string(), "error"),
+            ("application/json", json!({"data":[],"code":401}).to_string(), "error"),
+            ("application/json", json!({"data":[{"wrong":"model"}]}).to_string(), "error"),
+            ("application/json", json!({"data":[],"has_more":true}).to_string(), "error"),
+        ] {
+            let (base, server) = local_server(1, move |_, _| (200, content_type, response.clone()));
+            let result = discover_endpoint_models(&base, "fake-secret", "openai", &AtomicBool::new(false), 3);
+            server.join().unwrap();
+            assert_eq!(result.state, expected_state);
+            assert!(!result.msg.contains("fake-secret"));
+        }
+        let (base, server) = local_server(2, |_, _| (200, "application/json",
+            json!({"data":[{"id":"model-A"}],"has_more":true,"last_id":"model-A"}).to_string()));
+        let result = discover_endpoint_models(&base, "fake-secret", "openai", &AtomicBool::new(false), 3);
+        server.join().unwrap();
+        assert_eq!(result.state, "error", "重复游标不能伪装成完整成功");
+        assert_eq!(result.models, vec!["model-A"]);
+    }
+
+    #[test]
+    fn endpoint_identity_merges_site_and_key_endpoints_without_format_collapse() {
+        let site = json!({
+            "base_urls":[{"format":"openai","url":" http://127.0.0.1:1/a/ "},
+                {"format":"openai","url":"http://127.0.0.1:1/b"}],
+            "keys":[{"base_url":"http://127.0.0.1:1/a","base_format":"openai"},
+                {"base_url":"http://127.0.0.1:1/private","base_format":"anthropic"}]
+        });
+        let endpoints = matrix_endpoints(&site);
+        assert_eq!(endpoints.len(), 3);
+        assert_eq!(endpoints[2].fmt, "anthropic");
+        assert_eq!(endpoints[0].id, "openai|http://127.0.0.1:1/a");
+        assert_ne!(endpoints[0].id, endpoints[1].id);
+        assert_eq!(endpoint_id("", " http://127.0.0.1/v1/responses/// "),
+            "openai-resp|http://127.0.0.1/v1/responses");
+        assert_eq!(endpoint_id(" anthropic ", " http://127.0.0.1/v1/ "),
+            "anthropic|http://127.0.0.1/v1");
+        let explicit = matrix_endpoints(&json!({"base_urls":[{
+            "format":"openai","base_format":"anthropic","url":"http://127.0.0.1/v1"
+        }]}));
+        assert_eq!(explicit[0].fmt, "anthropic");
+    }
+
+    #[test]
+    fn local_http_discovery_visits_each_key_and_key_only_endpoint() {
+        let (base, server) = local_server(3, |i, request| {
+            assert_eq!(request.url(), if i == 1 { "/private/v1/models" } else { "/site/v1/models" });
+            assert_eq!(request_header(request, "Authorization"), if i < 2 { "Bearer fake-A" } else { "Bearer fake-B" });
+            (200, "application/json", json!({"data":[{"id":format!("model-{i}")}]}).to_string())
+        });
+        let site = json!({"base_urls":[{"format":"openai","url":format!("{base}/site")}],
+            "keys":[{"id":"A","key":"fake-A","base_url":format!("{base}/private"),"base_format":"openai"},
+                {"id":"B","key":"fake-B"}]});
+        let results = discover_site_models(&site, &AtomicBool::new(false));
+        server.join().unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r["state"] == "ok"));
+        assert_ne!(results[0]["endpoint_id"], results[1]["endpoint_id"]);
+        assert_eq!(results[2]["key_id"], "B");
+        assert_eq!(results[2]["endpoint_id"], results[0]["endpoint_id"]);
+    }
+
+    #[test]
+    fn key_catalogs_never_borrow_site_or_another_endpoint_permissions() {
+        let site = json!({"models_list":"site-model"});
+        let key = json!({"models_list":"manual-model", "model_catalogs":[
+            {"endpoint_id":"openai|one","state":"ok","models":["key-model"]},
+            {"endpoint_id":"openai|empty","state":"empty","models":[]},
+            {"endpoint_id":"openai|error","state":"error","models":["partial-model"]},
+            {"endpoint_id":"openai|stale","state":"stale","models":["old-model"]}
+        ]});
+        assert_eq!(models_for_endpoint(&site, &key, "openai|one"), vec!["key-model"]);
+        for endpoint in ["openai|empty", "openai|error", "openai|stale"] {
+            assert!(models_for_endpoint(&site, &key, endpoint).is_empty());
+        }
+        assert_eq!(models_for_endpoint(&site, &key, "openai|unknown"), vec!["manual-model"]);
+        assert!(models_for_endpoint(&site, &json!({}), "unknown").is_empty());
+        assert_eq!(models_for(&site, &key), vec!["key-model", "manual-model"]);
+        assert_eq!(models_for(&site, &json!({})), vec!["site-model"]);
+        assert!(models_for(&site, &json!({"models_list":""})).is_empty());
+        assert!(models_for(&site, &json!({"model_catalogs":[]})).is_empty());
+        let repeated = json!({"model_catalogs":[
+            {"endpoint_id":"openai|one","state":"ok","models":["old-model"]},
+            {"endpoint_id":"openai|one","state":"error","models":[]}
+        ]});
+        assert!(models_for(&site, &repeated).is_empty());
+        assert!(models_for_endpoint(&site, &repeated, "openai|one").is_empty());
+    }
+
+    #[test]
+    fn key_edits_preserve_catalogs_but_invalidate_on_probe_input_change() {
+        let old = json!({"id":"A","key":"fake-secret","base_url":"http://127.0.0.1/v1",
+            "base_format":"openai","models_list":"manual-model","probe_revision":"old-revision",
+            "model_catalogs":[{"endpoint_id":"openai|http://127.0.0.1/v1","state":"ok","models":["old-model"]}]});
+        let edited = merge_key_edit(Some(&old), &json!({"label":"新名称","key":"","model_catalogs":[]}));
+        assert_eq!(edited["model_catalogs"], old["model_catalogs"]);
+        assert_eq!(edited["probe_revision"], "old-revision");
+        assert_eq!(edited["key"], "fake-secret");
+        for (field, value) in [("key", "fake-new-secret"), ("base_url", "http://127.0.0.1/other"),
+            ("base_format", "anthropic"), ("models_list", "manual-new-model")]
+        {
+            let mut patch = json!({});
+            patch[field] = json!(value);
+            let edited = merge_key_edit(Some(&old), &patch);
+            assert_ne!(edited["probe_revision"], old["probe_revision"]);
+            assert_eq!(edited["model_catalogs"][0]["state"], "stale");
+            assert_eq!(edited["models_list"], if field == "models_list" { "manual-new-model" } else { "manual-model" });
+        }
+    }
+
+    #[test]
+    fn empty_locked_or_cancelled_keys_never_send_anonymous_requests() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let site = json!({"base_urls":[{"format":"openai","url":base}],
+            "keys":[{"id":"empty","key":""},{"id":"locked","key":"fake-secret","secret_locked":true}]});
+        let results = discover_site_models(&site, &AtomicBool::new(false));
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r["state"] == "error"));
+        let cancelled_discovery = discover_site_models(&site, &AtomicBool::new(true));
+        assert_eq!(cancelled_discovery.len(), 2);
+        assert!(cancelled_discovery.iter().all(|r| r["state"] == "cancelled"));
+        assert_ne!(probe_combo(&base, "", "fake-model", "openai", 1).state, "ok");
+        let cancelled = probe_matrix_cancellable(vec![test_job(&base, 0)], 1, 6, Arc::new(AtomicBool::new(true)));
+        assert_eq!(cancelled[0].state, "cancelled");
+        assert_eq!(cancelled[0].endpoint_id, endpoint_id("openai", &base));
+        assert_eq!(cancelled[0].url, base);
+        assert_eq!(cancelled[0].model, "fake-model-0");
+        assert!(server.recv_timeout(Duration::from_millis(30)).unwrap().is_none());
+    }
+
+    #[test]
+    fn local_http_cancellation_stops_next_matrix_job_and_model_page() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let server_cancel = cancel.clone();
+        let (base, server) = local_server(1, move |_, _| {
+            server_cancel.store(true, Ordering::Release);
+            (200, "application/json", chat_response("pong").to_string())
+        });
+        let cells = probe_matrix_cancellable((0..3).map(|i| test_job(&base, i)).collect(), 3, 1, cancel);
+        server.join().unwrap();
+        assert_eq!(cells[0].state, "ok");
+        assert!(cells[1..].iter().all(|c| c.state == "cancelled"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let server_cancel = cancel.clone();
+        let (base, server) = local_server(1, move |_, _| {
+            server_cancel.store(true, Ordering::Release);
+            (200, "application/json", json!({"models":[{"name":"models/model-A"}],"nextPageToken":"next"}).to_string())
+        });
+        let result = discover_endpoint_models(&base, "fake-secret", "gemini", &cancel, 3);
+        server.join().unwrap();
+        assert_eq!(result.state, "cancelled");
+        assert_eq!(result.models, vec!["model-A"]);
+    }
+
+    #[test]
+    fn local_http_matrix_caps_workers_at_six() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let server_cancel = cancel.clone();
+        let thread = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..6 {
+                requests.push(server.recv_timeout(Duration::from_secs(5)).unwrap().expect("应有六个在途请求"));
+            }
+            assert!(server.recv_timeout(Duration::from_millis(30)).unwrap().is_none(), "不得出现第七个在途请求");
+            server_cancel.store(true, Ordering::Release);
+            for request in requests {
+                request.respond(tiny_http::Response::from_string(chat_response("pong").to_string())
+                    .with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap())).unwrap();
+            }
+        });
+        let results = probe_matrix_cancellable((0..12).map(|i| test_job(&base, i)).collect(), 10, 99, cancel);
+        thread.join().unwrap();
+        assert_eq!(results.iter().filter(|c| c.state == "ok").count(), 6);
+        assert_eq!(results.iter().filter(|c| c.state == "cancelled").count(), 6);
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(result.key_id, format!("key-{i}"));
+            assert_eq!(result.model, format!("fake-model-{i}"));
+            assert!(!result.msg.contains("fake-key"));
+        }
+    }
 
     /// 上游 base 的形态五花八门（有的带 /v1、有的到 /v4、有的直接给了 /models），
     /// 「从上游获取」要能把这些都拼对，否则用户点了只会得到一个 404
@@ -1727,6 +2511,7 @@ mod tests {
     fn models_url_handles_common_base_shapes() {
         assert_eq!(models_url("").as_deref(), None);
         assert_eq!(models_url("   ").as_deref(), None);
+        assert_eq!(models_url("http://127.0.0.1/models/").as_deref(), Some("http://127.0.0.1/models"));
         assert_eq!(
             models_url("https://api.openai.com/v1").as_deref(),
             Some("https://api.openai.com/v1/models")
@@ -1877,9 +2662,6 @@ mod tests {
         assert!(list_masked().iter().all(|p| p["id"] != json!(site_id)));
     }
 
-    /// 接入点挂在站点上：一个站常有 OpenAI / Anthropic / DashScope 三种口，
-    /// 默认取 OpenAI 兼容那个，key 自己填了才覆盖
-    #[test]
     /// 真请求的地址：跟 models_url 同一套归一规则，别再叠一层动作后缀
     #[test]
     fn chat_url_normalizes_the_same_way() {
@@ -1976,19 +2758,12 @@ mod tests {
         assert_eq!(base_for(&only_resp, &json!({})), "https://api.xingchiapi.com/v1/responses");
     }
 
-    /// 协议判定的核心：fmt=openai-resp 或地址自带 /responses 都要走 Responses。
-    /// 这条规则写在 chat_probe 里，抽出来单测，避免真发网络请求。
     #[test]
-    fn wants_responses_covers_format_and_url() {
-        let wants = |fmt: &str, url: &str| {
-            fmt.eq_ignore_ascii_case("openai-resp")
-                || url.trim().trim_end_matches('/').to_ascii_lowercase().ends_with("/responses")
-        };
-        assert!(wants("openai-resp", "https://api.xingchiapi.com/v1"));
-        assert!(wants("OpenAI-Resp", "https://x/v1"), "格式名大小写不该影响判断");
-        assert!(wants("", "https://api.xingchiapi.com/v1/responses/"), "地址写明了就照办");
-        assert!(!wants("openai", "https://x/v1"), "普通 chat 站保持老行为");
-        assert!(!wants("", "https://x/v1"));
+    fn protocol_format_prefers_explicit_format_then_infers_url() {
+        assert_eq!(protocol_format("OpenAI-Resp", "http://127.0.0.1/v1"), "openai-resp");
+        assert_eq!(protocol_format("", "http://127.0.0.1/v1/responses/"), "openai-resp");
+        assert_eq!(protocol_format("anthropic", "http://127.0.0.1/v1/responses"), "anthropic");
+        assert_eq!(protocol_format("", "http://127.0.0.1/v1"), "openai");
     }
 
     /// 失败归因必须把「站点停用这个协议」和「这把密钥不行」分开。
@@ -2004,17 +2779,22 @@ mod tests {
         );
         assert_eq!(
             classify_failure(400, r#"{"error":{"message":"This group does not allow /v1/messages dispatch"}}"#),
-            "site_disabled"
+            "key_denied"
         );
         assert_eq!(
             classify_failure(400, r#"{"error":{"message":"model gpt-x not found"}}"#),
             "model_mismatch"
         );
         assert_eq!(classify_failure(400, r#"{"error":{"message":"bad request"}}"#), "error");
+        assert_eq!(classify_failure(400, "dispatch failed"), "error");
+        assert_eq!(classify_failure(400, "site-wide request limit reached"), "error");
         assert_eq!(classify_failure(401, "unauthorized"), "key_denied");
         assert_eq!(classify_failure(403, "forbidden"), "key_denied");
-        assert_eq!(classify_failure(429, "slow down"), "key_denied");
-        assert_eq!(classify_failure(404, ""), "site_disabled");
+        assert_eq!(classify_failure(429, "slow down"), "rate_limited");
+        assert_eq!(classify_failure(404, ""), "error");
+        assert_eq!(classify_failure(404, "model fake does not exist"), "model_mismatch");
+        assert_eq!(classify_failure(403, "This key has been disabled"), "key_denied");
+        assert_eq!(classify_failure(400, "This group: chat_completions_disabled"), "key_denied");
         assert_eq!(classify_failure(500, ""), "error");
     }
 
@@ -2030,9 +2810,9 @@ mod tests {
         assert_eq!(fmt_of_url("https://generativelanguage.googleapis.com/v1beta"), "gemini");
     }
 
-    /// 列来自站点登记的接入点；站点没登记时退回密钥自带地址，别让弹窗空着。
+    /// 同格式多根地址必须保留；站点和 Key 自带地址始终合并。
     #[test]
-    fn matrix_columns_prefers_site_then_falls_back_to_keys() {
+    fn matrix_columns_keeps_all_distinct_endpoints() {
         let site = json!({"base_urls": [
             {"format": "openai-resp", "url": "https://a/v1/responses"},
             {"format": "openai",      "url": "https://a/v1"},
@@ -2040,7 +2820,7 @@ mod tests {
             {"format": "anthropic",   "url": "  "}
         ]});
         let cols = matrix_columns(&site);
-        assert_eq!(cols.len(), 2, "同一格式只占一列，空地址要跳过");
+        assert_eq!(cols.len(), 3, "同一格式的不同端点都占一列，空地址跳过");
         assert_eq!(cols[0], ("openai-resp".to_string(), "https://a/v1/responses".to_string()));
         assert_eq!(cols[1], ("openai".to_string(), "https://a/v1".to_string()));
 
@@ -2073,6 +2853,7 @@ mod tests {
         assert_eq!(upstream_hint(""), "");
     }
 
+    #[test]
     fn base_url_prefers_the_key_override_then_the_site_openai_entry() {
         let site = json!({
             "models_list": "a, b",
@@ -2098,7 +2879,7 @@ mod tests {
             "https://old/v1"
         );
         assert_eq!(models_for(&site, &json!({})), vec!["a", "b"]);
-        assert_eq!(models_for(&site, &json!({ "models_list": "b, c" })), vec!["a", "b", "c"]);
+        assert_eq!(models_for(&site, &json!({ "models_list": "b, c" })), vec!["b", "c"]);
     }
 
     #[test]
